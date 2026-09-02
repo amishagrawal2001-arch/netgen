@@ -119,6 +119,29 @@ class DHCPPoolDialog(QDialog):
         self.gateway_route_edit.setPlaceholderText("Comma-separated CIDRs (optional)")
         form.addRow("Gateway Route(s):", self.gateway_route_edit)
 
+        # v0.5.245 (audit U relay-mode): DHCP relay support. Leave
+        # empty for direct-attached clients (server serves clients
+        # on its own L2 segment — the historical default). Fill
+        # with the RELAY's IP on the SERVER's segment when clients
+        # are behind a DHCP relay (e.g. 172.16.30.10 = the switch's
+        # irb.10 SVI when clients are on irb.30 = 192.168.30.1).
+        # When set:
+        #   • server skips anchoring `.1` in the pool subnet on its
+        #     interface (would collide with the relay's IP)
+        #   • pool subnet route installs as `<pool> via <relay_hop>`
+        #     so OFFER packets to giaddr traverse back correctly
+        self.relay_return_hop_edit = QLineEdit(
+            self.defaults.get("relay_return_hop", "")
+        )
+        self.relay_return_hop_edit.setPlaceholderText(
+            "Optional. Relay's IP on the SERVER's segment (e.g. 172.16.30.10)."
+        )
+        self.relay_return_hop_edit.setToolTip(
+            "For DHCP-relay setups only. Leave blank for direct-attached "
+            "clients (default). See CHANGELOG v0.5.245 for the mechanics."
+        )
+        form.addRow("Relay Return-Hop:", self.relay_return_hop_edit)
+
         # v0.5.231 (audit U client-7): named-pool IPv6 fields.
         # Pre-fix, DHCPPoolDialog was IPv4-only — IPv6 DHCP servers
         # could only be built via the Add Device inline block,
@@ -253,6 +276,13 @@ class DHCPPoolDialog(QDialog):
             "pool6_start": self.pool6_start_edit.text().strip(),
             "pool6_end": self.pool6_end_edit.text().strip(),
             "prefix6": self.prefix6_edit.text().strip(),
+            # v0.5.245 (audit U relay-mode): optional relay next-hop.
+            # Empty = direct-attached pool (server serves clients on
+            # its own segment). Set = server routes to the pool
+            # subnet via this IP and skips anchoring `.1` on its
+            # own interface. See the tooltip on the input for full
+            # semantics.
+            "relay_return_hop": self.relay_return_hop_edit.text().strip(),
         }
         lease_time = int(self.lease_time_spin.value())
         if lease_time > 0:

@@ -894,6 +894,7 @@ def _ensure_ipv4_address(
     gateway: str = "",
     ipv4_mask: str = "",
     container=None,
+    relay_return_hop: str = "",
 ) -> Optional[str]:
     """Ensure the interface has an IPv4 address in the pool's subnet.
 
@@ -915,11 +916,34 @@ def _ensure_ipv4_address(
     - Skip if the interface already has an IPv4 in the pool subnet
       (idempotent).
 
+    v0.5.245 (audit U relay-mode): SKIP anchor entirely when the
+    caller supplied ``relay_return_hop`` — that field is the
+    operator's declaration that the pool is served via a DHCP
+    relay and the pool subnet does NOT live on the server's
+    interface. Anchoring `.1` in a relayed pool causes the SERVER
+    to claim the relay's IP (e.g. 192.168.30.1 = the switch's
+    irb.30) and short-circuit dnsmasq's OFFER (kernel sees the
+    OFFER's destination as its own IP → loopback, never leaves).
+    Operator hit this exact case on srv06 2026-09-02: netgen
+    stole the switch's 192.168.30.1 and DHCPOFFERs never reached
+    the relay.
+
     Returns the IPv4 address assigned (or the pre-existing one), or
     None if the caller must fail loudly. Callers should surface the
     None case into ``dhcp_last_error`` so operators see it.
     """
     if not interface or not pool_start or not pool_end:
+        return None
+    if relay_return_hop:
+        # v0.5.245: relay mode — do NOT anchor. The pool subnet is
+        # remote (behind the relay). The server routes to it via
+        # `relay_return_hop`; _add_route_and_vrf_copy installs
+        # that route separately.
+        logger.info(
+            "[DHCP] Skipping IPv4 anchor on %s for pool %s-%s "
+            "because relay_return_hop=%s (pool served via relay).",
+            interface, pool_start, pool_end, relay_return_hop,
+        )
         return None
     try:
         # Find the SUPERNET (smallest prefix that covers both
@@ -2158,6 +2182,24 @@ def start_dhcp_server(
     pool_start = dhcp_config.get("pool_start") if ipv4_enabled else None
     pool_end = dhcp_config.get("pool_end") if ipv4_enabled else None
     gateway = dhcp_config.get("gateway", "") if ipv4_enabled else ""
+    # v0.5.245 (audit U relay-mode): when the pool is served via a
+    # DHCP relay (client's segment is L3-remote), the server must
+    # NOT anchor an IP in the pool subnet on its own interface AND
+    # must route to the pool subnet via the relay's IP on the
+    # server segment (NOT via the pool's client-side gateway,
+    # which is unreachable from the server). Two configs come out
+    # of one string field so the operator only fills what they
+    # actually know: relay's IP that the SERVER can reach.
+    relay_return_hop = (
+        dhcp_config.get("relay_return_hop", "") if ipv4_enabled else ""
+    )
+    if relay_return_hop:
+        logger.info(
+            "[DHCP] Server device in RELAY mode (return-hop=%s). "
+            "Pool subnet is remote — no interface anchor, pool "
+            "routes install via the return-hop.",
+            relay_return_hop,
+        )
 
     lease_hours_raw = dhcp_config.get("lease_time", dhcp_config.get("lease_hours", 24))
     try:
@@ -2262,6 +2304,7 @@ def start_dhcp_server(
             interface, pool_start, pool_end,
             gateway=gateway, ipv4_mask="",
             container=container,
+            relay_return_hop=relay_return_hop,  # v0.5.245: skip anchor in relay mode
         )
         if assigned:
             logger.info("[DHCP] Server-mode IPv4 anchor on %s: %s",
@@ -2298,10 +2341,15 @@ def start_dhcp_server(
                 continue
             _anchored_subnets.add(_add_key)
             _add_gw = _add_pool.get("gateway") or ""
+            # v0.5.245: per-pool relay override (defaults to the
+            # server device's relay_return_hop when the individual
+            # pool didn't set one).
+            _add_relay = _add_pool.get("relay_return_hop") or relay_return_hop
             _add_assigned = _ensure_ipv4_address(
                 interface, _add_start, _add_end,
                 gateway=_add_gw, ipv4_mask="",
                 container=container,
+                relay_return_hop=_add_relay,
             )
             if _add_assigned:
                 logger.info(
@@ -2594,17 +2642,28 @@ def start_dhcp_server(
                             vrf_host_exc,
                         )
 
+            # v0.5.245: in relay mode, all pool-adjacent routes
+            # (both gateway_routes and pool_networks_unique below)
+            # must use the RELAY's IP on the server segment as
+            # next-hop — the pool's `gateway` field is the CLIENT's
+            # gateway (e.g. 192.168.30.1 = the switch's irb.30),
+            # which isn't ARPable from the server's interface. Pre-
+            # fix, `192.168.30.0/24 via 192.168.30.1 dev vlan10`
+            # got installed → ARP for the unreachable next-hop →
+            # dnsmasq's OFFER got dropped silently.
+            _route_next_hop = relay_return_hop or gateway
             for net in gateway_routes:
                 _add_route_and_vrf_copy(
-                    str(net), gateway=gateway, interface=interface or "",
+                    str(net), gateway=_route_next_hop, interface=interface or "",
                     family="ipv4", vrf_name=vrf_name, container=container,
                     log_prefix="[DHCP]", label="gateway route",
                 )
 
-        if gateway and pool_networks_unique:
+        if (relay_return_hop or gateway) and pool_networks_unique:
+            _pool_next_hop = relay_return_hop or gateway
             for net in pool_networks_unique:
                 _add_route_and_vrf_copy(
-                    str(net), gateway=gateway, interface=interface or "",
+                    str(net), gateway=_pool_next_hop, interface=interface or "",
                     family="ipv4", vrf_name=vrf_name, container=container,
                     log_prefix="[DHCP]", label="static route",
                 )

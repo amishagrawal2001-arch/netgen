@@ -408,6 +408,10 @@ class DeviceDatabase:
             """)
             
             # Create DHCP pool definitions table
+            # v0.5.245: relay_return_hop added — see the field's
+            # semantics documented in `_dhcp_pool_to_api` (server) /
+            # `_ensure_ipv4_address` (utils/dhcp.py). Nullable so
+            # existing pools default to direct-attached mode.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS dhcp_pools (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -418,10 +422,22 @@ class DeviceDatabase:
                     lease_time INTEGER,
                     gateway_routes TEXT,
                     description TEXT,
+                    relay_return_hop TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # v0.5.245: migrate — add the column on existing installs
+            # where the CREATE-IF-NOT-EXISTS above is a no-op. sqlite
+            # ALTER TABLE ADD COLUMN is idempotent-guarded via a
+            # column existence check.
+            try:
+                _cols = {r[1] for r in conn.execute("PRAGMA table_info(dhcp_pools)").fetchall()}
+                if "relay_return_hop" not in _cols:
+                    conn.execute("ALTER TABLE dhcp_pools ADD COLUMN relay_return_hop TEXT")
+                    logger.info("[DEVICE DB] Migrated dhcp_pools: added relay_return_hop column")
+            except Exception as _mig_exc:
+                logger.warning("[DEVICE DB] dhcp_pools.relay_return_hop migration skipped: %s", _mig_exc)
             
             # Create device DHCP pool attachments table
             conn.execute("""
@@ -2112,6 +2128,9 @@ class DeviceDatabase:
                 pool_data.get("gateway_routes") or pool_data.get("gateway_route")
             )
             description = pool_data.get("description") or ""
+            # v0.5.245: relay_return_hop is optional; empty string
+            # stored as NULL so downstream `... or None` checks work.
+            relay_return_hop = (pool_data.get("relay_return_hop") or "").strip() or None
 
             timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -2125,9 +2144,10 @@ class DeviceDatabase:
                     """
                     INSERT INTO dhcp_pools (
                         pool_name, pool_start, pool_end, gateway, lease_time,
-                        gateway_routes, description, created_at, updated_at
+                        gateway_routes, description, relay_return_hop,
+                        created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         pool_name,
@@ -2137,6 +2157,7 @@ class DeviceDatabase:
                         lease_time,
                         gateway_routes,
                         description,
+                        relay_return_hop,
                         timestamp,
                         timestamp,
                     ),
@@ -2160,12 +2181,16 @@ class DeviceDatabase:
                 update_fields = []
                 update_values = []
 
+                # v0.5.245: relay_return_hop is optional metadata
+                # driving relay-mode server behavior; passes through
+                # the same update path as gateway/lease_time.
                 field_mapping = {
                     "pool_start": "pool_start",
                     "pool_end": "pool_end",
                     "gateway": "gateway",
                     "lease_time": "lease_time",
                     "description": "description",
+                    "relay_return_hop": "relay_return_hop",
                 }
 
                 for key, column in field_mapping.items():

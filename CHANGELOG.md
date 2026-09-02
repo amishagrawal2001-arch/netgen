@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.245] - 2026-09-02
+
+**DHCP relay mode: server can serve clients behind a DHCP relay
+without stealing the relay's IP or blackholing OFFERs.**
+
+Operator on srv06 2026-09-02: DHCP client on vlan30
+(192.168.30.0/24) with the Juniper irb.30 (192.168.30.1) acting
+as a DHCP relay forwarding to the netgen server on vlan10
+(172.16.30.1). netgen pre-fix couldn't serve this topology:
+
+- Attaching a 192.168.30 pool auto-anchored `192.168.30.1/24`
+  on the server's vlan10 — collided with the switch's own
+  irb.30 = 192.168.30.1 (both devices claiming the same IP).
+- The auto-anchor also implied a connected route
+  `192.168.30.0/24 dev vlan10 src 192.168.30.1`. When
+  dnsmasq replied to `giaddr=192.168.30.1`, the kernel saw
+  the destination as a local IP → short-circuited →
+  DHCPOFFER never left srv06.
+- Even without the anchor, netgen installed
+  `192.168.30.0/24 via 192.168.30.1 dev vlan10` (pool's
+  client-side gateway as next-hop) — unreachable from the
+  server segment.
+
+Fix — one new optional pool field `relay_return_hop`, the
+RELAY's IP on the SERVER's L2 segment (e.g. the switch's
+irb.10 = 172.16.30.10 for a 192.168.30 client pool served
+via 172.16.30 server segment). When set:
+
+1. `_ensure_ipv4_address` skips the interface anchor entirely
+   (no collision).
+2. Both gateway_routes and pool_networks_unique route-install
+   loops in `start_dhcp_server` use `relay_return_hop` as the
+   next-hop instead of the pool's `gateway` — so OFFERs to
+   giaddr traverse back through the relay via the correct
+   L2-reachable next-hop.
+3. dnsmasq option 3 (client-advertised gateway) unchanged —
+   still the pool's `gateway` (that's what clients need for
+   their default route, not what the server needs to reach
+   them).
+
+Absent (empty string): behavior unchanged — direct-attached
+clients on the pool's L2 segment (the historical model).
+
+Implementation:
+- **utils/dhcp.py** — `_ensure_ipv4_address` takes a new
+  `relay_return_hop` kwarg; early-returns if set.
+  `start_dhcp_server` reads `relay_return_hop` from
+  `dhcp_config` next to `gateway`; passes it to both primary
+  and additional-pool anchor calls. Route-install loops use
+  `relay_return_hop or gateway` as next-hop.
+- **run_tgen_server.py** — `POST /api/dhcp/pools` and
+  `PUT /api/dhcp/pools/<name>` accept the field.
+  `_dhcp_pool_to_api` emits it on GET.
+  `POST /api/device/dhcp/server/attach_pools` propagates
+  from the catalog pool + honors a per-attach override.
+  Per-pool passthrough for additional_pools too.
+- **utils/device_database.py** — `dhcp_pools` table gets a
+  new `relay_return_hop TEXT` column (with idempotent
+  `ALTER TABLE ADD COLUMN` migration for existing installs).
+  `add_dhcp_pool` and `update_dhcp_pool` persist it.
+- **utils/devices_tab_dhcp.py `DHCPPoolDialog`** — new
+  "Relay Return-Hop" input in the Add/Edit Pool form, with
+  a tooltip explaining direct-attached vs relay-mode.
+  `get_payload` emits the field to the server.
+
+Tests: `tests/test_v05245_relay_mode.py` — 17 pass. All 241
+DHCP-related tests in the suite still pass.
+
 ## [0.5.244] - 2026-09-02
 
 **Restart DHCP no longer reports "HTTP 500: Restart failed" for a

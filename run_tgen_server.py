@@ -7831,6 +7831,21 @@ def attach_dhcp_pools_to_server():
     elif replace_existing and "gateway" in dhcp_cfg:
         dhcp_cfg.pop("gateway", None)
 
+    # v0.5.245 (audit U relay-mode): propagate the pool's
+    # relay_return_hop into the device's dhcp_config so
+    # start_dhcp_server picks it up in server-restart. Also
+    # accept an override from the attach payload
+    # (relay_return_hop_override) for the rare case where the
+    # operator wants to point THIS device at a different relay
+    # than the pool's default.
+    _relay_override = (data.get("relay_return_hop") or "").strip()
+    if _relay_override:
+        dhcp_cfg["relay_return_hop"] = _relay_override
+    elif primary_pool.get("relay_return_hop"):
+        dhcp_cfg["relay_return_hop"] = primary_pool.get("relay_return_hop")
+    elif replace_existing and "relay_return_hop" in dhcp_cfg:
+        dhcp_cfg.pop("relay_return_hop", None)
+
     # Merge existing additional pools if requested
     additional_pools_payload = []
     existing_additional_names = set()
@@ -7862,6 +7877,11 @@ def attach_dhcp_pools_to_server():
             pool_entry["lease_time"] = pool.get("lease_time")
         if pool.get("gateway_routes"):
             pool_entry["gateway_route"] = pool.get("gateway_routes")
+        # v0.5.245: per-pool relay_return_hop passes through too,
+        # so a mixed-pool device (some direct, some relayed) can
+        # coexist.
+        if pool.get("relay_return_hop"):
+            pool_entry["relay_return_hop"] = pool.get("relay_return_hop")
         if pool_entry.get("pool_name") not in existing_additional_names:
             additional_pools_payload.append(pool_entry)
             if pool_entry.get("pool_name"):
@@ -14870,6 +14890,10 @@ def _dhcp_pool_to_api(pool: Dict[str, Any]) -> Dict[str, Any]:
         "lease_time": pool.get("lease_time"),
         "gateway_routes": pool.get("gateway_routes") or [],
         "description": pool.get("description"),
+        # v0.5.245: expose the relay return-hop on read so the
+        # client-side Manage/Attach dialogs can render the field
+        # and re-emit it on save without losing it.
+        "relay_return_hop": pool.get("relay_return_hop") or "",
         "created_at": pool.get("created_at"),
         "updated_at": pool.get("updated_at"),
     }
@@ -14908,6 +14932,16 @@ def create_dhcp_pool():
             "lease_time": data.get("lease_time"),
             "gateway_routes": data.get("gateway_routes") or data.get("gateway_route"),
             "description": data.get("description"),
+            # v0.5.245 (audit U relay-mode): relay_return_hop is the
+            # RELAY's IP on the SERVER's L2 segment (e.g. the
+            # switch's irb.10 = 172.16.30.10 when clients are on
+            # irb.30 = 192.168.30.1). When present:
+            #   1. dnsmasq NOT told to bind an IP in the pool subnet
+            #      on the server's interface (no anchor collision)
+            #   2. pool routes install as `<pool> via <relay_return_hop>
+            #      dev <iface>` so OFFERs traverse back correctly
+            # Absent (or empty) → direct-attached mode, unchanged.
+            "relay_return_hop": data.get("relay_return_hop"),
         }
 
         success = device_db.add_dhcp_pool(pool_data)
@@ -14942,7 +14976,11 @@ def update_dhcp_pool_endpoint(pool_name):
             return jsonify({"error": "Invalid JSON payload"}), 400
 
         pool_data = {}
-        for key in ["pool_start", "pool_end", "gateway", "lease_time", "description"]:
+        # v0.5.245: `relay_return_hop` joins the editable field list.
+        for key in [
+            "pool_start", "pool_end", "gateway", "lease_time",
+            "description", "relay_return_hop",
+        ]:
             if key in data:
                 pool_data[key] = data[key]
         if "gateway_routes" in data or "gateway_route" in data:
