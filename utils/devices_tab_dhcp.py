@@ -1090,7 +1090,11 @@ class DHCPHandler:
         self.parent.dhcp_manage_button.clicked.connect(self.manage_dhcp_pools)
         self.parent.dhcp_attach_button.clicked.connect(self.attach_dhcp_pools)
         self.parent.dhcp_apply_button.clicked.connect(self.apply_dhcp_pools)
-        self.parent.dhcp_refresh_button.clicked.connect(self.refresh_dhcp_status)
+        # v0.5.250: user-clicked Refresh shows the modal progress
+        # dialog; auto-triggered refreshes are silent.
+        self.parent.dhcp_refresh_button.clicked.connect(
+            lambda: self.refresh_dhcp_status(user_initiated=True)
+        )
         self.parent.dhcp_restart_button.clicked.connect(self.restart_dhcp_service)
 
         for b in (self.parent.dhcp_manage_button, self.parent.dhcp_attach_button):
@@ -1116,7 +1120,7 @@ class DHCPHandler:
         # Kick off an initial status refresh once the UI finishes rendering
         QTimer.singleShot(200, self.refresh_dhcp_status)
 
-    def refresh_dhcp_status(self):
+    def refresh_dhcp_status(self, user_initiated: bool = False):
         """Fetch DHCP status from server and update table.
 
         Kicks a server-side force-check first so the DB picks up live
@@ -1130,6 +1134,27 @@ class DHCPHandler:
         synchronously on the UI thread. On a slow / offline server
         every Refresh click froze the client for up to 20s.
         Wrapped in a QThread + indeterminate QProgressDialog.
+
+        v0.5.250 (audit U refresh-stampede): two fixes to stop the
+        "window frozen" symptom operators saw after any multi-device
+        Apply:
+          1. **Coalesce.** `refresh_dhcp_status` is called
+             optimistically from many places (line 1117 startup;
+             lines 1557/1695/1928 on Attach/Restart/Apply completion;
+             the multi-device apply worker also fires one PER
+             DEVICE via QTimer.singleShot). Without coalescing,
+             every trigger stacked its own modal QProgressDialog +
+             its own 15-20s HTTP worker. On a fresh Apply of 5
+             devices you got 5 modal dialogs stacked back-to-back,
+             each blocking the UI until it drained. Guard with
+             `self._dhcp_refresh_in_flight` — a second call skips
+             cleanly instead of stacking.
+          2. **Silent auto-refresh.** Only the user-clicked Refresh
+             button pops the modal. Auto-triggered refreshes
+             (post-Apply/Attach/Restart) run silently in the
+             background — same worker, just no progress dialog.
+             That's the real fix for "polling freezes the window":
+             those auto-refreshes were the polling.
         Refresh has no server-side side-effects → Cancel is
         enabled and safe (worker checks _should_stop between the
         force-check and the status GET). Worker keepalive on
@@ -1141,6 +1166,15 @@ class DHCPHandler:
         if not server_url:
             logging.debug("[DHCP UI] No server URL configured")
             return
+
+        # v0.5.250: coalesce — skip if a refresh is already in flight.
+        if getattr(self, "_dhcp_refresh_in_flight", False):
+            logging.debug(
+                "[DHCP UI] refresh already in flight — skipping this "
+                "trigger (user_initiated=%s)", user_initiated,
+            )
+            return
+        self._dhcp_refresh_in_flight = True
 
         from PyQt5.QtCore import QThread, pyqtSignal
         from PyQt5.QtWidgets import QProgressDialog
@@ -1204,28 +1238,40 @@ class DHCPHandler:
                     )
                     self.finished.emit([], str(exc))
 
-        progress = QProgressDialog(
-            "Refreshing DHCP status...", "Cancel", 0, 0, self.parent,
-        )
-        progress.setWindowModality(2)  # Qt.WindowModal
-        progress.setMinimumDuration(0)
-        progress.show()
+        # v0.5.250: only pop the modal for a user-clicked Refresh.
+        # Auto-triggered refreshes (post-Apply/Attach/Restart) run
+        # silently — the modal was the primary "polling freezes the
+        # window" symptom.
+        progress = None
+        if user_initiated:
+            progress = QProgressDialog(
+                "Refreshing DHCP status...", "Cancel", 0, 0, self.parent,
+            )
+            progress.setWindowModality(2)  # Qt.WindowModal
+            progress.setMinimumDuration(0)
+            progress.show()
 
         worker = RefreshDHCPWorker(server_url)
         worker.setParent(self.parent)
 
         def _on_cancel():
             worker.stop()
-            progress.setLabelText(
-                "Cancelling — waiting for current request to finish..."
-            )
-        progress.canceled.connect(_on_cancel)
+            if progress is not None:
+                progress.setLabelText(
+                    "Cancelling — waiting for current request to finish..."
+                )
+        if progress is not None:
+            progress.canceled.connect(_on_cancel)
 
         def _on_finished(devices, err):
-            try:
-                progress.close()
-            except Exception:
-                pass
+            # v0.5.250: always drop the guard so the next trigger
+            # can fire — even when the worker failed.
+            self._dhcp_refresh_in_flight = False
+            if progress is not None:
+                try:
+                    progress.close()
+                except Exception:
+                    pass
             if err and err != "cancelled":
                 # v0.5.230 (audit P client-12): pre-fix, refresh errors
                 # were silently logged and the table stayed with stale

@@ -2,6 +2,44 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.250] - 2026-09-02
+
+**DHCP refresh stampede: coalesce + silent auto-refresh (fixes the
+"polling freezes the window" symptom).**
+
+Operator on 2026-09-02: "it seems some polling is freezing the
+window".
+
+Trace: `refresh_dhcp_status()` is fired from ~6 places (startup,
+Attach completion, Restart completion, Apply completion, plus a
+per-device singleShot in the multi-device apply worker). Each
+call:
+- Opened its own **modal QProgressDialog** (blocking user input)
+- Spawned its own 15–20 s HTTP worker
+
+After any multi-device Apply the operator got a STACK of modal
+dialogs — one per applied device — draining back-to-back. Every
+dialog blocked input until it finished, so a 5-device Apply
+looked like a 1–2 minute total freeze.
+
+Fixes (`utils/devices_tab_dhcp.py`):
+
+1. **Coalesce** — new `self._dhcp_refresh_in_flight` guard. A
+   second trigger while the first refresh is running skips
+   cleanly instead of stacking a duplicate worker + modal. The
+   guard resets in the finished handler so the next trigger can
+   fire.
+2. **Silent auto-refresh** — `refresh_dhcp_status` takes a new
+   `user_initiated: bool = False` kwarg. The modal
+   `QProgressDialog` only pops when the user actually clicked
+   the Refresh button; auto-triggered refreshes (post-Apply /
+   Attach / Restart) run silently in the background. Same
+   worker, no modal. The Refresh toolbar button is rewired to
+   `lambda: self.refresh_dhcp_status(user_initiated=True)` so
+   its own clicks still show the progress dialog.
+
+Tests: `tests/test_v05250_refresh_stampede.py` — 8 pass.
+
 ## [0.5.249] - 2026-09-02
 
 **BGP + OSPF monitor wrapper managers expose `is_running`;
