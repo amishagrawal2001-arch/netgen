@@ -115,24 +115,56 @@ class CodeAnalyzer:
     def _check_security(self, code: str, tree: ast.AST) -> List[Dict]:
         """Check for security vulnerabilities"""
         issues = []
-        
-        # Check for dangerous functions
-        dangerous_functions = [
-            "eval", "exec", "compile", "__import__", "input",
-            "pickle.loads", "yaml.load", "subprocess.call"
-        ]
-        
+
+        # v0.5.245-followup (audit AI-*): match BOTH bare identifiers (eval, exec)
+        # AND dotted attribute calls (pickle.loads, yaml.load, subprocess.call).
+        # The old code only checked ast.Name, so the dotted forms — which is HOW
+        # those APIs are actually invoked — never matched.
+        dangerous_bare = {"eval", "exec", "compile", "__import__", "input"}
+        dangerous_dotted = {"pickle.loads", "yaml.load", "subprocess.call"}
+
+        def _dotted_name(func: ast.AST) -> Optional[str]:
+            """Reconstruct a dotted call target (e.g. `pkg.mod.fn`) or None."""
+            parts = []
+            cur = func
+            while isinstance(cur, ast.Attribute):
+                parts.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, ast.Name):
+                parts.append(cur.id)
+                return ".".join(reversed(parts))
+            return None
+
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name):
-                    if node.func.id in dangerous_functions:
-                        issues.append({
-                            "type": "security",
-                            "severity": "high",
-                            "message": f"Use of dangerous function: {node.func.id}",
-                            "line": getattr(node, "lineno", 0),
-                            "suggestion": f"Consider safer alternative for {node.func.id}"
-                        })
+            if not isinstance(node, ast.Call):
+                continue
+            name = None
+            if isinstance(node.func, ast.Name):
+                if node.func.id in dangerous_bare:
+                    name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                dotted = _dotted_name(node.func)
+                if dotted and dotted in dangerous_dotted:
+                    name = dotted
+                elif dotted:
+                    # Also flag "<something>.loads" / ".load" for pickle/yaml
+                    # imported under an alias (e.g. `from pickle import loads`).
+                    tail = dotted.split(".")[-1]
+                    for full in dangerous_dotted:
+                        if full.endswith("." + tail) and tail in {"loads", "load", "call"}:
+                            # only if the leading segment matches the module hint
+                            head = full.split(".")[0]
+                            if head in dotted.split("."):
+                                name = full
+                                break
+            if name:
+                issues.append({
+                    "type": "security",
+                    "severity": "high",
+                    "message": f"Use of dangerous function: {name}",
+                    "line": getattr(node, "lineno", 0),
+                    "suggestion": f"Consider safer alternative for {name}"
+                })
         
         # Check for hardcoded secrets
         secret_patterns = [
@@ -175,25 +207,58 @@ class CodeAnalyzer:
     def _check_performance(self, code: str, tree: ast.AST) -> List[Dict]:
         """Check for performance issues"""
         issues = []
-        
-        # Check for nested loops
-        loop_depth = 0
-        max_depth = 0
-        
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.For, ast.While)):
-                loop_depth += 1
-                max_depth = max(max_depth, loop_depth)
-            elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-                if loop_depth > 0:
-                    loop_depth = 0
-        
+
+        # v0.5.245-followup (audit AI-*): proper nested-loop detector.
+        # The old flat ast.walk incremented `loop_depth` per loop and never
+        # decremented it, so `max_depth` became "total loop count" (false
+        # positives) — and worse, it RESET to 0 on any nested FunctionDef, so
+        # real nesting inside a helper was missed entirely.
+        # Now we push/pop depth on visit_For/visit_While and start a fresh
+        # scope for each nested function, then take the max over all scopes.
+        class _NestedLoopVisitor(ast.NodeVisitor):
+            def __init__(self, initial_depth: int = 0):
+                self.depth = initial_depth
+                self.max_depth = initial_depth
+                self.deepest_line = 0
+
+            def _enter_loop(self, node):
+                self.depth += 1
+                if self.depth > self.max_depth:
+                    self.max_depth = self.depth
+                    self.deepest_line = getattr(node, "lineno", 0)
+                self.generic_visit(node)
+                self.depth -= 1
+
+            visit_For = _enter_loop
+            visit_AsyncFor = _enter_loop
+            visit_While = _enter_loop
+
+            def visit_FunctionDef(self, node):
+                # New scope: nested functions don't inherit outer loop depth,
+                # but their internal loops still get measured on their own.
+                inner = _NestedLoopVisitor(initial_depth=0)
+                inner.generic_visit(node)
+                if inner.max_depth > self.max_depth:
+                    self.max_depth = inner.max_depth
+                    self.deepest_line = inner.deepest_line
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, node):
+                # Methods get their own scope via visit_FunctionDef; still walk
+                # class body for module-level loops in edge cases.
+                self.generic_visit(node)
+
+        visitor = _NestedLoopVisitor()
+        visitor.visit(tree)
+        max_depth = visitor.max_depth
+
         if max_depth > 2:
             issues.append({
                 "type": "performance",
                 "severity": "medium",
                 "message": f"Deeply nested loops (depth: {max_depth})",
-                "line": 0,
+                "line": visitor.deepest_line,
                 "suggestion": "Consider refactoring to reduce nesting or use vectorized operations"
             })
         

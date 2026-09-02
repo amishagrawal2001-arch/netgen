@@ -262,7 +262,11 @@ def run_stream_multi_instance(
         if len(inst_cores) == 1:
             inst_corelist = str(inst_cores[0])
         else:
-            inst_corelist = f"{inst_cores[0]}-{inst_cores[-1]}"
+            # v0.5.245-followup (audit ext-*): emit explicit comma-separated
+            # list so non-contiguous allocations don't silently expand to
+            # include un-allocated cores (or cross NUMA boundaries) the way
+            # the old "{first}-{last}" range did. DPDK -l accepts both forms.
+            inst_corelist = ",".join(str(c) for c in inst_cores)
         
         # Build command
         file_prefix = _file_prefix(instance_id, interface)
@@ -312,10 +316,17 @@ def run_stream_multi_instance(
                     "[dpdk-multi] systemd_scope import failed: %s",
                     _e)
 
+            # v0.5.245-followup (audit ext-*): pipe both streams to DEVNULL.
+            # Nothing in this module (or monitor_instances below) drains
+            # proc.stdout / proc.stderr, so the previous PIPE plumbing let
+            # the ~64KB kernel pipe buffer fill and block the child on
+            # write(), freezing traffic silently. See the placeholder
+            # comment above monitor_instances for the parallel note that
+            # STAT lines are not being read here either.
             proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 env=child_env,
                 text=True,
                 bufsize=1

@@ -89,9 +89,22 @@ class AITroubleshootingDialog(QDialog):
         self.device_id_input.setPlaceholderText("Enter device ID or select from list")
         device_layout.addRow("Device ID:", self.device_id_input)
         
-        # Get devices from parent if available
-        if hasattr(self.parent(), 'devices_tab'):
-            devices = self.parent().devices_tab.get_all_devices()
+        # Get devices from parent if available.
+        # v0.5.245-followup (audit AI-*): the parent passed in IS the
+        # DevicesTab itself, not a container that holds one - so guard on
+        # its actual attribute (`devices_table`) and pull devices from a
+        # method it actually exposes.
+        parent = self.parent()
+        if parent is not None and hasattr(parent, 'devices_table'):
+            devices = []
+            for method_name in ('get_all_devices', 'get_devices', 'all_devices'):
+                fetcher = getattr(parent, method_name, None)
+                if callable(fetcher):
+                    try:
+                        devices = fetcher() or []
+                    except Exception:
+                        devices = []
+                    break
             if devices:
                 device_combo = QComboBox()
                 device_combo.addItem("Select device...")
@@ -280,11 +293,38 @@ class AITroubleshootingDialog(QDialog):
         """Handle diagnosis error"""
         self.progress.setVisible(False)
         self.diagnose_btn.setEnabled(True)
-        
+
         self.results_text.clear()
         self.results_text.append(f"❌ Error: {error_msg}")
-        
+
         QMessageBox.warning(self, "Diagnosis Error", f"Failed to diagnose:\n{error_msg}")
+
+    # v0.5.245-followup (audit AI-*): ensure the QThread worker is stopped
+    # and its signals are disconnected before the dialog goes away.
+    def closeEvent(self, event):
+        """Stop the worker thread cleanly before closing."""
+        worker = getattr(self, "worker", None)
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    try:
+                        worker.finished.disconnect(self.on_diagnosis_complete)
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        worker.error.disconnect(self.on_diagnosis_error)
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        worker.requestInterruption()
+                    except (AttributeError, RuntimeError):
+                        pass
+                    worker.quit()
+                    worker.wait(2000)
+            except RuntimeError:
+                # Worker's C++ object may already be gone.
+                pass
+        super().closeEvent(event)
 
 
 

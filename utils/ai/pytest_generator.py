@@ -3,6 +3,7 @@ AI-Powered Pytest Script Generator
 Generates ready-to-use pytest scripts for network device testing
 """
 
+import ast
 import json
 import logging
 from typing import Dict, List, Optional, Any
@@ -10,6 +11,31 @@ from pathlib import Path
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+# v0.5.245-followup (audit AI-*): safe literal helper — user-supplied test_params
+# values MUST NOT be interpolated raw into generated Python source (code injection
+# risk + breakage on quotes/backslashes). Use `repr()` for strings so they land as
+# safely-quoted Python literals, and validate types for everything else.
+def _py_literal(value: Any, *, allow: tuple = (str, int, float, bool, type(None))) -> str:
+    """Return `value` as a Python-source literal, or raise ValueError.
+
+    - Strings pass through `repr()` (produces valid, quote-safe literal).
+    - Numeric/bool/None are validated by type and rendered with `repr()`.
+    - Lists/tuples of the above are recursively rendered.
+    - Anything else is rejected rather than silently interpolated.
+    """
+    if isinstance(value, bool):
+        # bool is a subclass of int; check first
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        inner = ", ".join(_py_literal(v, allow=allow) for v in value)
+        return "[" + inner + "]" if isinstance(value, list) else "(" + inner + ")"
+    if isinstance(value, allow):
+        return repr(value)
+    raise ValueError(
+        f"Refusing to interpolate value of type {type(value).__name__} into generated source"
+    )
 
 
 class PytestGenerator:
@@ -136,20 +162,21 @@ TEST_TYPE = "{test_type}"
     
     def _generate_connectivity_tests(self, test_params: Dict, assertions: List[str]) -> str:
         """Generate connectivity test functions"""
-        target_ip = test_params.get("target_ip", "192.168.1.1")
-        
+        # v0.5.245-followup (audit AI-*): render values as safe Python literals
+        target_ip_lit = _py_literal(test_params.get("target_ip", "192.168.1.1"))
+
         return f"""
 def test_ping_connectivity(device_id, device_config):
     \"\"\"Test basic ping connectivity\"\"\"
-    target_ip = "{target_ip}"
-    
+    target_ip = {target_ip_lit}
+
     result = subprocess.run(
         ["ping", "-c", "5", target_ip],
         capture_output=True,
         text=True,
         timeout=10
     )
-    
+
     assert result.returncode == 0, f"Ping to {{target_ip}} failed"
     assert "0% packet loss" in result.stdout, "Packet loss detected"
 
@@ -172,70 +199,94 @@ def test_mtu_consistency(device_id, device_config):
     
     def _generate_performance_tests(self, test_params: Dict, assertions: List[str]) -> str:
         """Generate performance test functions"""
-        target_ip = test_params.get("target_ip", "192.168.1.1")
-        max_latency = test_params.get("max_latency_ms", 50)
-        max_packet_loss = test_params.get("max_packet_loss_percent", 1.0)
-        
+        # v0.5.245-followup (audit AI-*): render values as safe Python literals
+        target_ip_lit = _py_literal(test_params.get("target_ip", "192.168.1.1"))
+        max_latency_lit = _py_literal(test_params.get("max_latency_ms", 50))
+        max_packet_loss_lit = _py_literal(test_params.get("max_packet_loss_percent", 1.0))
+
+        # v0.5.245-followup (audit AI-*): BSD/macOS ping and non-English locales
+        # produce output the Linux-style regexes don't match. Previously the
+        # assertions lived inside `if <regex>_match:` so the test PASSED silently
+        # even at 100% packet loss. Now we try alternate patterns and fail
+        # explicitly if none match — never accept unparsed output as success.
         return f"""
 def test_latency(device_id, device_config):
     \"\"\"Test network latency\"\"\"
-    target_ip = "{target_ip}"
-    max_latency_ms = {max_latency}
-    
+    target_ip = {target_ip_lit}
+    max_latency_ms = {max_latency_lit}
+
     result = subprocess.run(
         ["ping", "-c", "10", target_ip],
         capture_output=True,
         text=True,
         timeout=30
     )
-    
+
     assert result.returncode == 0, "Ping failed"
-    
-    # Parse average latency
+
+    # Parse average latency (Linux "min/avg/max/mdev" and BSD "min/avg/max/stddev")
     import re
-    latency_match = re.search(r'min/avg/max.*?= [\\d.]+/([\\d.]+)/[\\d.]+', result.stdout)
-    if latency_match:
-        avg_latency = float(latency_match.group(1))
-        assert avg_latency < max_latency_ms, f"Latency {{avg_latency}}ms exceeds max {{max_latency_ms}}ms"
+    latency_match = (
+        re.search(r'min/avg/max.*?= [\\d.]+/([\\d.]+)/[\\d.]+', result.stdout)
+        or re.search(r'round-trip min/avg/max.*?= [\\d.]+/([\\d.]+)/[\\d.]+', result.stdout)
+    )
+    if not latency_match:
+        pytest.fail(
+            f"Could not parse ping output - SLA verification skipped. "
+            f"Raw: {{result.stdout[:500]!r}}"
+        )
+    avg_latency = float(latency_match.group(1))
+    assert avg_latency < max_latency_ms, f"Latency {{avg_latency}}ms exceeds max {{max_latency_ms}}ms"
 
 def test_packet_loss(device_id, device_config):
     \"\"\"Test packet loss\"\"\"
-    target_ip = "{target_ip}"
-    max_loss_percent = {max_packet_loss}
-    
+    target_ip = {target_ip_lit}
+    max_loss_percent = {max_packet_loss_lit}
+
     result = subprocess.run(
         ["ping", "-c", "100", target_ip],
         capture_output=True,
         text=True,
         timeout=120
     )
-    
+
     # Parse packet loss
     import re
     loss_match = re.search(r'(\\d+(?:\\.\\d+)?)% packet loss', result.stdout)
-    if loss_match:
-        packet_loss = float(loss_match.group(1))
-        assert packet_loss < max_loss_percent, f"Packet loss {{packet_loss}}% exceeds max {{max_loss_percent}}%"
+    if not loss_match:
+        pytest.fail(
+            f"Could not parse ping output - packet-loss SLA skipped. "
+            f"Raw: {{result.stdout[:500]!r}}"
+        )
+    packet_loss = float(loss_match.group(1))
+    assert packet_loss < max_loss_percent, f"Packet loss {{packet_loss}}% exceeds max {{max_loss_percent}}%"
 
 def test_jitter(device_id, device_config):
     \"\"\"Test packet jitter\"\"\"
-    target_ip = "{target_ip}"
-    
+    target_ip = {target_ip_lit}
+
     result = subprocess.run(
         ["ping", "-c", "100", target_ip],
         capture_output=True,
         text=True,
         timeout=120
     )
-    
-    # Parse jitter (simplified)
+
+    # Parse jitter (min/max spread)
     import re
-    stats_match = re.search(r'min/avg/max.*?= ([\\d.]+)/([\\d.]+)/([\\d.]+)', result.stdout)
-    if stats_match:
-        min_latency = float(stats_match.group(1))
-        max_latency = float(stats_match.group(3))
-        jitter = max_latency - min_latency
-        assert jitter < 10, f"Jitter {{jitter}}ms is too high"
+    stats_match = (
+        re.search(r'min/avg/max.*?= ([\\d.]+)/([\\d.]+)/([\\d.]+)', result.stdout)
+        or re.search(r'round-trip min/avg/max.*?= ([\\d.]+)/([\\d.]+)/([\\d.]+)', result.stdout)
+    )
+    if not stats_match:
+        pytest.fail(
+            f"Could not parse ping output - jitter SLA skipped. "
+            f"Raw: {{result.stdout[:500]!r}}"
+        )
+    min_latency = float(stats_match.group(1))
+    max_latency = float(stats_match.group(3))
+    jitter = max_latency - min_latency
+    assert jitter < 10, f"Jitter {{jitter}}ms is too high"
 """
     
     def _generate_protocol_tests(self, test_params: Dict, assertions: List[str]) -> str:
@@ -418,6 +469,38 @@ Generate a complete, ready-to-run pytest script.
         except Exception as e:
             logger.error(f"Failed to save pytest script: {e}")
             return False
+
+
+# v0.5.245-followup (audit AI-*): quote-injection round-trip check
+def _selftest_quote_injection() -> None:
+    """Show that a target_ip with an embedded quote survives round-trip via ast.parse.
+
+    Before the fix, `target_ip = "{target_ip}"` would splat the raw value into
+    the generated source, breaking the string literal (or worse, injecting code).
+    After the fix, values pass through repr() so the generated source is always
+    a valid Python literal.
+
+    Invoke manually: `python -c "from utils.ai.pytest_generator import _selftest_quote_injection; _selftest_quote_injection()"`
+    """
+    gen = PytestGenerator()
+    hostile = 'evil"; import os; os.system("touch /tmp/pwned"); x = "'
+    script = gen.generate_pytest_script({
+        "test_name": "test_x",
+        "test_type": "connectivity",
+        "device_id": "dev-1",
+        "test_params": {"target_ip": hostile},
+    })
+    # Must parse cleanly — if repr() weren't used the injected code would either
+    # execute at parse time or produce a SyntaxError.
+    ast.parse(script)
+    # And the hostile string must survive verbatim (as a literal) in the source.
+    assert repr(hostile) in script, "hostile value did not appear as a repr() literal"
+    # Also confirm the injected system call isn't sitting outside of a string.
+    tree = ast.parse(script)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "system":
+                raise AssertionError("Injected os.system() call landed in generated AST")
 
 
 

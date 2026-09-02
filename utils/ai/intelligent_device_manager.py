@@ -298,13 +298,18 @@ class IntelligentDeviceManager:
                 "success": False,
                 "error": "External device manager not available"
             }
-        
-        # Generate commands from changes
-        commands = []
-        # ... generate commands ...
-        
-        result = self.external_manager.apply_configuration(device_id, commands)
-        return result
+
+        # v0.5.245-followup (audit AI-*): don't silently succeed with an empty command
+        # list. Previously this method created `commands = []` and never populated it
+        # from `changes`, so every external-device apply returned "success" without
+        # doing any work. Until a vendor-specific translator exists, refuse the call.
+        device = self.device_db.get_device(device_id) if self.device_db else None
+        vendor = (device or {}).get("device_type", "unknown")
+        return {
+            "success": False,
+            "error": f"External config translation not implemented for {vendor}",
+            "changes": changes,
+        }
     
     def monitor_health(self, device_id: str) -> Dict[str, Any]:
         """
@@ -434,11 +439,16 @@ class IntelligentDeviceManager:
             device_type = device.get("device_type", "frr_container")
             
             if device_type == "frr_container":
-                # Apply FRR fixes
+                # v0.5.245-followup (audit AI-*): don't claim success without action.
+                # Auto-remediation for FRR containers isn't wired to a real apply path
+                # yet (would need to call /api/device/apply or /api/device/frr/start
+                # against the local server); surface the manual solutions instead of
+                # returning a fake success that hides the work still to be done.
                 return {
-                    "success": True,
-                    "message": "Remediation applied",
-                    "solutions": solutions
+                    "success": False,
+                    "error": "Auto-remediation for FRR devices not implemented - see solutions field for manual steps",
+                    "solutions": solutions,
+                    "diagnosis": diagnosis,
                 }
             else:
                 # Apply external device fixes

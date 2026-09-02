@@ -5,6 +5,7 @@ Allows users to create, edit, and manage custom test cases
 
 import json
 import logging
+import os
 from typing import Dict, List, Optional
 from pathlib import Path
 import sqlite3
@@ -15,15 +16,44 @@ from .network_test_framework import TestCase, TestStatus
 logger = logging.getLogger(__name__)
 
 
+def _default_user_test_cases_db_path() -> str:
+    """Resolve the default sqlite path for the user test case store.
+
+    v0.5.245-followup (audit AI-*): the old hard-coded '/opt/OSTG/...' path
+    was a Linux-only leftover from the pre-rebrand layout -- it broke on
+    macOS/Windows dev boxes and did not match the netgen install root. Honor
+    NETGEN_DATA_DIR when set, then fall back to '/opt/netgen/' if it exists
+    and is writable, else '~/.netgen/user_test_cases.db' which works on every
+    platform without root.
+    """
+    override = os.environ.get("NETGEN_DATA_DIR")
+    if override:
+        return os.path.join(override, "user_test_cases.db")
+    netgen_root = "/opt/netgen"
+    if os.path.isdir(netgen_root) and os.access(netgen_root, os.W_OK):
+        return os.path.join(netgen_root, "user_test_cases.db")
+    return os.path.join(os.path.expanduser("~"), ".netgen", "user_test_cases.db")
+
+
 class UserTestCaseManager:
     """Manage user-defined test cases"""
-    
-    def __init__(self, db_path: str = "/opt/OSTG/user_test_cases.db"):
-        self.db_path = db_path
+
+    def __init__(self, db_path: Optional[str] = None):
+        # v0.5.245-followup (audit AI-*): default was hard-coded to the
+        # pre-rebrand '/opt/OSTG/user_test_cases.db'; resolve a portable
+        # default when the caller does not pass one explicitly.
+        self.db_path = db_path or _default_user_test_cases_db_path()
         self._init_database()
-    
+
     def _init_database(self):
         """Initialize user test cases database"""
+        # v0.5.245-followup (audit AI-*): sqlite3.connect() fails with
+        # "unable to open database file" when the parent directory does not
+        # exist. Make sure it does before opening -- particularly important
+        # for the '~/.netgen/' fallback on a fresh dev box.
+        parent_dir = os.path.dirname(self.db_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         

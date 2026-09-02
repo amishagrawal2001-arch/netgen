@@ -18,6 +18,33 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# v0.5.245-followup (audit AI-*): numeric-aware version sort so '10.0'
+# orders before '2.0' in the versions table. Falls back through three
+# strategies; the outermost try/except means a malformed entry can never
+# take down the display.
+def _sort_versions_desc(items):
+    """Return a list of (version, info) sorted newest-first by version."""
+    items = list(items)
+    try:
+        from packaging.version import Version  # type: ignore
+
+        return sorted(items, key=lambda x: Version(x[0]), reverse=True)
+    except Exception:
+        pass
+    try:
+        return sorted(
+            items,
+            key=lambda x: tuple(int(p) for p in str(x[0]).split(".")),
+            reverse=True,
+        )
+    except Exception:
+        pass
+    try:
+        return sorted(items, key=lambda x: str(x[0]), reverse=True)
+    except Exception:
+        return items
+
+
 class ModelUpdateWorker(QThread):
     """Worker thread for model updates"""
     finished = pyqtSignal(dict)
@@ -235,23 +262,36 @@ class AIModelManagementDialog(QDialog):
         if current_version in versions:
             current_info = versions[current_version]
             self.current_training_cases_label.setText(str(current_info.get("training_cases", "Unknown")))
-            self.current_created_label.setText(current_info.get("created_at", "Unknown")[:10])
-        
+            # v0.5.245-followup (audit AI-*): server may return null for
+            # created_at; coerce to empty string before slicing.
+            current_created_at = current_info.get("created_at") or ""
+            self.current_created_label.setText(current_created_at[:10] if current_created_at else "Unknown")
+
+        # v0.5.245-followup (audit AI-*): sort versions numerically so
+        # '10.0' comes before '2.0'. Prefer packaging.version.Version; fall
+        # back to a tuple-of-ints key; last-resort fall back to string sort
+        # so a malformed version never crashes the display.
+        sorted_versions = _sort_versions_desc(versions.items())
+
         # Populate versions table
         self.versions_table.setRowCount(len(versions))
-        
-        for row, (version, info) in enumerate(sorted(versions.items(), key=lambda x: x[0], reverse=True)):
+
+        for row, (version, info) in enumerate(sorted_versions):
             # Version
             version_item = QTableWidgetItem(version)
             self.versions_table.setItem(row, 0, version_item)
-            
+
             # Training Cases
             cases_item = QTableWidgetItem(str(info.get("training_cases", "Unknown")))
             self.versions_table.setItem(row, 1, cases_item)
-            
-            # Created
-            created = info.get("created_at", "Unknown")
-            created_item = QTableWidgetItem(created[:10] if len(created) > 10 else created)
+
+            # Created (v0.5.245-followup (audit AI-*): null-safe)
+            created = info.get("created_at") or ""
+            if created:
+                display_created = created[:10] if len(created) > 10 else created
+            else:
+                display_created = "Unknown"
+            created_item = QTableWidgetItem(display_created)
             self.versions_table.setItem(row, 2, created_item)
             
             # Status
@@ -454,6 +494,33 @@ class AIModelManagementDialog(QDialog):
         self.progress.setVisible(False)
         self.status_text.append(f"❌ Error: {error_msg}")
         QMessageBox.warning(self, "Error", f"Operation failed:\n{error_msg}")
+
+    # v0.5.245-followup (audit AI-*): stop the worker thread cleanly so
+    # signals do not fire against a deleted dialog.
+    def closeEvent(self, event):
+        """Stop the worker thread cleanly before closing."""
+        worker = getattr(self, "worker", None)
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    for signal_name, slot in (
+                        ("finished", None),
+                        ("error", self.on_error),
+                        ("progress", self.on_progress),
+                    ):
+                        try:
+                            getattr(worker, signal_name).disconnect()
+                        except (TypeError, RuntimeError):
+                            pass
+                    try:
+                        worker.requestInterruption()
+                    except (AttributeError, RuntimeError):
+                        pass
+                    worker.quit()
+                    worker.wait(2000)
+            except RuntimeError:
+                pass
+        super().closeEvent(event)
 
 
 

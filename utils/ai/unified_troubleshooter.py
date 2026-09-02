@@ -38,13 +38,21 @@ class UnifiedTroubleshooter:
             logger.warning(f"Network troubleshooter not available: {e}")
         
         # Initialize code troubleshooter
+        # v0.5.245-followup (audit AI-*): the previous except branch retried the
+        # exact same failing constructor, which just re-raised out of __init__.
+        # Fall back to a no-AI CodeDebugger; if even that fails, leave the
+        # attribute as None and let downstream methods degrade gracefully.
         try:
             from .code_debugger import CodeDebugger
             self.code_troubleshooter = CodeDebugger(use_ai_api=use_ai_api, api_key=api_key)
         except Exception as e:
-            logger.debug(f"Code troubleshooter not available: {e}")
-            # Create basic code troubleshooter
-            self.code_troubleshooter = CodeDebugger(use_ai_api=use_ai_api, api_key=api_key)
+            logger.debug(f"Code troubleshooter (AI mode) not available: {e}")
+            try:
+                from .code_debugger import CodeDebugger
+                self.code_troubleshooter = CodeDebugger(use_ai_api=False)
+            except Exception as fallback_err:
+                logger.warning(f"Code troubleshooter not available at all: {fallback_err}")
+                self.code_troubleshooter = None
     
     def troubleshoot(self, domain: str, issue: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -362,7 +370,12 @@ class CodeDebugger:
         }
         
         # Common Python errors
-        if "nameerror" in error_lower or "name" in error_lower and "not defined" in error_lower:
+        # v0.5.245-followup (audit AI-*): parenthesize `A or B and C` so the AND
+        # binds tighter *inside* the second branch rather than pulling in the
+        # first. Without the parens, "type" + "error" matched any error string
+        # (they nearly all contain "error"), so e.g. "KeyError: 'user_type_id'"
+        # got misclassified as "Type mismatch".
+        if "nameerror" in error_lower or ("name" in error_lower and "not defined" in error_lower):
             analysis["root_cause"] = "Undefined variable or name"
             analysis["solutions"] = [
                 "Check variable name spelling",
@@ -371,8 +384,11 @@ class CodeDebugger:
                 "Verify variable scope"
             ]
             analysis["confidence"] = 0.8
-        
-        if "typeerror" in error_lower or "type" in error_lower and "error" in error_lower:
+
+        # v0.5.245-followup (audit AI-*): "KeyError: 'user_type_id'" no longer
+        # matches "Type mismatch" here (used to, because "type" and "error"
+        # both appear in the message; the AND now stays inside the parens).
+        if "typeerror" in error_lower or ("type" in error_lower and "error" in error_lower):
             analysis["root_cause"] = "Type mismatch"
             analysis["solutions"] = [
                 "Check variable types",
@@ -381,8 +397,9 @@ class CodeDebugger:
                 "Review type hints"
             ]
             analysis["confidence"] = 0.7
-        
-        if "attributeerror" in error_lower or "attribute" in error_lower and "not found" in error_lower:
+
+        # v0.5.245-followup (audit AI-*): same parenthesization fix as above.
+        if "attributeerror" in error_lower or ("attribute" in error_lower and "not found" in error_lower):
             analysis["root_cause"] = "Attribute not found"
             analysis["solutions"] = [
                 "Check object type",

@@ -8,6 +8,7 @@ import argparse
 import sys
 import logging
 from pathlib import Path
+from typing import Dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -67,16 +68,35 @@ def main():
             return
         
         config_files = list(config_dir.glob("*.conf")) + list(config_dir.glob("*.txt")) + list(config_dir.glob("*.cfg"))
-        
+
+        # v0.5.245-followup (audit AI-*): the previous loop passed the file
+        # stem as both device_id AND device_name, so router1.conf and
+        # router1.cfg (or router1.txt) collided on the primary key inside
+        # ConfigKnowledgeBase -- the second import silently overwrote the
+        # first (or raised, depending on the backend). Give each file a
+        # unique device_id derived from stem + extension while keeping the
+        # human-readable device_name as the stem alone.
+        seen_ids: Dict[str, Path] = {}
         for config_file in config_files:
             try:
                 config_text = config_file.read_text()
                 device_name = config_file.stem
+                # Extension without leading dot; falls back to 'cfg' if none.
+                ext = config_file.suffix.lstrip(".").lower() or "cfg"
+                device_id = f"{device_name}-{ext}"
+                if device_id in seen_ids:
+                    logger.warning(
+                        f"Duplicate device_id '{device_id}' from {config_file} "
+                        f"(already imported from {seen_ids[device_id]}); skipping."
+                    )
+                    continue
+                seen_ids[device_id] = config_file
+
                 vendor = args.vendor if args.vendor != "auto" else parser_obj.detect_vendor(config_text)
-                
-                kb.add_config(device_name, device_name, config_text, vendor=vendor)
+
+                kb.add_config(device_id, device_name, config_text, vendor=vendor)
                 imported_count += 1
-                logger.info(f"✅ Imported: {device_name} ({vendor})")
+                logger.info(f"✅ Imported: {device_name} as {device_id} ({vendor})")
             except Exception as e:
                 logger.error(f"Failed to import {config_file}: {e}")
     

@@ -33,7 +33,12 @@ class SONiCTroubleshooter:
         # Check 1: Kernel-level interface detection
         ip_link_output = device_output.get('ip_link_show', '')
         if ip_link_output:
-            interfaces = re.findall(r'\d+:\s+(\w+):', ip_link_output)
+            # v0.5.245-followup (audit AI-*): accept VLAN/veth/bond sub-interface names
+            # (e.g. "eth0@if4", "bond0.100@bond0") and strip the "@peer" suffix so that
+            # sub-interfaces don't trigger a false "no interfaces detected" critical alert.
+            # Tests: "2: eth0@if4:" -> "eth0"; "3: bond0.100@bond0:" -> "bond0.100".
+            raw_interfaces = re.findall(r'\d+:\s+([\w.@-]+):', ip_link_output)
+            interfaces = [name.split('@', 1)[0] for name in raw_interfaces]
             if interfaces:
                 findings.append({
                     "severity": "info",

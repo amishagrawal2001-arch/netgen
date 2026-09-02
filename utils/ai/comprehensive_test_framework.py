@@ -319,13 +319,21 @@ def test_e2e_{flow_name}():
                     if isinstance(node, ast.FunctionDef):
                         func_name = node.name
                         if func_name.startswith('test_'):
-                            # Extract function/class name from test name
-                            parts = func_name.replace('test_', '').split('_')
-                            if len(parts) > 1:
-                                tested_classes.add(parts[0])
-                                tested_functions.add('_'.join(parts[1:]))
+                            # v0.5.245-followup (audit AI-*): the previous logic
+                            # used str.replace('test_', '') (which strips every
+                            # occurrence, so 'test_reset_test_state' became
+                            # 'resetstate') and then split on '_' to guess
+                            # class-vs-function -- misclassifying every
+                            # multi-word test name (e.g. 'test_parse_config'
+                            # was counted as class 'parse' + function 'config').
+                            # Strip only the 'test_' prefix and treat the whole
+                            # remainder as the tested-function name.
+                            if hasattr(func_name, 'removeprefix'):
+                                stripped = func_name.removeprefix('test_')
                             else:
-                                tested_functions.add(parts[0])
+                                stripped = func_name[5:]
+                            if stripped:
+                                tested_functions.add(stripped)
             except SyntaxError:
                 continue
         
@@ -417,8 +425,24 @@ class TestSuite(unittest.TestCase):
         if test_framework == "pytest":
             suite = header + "\n\n".join(tests)
         else:
-            suite = header + "\n    ".join(tests) + "\n\nif __name__ == '__main__':\n    unittest.main()"
-        
+            # v0.5.245-followup (audit AI-*): the previous join used '\n    '
+            # which only indented the FIRST line of each subsequent method --
+            # every following line (docstring, body, subsequent statements) sat
+            # at column 0, producing an unparseable class body. Indent every
+            # line of every method by 4 spaces so each method sits inside the
+            # TestSuite class definition.
+            indent = "    "
+            indented_tests = []
+            for test_code in tests:
+                indented_tests.append(
+                    "\n".join(indent + line if line else line for line in test_code.splitlines())
+                )
+            suite = (
+                header
+                + "\n\n".join(indented_tests)
+                + "\n\n\nif __name__ == '__main__':\n    unittest.main()"
+            )
+
         return suite
 
 

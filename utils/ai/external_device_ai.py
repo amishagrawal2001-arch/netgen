@@ -77,7 +77,18 @@ class ExternalDeviceAI:
         if symptoms.get("interface_down"):
             down_interfaces = [iface for iface in interfaces if iface.get("status") == "down"]
             if down_interfaces:
-                diagnosis["root_cause"] = f"Interface(s) down: {', '.join([i['name'] for i in down_interfaces])}"
+                # v0.5.245-followup (audit AI-*): interface dicts vary by vendor
+                # (Juniper/SNMP shapes use 'ifDescr' or bare 'ifindex' rather than
+                # 'name'); direct ['name'] access blew up with KeyError. Fall back
+                # through the common shapes to a synthetic "if<index>" label.
+                def _iface_label(i):
+                    return (
+                        i.get('name')
+                        or i.get('ifname')
+                        or i.get('ifDescr')
+                        or f"if{i.get('ifindex', '?')}"
+                    )
+                diagnosis["root_cause"] = f"Interface(s) down: {', '.join(_iface_label(i) for i in down_interfaces)}"
                 diagnosis["solutions"] = [
                     "Check physical cable connections",
                     "Verify interface is not administratively shut down",

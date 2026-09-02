@@ -275,6 +275,10 @@ class UnifiedAddDeviceDialog(QDialog):
         buttons = QDialogButtonBox()
         select_btn = buttons.addButton("Select", QDialogButtonBox.AcceptRole)
         cancel_btn = buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
+        # v0.5.245-followup (audit AI-*): wire Select/Cancel to the inner
+        # discovered-devices dialog so they actually accept/reject.
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         
         if dialog.exec_() == QDialog.Accepted:
@@ -347,6 +351,29 @@ class UnifiedAddDeviceDialog(QDialog):
     def get_device_data(self):
         """Get device data"""
         return self.device_data
+
+    # v0.5.245-followup (audit AI-*): stop the discovery worker thread
+    # cleanly so signals do not fire against a deleted dialog.
+    def closeEvent(self, event):
+        """Stop any running discovery worker before closing."""
+        worker = getattr(self, "discovery_worker", None)
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    for signal_name in ("device_found", "discovery_complete", "error"):
+                        try:
+                            getattr(worker, signal_name).disconnect()
+                        except (TypeError, RuntimeError):
+                            pass
+                    try:
+                        worker.requestInterruption()
+                    except (AttributeError, RuntimeError):
+                        pass
+                    worker.quit()
+                    worker.wait(2000)
+            except RuntimeError:
+                pass
+        super().closeEvent(event)
 
 
 

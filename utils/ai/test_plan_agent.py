@@ -256,7 +256,13 @@ class TestPlanAgentToolRegistry:
             if isinstance(test_plan, str):
                 # Error message
                 return {"error": test_plan}
-            
+
+            # v0.5.245-followup (audit AI-*): stamp with 'kind' so the receiver
+            # in TestPlanAgent.execute() can distinguish a real test plan from
+            # analyze_requirements output (both carry 'title').
+            if isinstance(test_plan, dict):
+                test_plan.setdefault("kind", "test_plan")
+
             return test_plan
         
         except Exception as e:
@@ -449,12 +455,19 @@ class TestPlanAgent:
                     tool_results = self._execute_tool_calls(llm_response["tool_calls"])
                     
                     # Check if we got a test plan from the results
+                    # v0.5.245-followup (audit AI-*): the previous 'title in result'
+                    # check misidentified analyze_requirements output (which also
+                    # carries 'title') as the test plan. Require the generator's
+                    # own marker ('kind' == 'test_plan') or an explicit
+                    # 'test_cases' collection before treating the result as one.
                     for result in tool_results:
-                        if "test_plan" in result.get("result", {}):
-                            generated_test_plan = result["result"]["test_plan"]
-                        elif isinstance(result.get("result"), dict) and "title" in result.get("result", {}):
-                            # Could be test plan directly
-                            generated_test_plan = result["result"]
+                        result_payload = result.get("result")
+                        if not isinstance(result_payload, dict):
+                            continue
+                        if "test_plan" in result_payload:
+                            generated_test_plan = result_payload["test_plan"]
+                        elif result_payload.get("kind") == "test_plan" or "test_cases" in result_payload:
+                            generated_test_plan = result_payload
                     
                     # Add tool results to conversation
                     self.conversation_history.append(AgentMessage(
@@ -630,23 +643,37 @@ Help users create comprehensive test plans by understanding their requirements a
                         # Try to parse arguments JSON
                         arguments = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError as e:
-                        # If JSON is malformed, log error and try to extract what we can
-                        logger.warning(f"[TEST PLAN AGENT] Failed to parse tool call arguments JSON: {e}")
-                        logger.debug(f"[TEST PLAN AGENT] Raw arguments: {tool_call.function.arguments}")
-                        # Try to provide empty dict and let the tool handle missing parameters
-                        arguments = {}
-                        # If output_format was mentioned in the raw string, try to extract it
-                        if 'output_format' in tool_call.function.arguments:
-                            # Try to extract output_format value
-                            format_match = re.search(r'"output_format"\s*:\s*"([^"]+)"', tool_call.function.arguments)
-                            if format_match:
-                                arguments["output_format"] = format_match.group(1)
-                            else:
-                                # Default to "file"
-                                arguments["output_format"] = "file"
+                        # v0.5.245-followup (audit AI-*): the previous fallback
+                        # unconditionally set arguments['output_format'] = 'file',
+                        # which is only a valid parameter on generate_pytest_script.
+                        # For every other tool this fabricated an unknown kwarg;
+                        # for tools with required positional args (e.g.
+                        # generate_test_plan needs title + requirements) that
+                        # blew up inside the tool with a confusing signature
+                        # error instead of surfacing the parse failure. Now the
+                        # default is only applied when the target tool actually
+                        # accepts output_format, and other tools return a
+                        # structured error rather than silently inventing args.
+                        raw_args = tool_call.function.arguments
+                        tool_name = tool_call.function.name
+                        logger.warning(
+                            f"[TEST PLAN AGENT] Failed to parse tool call arguments JSON for {tool_name}: {e}"
+                        )
+                        logger.debug(f"[TEST PLAN AGENT] Raw arguments: {raw_args}")
+
+                        if tool_name == "generate_pytest_script":
+                            # Only this tool accepts output_format; safe to default it.
+                            arguments = {}
+                            format_match = re.search(r'"output_format"\s*:\s*"([^"]+)"', raw_args or "")
+                            arguments["output_format"] = format_match.group(1) if format_match else "file"
                         else:
-                            # Default to "file" if not specified
-                            arguments["output_format"] = "file"
+                            # Any other tool: don't fabricate args. Surface the
+                            # parse failure as a tool-call error so the agent
+                            # loop reports it instead of calling with garbage.
+                            raise ValueError(
+                                f"Malformed tool_call arguments JSON from LLM for tool "
+                                f"'{tool_name}': {e}. Raw: {raw_args!r}"
+                            )
                     
                     tool_calls.append({
                         "id": tool_call.id,
