@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.243] - 2026-09-02
+
+**No DHCPDISCOVER on the wire even though dhclient is "running":
+DHCP monitor tick races the API restart, spawns two dhclients
+that fight for the raw AF_PACKET socket.**
+
+Operator on srv06 2026-09-02: `tcpdump -i vlan30` saw ZERO DHCP
+packets despite dhclient allegedly running for the vlan30 client
+device. Inspection:
+
+    dhclient -4 -nw -pf /run/dhclient-vlan30-ipv4.pid vlan30  (pid 3277082)
+    dhclient -4 -nw -pf /run/dhclient-vlan30-ipv4.pid vlan30  (pid 3278117)
+
+Two dhclients on vlan30, both sleeping, neither transmitting.
+Killed both, spawned a single fresh dhclient — DHCPDISCOVER
+appeared on vlan30 within a second.
+
+Root cause: the DHCP monitor's periodic tick calls
+`ensure_dhcp_services(force_client_restart=True)` on any client
+that isn't in `state=Leased`. If the operator ALSO clicks Restart
+DHCP (or triggers Apply) at the same time, the API calls the SAME
+`ensure_dhcp_services`. Each caller did stop → sweep → start
+independently — but between one's sweep and its own start, the
+other one's start had already spawned. Two dhclients ended up
+bound to the same interface's raw AF_PACKET socket; bind()
+succeeded on both, but only one could actually transmit, and
+that transmission frequently got starved out.
+
+The v0.5.240 `_kill_stale_dhclients` sweep only helps WITHIN one
+caller's flow; it can't protect against a concurrent caller.
+
+Fix: `ensure_dhcp_services` now acquires a per-device
+`threading.Lock` before running its stop → sweep → start. A
+second concurrent caller blocks up to 45 s for the first one to
+finish; on lock-timeout it gives up with a clear error instead
+of piling on a second dhclient. Lock is per-device so unrelated
+devices continue to run in parallel.
+
+Implementation split:
+- `ensure_dhcp_services(...)` is now a thin wrapper that
+  acquires `_ENSURE_LOCKS[device_id]`.
+- `_ensure_dhcp_services_locked(...)` holds the original body
+  (mode-transition, container-creation, `start_dhcp_*` call).
+
+Tests: `tests/test_v05243_ensure_lock.py` — 7 pass.
+
 ## [0.5.242] - 2026-09-01
 
 **Force Apply: let the operator recover from stale-peer collisions

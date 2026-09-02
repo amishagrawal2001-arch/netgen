@@ -3067,6 +3067,30 @@ def stop_dhcp_services(
     return result
 
 
+# v0.5.243 (audit U ensure-race): per-device lock so DHCP monitor
+# auto-restart and API-driven restart/apply can't race on
+# ensure_dhcp_services. Symptom without this: both callers ran
+# stop → sweep → start concurrently, ending up with two dhclients
+# bound to the same interface's raw AF_PACKET socket. bind() succeeded
+# on both (SO_REUSEADDR-like semantics on packet sockets) but only
+# one could actually send — tcpdump saw ZERO DHCPDISCOVER on vlan30
+# despite two dhclients running. Serializing ensure_dhcp_services
+# per device pushes the monitor's tick to wait for the API restart
+# to finish before doing its own restart.
+_ENSURE_LOCKS: Dict[str, threading.Lock] = {}
+_ENSURE_LOCKS_GUARD = threading.Lock()
+
+
+def _get_ensure_lock(device_id: str) -> threading.Lock:
+    """Return the per-device lock for ensure_dhcp_services calls."""
+    with _ENSURE_LOCKS_GUARD:
+        lock = _ENSURE_LOCKS.get(device_id)
+        if lock is None:
+            lock = threading.Lock()
+            _ENSURE_LOCKS[device_id] = lock
+        return lock
+
+
 def ensure_dhcp_services(
     device_db,
     device_id: str,
@@ -3076,12 +3100,72 @@ def ensure_dhcp_services(
     force_client_restart: bool = False,
 ) -> Dict:
     """Ensure DHCP services (client/server) are running as requested.
-    
+
     Note: For DHCP server mode, this always creates a separate DHCP container,
     even if a container is passed. This allows DHCP server devices to have both:
     - FRR container for routing protocols (BGP, OSPF, ISIS)
     - Separate DHCP container for DHCP server functionality
     """
+    if not dhcp_config:
+        return {"success": False, "error": "No DHCP configuration provided"}
+    # v0.5.243 (audit U ensure-race): acquire the per-device lock for
+    # the entire stop→sweep→start critical section. Non-blocking
+    # first attempt so we can log a helpful skip; if that fails, we
+    # block with a bounded timeout so the second caller doesn't just
+    # duplicate the work the first one is already doing.
+    _lock = _get_ensure_lock(device_id) if device_id else None
+    _acquired = False
+    if _lock is not None:
+        _acquired = _lock.acquire(blocking=False)
+        if not _acquired:
+            logger.info(
+                "[DHCP] ensure_dhcp_services for %s already in flight — "
+                "blocking up to 45s so this caller doesn't spawn a "
+                "concurrent dhclient/dnsmasq that would fight the one "
+                "the other caller is bringing up.",
+                device_id,
+            )
+            _acquired = _lock.acquire(timeout=45)
+            if not _acquired:
+                logger.warning(
+                    "[DHCP] ensure_dhcp_services for %s: 45s wait "
+                    "expired, giving up to avoid a runaway retry loop. "
+                    "Another caller is still working on this device.",
+                    device_id,
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        "ensure_dhcp_services is already in flight for "
+                        "this device (waited 45s). Try again shortly."
+                    ),
+                }
+    try:
+        return _ensure_dhcp_services_locked(
+            device_db, device_id, interface, dhcp_config,
+            container=container, force_client_restart=force_client_restart,
+        )
+    finally:
+        if _acquired and _lock is not None:
+            try:
+                _lock.release()
+            except RuntimeError:
+                pass
+
+
+def _ensure_dhcp_services_locked(
+    device_db,
+    device_id: str,
+    interface: str,
+    dhcp_config: Optional[Dict],
+    container=None,
+    force_client_restart: bool = False,
+) -> Dict:
+    """v0.5.243: the actual ensure body. Extracted so the lock
+    wrapper in `ensure_dhcp_services` doesn't have to re-implement
+    every existing branch. Behavior is IDENTICAL to the pre-v0.5.243
+    `ensure_dhcp_services` — just now guaranteed to run at most
+    once per device at a time."""
     if not dhcp_config:
         return {"success": False, "error": "No DHCP configuration provided"}
     mode = (dhcp_config.get("mode") or "").lower()
