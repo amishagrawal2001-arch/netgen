@@ -2,6 +2,63 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.249] - 2026-09-02
+
+**BGP + OSPF monitor wrapper managers expose `is_running`;
+details dialog shows "N s ago" when no ISO timestamp available.**
+
+Operator on 2026-09-02 opened the v0.5.248 monitor-details dialog:
+
+```
+ARP        ✓ OK          last tick: —
+BGP        ✗ DOWN        last tick: —
+DHCP       ✓ OK          last tick: —
+ISIS       ✓ OK          last tick: —
+OSPF       ✗ DOWN        last tick: —
+```
+
+Two bugs:
+
+1. **BGP and OSPF wrongly report DOWN.** `/api/monitors/health`
+   does `getattr(bgp_monitor, "is_running", False)` — but
+   `bgp_monitor` is a `BGPStatusManager` wrapper that never had
+   an `is_running` attribute of its own, so the getattr default
+   `False` shipped forever. The inner `BGPStatusMonitor`
+   (`bgp_monitor.monitor`) has the real flag. Same for OSPF's
+   `OSPFStatusManager`. ISIS's manager already had a matching
+   property added for exactly this reason (see
+   `utils/isis_monitor.py:332`).
+
+2. **"last tick: —"** for every row. The endpoint returns
+   `stale_secs` (age of the freshest DB heartbeat), never an
+   ISO timestamp — but the client wrote `info.get("last_tick")
+   or "—"`, so every row displayed a bare "—".
+
+Fixes:
+
+- **utils/bgp_monitor.py `BGPStatusManager`** — new `is_running`
+  `@property` returning
+  `bool(self.monitor and self.monitor.is_running)`.
+- **utils/ospf_monitor.py `OSPFStatusManager`** — same.
+- **widgets/devices_tab.py `_show_monitor_health_details`** —
+  falls back through `last_tick` / `last_update` / `last_check_at`
+  ISO fields; when all absent, derives
+  `"{int(stale_secs)} s ago"` from the endpoint's actual returned
+  field. Final fallback `"no heartbeat yet"` for genuinely
+  empty rows.
+
+After upgrade, the dialog will show:
+
+```
+ARP        ✓ OK          last tick: 16 s ago
+BGP        ✓ OK          last tick: 5 s ago
+DHCP       ✓ OK          last tick: no heartbeat yet
+ISIS       ✓ OK          last tick: 7 s ago
+OSPF       ✓ OK          last tick: 6 s ago
+```
+
+Tests: `tests/test_v05249_monitor_running_flag.py` — 5 pass.
+
 ## [0.5.248] - 2026-09-02
 
 **Apply progress shows elapsed time; monitor pill click opens

@@ -5166,14 +5166,28 @@ class DevicesTab(QWidget):
                     _running = bool(_info.get("running", False))
                     _stale = bool(_info.get("stale", False))
                     _stale_secs = _info.get("stale_secs")
-                    _last_tick = _info.get("last_tick") or _info.get("last_update") or "—"
+                    _last_tick = (
+                        _info.get("last_tick") or _info.get("last_update") or _info.get("last_check_at")
+                    )
+                    # v0.5.249: the server's /api/monitors/health
+                    # returns `stale_secs` (age of the freshest DB
+                    # heartbeat), not an ISO timestamp. When
+                    # last_tick is absent, derive a friendly
+                    # "N sec ago" from stale_secs so the column
+                    # shows real info instead of a bare "—".
+                    if _last_tick:
+                        _last_display = _last_tick
+                    elif isinstance(_stale_secs, (int, float)):
+                        _last_display = f"{int(_stale_secs)} s ago"
+                    else:
+                        _last_display = "no heartbeat yet"
                     if not _running:
                         _status = "✗ DOWN"
                     elif _stale:
                         _status = f"⚠ STALE ({int(_stale_secs)}s)" if _stale_secs else "⚠ STALE"
                     else:
                         _status = "✓ OK"
-                    _lines.append(f"  {_name.upper():<10} {_status:<20}  last tick: {_last_tick}")
+                    _lines.append(f"  {_name.upper():<10} {_status:<20}  last tick: {_last_display}")
             _off = _snap.get("offenders") or []
             if _off:
                 _lines.append("")

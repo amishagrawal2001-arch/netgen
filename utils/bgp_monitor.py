@@ -402,6 +402,19 @@ class BGPStatusManager:
         except Exception as e:
             logger.error(f"[BGP MANAGER] Failed to initialize BGP status monitor: {e}")
     
+    # v0.5.249 (audit U monitor-running-flag): expose the inner
+    # BGPStatusMonitor's is_running so `/api/monitors/health`'s
+    # `getattr(bgp_monitor, "is_running", False)` returns the
+    # real state instead of the default False. Pre-fix, the
+    # Manager wrapper had no is_running attribute of its own, so
+    # the health endpoint reported BGP as DOWN even while ticks
+    # were happening (operator on srv06 2026-09-02 saw BGP ✗ DOWN
+    # in the monitor-details dialog with heartbeats 5s fresh).
+    # Same pattern ISISMonitor added in an earlier version.
+    @property
+    def is_running(self) -> bool:
+        return bool(self.monitor and getattr(self.monitor, "is_running", False))
+
     def start_monitoring(self):
         """Start BGP status monitoring."""
         if self.monitor:

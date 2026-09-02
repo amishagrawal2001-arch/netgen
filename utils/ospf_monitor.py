@@ -408,6 +408,15 @@ class OSPFStatusManager:
         except Exception as e:
             logger.error(f"[OSPF MANAGER] Failed to initialize OSPF status monitor: {e}")
     
+    # v0.5.249 (audit U monitor-running-flag): expose the inner
+    # OSPFStatusMonitor's is_running so `/api/monitors/health`'s
+    # `getattr(ospf_monitor, "is_running", False)` returns the
+    # real state. Same pattern the BGP Manager gets in this ship
+    # and that ISISMonitor already had as an explicit property.
+    @property
+    def is_running(self) -> bool:
+        return bool(self.monitor and getattr(self.monitor, "is_running", False))
+
     def start_monitoring(self):
         """Start OSPF status monitoring."""
         if self.monitor:
