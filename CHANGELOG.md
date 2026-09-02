@@ -2,6 +2,48 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.248] - 2026-09-02
+
+**Apply progress shows elapsed time; monitor pill click opens
+details dialog.**
+
+Operator on 2026-09-02:
+1. Clicked Apply, saw `Applying 0/1` frozen for the whole run —
+   the label only changed when a device COMPLETED, so a 40s slow
+   apply (server-side DHCP restart, FRR spin-up) looked identical
+   to a hard hang. Zero feedback.
+2. Saw `monitors: ⚠ 2` pill in the toolbar, clicked it, nothing
+   visible happened (the click silently re-polled; the actual
+   monitor warnings only lived in the tooltip — easy to miss).
+
+Fixes:
+
+- **widgets/devices_tab.py `_show_apply_progress`** starts a 1Hz
+  QTimer (`_apply_progress_ticker`) that repaints the label as
+  `Applying N/M (Ss)` while the batch runs. `_tick_apply_progress`
+  (called per-device completion) also stamps the elapsed seconds
+  so the label stays consistent. `_hide_apply_progress` stops
+  the ticker. The elapsed handler bails and self-stops if it
+  fires after the bar is already hidden.
+
+- **widgets/devices_tab.py new `_show_monitor_health_details`**
+  opens a QMessageBox with per-monitor state
+  (`✓ OK` / `⚠ STALE (Ns)` / `✗ DOWN` + last tick timestamp)
+  drawn from a snapshot cached by `_refresh_monitor_health`.
+  A "Re-poll" button triggers a fresh HTTP round-trip. The
+  Detailed Text box is auto-expanded so the operator sees the
+  offenders immediately without having to click "Show Details…".
+  Pill's click handler now invokes this instead of the silent
+  re-poll.
+
+- `_refresh_monitor_health` caches
+  `{overall_ok, monitors, offenders, raw}` in
+  `_monitor_health_last_snapshot` so the details dialog opens
+  instantly.
+
+Tests: `tests/test_v05248_apply_progress_monitor_details.py` —
+10 pass.
+
 ## [0.5.247] - 2026-09-02
 
 **Startup reaper for orphan DHCP containers.**

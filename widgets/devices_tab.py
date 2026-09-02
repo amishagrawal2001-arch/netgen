@@ -2023,9 +2023,15 @@ class DevicesTab(QWidget):
         )
         self._monitor_health_label.setToolTip("Background-monitor health: polling…")
         self._monitor_health_label.setCursor(Qt.PointingHandCursor)
-        # mousePressEvent — fire a manual refresh on click for impatient users.
+        # v0.5.248 (audit U monitor-details): click opens a details
+        # dialog listing the offending monitors (name / state /
+        # stale-secs) with a Re-poll button. Pre-fix, click silently
+        # re-polled and the only way to see WHICH monitors were down
+        # was the tooltip — easy to miss when the operator asks
+        # "OK but WHAT'S wrong?"
+        self._monitor_health_last_snapshot = None
         def _click_health(event, lbl=self._monitor_health_label):
-            self._refresh_monitor_health()
+            self._show_monitor_health_details()
         self._monitor_health_label.mousePressEvent = _click_health
         btns.addWidget(self._monitor_health_label)
 
@@ -4887,6 +4893,37 @@ class DevicesTab(QWidget):
         self._apply_progress_label.setText(f"Applying 0/{self._apply_progress_total}")
         self._apply_progress_label.setVisible(True)
         self._apply_progress_bar.setVisible(True)
+        # v0.5.248 (audit U apply-elapsed): start a 1Hz elapsed-time
+        # tick so the operator sees "Applying 0/1 (12s)" instead of
+        # a frozen "Applying 0/1" when a device's apply-time is
+        # dominated by a slow server-side step (e.g. DHCP server
+        # dnsmasq restart, FRR container spin-up). Pre-fix, the
+        # label only updated when a device COMPLETED, so a 45s
+        # slow apply looked identical to a hard hang.
+        import time as _t
+        self._apply_progress_started_at = _t.monotonic()
+        if not hasattr(self, "_apply_progress_ticker"):
+            self._apply_progress_ticker = QTimer(self)
+            self._apply_progress_ticker.setInterval(1000)
+            self._apply_progress_ticker.timeout.connect(self._on_apply_elapsed_tick)
+        self._apply_progress_ticker.start()
+
+    def _on_apply_elapsed_tick(self) -> None:
+        """v0.5.248: repaint the progress label with elapsed seconds
+        so a slow apply visibly moves. Bail if the bar is hidden."""
+        if not hasattr(self, "_apply_progress_bar"):
+            return
+        if not self._apply_progress_bar.isVisible():
+            if hasattr(self, "_apply_progress_ticker"):
+                self._apply_progress_ticker.stop()
+            return
+        import time as _t
+        _elapsed = int(_t.monotonic() - getattr(self, "_apply_progress_started_at", _t.monotonic()))
+        _done = getattr(self, "_apply_progress_done", 0)
+        _total = getattr(self, "_apply_progress_total", 1)
+        self._apply_progress_label.setText(
+            f"Applying {_done}/{_total} ({_elapsed}s)"
+        )
 
     def _tick_apply_progress(self) -> None:
         """Bump the progress counter by one — called per per-device result."""
@@ -4899,8 +4936,13 @@ class DevicesTab(QWidget):
             getattr(self, "_apply_progress_total", 1),
         )
         self._apply_progress_bar.setValue(self._apply_progress_done)
+        # v0.5.248: still show elapsed on the "done +1" tick so the
+        # label stays consistent between the per-second ticker and
+        # per-device completion.
+        import time as _t
+        _elapsed = int(_t.monotonic() - getattr(self, "_apply_progress_started_at", _t.monotonic()))
         self._apply_progress_label.setText(
-            f"Applying {self._apply_progress_done}/{self._apply_progress_total}"
+            f"Applying {self._apply_progress_done}/{self._apply_progress_total} ({_elapsed}s)"
         )
 
     def _hide_apply_progress(self) -> None:
@@ -4910,6 +4952,13 @@ class DevicesTab(QWidget):
             return
         self._apply_progress_bar.setVisible(False)
         self._apply_progress_label.setVisible(False)
+        # v0.5.248: stop the elapsed-time ticker so it doesn't keep
+        # firing after the apply batch is done.
+        if hasattr(self, "_apply_progress_ticker"):
+            try:
+                self._apply_progress_ticker.stop()
+            except RuntimeError:
+                pass
 
     def _retry_failed_apply(self, failed_devices):
         """Re-apply just the devices that failed in the previous batch.
@@ -5058,13 +5107,23 @@ class DevicesTab(QWidget):
                             f"{name.upper()} stale ({int(secs)}s)" if secs else f"{name.upper()} stale"
                         )
 
+                # v0.5.248: cache the raw snapshot + parsed offenders
+                # so `_show_monitor_health_details` renders instantly on
+                # click instead of racing another HTTP round-trip.
+                self._monitor_health_last_snapshot = {
+                    "overall_ok": overall_ok,
+                    "monitors": monitors,
+                    "offenders": offenders,
+                    "raw": payload,
+                }
                 if overall_ok and not offenders:
                     self._monitor_health_label.setText("monitors: OK")
                     self._monitor_health_label.setStyleSheet(
                         "color: #16a34a; font-size: 11px; padding: 0 6px;"
                     )
                     self._monitor_health_label.setToolTip(
-                        "All background monitors running and reporting on time."
+                        "All background monitors running and reporting on time.\n"
+                        "Click for details."
                     )
                 else:
                     self._monitor_health_label.setText(f"monitors: ⚠ {len(offenders)}")
@@ -5072,7 +5131,7 @@ class DevicesTab(QWidget):
                         "color: #d97706; font-size: 11px; padding: 0 6px; font-weight: 600;"
                     )
                     self._monitor_health_label.setToolTip(
-                        "Click to re-poll. Issues:\n• " + "\n• ".join(offenders)
+                        "Click for details. Issues:\n• " + "\n• ".join(offenders)
                     )
             except Exception as exc:
                 logger.debug(f"[MONITOR HEALTH] apply failed: {exc}")
@@ -5083,7 +5142,67 @@ class DevicesTab(QWidget):
             if w in self._monitor_health_workers else None
         )
         worker.start()
-    
+
+    def _show_monitor_health_details(self):
+        """v0.5.248 (audit U monitor-details): open a modal listing
+        the actual monitor state (up/down/stale + stale_secs) and
+        offering a Re-poll button.
+
+        Uses the cached snapshot from the last `_refresh_monitor_health`
+        so opening is instant. Falls back to a "polling…" placeholder
+        + immediate refresh when no snapshot has landed yet.
+        """
+        _snap = getattr(self, "_monitor_health_last_snapshot", None)
+        _lines = []
+        if _snap is None:
+            _lines.append("Health poll hasn't completed yet — click Re-poll below.")
+        else:
+            _mons = _snap.get("monitors") or {}
+            if not _mons:
+                _lines.append("Server returned no monitor state.")
+            else:
+                for _name in sorted(_mons.keys()):
+                    _info = _mons.get(_name) or {}
+                    _running = bool(_info.get("running", False))
+                    _stale = bool(_info.get("stale", False))
+                    _stale_secs = _info.get("stale_secs")
+                    _last_tick = _info.get("last_tick") or _info.get("last_update") or "—"
+                    if not _running:
+                        _status = "✗ DOWN"
+                    elif _stale:
+                        _status = f"⚠ STALE ({int(_stale_secs)}s)" if _stale_secs else "⚠ STALE"
+                    else:
+                        _status = "✓ OK"
+                    _lines.append(f"  {_name.upper():<10} {_status:<20}  last tick: {_last_tick}")
+            _off = _snap.get("offenders") or []
+            if _off:
+                _lines.append("")
+                _lines.append("Offenders summary:")
+                _lines.extend("  • " + o for o in _off)
+        # Show as an information-level modal with a Re-poll button.
+        # QMessageBox lets us customize buttons via addButton.
+        from PyQt5.QtWidgets import QMessageBox as _QMB
+        _dlg = _QMB(self)
+        _dlg.setWindowTitle("Background Monitor Health")
+        _dlg.setIcon(_QMB.Information if (_snap and _snap.get("overall_ok")) else _QMB.Warning)
+        _dlg.setText(
+            "Background monitors (BGP / OSPF / ISIS / DHCP / VXLAN / ARP)"
+            " keep the device rows fresh in the DB. This is their live"
+            " state."
+        )
+        _dlg.setDetailedText("\n".join(_lines) if _lines else "(no data)")
+        _repoll_btn = _dlg.addButton("Re-poll", _QMB.ActionRole)
+        _dlg.addButton(_QMB.Close)
+        # Auto-expand the detail box on open so the operator doesn't
+        # have to click "Show Details…" to see the actual issue.
+        for _b in _dlg.buttons():
+            if _b.text() in ("Show Details...", "Show Details"):
+                _b.click()
+                break
+        _dlg.exec_()
+        if _dlg.clickedButton() is _repoll_btn:
+            self._refresh_monitor_health()
+
     def apply_selected_device_with_arp(self):
         """Apply selected devices and automatically trigger ARP operations."""
         selected_items = self.devices_table.selectedItems()
