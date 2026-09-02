@@ -7246,9 +7246,92 @@ def restart_dhcp_service():
             device_db, device_id, interface, dhcp_cfg,
             force_client_restart=True,
         )
+
+        # v0.5.244 (audit U restart-error): extract nested per-family
+        # errors before falling back to "Restart failed". Pre-fix,
+        # `ensure_dhcp_services` returns
+        #   {success: False, ipv4: {..., error: 'Lease timeout'},
+        #                    ipv6: {..., error: 'IPv6 skipped'}}
+        # on a client-mode start where dhclient launched but no
+        # DHCPOFFER arrived. The endpoint saw `success=False`, no
+        # top-level `error`, and returned HTTP 500 with the useless
+        # string "Restart failed" — the operator had no idea WHY.
+        def _pluck_family_errors(_r: Dict) -> List[str]:
+            _out: List[str] = []
+            if not isinstance(_r, dict):
+                return _out
+            for _fam in ("ipv4", "ipv6"):
+                _sub = _r.get(_fam) or {}
+                if isinstance(_sub, dict):
+                    _e = _sub.get("error")
+                    # Skip cosmetic "skipped" markers when the OTHER
+                    # family is enabled — they aren't real failures.
+                    if _e and _e != "IPv4 skipped" and _e != "IPv6 skipped":
+                        _out.append(f"{_fam}: {_e}")
+            # `failures` (server-mode stop_dhcp_server aggregator, v0.5.217)
+            _fails = _r.get("failures") or []
+            if isinstance(_fails, (list, tuple)):
+                for _f in _fails:
+                    if _f:
+                        _out.append(str(_f))
+            return _out
+
+        # v0.5.244: distinguish "daemon failed to start" (hard) from
+        # "daemon started but no lease yet" (soft — the client-mode
+        # start returns success=False on Lease timeout even though
+        # dhclient IS running). The former deserves HTTP 500; the
+        # latter is HTTP 200 with a `pending_lease` warning so the
+        # client can render "kicking… waiting for lease" instead of
+        # a scary error dialog.
+        _fam_errs = _pluck_family_errors(result if isinstance(result, dict) else {})
+        _lease_timeout_only = (
+            _fam_errs
+            and all("lease timeout" in _e.lower() for _e in _fam_errs)
+        )
         if isinstance(result, dict) and not result.get("success", True):
+            if _lease_timeout_only and mode == "client":
+                # Soft success — the restart itself worked; the lease
+                # just hasn't come yet. The DHCP monitor will keep
+                # polling and update the state when a lease lands (or
+                # write "No Lease" if the server is truly unreachable).
+                logging.info(
+                    "[DHCP RESTART] %s: dhclient restarted but no lease "
+                    "in %ss (%s). Reporting soft-success so the client "
+                    "doesn't render a scary error.",
+                    device_id,
+                    dhcp_cfg.get("timeout", 20),
+                    "; ".join(_fam_errs),
+                )
+                try:
+                    fresh = device_db.get_device(device_id) or {}
+                except Exception:
+                    fresh = {}
+                return jsonify({
+                    "status": "restarted_pending_lease",
+                    "dhcp_state": fresh.get("dhcp_state"),
+                    "dhcp_running": bool(fresh.get("dhcp_running")),
+                    "warning": (
+                        "dhclient restarted successfully but no lease "
+                        "arrived within the timeout window. The DHCP "
+                        "monitor will keep polling; if the DHCP server "
+                        "is reachable, a lease should appear within 60s. "
+                        "If not, check the server / VLAN reachability."
+                    ),
+                    "family_errors": _fam_errs,
+                }), 200
+            # Hard failure — surface the specific reason.
+            _err = (
+                result.get("error")
+                or "; ".join(_fam_errs)
+                or "Restart failed (no error detail from ensure_dhcp_services)"
+            )
+            logging.warning(
+                "[DHCP RESTART] %s hard-failed: %s (full result: %s)",
+                device_id, _err, result,
+            )
             return jsonify({
-                "error": result.get("error") or "Restart failed"
+                "error": _err,
+                "family_errors": _fam_errs,
             }), 500
         # Return the fresh state so the client can update its row
         # without waiting for the next monitor poll.

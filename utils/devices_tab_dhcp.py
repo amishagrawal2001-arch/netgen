@@ -1607,14 +1607,21 @@ class DHCPHandler:
         finally:
             _prog.close()
         if resp.status_code != 200:
+            # v0.5.244: unpack the structured error body. Server now
+            # returns {error, family_errors: [...]} on hard failures.
             _err_body = ""
+            _family_errs = []
             try:
-                _err_body = (resp.json() or {}).get("error") or resp.text
+                _js = resp.json() or {}
+                _err_body = _js.get("error") or resp.text
+                _family_errs = _js.get("family_errors") or []
             except Exception:
                 _err_body = resp.text
+            _detail = f"HTTP {resp.status_code}: {_err_body}"
+            if _family_errs:
+                _detail += "\n\nPer-family details:\n  " + "\n  ".join(_family_errs)
             QMessageBox.warning(
-                self.parent, "Restart Failed",
-                f"HTTP {resp.status_code}: {_err_body}",
+                self.parent, "Restart Failed", _detail,
             )
             return
         # Success — nudge the table to refresh so the operator sees
@@ -1623,18 +1630,37 @@ class DHCPHandler:
             body = resp.json() or {}
         except Exception:
             body = {}
+        # v0.5.244: honor "restarted_pending_lease" — dhclient restarted
+        # OK but no lease landed within the timeout. Show a friendly
+        # info dialog (not a scary Warning) so the operator knows the
+        # restart itself worked; the monitor will pick up any late lease.
+        _status = body.get("status") or ""
         _new_state = body.get("dhcp_state") or "(unknown)"
-        try:
-            _sb = getattr(self.parent, "statusBar", None)
-            if callable(_sb):
-                _bar = _sb()
-                if _bar is not None:
-                    _bar.showMessage(
-                        f"DHCP restart succeeded — new state: {_new_state}",
-                        4000,
-                    )
-        except Exception:
-            pass
+        if _status == "restarted_pending_lease":
+            _warning = body.get("warning") or (
+                "dhclient restarted but no lease yet. The DHCP monitor "
+                "will keep polling."
+            )
+            _family_errs = body.get("family_errors") or []
+            _extra = ""
+            if _family_errs:
+                _extra = "\n\nPer-family details:\n  " + "\n  ".join(_family_errs)
+            QMessageBox.information(
+                self.parent, "DHCP Restarted — Waiting for Lease",
+                _warning + _extra,
+            )
+        else:
+            try:
+                _sb = getattr(self.parent, "statusBar", None)
+                if callable(_sb):
+                    _bar = _sb()
+                    if _bar is not None:
+                        _bar.showMessage(
+                            f"DHCP restart succeeded — new state: {_new_state}",
+                            4000,
+                        )
+            except Exception:
+                pass
         # Kick a refresh so table + State column reflect reality.
         QTimer.singleShot(500, self.refresh_dhcp_status)
 

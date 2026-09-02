@@ -2,6 +2,53 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.244] - 2026-09-02
+
+**Restart DHCP no longer reports "HTTP 500: Restart failed" for a
+lease that just hasn't arrived yet, and hard-failure dialogs now
+say WHY.**
+
+Operator on srv06 2026-09-02: clicked Restart DHCP → dialog said
+"HTTP 500: Restart failed". No detail on WHY.
+
+Trace: `ensure_dhcp_services` returned
+```
+{'success': False,
+ 'ipv4': {'success': False, 'error': 'Lease timeout'},
+ 'ipv6': {'success': False, 'error': 'IPv6 skipped'}}
+```
+The endpoint saw `success=False`, no top-level `error` key, and
+fell through to the hardcoded string `"Restart failed"`.
+Meanwhile "Lease timeout" isn't a restart failure — dhclient DID
+restart cleanly, it just hasn't gotten a DHCPOFFER within the
+timeout window. The DHCP monitor keeps polling; a late lease
+will still land. Reporting HTTP 500 with an opaque message was
+wrong on both axes: severity (soft, not hard) and detail (none).
+
+Fixes:
+
+- **run_tgen_server.py `restart_dhcp_service`** — new inline
+  helper `_pluck_family_errors(result)` extracts per-family
+  errors from `result["ipv4"]["error"]` and `result["ipv6"]["error"]`
+  (skipping cosmetic "IPv4 skipped" / "IPv6 skipped" markers) as
+  well as the server-mode `result["failures"]` aggregator from
+  v0.5.217. On a client-mode restart whose ONLY errors are
+  "Lease timeout": return HTTP 200 with
+  `status: "restarted_pending_lease"`, `warning: "…"`, and
+  `family_errors: [...]`. On a real hard failure: return HTTP
+  500 but with `error` = the extracted reason (no more generic
+  "Restart failed") + `family_errors: [...]`.
+
+- **utils/devices_tab_dhcp.py `restart_dhcp_service`** — handles
+  the new `restarted_pending_lease` status with a friendly
+  QMessageBox.**information** dialog (`"DHCP Restarted — Waiting
+  for Lease"`) instead of a scary Warning. Both the hard-fail and
+  pending-lease dialogs now unpack `family_errors` into a
+  per-line "Per-family details:" block so the operator sees
+  "ipv4: Lease timeout" rather than an opaque "Restart failed".
+
+Tests: `tests/test_v05244_restart_error.py` — 8 pass.
+
 ## [0.5.243] - 2026-09-02
 
 **No DHCPDISCOVER on the wire even though dhclient is "running":
