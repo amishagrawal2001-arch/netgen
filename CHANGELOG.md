@@ -2,6 +2,110 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.252] - 2026-09-02
+
+**L2 emulation audit — 10 correctness fixes across
+`utils/l2_protocols.py`, `server/l2_routes.py`, and
+`widgets/l2_emulation_tab.py`.**
+
+Post-v0.5.251 review agent surveyed the L2 emulation subsystem
+(LACP / LLDP / VRRP / IGMP / PIM / BFD / STP / MLD / 802.1X / QinQ
+emitters). Ten confirmed findings; all fixed in this ship. Three
+are on-the-wire protocol violations that made real peers silently
+reject every frame we emitted — those are the important ones.
+
+**Wire-protocol correctness (peers were rejecting our frames):**
+
+- **L2-1: BFD version = 1, not 3.** RFC 5880 §4.1 defines the only
+  valid BFD version as 1; §6.8.6 requires peers to DROP every
+  packet with a different version. Both the live emitter
+  (`start_bfd`) and the preview builder (`_bfd_preview`) shipped
+  version=3, so `frames_sent` climbed but no BFD session ever came
+  Up. The pre-existing regression test `tests/test_bfd_l2.py`
+  locked in the bug with `assert version == 3` and a misleading
+  docstring ("version (3 per RFC 5880)"). Flipped to 1 and renamed
+  the test.
+- **L2-3: IGMPv2 General Query destination.** For query type
+  `0x11` with group `0.0.0.0`, RFC 2236 §3 mandates IP dst =
+  `224.0.0.1` (ALL-HOSTS). Pre-fix used `group` verbatim →
+  IP dst = `0.0.0.0`, L2 dst = `01:00:5e:00:00:00`. Switches
+  silently dropped it; IGMP-snooping tests produced zero host
+  responses.
+- **L2-4: IGMPv3 Router Alert option.** RFC 3376 §4 REQUIRES
+  every IGMPv3 message to carry an IP Router Alert option.
+  Pre-fix used `options=[]` — real multicast routers ignored our
+  reports and never updated group state. Now includes
+  `IPOption_Router_Alert()`.
+
+**Session lifecycle:**
+
+- **L2-5: `stop_session` returns the counter snapshot.** Pre-fix
+  returned `bool` with a comment claiming "final counters are in
+  the stop response" — but the HTTP endpoint returned only
+  `{"stopped": bool, "session_id": sid}` and the next 3s poll
+  found the session evicted from `/api/l2/sessions`. Post-mortem
+  counters (frames_sent, bytes_sent, last_error) vanished.
+  `stop_session` now returns `Optional[Dict]` (the snapshot) and
+  `server/l2_routes.py` puts it in the response body.
+- **L2-8: `stop_session` leaves zombies visible.** Pre-fix popped
+  the entry from `_SESSIONS` unconditionally after a bounded 3s
+  join, even when `thread.is_alive()` still returned True.
+  A worker stuck in scapy `sendp()` kept emitting frames but was
+  invisible to `list_sessions()` and unreachable to
+  `stop_all_sessions`. Now: on join-timeout, keep the session in
+  the registry with a loud warning log so the operator can
+  diagnose + retry.
+- **L2-6: Client-side Stop moves to a background QThread.**
+  `_on_stop_selected` / `_on_stop_all` / `_stop_session_by_id`
+  all called `requests.post(..., timeout=5|10)` on the Qt main
+  thread. 8 stuck sessions × 5s timeout = 40s of frozen client
+  UI. Now all three route through a shared
+  `_start_l2_stop_worker` QThread with an error-summary dialog +
+  keepalive against the PyQt5 5.15.11 + Python 3.14 SIGABRT
+  pattern.
+
+**Silent-failure classes:**
+
+- **L2-2: VRRP dialog blank Source MAC.** The Source MAC input's
+  placeholder + tooltip both say "leave blank to use the RFC
+  5798 virtual MAC" — but `_on_accept` called `_validate_mac('')`
+  which returned "MAC address is empty" and refused the submit.
+  The documented auto-derive path (`start_vrrp(src_mac=None) →
+  _vrrp_virtual_mac(vrid, family)`) was unreachable from the GUI.
+  Validator now only runs when the operator actually typed a MAC.
+- **L2-7: LLDP non-ASCII crashes worker every tick.** The four
+  string TLV fields (chassis_id, port_id, system_name,
+  system_description) all used `.encode("ascii")` bare. Any
+  non-ASCII input (`switch-café`, non-Latin hostname) raised
+  `UnicodeEncodeError` inside the periodic worker loop; the
+  generic except bumped `frames_failed` and wrote to
+  `last_error`, then the loop spun forever at 0 frames/sec on
+  the wire. Switched to `.encode("utf-8", errors="replace")`
+  everywhere (802.1AB doesn't restrict to ASCII).
+
+**Minor:**
+
+- **L2-9: LACP preview default state = 0x05.** `_lacpdu` (preview
+  builder) defaulted `actor_state` to `0x3d`; live `start_lacp`
+  defaults to `0x05`. Partial-body callers of the preview saw a
+  different frame from the wire. Preview now matches.
+- **L2-10: `_run_periodic` drift compensation.** Cycle time was
+  `send_duration + interval_s` (wait ran AFTER sendp). For BFD
+  sub-second modes (0.1s + detect_mult=3, ~300ms detection),
+  a scapy sendp taking 30-50ms pushed actual cadence to
+  ~130-150ms → exceeded peer's detection window → spurious "peer
+  down" declarations that would misdiagnose as real link
+  issues. Now schedules `next_tick_at = last_tick + interval`
+  and waits only the residual; re-anchors to now if behind.
+
+Tests: `tests/test_v05252_l2_audit_fixes.py` — 19 pass. Updated
+`tests/test_bfd_l2.py` (version=3→1), `tests/test_l2_protocols.py`
+(stop_session return-type contract), `tests/test_l2_v0_3_8.py`
+(same + snapshot's iface field), and
+`tests/test_v05237_api_guide_dhcp.py` (widened restart-contract
+slice). All 384 DHCP-related + L2-related tests in the suite
+still pass.
+
 ## [0.5.251] - 2026-09-02
 
 **API_GUIDE documents v0.5.240–v0.5.250 additions (docs-only).**

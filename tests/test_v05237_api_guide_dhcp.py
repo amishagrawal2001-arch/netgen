@@ -26,9 +26,15 @@ def test_all_four_dhcp_endpoints_listed():
 
 def test_restart_endpoint_has_contract():
     """The v0.5.231 restart endpoint must show the request shape,
-    the success response shape, and the error codes."""
+    the success response shape, and the error codes.
+
+    v0.5.252: widened the slice to 4500 — v0.5.251 rewrote the
+    restart contract to document the three response shapes
+    (restarted / restarted_pending_lease / HTTP 500 with real
+    reason), which pushed the 400/404/500 status-code block well
+    past the pre-v0.5.251 1500-char window."""
     idx = GUIDE.find("`POST /api/device/dhcp/restart`")
-    body = GUIDE[idx:idx + 1500]
+    body = GUIDE[idx:idx + 4500]
     assert '"device_id"' in body
     assert '"status":           "restarted"' in body
     assert "400" in body and "404" in body and "500" in body

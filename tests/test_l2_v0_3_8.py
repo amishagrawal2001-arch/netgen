@@ -39,11 +39,17 @@ class _DummyThread:
 
 
 def _make_dummy_session():
-    """Build the minimal session object `stop_session` walks."""
+    """Build the minimal session object `stop_session` walks.
+
+    v0.5.252 (audit L2-5): stop_session now calls sess.snapshot() —
+    which reads .iface + .config — so the fixture must supply those
+    too. Pre-v0.5.252 stop_session only touched .thread / .stop_evt /
+    .counters / .lock; the extra fields didn't matter."""
     from utils.l2_protocols import _Session, _Counters
     sess = _Session.__new__(_Session)
     sess.session_id = "test-sid"
     sess.protocol = "lacp"
+    sess.iface = "lo0"
     sess.config = {}
     sess.counters = _Counters()
     sess.lock = threading.Lock()
@@ -66,8 +72,11 @@ def test_v0_3_8_stop_session_evicts_from_registry():
         _SESSIONS[sess.session_id] = sess
         assert sess.session_id in _SESSIONS, "fixture setup failed"
 
-    ok = stop_session(sess.session_id)
-    assert ok is True
+    # v0.5.252 (audit L2-5): stop_session now returns Optional[Dict]
+    # (the counter snapshot) instead of bool. Any dict = stopped.
+    snap = stop_session(sess.session_id)
+    assert snap is not None
+    assert isinstance(snap, dict)
 
     with _REG_LOCK:
         assert sess.session_id not in _SESSIONS, (
@@ -79,11 +88,12 @@ def test_v0_3_8_stop_session_evicts_from_registry():
         assert set(_SESSIONS.keys()) == baseline_keys
 
 
-def test_v0_3_8_stop_session_returns_false_for_unknown():
-    """Unknown session id stays a no-op + False return — the
-    eviction logic must not mask the "not found" signal."""
+def test_v0_3_8_stop_session_returns_none_for_unknown():
+    """v0.5.252 (audit L2-5): stop_session returns None on unknown
+    session_id (was `False` pre-v0.5.252). The "not found" signal
+    remains distinguishable from a real stop (dict) via `is None`."""
     from utils.l2_protocols import stop_session
-    assert stop_session("does-not-exist") is False
+    assert stop_session("does-not-exist") is None
 
 
 def test_v0_3_8_stop_all_sessions_drains_registry():

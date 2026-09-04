@@ -83,9 +83,13 @@ class _Session:
 
     def snapshot(self) -> Dict[str, Any]:
         with self.lock:
+            # v0.5.252: getattr guard for thread-shaped mocks that
+            # lack is_alive (existing test fixtures rely on this).
+            _is_alive_fn = getattr(self.thread, "is_alive", None)
+            _thread_alive = bool(callable(_is_alive_fn) and _is_alive_fn())
             running = (
                 self.thread is not None
-                and self.thread.is_alive()
+                and _thread_alive
                 and not self.stop_evt.is_set()
             )
             return {
@@ -116,27 +120,64 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
     return sess.snapshot() if sess else None
 
 
-def stop_session(session_id: str) -> bool:
+def stop_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """Stop a session and return its final counter snapshot, or None
+    when the session_id doesn't exist.
+
+    v0.5.252 (audit L2-5 + L2-8): two changes.
+
+    1. **Return the snapshot.** Pre-fix returned bool; the eviction
+       comment said "final counters are already returned in the
+       /api/l2/<proto>/stop response body" — but no per-protocol stop
+       endpoint exists (only the kind-agnostic /api/l2/stop) and
+       server/l2_routes.py's stop returned {"stopped": bool} with no
+       counters. The client's 3s poll then found the session gone
+       from /api/l2/sessions, so the row disappeared with no chance
+       to read frames_sent / bytes_sent / last_error post-mortem.
+       Now the callers get the snapshot back and the HTTP layer
+       includes it in the response body.
+
+    2. **Only evict when the thread actually finished.** Pre-fix
+       popped the entry after a bounded 3s join even when
+       `thread.is_alive()` remained True — the worker (blocked in
+       scapy sendp() or a slow driver TX ring) kept emitting frames
+       with no session visible in list_sessions and no way to
+       re-stop it via stop_all_sessions. Now, if the join times out,
+       the entry stays in the registry with `stopped=True` set on
+       the counters so the operator can see the zombie state and
+       retry `stop_session` (which is idempotent — stop_evt is
+       already set, we just re-join).
+    """
     with _REG_LOCK:
         sess = _SESSIONS.get(session_id)
     if not sess:
-        return False
+        return None
     sess.stop_evt.set()
+    _clean_exit = True
     if sess.thread:
         sess.thread.join(timeout=3.0)
+        # v0.5.252: use getattr guard so a thread-shaped mock (or
+        # any object that lacks is_alive) counts as clean-exit,
+        # matching the pre-v0.5.252 behavior for those callers.
+        _is_alive = getattr(sess.thread, "is_alive", lambda: False)
+        if callable(_is_alive) and _is_alive():
+            _clean_exit = False
+            logger.warning(
+                "[L2] stop_session %s: worker thread still alive after "
+                "3s join — leaving in registry as zombie. Retry stop "
+                "or restart netgen-server to reap.",
+                session_id,
+            )
     with sess.lock:
         sess.counters.stopped_at = time.time()
-    # v0.3.8: evict the entry from the registry. Pre-v0.3.8 the
-    # session stayed in `_SESSIONS` forever — `list_sessions()`
-    # would keep returning it as `running=False`, and on a long-
-    # running server with many start/stop cycles the dict grew
-    # without bound. The final counters are already returned in
-    # the /api/l2/<proto>/stop response body so the client has its
-    # post-mortem data; keeping the in-memory entry alive added
-    # nothing the operator could use.
-    with _REG_LOCK:
-        _SESSIONS.pop(session_id, None)
-    return True
+    snap = sess.snapshot()
+    # v0.5.252: only evict on a clean thread exit. A stuck sendp()
+    # worker keeps holding the interface; keeping it visible in
+    # list_sessions() lets the operator diagnose + retry.
+    if _clean_exit:
+        with _REG_LOCK:
+            _SESSIONS.pop(session_id, None)
+    return snap
 
 
 def stop_all_sessions() -> int:
@@ -144,7 +185,10 @@ def stop_all_sessions() -> int:
         ids = list(_SESSIONS.keys())
     n = 0
     for sid in ids:
-        if stop_session(sid):
+        # v0.5.252: stop_session now returns Optional[Dict] (the
+        # snapshot) instead of bool; None = session_id vanished
+        # between list and stop.
+        if stop_session(sid) is not None:
             n += 1
     return n
 
@@ -165,9 +209,21 @@ def _run_periodic(sess: _Session, frame_factory, interval_s: float,
     """
     from scapy.all import sendp
     deadline = (time.time() + duration_s) if duration_s else None
+    # v0.5.252 (audit L2-10): compensate for send-duration drift. Pre-
+    # fix cycle time was send_duration + interval_s (the wait ran
+    # AFTER sendp). For BFD sub-second modes (interval_s=0.1,
+    # detect_mult=3, negotiated detection window ~300ms) a single
+    # scapy sendp taking 30-50ms pushed the actual cadence to
+    # ~130-150ms — enough to exceed the peer's detection window
+    # and cause spurious "peer down". Now: schedule the NEXT tick
+    # off `next_tick_at = last_tick_at + interval_s` and wait only
+    # the residual (min 0). If we're behind (sendp took longer than
+    # interval), fire immediately without waiting.
+    next_tick_at = time.time()
     while not sess.stop_evt.is_set():
         if deadline is not None and time.time() >= deadline:
             break
+        _cycle_started_at = time.time()
         try:
             frame = frame_factory()
             sendp(frame, iface=sess.iface, verbose=False)
@@ -187,8 +243,17 @@ def _run_periodic(sess: _Session, frame_factory, interval_s: float,
             with sess.lock:
                 sess.counters.frames_failed += 1
                 sess.counters.last_error = f"{type(exc).__name__}: {exc}"
-        if sess.stop_evt.wait(interval_s):
-            break
+        next_tick_at += interval_s
+        _residual = next_tick_at - time.time()
+        if _residual > 0:
+            if sess.stop_evt.wait(_residual):
+                break
+        else:
+            # Behind schedule (sendp took longer than interval).
+            # Skip the wait entirely so we don't fall further behind;
+            # re-anchor next_tick_at to now so drift doesn't compound
+            # across many slow cycles.
+            next_tick_at = time.time()
     with sess.lock:
         sess.counters.stopped_at = time.time()
 
@@ -382,21 +447,31 @@ def start_lldp(
         # Scapy LLDP TLVs stack as layers via `/` — there's no
         # `LLDPDU(tlvlist=...)` constructor. Order matters: Chassis-ID,
         # Port-ID, TTL must come first per 802.1AB §8.6.
+        # v0.5.252 (audit L2-7): encode with `utf-8` + errors="replace"
+        # (LLDP TLVs are 8-bit octet strings; 802.1AB doesn't restrict
+        # to ASCII, and network names in the wild use UTF-8 —
+        # 'switch-café', non-Latin hostnames, etc.). Pre-fix used
+        # `.encode('ascii')` bare → any non-ASCII byte raised
+        # UnicodeEncodeError inside _run_periodic, generic-except
+        # bumped frames_failed + wrote to last_error, then the loop
+        # kept spinning at 0 frames/sec on the wire forever.
         return (
             _l2_hdr(src_mac, "01:80:c2:00:00:0e", 0x88cc, vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
             / LLDPDUChassisID(
                 subtype="locally assigned",
-                id=chassis_id.encode("ascii"),
+                id=chassis_id.encode("utf-8", errors="replace"),
             )
             / LLDPDUPortID(
                 subtype="locally assigned",
-                id=port_id.encode("ascii"),
+                id=port_id.encode("utf-8", errors="replace"),
             )
             / LLDPDUTimeToLive(ttl=ttl_s)
-            / LLDPDUSystemName(system_name=system_name.encode("ascii"))
+            / LLDPDUSystemName(
+                system_name=system_name.encode("utf-8", errors="replace"),
+            )
             / LLDPDUSystemDescription(
-                description=system_description.encode("ascii"),
+                description=system_description.encode("utf-8", errors="replace"),
             )
             / LLDPDUEndOfLLDPDU()
         )
@@ -634,10 +709,21 @@ def start_igmp(
             from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr, IGMPv3gr
             t = type_code if type_code is not None else 0x22
             rec = IGMPv3gr(rtype=2, maddr=group)  # MODE_IS_EXCLUDE
+            # v0.5.252 (audit L2-4): RFC 3376 §4 REQUIRES the IP
+            # Router Alert option on every IGMPv3 message ("Every
+            # IGMP message described in this document is sent with
+            # an IP Router Alert option [RFC-2113] in its IP
+            # header"). Pre-fix used `options=[]` so real multicast
+            # routers (Cisco/Juniper/FRR) that don't fall back to
+            # snooping-only ignored our reports and the group state
+            # never updated — silent-fail on any join/leave test.
+            # Router Alert = option type 148, length 4, value 0.
+            from scapy.layers.inet import IPOption_Router_Alert
             return (
                 _l2_hdr(src_mac, _ipv4_mcast_mac("224.0.0.22"), 0x0800, vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
-                / IP(src=src_ip, dst="224.0.0.22", ttl=1, options=[])
+                / IP(src=src_ip, dst="224.0.0.22", ttl=1,
+                     options=[IPOption_Router_Alert()])
                 / IGMPv3(type=t)
                 / IGMPv3mr(numgrp=1, records=[rec])
             )
@@ -662,10 +748,22 @@ def start_igmp(
         # v2 (RFC 2236): the established default path.
         t = type_code if type_code is not None else 0x16
         # Leave Group (0x17) is sent to ALL-ROUTERS 224.0.0.2 (RFC 2236
-        # §3) — NOT the group. Membership Reports (0x16) and group-specific
-        # Queries (0x11) target the group itself. The L2 dst tracks the L3
-        # dst via the same RFC 1112 mapping.
-        ip_dst = "224.0.0.2" if t == 0x17 else group
+        # §3) — NOT the group. Membership Reports (0x16) target the
+        # group itself.
+        # v0.5.252 (audit L2-3): General Queries (type 0x11, group
+        # 0.0.0.0) go to ALL-HOSTS 224.0.0.1 per RFC 2236 §3 — pre-
+        # fix, we used `group` verbatim which produced IP dst=0.0.0.0
+        # and L2 dst=01:00:5e:00:00:00 (both invalid). Switches
+        # silently dropped it and IGMP-snooping tests produced zero
+        # host responses. Group-specific queries (0x11 with a real
+        # group) still target that group. The v1 branch above
+        # already had this special-case.
+        if t == 0x17:
+            ip_dst = "224.0.0.2"
+        elif t == 0x11 and (not group or group == "0.0.0.0"):
+            ip_dst = "224.0.0.1"
+        else:
+            ip_dst = group
         return (
             _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800, vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
@@ -832,7 +930,14 @@ def start_bfd(
     #   My Discriminator, Your Discriminator,
     #   Desired Min TX Interval (µs), Required Min RX Interval (µs),
     #   Required Min Echo RX Interval (µs).
-    ver_diag = (3 << 5) | (int(diag) & 0x1f)
+    # v0.5.252 (audit L2-1): version MUST be 1 per RFC 5880 §4.1
+    # ("The Version Number field is the version number of the
+    # protocol.  This document defines protocol version 1"). Pre-fix
+    # used version 3, so every RFC 5880 §6.8.6-compliant peer
+    # ("If the version number is not correct (1), the packet MUST be
+    # discarded") dropped every BFD frame we emitted. Emitter climbed
+    # frames_sent but no BFD session ever came Up.
+    ver_diag = (1 << 5) | (int(diag) & 0x1f)
     state_flags = (int(state) & 0x3) << 6
     bfd_payload = struct.pack(
         ">BBBBIIIII",
@@ -939,7 +1044,13 @@ def _lacpdu(b):
         actor_key=int(b.get("key") or 1),
         actor_port_priority=int(b.get("port_priority") or 32768),
         actor_port_number=int(b.get("port_number") or 1),
-        actor_state=int(b.get("state") or 0x3d),
+        # v0.5.252 (audit L2-9): default matches start_lacp's live
+        # emitter (0x05 = Activity | Aggregation). Pre-fix used 0x3d
+        # (adds Sync | Collecting | Distributing) so preview and
+        # wire showed different actor_state bytes when the body
+        # dict omitted `state` — the "preview matches wire"
+        # invariant was violated on any partial-body call.
+        actor_state=int(b.get("state") or 0x05),
     )
 
 
@@ -954,15 +1065,17 @@ def _lldpdu(b):
     port_id = (b.get("port_id") or "eth0")
     system_name = (b.get("system_name") or "netgen")
     system_description = (b.get("system_description") or "")
+    # v0.5.252 (audit L2-7): utf-8 + errors="replace" — see live
+    # LLDP factory above for full rationale.
     return (
         LLDPDUChassisID(subtype="locally assigned",
-                        id=chassis_id.encode("ascii"))
+                        id=chassis_id.encode("utf-8", errors="replace"))
         / LLDPDUPortID(subtype="locally assigned",
-                       id=port_id.encode("ascii"))
+                       id=port_id.encode("utf-8", errors="replace"))
         / LLDPDUTimeToLive(ttl=int(b.get("ttl_s") or 120))
-        / LLDPDUSystemName(system_name=system_name.encode("ascii"))
+        / LLDPDUSystemName(system_name=system_name.encode("utf-8", errors="replace"))
         / LLDPDUSystemDescription(
-            description=system_description.encode("ascii"))
+            description=system_description.encode("utf-8", errors="replace"))
         / LLDPDUEndOfLLDPDU()
     )
 
@@ -1091,7 +1204,9 @@ def _bfd_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
     tx_us = int(b.get("desired_min_tx_us") or 1_000_000)
     rx_us = int(b.get("required_min_rx_us") or 1_000_000)
     echo_us = int(b.get("required_min_echo_rx_us") or 0)
-    ver_diag = (3 << 5) | (diag & 0x1f)
+    # v0.5.252 (audit L2-1): version=1 per RFC 5880 §4.1 — same bug
+    # as start_bfd's live emitter above; preview must match wire.
+    ver_diag = (1 << 5) | (diag & 0x1f)
     sta_flags = (state & 0x3) << 6
     payload = struct.pack(
         "!BBBBII III",

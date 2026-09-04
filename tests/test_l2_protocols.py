@@ -325,20 +325,30 @@ def test_session_registry_round_trip():
         all_sess = l2_protocols.list_sessions()
         assert any(s["session_id"] == "test-1" for s in all_sess)
 
-        # stop_session on a session with no thread still flags it stopped.
-        ok = l2_protocols.stop_session("test-1")
-        assert ok is True
+        # v0.5.252 (audit L2-5): stop_session now returns the
+        # counter snapshot instead of bool. `None` means the
+        # session_id didn't exist; any dict means it was stopped.
+        # The old assertion `ok is True` breaks under the new
+        # contract — the returned dict is truthy but not True.
+        snap = l2_protocols.stop_session("test-1")
+        assert snap is not None
+        assert isinstance(snap, dict)
+        assert snap["session_id"] == "test-1"
+        assert snap["counters"]["stopped_at"] is not None
 
-        # v0.3.8 contract: entry is evicted from the registry.
+        # v0.3.8 contract: entry is evicted from the registry
+        # (on clean thread exit — v0.5.252 audit L2-8 added a
+        # zombie-preservation branch for stuck threads; here we
+        # have no thread so `thread.join` returns immediately +
+        # `is_alive()` is False → clean-exit path).
         assert l2_protocols.get_session("test-1") is None
-        # The counters were set on the local session before eviction —
-        # observable via the reference we held since registration.
-        assert sess.counters.stopped_at is not None
     finally:
         with l2_protocols._REG_LOCK:
             l2_protocols._SESSIONS.pop("test-1", None)
 
 
-def test_stop_unknown_session_returns_false():
+def test_stop_unknown_session_returns_none():
+    # v0.5.252 (audit L2-5): stop_session now returns Optional[Dict]
+    # — None on unknown session_id (was `False` pre-v0.5.252).
     from utils import l2_protocols
-    assert l2_protocols.stop_session("does-not-exist") is False
+    assert l2_protocols.stop_session("does-not-exist") is None

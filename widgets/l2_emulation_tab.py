@@ -820,11 +820,18 @@ class _L2ConfigDialog(QDialog):
             if err:
                 _reject(f"Source IP: {err}")
                 return
+            # v0.5.252 (audit L2-2): blank Source MAC is the documented
+            # auto-derive path (placeholder + tooltip both say "leave
+            # blank to use RFC 5798 00:00:5e:00:01:<vrid>"), so only
+            # validate when the operator actually typed a MAC.
+            # start_vrrp treats src_mac=None → _vrrp_virtual_mac(vrid,
+            # family) which is what the docstring promises.
             src_mac = self._vrrp_src_mac.text().strip()
-            err = _validate_mac(src_mac)
-            if err:
-                _reject(f"Source MAC: {err}")
-                return
+            if src_mac:
+                err = _validate_mac(src_mac)
+                if err:
+                    _reject(f"Source MAC: {err}")
+                    return
             body.update({
                 "version": version,
                 "family": family,
@@ -1643,24 +1650,15 @@ class L2EmulationTab(QWidget):
 
     def _stop_session_by_id(self, session_id: str) -> None:
         """Stop one specific session — invoked by the per-row Stop
-        button (v0.2.84). Mirrors _on_stop_selected's POST logic but
-        scoped to a single id."""
+        button (v0.2.84). v0.5.252 (audit L2-6): now uses the shared
+        `_start_l2_stop_worker` so the click doesn't block the UI
+        thread on a slow / unreachable server."""
         if not session_id:
             return
         url = self._get_server_url()
         if not url:
             return
-        try:
-            requests.post(
-                f"{url.rstrip('/')}/api/l2/stop",
-                json={"session_id": session_id},
-                headers=self._auth_headers(), timeout=5,
-            )
-        except Exception as exc:
-            logger.debug(f"[L2] per-row stop failed for {session_id}: {exc}")
-        # Refresh immediately so the row flips from running to stopped
-        # without waiting for the next 3 s poll.
-        QTimer.singleShot(150, self.refresh)
+        self._start_l2_stop_worker(url.rstrip("/"), [session_id], all_flag=False)
 
     # ------------------------------------------------------------------
     def _on_start_clicked(self):
@@ -1807,17 +1805,12 @@ class L2EmulationTab(QWidget):
             sid = it.data(Qt.UserRole)
             if sid:
                 sids.append(str(sid))
-        for sid in sids:
-            try:
-                requests.post(
-                    f"{url}/api/l2/stop",
-                    json={"session_id": sid},
-                    headers=self._auth_headers(),
-                    timeout=5,
-                )
-            except Exception as exc:
-                logger.debug(f"[L2] stop {sid} failed: {exc}")
-        QTimer.singleShot(150, self.refresh)
+        # v0.5.252 (audit L2-6): fire the stop POSTs from a
+        # background QThread so the UI stays responsive. Pre-fix
+        # this looped requests.post(timeout=5) on the Qt main
+        # thread — 8 selected rows against an unreachable server
+        # froze the client for 40s (beach-ball on macOS).
+        self._start_l2_stop_worker(url, sids, all_flag=False)
 
     def _on_stop_all(self):
         url = self._get_server_url()
@@ -1832,15 +1825,85 @@ class L2EmulationTab(QWidget):
         )
         if confirm != QMessageBox.Yes:
             return
-        try:
-            requests.post(
-                f"{url}/api/l2/stop", json={},
-                headers=self._auth_headers(), timeout=10,
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "Stop all", f"Request failed: {exc}")
-            return
-        QTimer.singleShot(150, self.refresh)
+        # v0.5.252 (audit L2-6): background worker, same rationale as
+        # _on_stop_selected.
+        self._start_l2_stop_worker(url, sids=None, all_flag=True)
+
+    # ------------------------------------------------------------------
+    def _start_l2_stop_worker(self, url, sids, all_flag):
+        """v0.5.252 (audit L2-6): background QThread that fires the
+        stop POSTs so the Qt main thread never blocks on
+        requests.post. Refreshes the session table when the worker
+        finishes. Handles both `stop selected` (list of session_ids)
+        and `stop all` (single body-less request).
+        """
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class _L2StopWorker(QThread):
+            done = pyqtSignal(int, list)  # (ok_count, errors_list)
+
+            def __init__(self, url, sids, all_flag, headers):
+                super().__init__()
+                self._url = url
+                self._sids = sids or []
+                self._all = bool(all_flag)
+                self._headers = headers or {}
+
+            def run(self):
+                _errs = []
+                _ok = 0
+                if self._all:
+                    try:
+                        r = requests.post(
+                            f"{self._url}/api/l2/stop", json={},
+                            headers=self._headers, timeout=10,
+                        )
+                        if r.status_code == 200:
+                            _ok = int((r.json() or {}).get("count", 1))
+                        else:
+                            _errs.append(f"HTTP {r.status_code}: {r.text[:200]}")
+                    except Exception as exc:
+                        _errs.append(f"stop-all: {exc}")
+                else:
+                    for sid in self._sids:
+                        try:
+                            r = requests.post(
+                                f"{self._url}/api/l2/stop",
+                                json={"session_id": sid},
+                                headers=self._headers, timeout=5,
+                            )
+                            if r.status_code == 200 and (r.json() or {}).get("stopped"):
+                                _ok += 1
+                            else:
+                                _errs.append(
+                                    f"{sid}: HTTP {r.status_code} / {r.text[:120]}"
+                                )
+                        except Exception as exc:
+                            _errs.append(f"{sid}: {exc}")
+                self.done.emit(_ok, _errs)
+
+        _w = _L2StopWorker(url, sids, all_flag, self._auth_headers())
+        # Keepalive so PyQt5 5.15.11 + Python 3.14 doesn't SIGABRT on
+        # "QThread: Destroyed while thread is still running" — same
+        # pattern the fetch worker + BGP / OSPF / ISIS refreshers use.
+        if not hasattr(self, "_l2_stop_workers"):
+            self._l2_stop_workers = []
+        self._l2_stop_workers.append(_w)
+
+        def _on_done(ok_count, errors, w=_w):
+            try:
+                self._l2_stop_workers.remove(w)
+            except (ValueError, AttributeError):
+                pass
+            if errors:
+                _msg = f"{ok_count} stopped; {len(errors)} failed:\n" + "\n".join(errors[:6])
+                if len(errors) > 6:
+                    _msg += f"\n… and {len(errors) - 6} more"
+                QMessageBox.warning(self, "Stop L2 sessions", _msg)
+            QTimer.singleShot(150, self.refresh)
+
+        _w.done.connect(_on_done)
+        _w.start()
 
     # ------------------------------------------------------------------
     def cleanup_threads(self):

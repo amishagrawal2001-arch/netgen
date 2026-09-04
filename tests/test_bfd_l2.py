@@ -44,7 +44,10 @@ def _build_bfd_frame(**overrides):
         "outer_vlan_id": None, "outer_vlan_pcp": 0,
     }
     p.update(overrides)
-    ver_diag = (3 << 5) | (p["diag"] & 0x1f)
+    # v0.5.252 (audit L2-1): RFC 5880 §4.1 defines BFD version = 1
+    # (not 3). Pre-fix this reference builder + the emitter both
+    # used (3 << 5) which every peer would drop under §6.8.6.
+    ver_diag = (1 << 5) | (p["diag"] & 0x1f)
     state_flags = (p["state"] & 0x3) << 6
     payload = struct.pack(
         ">BBBBIIIII",
@@ -120,12 +123,19 @@ def test_bfd_payload_length_is_24_bytes():
     assert len(raw_load) == 24
 
 
-def test_bfd_version_is_3_and_length_byte_is_24():
-    """Byte 0 top 3 bits = version (3 per RFC 5880). Byte 3 = length."""
+def test_bfd_version_is_1_and_length_byte_is_24():
+    """Byte 0 top 3 bits = version. RFC 5880 §4.1 defines the only
+    valid BFD version as 1 (§6.8.6: 'If the version number is not
+    correct (1), the packet MUST be discarded'). Byte 3 = length.
+
+    v0.5.252 (audit L2-1): pre-fix asserted `version == 3`, which
+    locked in the emitter's protocol-violation bug — every RFC
+    5880-compliant peer dropped every BFD frame we sent.
+    """
     payload = _build_bfd_frame()[Raw].load
     version = payload[0] >> 5
     length  = payload[3]
-    assert version == 3
+    assert version == 1
     assert length == 24
 
 
@@ -149,7 +159,7 @@ def test_bfd_diag_encoded_in_bottom_5_bits_of_byte_0():
     trips and doesn't leak into the version bits."""
     payload = _build_bfd_frame(diag=5)[Raw].load
     assert payload[0] & 0x1f == 5
-    assert payload[0] >> 5 == 3   # version still 3
+    assert payload[0] >> 5 == 1   # v0.5.252: version 1 per RFC 5880 §4.1
 
 
 def test_bfd_detect_mult_in_byte_2():

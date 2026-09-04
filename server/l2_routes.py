@@ -150,8 +150,19 @@ def _l2_stop_impl():
         body = request.get_json(force=True, silent=True) or {}
         sid = (body.get("session_id") or "").strip()
         if sid:
-            ok = _l2.stop_session(sid)
-            return jsonify({"stopped": bool(ok), "session_id": sid}), 200
+            # v0.5.252 (audit L2-5): stop_session now returns the
+            # snapshot (None on unknown session_id). Include it in
+            # the response so the client can render post-mortem
+            # counters (frames_sent, bytes_sent, last_error) before
+            # the eviction happens — pre-fix the row vanished from
+            # /api/l2/sessions on the next poll with no data
+            # visible to the operator.
+            snap = _l2.stop_session(sid)
+            return jsonify({
+                "stopped":    snap is not None,
+                "session_id": sid,
+                "snapshot":   snap,
+            }), 200
         n = _l2.stop_all_sessions()
         return jsonify({"stopped_all": True, "count": n}), 200
     except Exception as exc:
