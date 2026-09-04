@@ -2,6 +2,53 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.251] - 2026-09-02
+
+**API_GUIDE documents v0.5.240–v0.5.250 additions (docs-only).**
+
+The 11 previous versions added many new API surfaces but only
+v0.5.237's initial DHCP-section rewrite touched `API_GUIDE.md`.
+Anyone reading the guide since would see a snapshot frozen at
+v0.5.231's semantics.
+
+Folds these into §5 (Device Configuration → DHCP endpoint
+contracts) and the §4 Apply-device body:
+
+- **v0.5.241** — `container.exec_run()` timeout enforcement fix
+  (utils/dhcp.py `_run_command`'s `threading.Thread` +
+  `join(timeout=...)` wrapper). Client-side guidance: use a
+  60 s HTTP timeout on `/api/device/remove` and
+  `/api/device/cleanup`.
+- **v0.5.242** — Force Apply. `POST /api/device/apply` accepts
+  `force: true` (or `force_apply: true`) which purges stale
+  peer rows blocking the collision gates. 409 response now
+  includes `code`, `conflicting_device_id`,
+  `conflicting_device_name`, `force_supported: true`. All 5
+  `code` values (`duplicate_iface_vlan`,
+  `duplicate_loopback_ipv4`, `duplicate_loopback_ipv6`,
+  `duplicate_ipv4_address`, `duplicate_ipv6_address`) listed.
+- **v0.5.243** — Second per-device lock (`_ENSURE_LOCKS`)
+  around `ensure_dhcp_services` documented alongside the
+  existing `_APPLY_LOCKS` doc. Root cause (two dhclients on
+  the same raw AF_PACKET socket) explained.
+- **v0.5.244** — `POST /api/device/dhcp/restart` documented
+  with all three response shapes: HTTP 200 `"restarted"`,
+  HTTP 200 `"restarted_pending_lease"` (soft — dhclient did
+  restart, lease didn't land yet), HTTP 500 with real reason.
+  `family_errors: [...]` field explained.
+- **v0.5.245** — DHCP relay mode. Pool payload documents the
+  new optional `relay_return_hop` field with the full
+  three-point behavior (skip anchor, install via-relay route,
+  dnsmasq option-3 from `gateway`). `POST /api/device/dhcp/server/attach_pools`
+  can override per-device.
+- **v0.5.246** — Mandatory netmask on the dhcp-range line for
+  relay-mode pools whose subnet isn't on any local interface.
+- **v0.5.247** — Orphan-container reaper
+  (`reap_orphan_dhcp_containers`) documented as a
+  server-startup hook. Result-dict shape shown.
+
+Tests: `tests/test_v05251_api_guide_recent_versions.py` — 15 pass.
+
 ## [0.5.250] - 2026-09-02
 
 **DHCP refresh stampede: coalesce + silent auto-refresh (fixes the

@@ -227,6 +227,7 @@ Aggregated status of every background monitor (ARP / BGP / OSPF / ISIS / DHCP). 
 
 **Apply device (POST `/api/device/apply`):**
 - **Body:** `device_id`, `device_name`, `interface`, `vlan`, `mtu`, `ipv4`, `ipv6`, `ipv4_mask`, `ipv6_mask`, `ipv4_gateway`, `ipv6_gateway`, `loopback_ipv4`, `loopback_ipv6`, `protocols` (e.g. BGP, OSPF, ISIS, DHCP, VXLAN), `bgp_config`, `dhcp_config`, `vxlan_config`, etc.
+- **Optional:** `force: true` (or `force_apply: true`) — v0.5.242. Skips the duplicate-(iface, VLAN) and duplicate-loopback/IP gates by PURGING the conflicting peer row from the DB and continuing. See §5 "Force Apply" for the full recovery-from-stale-peer workflow and the 409 response shape when `force` is absent.
 
 ---
 
@@ -322,11 +323,22 @@ Validation (v0.5.229 + v0.5.236): rejects with `400` if pool addresses are malfo
 - v0.5.236: named-pool join table is cleared ONLY after `ensure_dhcp_services` succeeds, so a launch failure doesn't leave the device in a half-detached state.
 - Set `detach_all: true` (all other fields optional) to remove every named pool from the device.
 
-**`POST /api/device/dhcp/restart`** — rescue path (v0.5.231)
+**`POST /api/device/dhcp/restart`** — rescue path (v0.5.231, refined
+in v0.5.244)
+
 ```json
 { "device_id": "<uuid>" }
 ```
-Response:
+
+Force-restarts the DHCP daemon via
+`ensure_dhcp_services(force_client_restart=True)`. Use this instead of
+a full `/api/device/apply` when the operator just needs to kick a
+stuck daemon.
+
+Three response shapes:
+
+**A. Success (HTTP 200, `status: "restarted"`)** — daemon restarted
+and the DB state is fresh:
 ```json
 {
   "status":           "restarted",
@@ -335,11 +347,148 @@ Response:
   "dhcp_last_error":  ""
 }
 ```
-Force-restarts the DHCP daemon via `ensure_dhcp_services(force_client_restart=True)`. Returns `400` if the device has no DHCP mode configured or no interface, `404` if not found, `500` with the underlying error on restart failure. Use this instead of a full `/api/device/apply` when the operator just needs to kick a stuck daemon.
 
-### Related concurrency guard (v0.5.231)
+**B. Soft success (HTTP 200, `status: "restarted_pending_lease"`)** —
+v0.5.244. Client-mode dhclient DID restart cleanly, but no
+DHCPOFFER arrived within the timeout window (usually because the
+DHCP server is unreachable or slow). The DHCP monitor will keep
+polling; a late lease still lands automatically:
+```json
+{
+  "status":         "restarted_pending_lease",
+  "dhcp_state":     "Requesting",
+  "dhcp_running":   false,
+  "warning":        "dhclient restarted successfully but no lease
+                     arrived within the timeout window. The DHCP
+                     monitor will keep polling; if the DHCP server
+                     is reachable, a lease should appear within 60s.
+                     If not, check the server / VLAN reachability.",
+  "family_errors":  ["ipv4: Lease timeout"]
+}
+```
+Clients should treat this as "kicked, waiting" — a friendly
+information dialog, not an error. The GUI's Restart button uses this
+distinction to avoid scaring the operator with an HTTP-500 red pill
+every time the upstream DHCP server takes a moment.
 
-`POST /api/device/apply` acquires a **per-device** lock (module-level `threading.Lock` in `_APPLY_LOCKS`, keyed by `device_id`). Two rapid Apply POSTs for the same device return `HTTP 409` with `"Another Apply for device '...' is still in flight."` instead of racing through DHCP config-write + pidfile-kill + dnsmasq-relaunch. The `finally:` block always releases the lock — even on 4xx / 5xx failures.
+**C. Hard failure (HTTP 500)** — daemon failed to launch, container
+missing, or a real config error. `error` now contains the ACTUAL
+reason (not the pre-v0.5.244 opaque `"Restart failed"` fallback).
+`family_errors` is a list of per-address-family strings extracted
+from `ensure_dhcp_services`'s nested `ipv4` / `ipv6` sub-results plus
+the server-mode `failures[]` aggregator:
+```json
+{
+  "error":         "dnsmasq launch failed: no interface with matching address",
+  "family_errors": ["ipv4: dnsmasq launch failed: no interface with matching address"]
+}
+```
+
+Returns `400` when the device has no DHCP mode configured or no
+interface, `404` when the device_id doesn't exist.
+
+### Related concurrency guards
+
+`POST /api/device/apply` acquires a **per-device** lock (module-level
+`threading.Lock` in `_APPLY_LOCKS`, keyed by `device_id`, v0.5.231).
+Two rapid Apply POSTs for the same device return `HTTP 409` with
+`"Another Apply for device '...' is still in flight."` instead of
+racing through DHCP config-write + pidfile-kill + dnsmasq-relaunch.
+
+v0.5.243 added a SECOND per-device lock inside
+`utils/dhcp.py:ensure_dhcp_services` itself (module-level
+`_ENSURE_LOCKS`). This one covers the case where the DHCP monitor's
+background tick and an API-driven Restart both invoke
+`ensure_dhcp_services` at the same time. Pre-fix, both callers ran
+stop → sweep → start independently and ended up with two dhclients
+bound to the same interface's raw AF_PACKET socket, neither
+transmitting. Second concurrent caller now blocks up to 45s for the
+first; on timeout returns `{"success": False, "error": "...still in
+flight..."}` instead of piling on a duplicate daemon.
+
+The two locks stack: an `/api/device/apply` for a DHCP device holds
+`_APPLY_LOCKS[device_id]` (from the endpoint) AND, when it reaches
+its DHCP step, `_ENSURE_LOCKS[device_id]`. Both `finally:` blocks
+always release even on 4xx / 5xx failures.
+
+### Force Apply — recover from stale-peer collisions (v0.5.242)
+
+`POST /api/device/apply` accepts an optional `force` (or
+`force_apply`) boolean in the payload. When true, both v0.5.224
+validation gates behave differently:
+
+1. **Duplicate (interface, VLAN) gate.** Normally rejects with 409
+   when another device already claims the same
+   `(interface, vlan)` tuple. On `force=true`, the peer row is
+   **purged** from the DB via `device_db.remove_device(<peer_id>)`
+   before the Apply continues. Loud warning log so the destructive
+   step leaves an audit trail.
+2. **Duplicate loopback / interface-IP gate.** Normally rejects
+   with 409 when another device already claims the same
+   loopback_ipv4 / ipv6 / interface IP. On `force=true`, the
+   duplicate check is skipped (logged as warning).
+
+The 409 response now includes machine-readable fields so the client
+can render a "Force Apply" prompt without string-matching:
+```json
+{
+  "error":                     "Interface 'ens2f1np1' with VLAN '30' is already in use by device 'device4'. …",
+  "code":                      "duplicate_iface_vlan",
+  "conflicting_device_id":     "<uuid>",
+  "conflicting_device_name":   "device4",
+  "force_supported":           true
+}
+```
+`code` values: `duplicate_iface_vlan`, `duplicate_loopback_ipv4`,
+`duplicate_loopback_ipv6`, `duplicate_ipv4_address`,
+`duplicate_ipv6_address`. Client behavior: when `force_supported: true`,
+the operator sees a "Force Apply — purge stale peers?" dialog after
+the batch results and can retry with `force=true` in one click.
+Recommended use is recovering from a botched Remove that left a
+stale DB row behind — a common class pre-v0.5.241 when
+`/api/device/remove` could hang forever mid-stop.
+
+### `Remove` timeout guidance
+
+`POST /api/device/remove` in v0.5.240 and earlier could hang
+indefinitely inside `stop_dhcp_client` when `dhclient -r` waited for
+a DHCPRELEASE ack from an unreachable server. v0.5.241 fixed the
+root cause: `utils/dhcp.py:_run_command`'s container path now
+enforces its `timeout=` parameter via `threading.Thread` +
+`join(timeout=...)` around `container.exec_run()`. Pre-v0.5.241, the
+timeout parameter was silently only honored on the `subprocess.run`
+branch.
+
+Client callers should still use a **60 s HTTP timeout** on
+`/api/device/remove` and `/api/device/cleanup` (v0.5.241 client fix)
+because even a healthy remove can take 15–20 s (stop_dhcp_services +
+FRR container stop + VXLAN cleanup + DB delete).
+
+### Orphan-container reaper (v0.5.247)
+
+On every server startup, `run_tgen_server.py:main()` calls
+`utils/dhcp.py:reap_orphan_dhcp_containers(device_db)` which:
+
+1. Enumerates every container whose name starts with
+   `dhcp-client-`, `dhcp-server-`, or `dhcp-frr-`.
+2. Extracts the `<device_id>` suffix.
+3. Force-removes any container whose device_id isn't in the current
+   DB snapshot.
+
+This catches leftovers from pre-v0.5.241 failed Removes (Remove
+hung → `device_db.remove_device` never ran, but the DB row eventually
+got scrubbed by another path). The reap is best-effort with a warning
+log; a docker-daemon hiccup won't block server startup. Result shape:
+```json
+{
+  "scanned":         5,
+  "orphans_reaped":  1,
+  "orphan_names":    ["dhcp-client-7f539da4-..."],
+  "errors":          []
+}
+```
+The reap is not exposed as an HTTP endpoint today — it's a startup
+hook. If you need to force one mid-flight, restart `netgen-server`.
 
 ### Related endpoints — named pool catalog
 
@@ -353,21 +502,62 @@ The named pools that `attach_pools` references live in the shared catalog:
 | PUT    | `/api/dhcp/pools/<pool_name>` | Update a pool in place. |
 | DELETE | `/api/dhcp/pools/<pool_name>` | Delete a pool from the catalog. |
 
-Pool payload (v0.5.231 added IPv6 fields):
+Pool payload (v0.5.231 added IPv6 fields; v0.5.245 added
+`relay_return_hop`):
 ```json
 {
-  "name":            "p1",
-  "pool_start":      "172.16.30.10",
-  "pool_end":        "172.16.30.200",
-  "gateway":         "172.16.30.1",
-  "gateway_routes":  ["172.16.30.0/24"],
-  "lease_time":      3600,
-  "description":     "Lab pool #1",
-  "pool6_start":     "2001:db8:50::100",   // optional; all-or-none with the two below
-  "pool6_end":       "2001:db8:50::1ff",
-  "prefix6":         "64"
+  "name":              "p1",
+  "pool_start":        "192.168.30.10",
+  "pool_end":          "192.168.30.250",
+  "gateway":           "192.168.30.1",
+  "gateway_routes":    ["192.168.30.0/24"],
+  "lease_time":        3600,
+  "description":       "Lab pool #1",
+  "pool6_start":       "2001:db8:50::100",   // optional; all-or-none with the two below
+  "pool6_end":         "2001:db8:50::1ff",
+  "prefix6":           "64",
+  "relay_return_hop":  "172.16.30.10"        // optional; DHCP relay mode
 }
 ```
+
+**`relay_return_hop`** (optional, v0.5.245) — populate when the pool
+is served to clients **behind a DHCP relay** (i.e. the pool subnet
+is L3-remote from the DHCP server's interface). The value is the
+**relay's IP on the SERVER's segment** — e.g. `172.16.30.10` (the
+Juniper switch's irb.10 SVI) when clients live on the switch's
+irb.30 (`192.168.30.1`) and the netgen DHCP server sits on
+`172.16.30.1`.
+
+When present, `start_dhcp_server`:
+1. **Skips** the interface anchor — `_ensure_ipv4_address` does NOT
+   assign the pool's `.1` on the server's interface. (Anchoring
+   `192.168.30.1` on the server's vlan10 would collide with the
+   relay's own irb.30 IP and cause dnsmasq's DHCPOFFER to
+   short-circuit locally.)
+2. Installs pool subnet routes as
+   `<pool> via <relay_return_hop> dev <iface>` (the SERVER's return
+   path via the L2-reachable relay) instead of via the pool's
+   client-side gateway.
+3. dnsmasq's `dhcp-option=3` (client-advertised gateway) still
+   comes from the pool's `gateway` field — that's what CLIENTS need
+   for their default route.
+
+Additionally, dnsmasq's `dhcp-range` line now always carries an
+explicit netmask (v0.5.246) so relay-mode pools whose subnet isn't
+on any local interface still get served — dnsmasq requires the
+netmask when it can't infer from a local interface.
+
+Leave `relay_return_hop` empty (or omit) for direct-attached pools
+where the DHCP server serves clients on its own L2 segment
+(historical default). Backward-compatible: existing pools without
+the field continue to work unchanged.
+
+**`POST /api/device/dhcp/server/attach_pools`** also accepts a
+`relay_return_hop` override in its payload (v0.5.245) — supersedes
+the pool's own value for the target device. Useful when the same
+named pool needs to serve two devices behind different relays.
+Additional pools in the payload can each carry their own
+`relay_return_hop` too, for mixed direct/relay setups on one server.
 
 ---
 
