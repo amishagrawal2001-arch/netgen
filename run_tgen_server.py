@@ -14517,6 +14517,63 @@ def get_device_arp_status(device_id):
         ipv4_gateway = _strip_mask(device.get('ipv4_gateway'))
         ipv6_gateway = _strip_mask(device.get('ipv6_gateway'))
 
+        # v0.5.254: ping is a poor proxy for "ARP resolved". Many
+        # devices (notably Juniper QFX IRB interfaces in the srv06
+        # lab, and any router with an ICMP-rate-limit / firewall
+        # filter) silently drop ICMP echo while still answering ARP
+        # and carrying BGP just fine. Pre-fix the field `arp_gateway_
+        # resolved` was set purely from the ping exit code, so the
+        # UI's IPv4 Gateway cell stayed orange even though BGP was
+        # UP through that gateway. Fall back to the actual neighbor
+        # table: if `ip neigh show <ip>` reports a state that means
+        # "we have a MAC for this peer" (REACHABLE / STALE / DELAY /
+        # PROBE / PERMANENT / NOARP), treat as resolved. IPv6 stays
+        # green because ICMPv6 echo is RFC-strongly-encouraged
+        # (RFC 4443 §4.2) and Junos honors it, so ping6 succeeds —
+        # this helper is family-agnostic and helps both sides.
+        _RESOLVED_NEIGH_STATES = {
+            "REACHABLE", "STALE", "DELAY", "PROBE",
+            "PERMANENT", "NOARP",
+        }
+
+        def _neigh_state_ok(target, family="ipv4"):
+            """Return True iff the kernel has an ARP/ND entry for
+            ``target`` in a state that means the peer's MAC is
+            known. Runs inside the same VRF as the ping checks,
+            so multi-device deployments work."""
+            if not target:
+                return False
+            try:
+                cmd = list(ping_prefix)  # VRF prefix (may be empty).
+                cmd += ["ip"]
+                if family == "ipv6":
+                    cmd += ["-6"]
+                cmd += ["neigh", "show", "to", str(target)]
+                res = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=3,
+                )
+                if res.returncode != 0:
+                    return False
+                out = (res.stdout or "").strip()
+                if not out:
+                    return False
+                # Line shape: "<ip> dev <iface> [lladdr <mac>] <STATE>"
+                # State is the LAST whitespace-separated token that
+                # matches a known kernel neighbor state.
+                last = out.splitlines()[0].split()
+                for tok in reversed(last):
+                    up = tok.upper()
+                    if up in _RESOLVED_NEIGH_STATES:
+                        return True
+                    if up in ("INCOMPLETE", "FAILED", "NONE"):
+                        return False
+                return False
+            except Exception as _neigh_exc:
+                logging.debug(
+                    f"[ARP STATUS] neigh probe for {target} failed: {_neigh_exc}"
+                )
+                return False
+
         # When multi-device-on-same-iface is enabled, each device's
         # interface lives inside its own Linux VRF (created in
         # utils/frr_docker._create_vrf). Routes to the device's
@@ -14584,15 +14641,21 @@ def get_device_arp_status(device_id):
             try:
                 result = subprocess.run(ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_address],
                                       capture_output=True, text=True, timeout=5)
-                arp_results["arp_ipv4_resolved"] = result.returncode == 0
-                arp_results["details"]["ipv4_ping"] = "success" if result.returncode == 0 else "failed"
-                if result.returncode != 0:
-                    # Surface ping stderr so a failure mode like
-                    # "Network is unreachable" or "Destination Host
-                    # Unreachable" is visible.
-                    err = (result.stderr or result.stdout or "").strip()[:200]
-                    if err:
-                        arp_results["details"]["ipv4_ping_error"] = err
+                ping_ok = result.returncode == 0
+                arp_results["details"]["ipv4_ping"] = "success" if ping_ok else "failed"
+                if ping_ok:
+                    arp_results["arp_ipv4_resolved"] = True
+                else:
+                    # v0.5.254: ping-fail is not proof of ARP failure.
+                    # Consult the neighbor table before flagging orange.
+                    if _neigh_state_ok(ipv4_address, family="ipv4"):
+                        arp_results["arp_ipv4_resolved"] = True
+                        arp_results["details"]["ipv4_neigh_fallback"] = "resolved via ip neigh"
+                    else:
+                        arp_results["arp_ipv4_resolved"] = False
+                        err = (result.stderr or result.stdout or "").strip()[:200]
+                        if err:
+                            arp_results["details"]["ipv4_ping_error"] = err
             except Exception as e:
                 arp_results["details"]["ipv4_ping"] = f"error: {e}"
 
@@ -14603,22 +14666,33 @@ def get_device_arp_status(device_id):
                 ipv6_target = ipv6_gateway or ipv6_address
                 ping6_cmd = ping_prefix + ["ping6", "-c", "1", "-W", "1", ipv6_target]
                 result = subprocess.run(ping6_cmd, capture_output=True, text=True, timeout=5)
-                arp_results["arp_ipv6_resolved"] = result.returncode == 0
+                ping_ok = result.returncode == 0
                 arp_results["details"]["ipv6_ping_target"] = ipv6_target
-                arp_results["details"]["ipv6_ping"] = "success" if result.returncode == 0 else "failed"
-                if result.returncode != 0:
-                    try:
-                        # Look up the neighbor in the correct VRF too.
-                        neigh_cmd = ["ip", "-6", "neigh", "show"]
-                        if ping_prefix:
-                            neigh_cmd += ["vrf", ping_prefix[3]]
-                        neigh_cmd += [ipv6_target]
-                        neigh_result = subprocess.run(
-                            neigh_cmd, capture_output=True, text=True, timeout=5
-                        )
-                        arp_results["details"]["ipv6_neigh"] = neigh_result.stdout.strip() or "no entry"
-                    except Exception as neigh_exc:
-                        arp_results["details"]["ipv6_neigh"] = f"error: {neigh_exc}"
+                arp_results["details"]["ipv6_ping"] = "success" if ping_ok else "failed"
+                if ping_ok:
+                    arp_results["arp_ipv6_resolved"] = True
+                else:
+                    # v0.5.254: fall back to the ND table before
+                    # declaring failure. Same rationale as IPv4.
+                    if _neigh_state_ok(ipv6_target, family="ipv6"):
+                        arp_results["arp_ipv6_resolved"] = True
+                        arp_results["details"]["ipv6_neigh_fallback"] = "resolved via ip -6 neigh"
+                    else:
+                        arp_results["arp_ipv6_resolved"] = False
+                        try:
+                            # Diagnostic dump — surfaces the actual
+                            # entry state so the operator can tell
+                            # INCOMPLETE from FAILED from no-entry.
+                            neigh_cmd = ["ip", "-6", "neigh", "show"]
+                            if ping_prefix:
+                                neigh_cmd += ["vrf", ping_prefix[3]]
+                            neigh_cmd += [ipv6_target]
+                            neigh_result = subprocess.run(
+                                neigh_cmd, capture_output=True, text=True, timeout=5
+                            )
+                            arp_results["details"]["ipv6_neigh"] = neigh_result.stdout.strip() or "no entry"
+                        except Exception as neigh_exc:
+                            arp_results["details"]["ipv6_neigh"] = f"error: {neigh_exc}"
             except Exception as e:
                 arp_results["details"]["ipv6_ping"] = f"error: {e}"
                 arp_results["details"]["ipv6_ping_target"] = ipv6_gateway or ipv6_address
@@ -14628,12 +14702,24 @@ def get_device_arp_status(device_id):
             try:
                 result = subprocess.run(ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_gateway],
                                       capture_output=True, text=True, timeout=5)
-                arp_results["arp_gateway_resolved"] = result.returncode == 0
-                arp_results["details"]["gateway_ping"] = "success" if result.returncode == 0 else "failed"
-                if result.returncode != 0:
-                    err = (result.stderr or result.stdout or "").strip()[:200]
-                    if err:
-                        arp_results["details"]["gateway_ping_error"] = err
+                ping_ok = result.returncode == 0
+                arp_results["details"]["gateway_ping"] = "success" if ping_ok else "failed"
+                if ping_ok:
+                    arp_results["arp_gateway_resolved"] = True
+                else:
+                    # v0.5.254: the important one — Juniper QFX IRB
+                    # gateways in the srv06 lab drop ICMPv4 echo
+                    # under default filters, but ARP works and BGP
+                    # comes up. Pre-fix the "IPv4 Gateway" cell went
+                    # orange while BGP was clearly UP through it.
+                    if _neigh_state_ok(ipv4_gateway, family="ipv4"):
+                        arp_results["arp_gateway_resolved"] = True
+                        arp_results["details"]["gateway_neigh_fallback"] = "resolved via ip neigh"
+                    else:
+                        arp_results["arp_gateway_resolved"] = False
+                        err = (result.stderr or result.stdout or "").strip()[:200]
+                        if err:
+                            arp_results["details"]["gateway_ping_error"] = err
             except Exception as e:
                 arp_results["details"]["gateway_ping"] = f"error: {e}"
         

@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.254] - 2026-09-04
+
+**Gateway / self-IP ARP status: fall back to neighbor table when
+ping is filtered.**
+
+Live srv06 lab bug — three devices behind a Juniper QFX5130 with
+BGP UP through gateways `192.168.0.1` / `192.168.10.1`, yet the
+IPv4 Gateway cell in the Devices tab stayed orange (IPv6 gateway
+green). Root cause: `/api/device/arp/<device_id>` set the
+`arp_gateway_resolved` / `arp_ipv4_resolved` / `arp_ipv6_resolved`
+fields purely from `ping` / `ping6` exit codes. The field name
+says "arp" but the probe was ICMP echo.
+
+Juniper's default control-plane filter drops ICMPv4 echo to IRB
+interfaces while still answering ARP and carrying BGP, so ping
+failed and the gateway went orange even though the actual peer
+MAC was in the neighbor table (BGP proves it: no TCP session
+without ARP first). IPv6 stayed green because ICMPv6 echo is
+RFC 4443 §4.2 SHOULD-respond and Junos honors it, so `ping6`
+succeeded — the bug was IPv4-only in symptom, class-of-bug in
+both families.
+
+Fix — new `_neigh_state_ok(target, family)` helper (closure
+inside `get_device_arp_status`) that runs
+`ip [-6] neigh show to <ip>` inside the same VRF as the ping
+check and returns True iff the entry state is REACHABLE / STALE
+/ DELAY / PROBE / PERMANENT / NOARP. All three ping-check
+branches (IPv4 self, IPv6 self, IPv4 gateway) now do:
+`ping succeeds → resolved; ping fails → fall back to neigh
+table`. A `*_neigh_fallback: "resolved via ip neigh"` note is
+added to `arp_results["details"]` when the fallback saves the
+day, so operators can see WHY a cell went green despite ping
+failing.
+
+Also fixes an adjacent quirk: the `/api/device/arp/check` POST
+endpoint (line 8010) has always used `ip neigh` directly and
+handles all six resolved states correctly — the new helper
+matches its classification (DELAY / PROBE treated as resolved
+since the cached MAC is available immediately while the kernel
+double-checks in the background).
+
+Regression test in `tests/test_v05254_gateway_neigh_fallback.py`
+covers: source-level presence of the helper, correct state
+classification (7 states), IPv4/IPv6/gateway all use the
+fallback, ping-success short-circuit skips the fallback.
+
 ## [0.5.253] - 2026-09-04
 
 **DPDK tx_worker audit — 8 correctness fixes across
