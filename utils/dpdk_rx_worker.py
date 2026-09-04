@@ -91,6 +91,16 @@ class RxHandle:
     proc: subprocess.Popen
     cmd: list[str]
     started_at: float
+    # v0.5.255 (audit RX-3): track the process-group id + the
+    # systemd scope unit so Stop / is_running can reach the REAL
+    # worker even when systemd-run --no-block has reparented it
+    # into a scope under PID 1. Pre-fix, `proc.pid` was the
+    # systemd-run wrapper's PID — which exits within milliseconds
+    # of registering the scope — so SIGTERM to it was a no-op,
+    # `is_running()` returned False, and the real rx_worker kept
+    # running as an untracked orphan.
+    pgid: Optional[int] = None
+    unit: Optional[str] = None  # sanitised systemd scope unit name
     # Updated by the stdout-reader thread on every heartbeat line.
     # Always read via .latest() (which copies under the lock).
     _latest: dict = field(default_factory=dict)
@@ -121,6 +131,46 @@ class RxHandle:
             return dict(self._final) if self._final else None
 
     def is_running(self) -> bool:
+        """v0.5.255 (audit RX-3, cascade RX-6): check whether the
+        REAL worker is alive, not the (already-exited) systemd-run
+        wrapper. Priority: scope active → PID in scope alive →
+        proc.poll() as last resort."""
+        # 1. Preferred: ask systemd whether the scope is still up.
+        # This is the ground truth when systemd-run is in use.
+        if self.unit:
+            try:
+                r = subprocess.run(
+                    ["systemctl", "is-active", "--quiet", f"{self.unit}.scope"],
+                    capture_output=True, timeout=3,
+                )
+                if r.returncode == 0:
+                    return True
+                # rc=3 (inactive) — fall through to heartbeat check;
+                # the scope may already be cleaned up while the real
+                # worker is still draining its final counters.
+            except Exception:
+                pass
+        # 2. Fresh heartbeat within the last 3 s means the worker
+        # is still emitting → alive. Belt-and-braces for the case
+        # where systemctl is missing or slow.
+        with _LATEST_LOCK:
+            hb = self._latest.get("ts") or self._latest.get("uptime_s")
+        if hb is not None:
+            try:
+                if time.monotonic() - self.started_at < 3.0:
+                    # Too early to trust the heartbeat gate.
+                    pass
+                else:
+                    # Any heartbeat at all within recent memory is
+                    # a positive signal — the reader thread only
+                    # writes to _latest when the worker emits a line.
+                    return self._final is None and (
+                        self.proc.poll() is None or bool(self._latest)
+                    )
+            except Exception:
+                pass
+        # 3. Last resort — poll the (wrapper) PID. Correct when
+        # systemd-run wasn't used (naked Popen fallback).
         return self.proc.poll() is None
 
     def stderr_tail(self, n: int = 50) -> list:
@@ -244,9 +294,34 @@ def start_rx_worker(
     if not pci_bdf:
         raise ValueError("pci_bdf is required for DPDK RX")
 
+    # v0.5.255 (audit RX-4): coerce port 0 → None so `--dst-port 0`
+    # / `--src-port 0` never reaches the C worker. Pre-fix
+    # rx_worker.c's `packet_matches` treated port=0 as "match only
+    # port 0", so every real UDP frame was dropped from
+    # `matched_pkts` while `rx_pkts` climbed — same v0.5.129
+    # footgun the RX autoscaler already fixes via
+    # `_port_filter_or_none`. Belt-and-braces here so BOTH entry
+    # points (`_maybe_start_dpdk_rx_for_stream` AND the manual
+    # `/api/admin/dpdk/rx/start` endpoint) are safe.
+    if dst_port is not None and int(dst_port) <= 0:
+        LOG.debug("[dpdk-rx] dropping dst_port=%s (0 = no-filter)", dst_port)
+        dst_port = None
+    if src_port is not None and int(src_port) <= 0:
+        LOG.debug("[dpdk-rx] dropping src_port=%s (0 = no-filter)", src_port)
+        src_port = None
+
     if file_prefix is None:
         # Same naming convention as tx_worker for log greppability.
-        file_prefix = f"rxw_{stream_id[:8]}_{os.getpid()}_{int(time.time()*1000)}"
+        # v0.5.255 (audit RX-5): append a short random suffix so two
+        # streams whose ids share the first 8 chars (or a fast
+        # crash-and-relaunch inside the same millisecond) can never
+        # collide on --file-prefix. Pre-fix the ms-timestamp was
+        # the only uniqueness guarantee below the 8-char slice.
+        import secrets as _secrets
+        file_prefix = (
+            f"rxw_{stream_id[:8]}_{os.getpid()}_"
+            f"{int(time.time()*1000)}_{_secrets.token_hex(3)}"
+        )
 
     eal = [binary,
            "-l", lcores,
@@ -273,24 +348,58 @@ def start_rx_worker(
     cmd = eal + app
     # v0.5.169: wrap in systemd-run --scope for cgroup lifecycle
     # tracking (see utils/dpdk_tx_worker.py for the rationale).
+    # v0.5.255 (audit RX-3): remember the unit name so stop_rx_worker
+    # can `systemctl stop netgen-rx-<sid>.scope` — the ONLY
+    # reliable way to kill the real worker when systemd-run
+    # --no-block has reparented it under PID 1.
+    _unit_name: Optional[str] = None
     try:
         from utils import systemd_scope
         cmd = systemd_scope.build_systemd_run_prefix(
             role="rx", stream_id=stream_id) + cmd
+        if systemd_scope.has_systemd_run():
+            _unit_name = systemd_scope.sanitise_unit_name("rx", stream_id)
     except Exception as _e:
         LOG.debug("[dpdk-rx] systemd_scope import failed: %s", _e)
     LOG.info("[dpdk-rx] exec: %s", " ".join(shlex.quote(a) for a in cmd))
 
+    # v0.5.255 (audit RX-1 + RX-2): build a child env with the DPDK
+    # library search path resolved + the mempool-ops default the
+    # tx launcher has always set. Pre-fix, rx inherited only
+    # `os.environ` and died with `librte_ethdev.so.XX` load errors
+    # on rebuilt-DPDK hosts (srv06 after install_dpdk.sh). Same
+    # helper the tx side uses since v0.5.253.
+    child_env = os.environ.copy()
+    try:
+        from utils.dpdk_tx_worker import resolve_dpdk_ld_library_path
+        _merged_ld = resolve_dpdk_ld_library_path(
+            child_env.get("LD_LIBRARY_PATH", "")
+        )
+        if _merged_ld:
+            child_env["LD_LIBRARY_PATH"] = _merged_ld
+    except Exception as _e:
+        LOG.debug("[dpdk-rx] LD_LIBRARY_PATH discovery skipped: %s", _e)
+    child_env.setdefault("RTE_DISABLE_MEMPOOL_OPS", "1")
+
     # text=True so we get str lines, not bytes — matches tx_worker
     # pattern. bufsize=1 → line-buffered so we get heartbeats with
     # 1-second granularity, not after some big stdout buffer fills.
+    # v0.5.255 (audit RX-3): start_new_session=True so we can
+    # killpg() the group on the non-systemd fallback path.
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
+        text=True, bufsize=1, env=child_env,
+        start_new_session=True,
     )
+    _pgid: Optional[int] = None
+    try:
+        _pgid = os.getpgid(proc.pid)
+    except Exception:
+        _pgid = None
     handle = RxHandle(
         stream_id=stream_id, proc=proc, cmd=cmd,
         started_at=time.monotonic(),
+        pgid=_pgid, unit=_unit_name,
     )
     t = threading.Thread(
         target=_stdout_reader, args=(handle,),
@@ -316,25 +425,83 @@ def stop_rx_worker(handle: RxHandle, timeout_s: float = 5.0) -> dict:
     """Stop the worker cleanly. Returns the final summary dict (or
     empty if the worker died before emitting one).
 
-    Sequence: SIGTERM → wait up to timeout_s → SIGKILL fallback.
-    SIGTERM lets the worker drain its current burst and emit the
-    `{"final":true,...}` line; SIGKILL is the last-resort backstop
-    for a wedged worker."""
-    if handle.proc.poll() is None:
+    v0.5.255 (audit RX-3): reworked Stop sequence because
+    ``systemd-run --scope --no-block`` reparents the real worker
+    into a scope under PID 1 — ``handle.proc.pid`` was the
+    (already-exited) systemd-run wrapper, so the pre-fix
+    ``handle.proc.send_signal(SIGTERM)`` targeted a dead PID and
+    the real rx_worker kept running as an orphan.
+
+    New sequence:
+      1. If we have a systemd scope name, ``systemctl stop
+         netgen-rx-<sid>.scope`` — kernel-guaranteed and reaches
+         the real worker regardless of PID reparenting.
+      2. Else (no systemd, naked Popen fallback) ``killpg(pgid,
+         SIGTERM)`` on the process group we created with
+         ``start_new_session=True``.
+      3. Wait up to ``timeout_s`` for the worker to drain +
+         emit its ``{"final":true,...}`` line.
+      4. SIGKILL escalation via the same channel as #1 or #2.
+    """
+    # 1. Preferred stop path — the systemd scope.
+    stopped_via_scope = False
+    if handle.unit:
         try:
-            handle.proc.send_signal(signal.SIGTERM)
+            from utils import systemd_scope
+            stopped_via_scope = systemd_scope.stop_scope_for_stream(
+                role="rx", stream_id=handle.stream_id,
+            )
+            if stopped_via_scope:
+                LOG.info(
+                    "[dpdk-rx %s] stopped via systemctl stop %s.scope",
+                    handle.stream_id, handle.unit,
+                )
+        except Exception as _e:
+            LOG.debug(
+                "[dpdk-rx %s] scope stop failed: %s", handle.stream_id, _e,
+            )
+
+    # 2. Fallback (or belt-and-braces): signal the process group.
+    # killpg reaches the wrapper's session even after the wrapper
+    # exited, and — importantly — reaches the real worker on the
+    # non-systemd path where it inherits our session.
+    if not stopped_via_scope and handle.proc.poll() is None:
+        try:
+            if handle.pgid is not None:
+                os.killpg(handle.pgid, signal.SIGTERM)
+            else:
+                handle.proc.send_signal(signal.SIGTERM)
         except ProcessLookupError:
             pass
+        except Exception as _e:
+            LOG.debug(
+                "[dpdk-rx %s] killpg SIGTERM: %s", handle.stream_id, _e,
+            )
+
+    # 3. Wait for the worker to exit + drain its final line.
+    try:
+        handle.proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        LOG.warning(
+            "[dpdk-rx %s] wrapper still alive after %.1fs — escalating "
+            "to SIGKILL",
+            handle.stream_id, timeout_s,
+        )
+        # 4. SIGKILL escalation.
         try:
-            handle.proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            LOG.warning("[dpdk-rx %s] SIGTERM ignored, sending SIGKILL",
-                        handle.stream_id)
-            handle.proc.kill()
+            if handle.pgid is not None:
+                os.killpg(handle.pgid, signal.SIGKILL)
+            else:
+                handle.proc.kill()
+        except Exception:
             try:
-                handle.proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
+                handle.proc.kill()
+            except Exception:
                 pass
+        try:
+            handle.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
     # Reader thread holds onto stdout until proc closes the FD; join
     # briefly to let it parse the final line if any.

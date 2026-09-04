@@ -284,6 +284,17 @@ def test_registry_reaps_dead_handle_on_re_start(monkeypatch):
         dpdk_rx_worker, "_resolve_rx_worker_bin",
         lambda: "/usr/local/bin/rx_worker",
     )
+    # v0.5.255 (audit RX-1): start_rx_worker now calls
+    # `resolve_dpdk_ld_library_path`, which invokes
+    # `subprocess.run(["pkg-config", ...])` and `[..., "ldconfig",
+    # "-p"]`. `subprocess.run` internally instantiates
+    # `subprocess.Popen`, so the monkeypatched Popen below would
+    # eat iterator items on pkg-config / ldconfig probes and the
+    # real spawn would get StopIteration. Stub the helper so it
+    # returns "" quickly without any subprocess call.
+    from utils import dpdk_tx_worker as _tx
+    monkeypatch.setattr(_tx, "resolve_dpdk_ld_library_path",
+                        lambda cur="": "")
     monkeypatch.setattr(
         dpdk_rx_worker.subprocess, "Popen",
         lambda *a, **kw: next(bins),

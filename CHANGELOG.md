@@ -2,6 +2,102 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.255] - 2026-09-04
+
+**DPDK rx_worker audit — 7 correctness fixes across
+`utils/dpdk_rx_worker.py` and `utils/dpdk_rx_manager.py`.**
+
+Follow-up to v0.5.253's tx-side audit. Review agent scoped to
+the rx launcher / registry, briefed on the tx-side footgun
+classes we just fixed so it could check whether any applied
+verbatim on the rx side (three did). Seven confirmed findings;
+all fixed. The most interesting is Finding RX-3 — a silent
+`systemd-run --no-block` reparenting bug that made Stop a no-op
+and `is_running()` lie for months.
+
+**Tier-2 — silent orphans / launch failures / silent-drop:**
+
+- **RX-3 (+RX-6 cascade): `systemd-run --no-block` reparents
+  rx_worker → `handle.proc.pid` is the wrapper → Stop targets a
+  dead PID → real rx_worker keeps running as an untracked
+  orphan.** systemd-run with `--no-block` registers the transient
+  scope with PID 1 and returns; the actual rx_worker is reparented
+  into the scope under systemd. `handle.proc` is the (already
+  exited) wrapper. Pre-fix `stop_rx_worker` called
+  `handle.proc.send_signal(SIGTERM)` — no-op — and `is_running()`
+  was `handle.proc.poll() is None`, which returned False while
+  the real worker kept blasting.
+
+  Fix — reworked Stop sequence:
+  1. `stop_scope_for_stream("rx", stream_id)` — kernel-guaranteed
+     `systemctl stop netgen-rx-<sid>.scope`.
+  2. Fallback (or belt-and-braces): `killpg(pgid, SIGTERM)` on
+     the process group we created with `start_new_session=True`
+     at Popen. Cached `pgid = os.getpgid(proc.pid)` right after
+     spawn, cached `unit = sanitise_unit_name("rx", stream_id)`.
+  3. Wait `timeout_s` for the worker to drain + emit its final
+     summary.
+  4. SIGKILL escalation via the same channels.
+
+  `is_running()` reworked to check the systemd scope first, then
+  heartbeat freshness, then wrapper PID as last resort — so the
+  cascade (Finding RX-6: `list()` reports `is_running=False`
+  while live counters keep arriving) is closed too.
+
+- **RX-1: rx launcher never sets `LD_LIBRARY_PATH`** — same class
+  as v0.5.253 DPDK-5. The Popen was passing no `env=`, so on any
+  host where DPDK libs live off the default search path (srv06
+  after `install_dpdk.sh`) the child died with `librte_ethdev.so.
+  XX` load errors. Now calls `resolve_dpdk_ld_library_path()` and
+  passes `env=child_env`.
+
+- **RX-4: `/api/admin/dpdk/rx/start` accepted `dst_port=0` and
+  passed it through, which rejects every real frame.** Same
+  v0.5.129 footgun the RX auto-scaler already dodges via
+  `_port_filter_or_none` — the manual admin endpoint didn't. In
+  `rx_worker.c:packet_matches`, `dst_port=0` triggers the filter
+  and drops every non-port-0 frame, so `matched_pkts` stays 0
+  while `rx_pkts` climbs. Coerce `dst_port` / `src_port` <= 0
+  to `None` inside `start_rx_worker` so BOTH entry points are
+  safe (admin endpoint + `_maybe_start_dpdk_rx_for_stream`).
+
+**Tier-3 — edge-case correctness:**
+
+- **RX-2: rx child missing `RTE_DISABLE_MEMPOOL_OPS=1`** — tx
+  defensively sets it ("avoids missing shared objs on some
+  hosts"); rx didn't because rx built no `child_env` at all.
+  Rolled into the RX-1 env fix — `child_env.setdefault(
+  "RTE_DISABLE_MEMPOOL_OPS", "1")`.
+
+- **RX-5: `file_prefix = f"rxw_{stream_id[:8]}_..."` collides
+  when two stream ids share their first 8 chars and Start hits
+  within the same millisecond.** The admin endpoint accepts any
+  `[A-Za-z0-9_.-]{1,64}` stream_id, so operators can pass
+  `rx-test-a` / `rx-test-b` (both truncate to `"rx-test-"`).
+  Append `secrets.token_hex(3)` for a hard uniqueness guarantee.
+
+- **RX-7: `RxRegistry.start` held the registry lock across the
+  entire `Popen + systemd-run` fork/exec (200-800 ms, sometimes
+  seconds).** During that window `list()`, `stop()`, `latest_for()`
+  and every stats-fold HTTP request behind them stalled. Split
+  into three phases: (1) reserve the slot under lock with a
+  `_SPAWNING` sentinel, (2) Popen with lock RELEASED, (3) swap
+  the sentinel for the real handle under lock. Two operators
+  clicking Start on different streams no longer serialise.
+
+**Regression tests:** new
+`tests/test_v05255_dpdk_rx_audit.py` (20 tests). No regressions
+in the 249 DPDK-adjacent tests from v0.5.253.
+
+**Not shipped (false positives from the audit prompt):** the
+SIGTERM-vs-SIGINT hugepage-leak class fixed on tx (DPDK-3) does
+NOT apply here — `rx_worker.c` installs both SIGINT and SIGTERM
+handlers, so SIGTERM does drive `rte_eth_dev_stop`/`close`. The
+`pkill --stream-id` friendly-fire class (DPDK-1) has no equivalent
+on rx (no pkill/pgrep anywhere in the rx path). `_iface_to_bdf`
+returning None (DPDK-4) doesn't apply either — rx requires
+`pci_bdf` in the request body up front.
+
 ## [0.5.254] - 2026-09-04
 
 **Gateway / self-IP ARP status: fall back to neighbor table when

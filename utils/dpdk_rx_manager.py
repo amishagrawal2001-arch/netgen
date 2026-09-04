@@ -34,6 +34,16 @@ class RxRegistry:
         self._handles: dict[str, RxHandle] = {}
         self._lock = threading.Lock()
 
+    # v0.5.255 (audit RX-7): sentinel object marking "spawn in flight"
+    # for a given stream_id. It occupies the dict slot briefly (from
+    # collision check → after Popen), so a concurrent start() sees
+    # the reservation without holding the registry lock across the
+    # Popen (which itself calls out to systemd-run and blocks for
+    # 200-800 ms, sometimes seconds on a slow D-Bus). Any other
+    # request (list / stop / latest_for) that lands in that window
+    # is no longer head-of-line-blocked.
+    _SPAWNING = object()
+
     def start(
         self,
         *,
@@ -54,8 +64,15 @@ class RxRegistry:
         a clear error instead of two processes fighting over the
         same PCI port.
         """
+        # PHASE 1 — under lock, decide whether to spawn and reserve
+        # the slot. Fast — no I/O.
         with self._lock:
             existing = self._handles.get(stream_id)
+            if existing is self._SPAWNING:
+                raise ValueError(
+                    f"rx_worker spawn already in flight for stream "
+                    f"{stream_id}. Wait for it to complete."
+                )
             if existing and existing.is_running():
                 raise ValueError(
                     f"rx_worker already running for stream {stream_id} "
@@ -65,7 +82,15 @@ class RxRegistry:
             # Reap a dead-but-not-removed handle before re-launching.
             if existing and not existing.is_running():
                 self._handles.pop(stream_id, None)
+            self._handles[stream_id] = self._SPAWNING  # reservation
 
+        # PHASE 2 — actual Popen + systemd-run, LOCK RELEASED.
+        # Pre-fix this ran inside the lock, serialising every
+        # concurrent list()/stop()/latest_for() call against the
+        # ~200-800 ms Popen. Two operators clicking Start on
+        # different streams then serialised each other AND every
+        # viewer request behind them.
+        try:
             handle = start_rx_worker(
                 stream_id=stream_id, pci_bdf=pci_bdf, lcores=lcores,
                 rx_queues=rx_queues, vlan=vlan,
@@ -73,6 +98,15 @@ class RxRegistry:
                 src_ip=src_ip, dst_ip=dst_ip,
                 duration_s=duration_s,
             )
+        except Exception:
+            # Spawn failed — release the reservation so a retry works.
+            with self._lock:
+                if self._handles.get(stream_id) is self._SPAWNING:
+                    self._handles.pop(stream_id, None)
+            raise
+
+        # PHASE 3 — swap the reservation for the real handle.
+        with self._lock:
             self._handles[stream_id] = handle
         return {
             "stream_id": stream_id,
@@ -90,6 +124,13 @@ class RxRegistry:
             handle = self._handles.pop(stream_id, None)
         if handle is None:
             return {"status": "unknown", "stream_id": stream_id}
+        # v0.5.255 (audit RX-7): a Stop that lands mid-spawn should
+        # NOT try to stop the sentinel. Restore the reservation so
+        # the concurrent start() finishes; caller retries Stop.
+        if handle is self._SPAWNING:
+            with self._lock:
+                self._handles.setdefault(stream_id, self._SPAWNING)
+            return {"status": "spawning", "stream_id": stream_id}
         if not handle.is_running():
             # Reap so we still surface .final() if available.
             return {
@@ -110,6 +151,11 @@ class RxRegistry:
             items = list(self._handles.items())
         out = []
         for sid, h in items:
+            # v0.5.255 (audit RX-7): skip in-flight spawns from
+            # every list/show endpoint.
+            if h is self._SPAWNING:
+                out.append({"stream_id": sid, "status": "spawning"})
+                continue
             entry = {
                 "stream_id": sid,
                 "pid": h.proc.pid,
@@ -142,7 +188,9 @@ class RxRegistry:
         rx_engine is dpdk. Returns None if no handle registered."""
         with self._lock:
             handle = self._handles.get(stream_id)
-        if handle is None:
+        # v0.5.255 (audit RX-7): sentinel means "spawn in flight" —
+        # no real handle yet, no counters to fold.
+        if handle is None or handle is self._SPAWNING:
             return None
         return handle.latest()
 
