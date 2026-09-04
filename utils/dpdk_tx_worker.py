@@ -13,6 +13,92 @@ from typing import Optional, Dict, Any
 
 LOG = logging.getLogger("dpdk_tx_worker")
 
+
+def resolve_dpdk_ld_library_path(current_ld_path: str = "") -> str:
+    """Discover DPDK library directories and prepend them to
+    ``current_ld_path`` (":"-joined), returning the merged value.
+
+    v0.5.253 (audit DPDK-5): extracted from ``run_stream``'s body so
+    ``dpdk_tx_worker_multi.py`` can call it too — pre-fix the multi-
+    instance launcher inherited only ``os.environ.copy()`` and died
+    with ``error while loading shared libraries: librte_ethdev.so.XX``
+    on any host where DPDK libs weren't on the default search path
+    (e.g. srv06 after ``install_dpdk.sh``).
+
+    Returns "" if nothing was found AND ``current_ld_path`` was empty
+    — caller decides whether to LOG.warning or silently proceed.
+    """
+    dpdk_lib_paths: list = []
+
+    # Method 1: pkg-config
+    try:
+        pkg_config_paths = [
+            "/usr/local/lib/x86_64-linux-gnu/pkgconfig",
+            "/usr/local/lib/pkgconfig",
+            "/usr/lib/x86_64-linux-gnu/pkgconfig",
+            "/usr/lib/pkgconfig",
+        ]
+        for pc_path in pkg_config_paths:
+            if os.path.exists(pc_path):
+                env_pc = os.environ.copy()
+                env_pc["PKG_CONFIG_PATH"] = f"{pc_path}:{env_pc.get('PKG_CONFIG_PATH', '')}"
+                result = subprocess.run(
+                    ["pkg-config", "--variable=libdir", "libdpdk"],
+                    env=env_pc, capture_output=True, text=True, timeout=2,
+                )
+                if result.returncode == 0:
+                    libdir = result.stdout.strip()
+                    if libdir and os.path.exists(libdir) and libdir not in dpdk_lib_paths:
+                        dpdk_lib_paths.append(libdir)
+                        LOG.debug("[dpdk] Found DPDK libdir via pkg-config: %s", libdir)
+                    break
+    except Exception as e:
+        LOG.debug("[dpdk] pkg-config method failed: %s", e)
+
+    # Method 2: common locations
+    common_paths = [
+        "/usr/local/lib/x86_64-linux-gnu",
+        "/usr/local/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib",
+    ]
+    for lib_path in common_paths:
+        if os.path.exists(lib_path):
+            try:
+                files = os.listdir(lib_path)
+                if any(f.startswith("librte_") and f.endswith(".so") or ".so." in f for f in files):
+                    if lib_path not in dpdk_lib_paths:
+                        dpdk_lib_paths.append(lib_path)
+                        LOG.debug("[dpdk] Found DPDK libraries in: %s", lib_path)
+            except Exception:
+                pass
+
+    # Method 3: ldconfig
+    try:
+        result = subprocess.run(
+            ["ldconfig", "-p"], capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if "librte_ethdev.so" in line:
+                    parts = line.split("=>")
+                    if len(parts) == 2:
+                        lib_file = parts[1].strip()
+                        lib_dir = os.path.dirname(lib_file)
+                        if lib_dir and os.path.exists(lib_dir) and lib_dir not in dpdk_lib_paths:
+                            dpdk_lib_paths.append(lib_dir)
+                            LOG.debug("[dpdk] Found DPDK library via ldconfig: %s", lib_dir)
+                            break
+    except Exception as e:
+        LOG.debug("[dpdk] ldconfig method failed: %s", e)
+
+    merged = current_ld_path or ""
+    for lib_path in dpdk_lib_paths:
+        if lib_path not in merged:
+            merged = f"{lib_path}:{merged}" if merged else lib_path
+    return merged
+
+
 # ------------------------- Public API -------------------------
 
 def _resolve_stream_name(stream_data, interface, stream_id):
@@ -153,16 +239,18 @@ def resolve_actual_tx_cores(stream_data: Dict[str, Any],
     """
     explicit = _user_specified_tx_cores(stream_data)
     tx_cores = _resolve_tx_cores(stream_data)
-    pps = _resolve_target_pps(stream_data)
-    if pps == 0 and not explicit and interface:
+    frame_size = 64
+    try:
+        ps = stream_data.get("protocol_selection") or {}
+        fs = (ps.get("frame_size")
+              or stream_data.get("frame_size") or 64)
+        frame_size = int(fs)
+    except (TypeError, ValueError):
         frame_size = 64
-        try:
-            ps = stream_data.get("protocol_selection") or {}
-            fs = (ps.get("frame_size")
-                  or stream_data.get("frame_size") or 64)
-            frame_size = int(fs)
-        except (TypeError, ValueError):
-            frame_size = 64
+    # v0.5.253 (audit DPDK-2): plumb iface + frame_size into
+    # _resolve_target_pps so Load-% math uses the real link speed.
+    pps = _resolve_target_pps(stream_data, iface=interface, frame_size=frame_size)
+    if pps == 0 and not explicit and interface:
         auto = _auto_tx_cores_for_line_rate(interface, frame_size)
         if auto > tx_cores:
             return auto, True
@@ -238,9 +326,11 @@ def run_stream(
 
     # Resolve target rate first — needed below to decide whether to
     # auto-bump tx_cores for Line Rate streams.
-    pps = _resolve_target_pps(stream_data)
+    # v0.5.253 (audit DPDK-2): pass iface + frame_size so Load-% math
+    # scales off the real link speed, not the historical 1 GbE baseline.
     vlan_id = fields["vlan_id"]
     frame_size = int(fields["frame_size"] or 64)
+    pps = _resolve_target_pps(stream_data, iface=interface, frame_size=frame_size)
 
     # Multi-queue scaling: tx_cores TX queues = tx_cores worker threads.
     # EAL needs (1 main + tx_cores workers) lcores total.
@@ -370,94 +460,19 @@ def run_stream(
 
     # Helpful defaults if user didn't set them
     child_env.setdefault("RTE_DISABLE_MEMPOOL_OPS", "1")   # avoids missing shared objs on some hosts
-    
-    # Set LD_LIBRARY_PATH to include DPDK libraries
-    # Try multiple methods to find DPDK library directory
+
+    # v0.5.253 (audit DPDK-5): LD_LIBRARY_PATH discovery hoisted out
+    # of the launcher body into `resolve_dpdk_ld_library_path()` so
+    # the multi-instance launcher (dpdk_tx_worker_multi.py) can call
+    # the same code. Pre-fix, multi-instance skipped this entirely
+    # and died with "error while loading shared libraries:
+    # librte_ethdev.so.XX" on any host where DPDK libs weren't on
+    # the default search path (e.g. srv06 after install_dpdk.sh).
     current_ld_path = child_env.get("LD_LIBRARY_PATH", "")
-    dpdk_lib_paths = []
-    
-    # Method 1: Use pkg-config to find DPDK library directory
-    try:
-        import subprocess
-        pkg_config_paths = [
-            "/usr/local/lib/x86_64-linux-gnu/pkgconfig",
-            "/usr/local/lib/pkgconfig",
-            "/usr/lib/x86_64-linux-gnu/pkgconfig",
-            "/usr/lib/pkgconfig"
-        ]
-        for pc_path in pkg_config_paths:
-            if os.path.exists(pc_path):
-                env_pc = os.environ.copy()
-                env_pc["PKG_CONFIG_PATH"] = f"{pc_path}:{env_pc.get('PKG_CONFIG_PATH', '')}"
-                result = subprocess.run(
-                    ["pkg-config", "--variable=libdir", "libdpdk"],
-                    env=env_pc,
-                    capture_output=True,
-                    text=True,
-                    timeout=2
-                )
-                if result.returncode == 0:
-                    libdir = result.stdout.strip()
-                    if libdir and os.path.exists(libdir) and libdir not in dpdk_lib_paths:
-                        dpdk_lib_paths.append(libdir)
-                        LOG.debug("[dpdk] Found DPDK libdir via pkg-config: %s", libdir)
-                    break
-    except Exception as e:
-        LOG.debug("[dpdk] pkg-config method failed: %s", e)
-    
-    # Method 2: Check common locations for DPDK libraries
-    common_paths = [
-        "/usr/local/lib/x86_64-linux-gnu",
-        "/usr/local/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib"
-    ]
-    for lib_path in common_paths:
-        if os.path.exists(lib_path):
-            # Check if this directory contains DPDK libraries
-            try:
-                files = os.listdir(lib_path)
-                if any(f.startswith("librte_") and f.endswith(".so") or ".so." in f for f in files):
-                    if lib_path not in dpdk_lib_paths:
-                        dpdk_lib_paths.append(lib_path)
-                        LOG.debug("[dpdk] Found DPDK libraries in: %s", lib_path)
-            except Exception:
-                pass
-    
-    # Method 3: Use ldconfig to find librte_ethdev.so
-    try:
-        result = subprocess.run(
-            ["ldconfig", "-p"],
-            capture_output=True,
-            text=True,
-            timeout=2
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                if "librte_ethdev.so" in line:
-                    # Extract path from ldconfig output (format: "librte_ethdev.so.22 (libc6,x86-64) => /path/to/lib.so.22")
-                    parts = line.split("=>")
-                    if len(parts) == 2:
-                        lib_file = parts[1].strip()
-                        lib_dir = os.path.dirname(lib_file)
-                        if lib_dir and os.path.exists(lib_dir) and lib_dir not in dpdk_lib_paths:
-                            dpdk_lib_paths.append(lib_dir)
-                            LOG.debug("[dpdk] Found DPDK library via ldconfig: %s", lib_dir)
-                            break
-    except Exception as e:
-        LOG.debug("[dpdk] ldconfig method failed: %s", e)
-    
-    # Add paths that aren't already in LD_LIBRARY_PATH
-    for lib_path in dpdk_lib_paths:
-        if lib_path not in current_ld_path:
-            if current_ld_path:
-                current_ld_path = f"{lib_path}:{current_ld_path}"
-            else:
-                current_ld_path = lib_path
-    
-    if current_ld_path:
-        child_env["LD_LIBRARY_PATH"] = current_ld_path
-        LOG.info("[dpdk] Setting LD_LIBRARY_PATH=%s", current_ld_path)
+    merged = resolve_dpdk_ld_library_path(current_ld_path)
+    if merged:
+        child_env["LD_LIBRARY_PATH"] = merged
+        LOG.info("[dpdk] Setting LD_LIBRARY_PATH=%s", merged)
     else:
         LOG.warning("[dpdk] Could not find DPDK library directory. LD_LIBRARY_PATH not set.")
 
@@ -728,10 +743,20 @@ def run_stream(
         # SIGTERM first (lets DPDK release hugepages cleanly), SIGKILL
         # 1s later as a backstop. Scoped by stream_id so we don't
         # disturb other concurrent streams.
+        #
+        # v0.5.253 (audit DPDK-1): mirror the pre-launch sweep (line
+        # 480) — the previous pattern `--stream-id <sid>` had two
+        # bugs. First, pkill treats a pattern that starts with `--`
+        # as an unknown option and returns rc=2, so the whole reaper
+        # was a silent no-op. Second, adding just `--` re-opens the
+        # v0.5.119 friendly-fire regression: `--stream-id <sid>` also
+        # matches the rx_worker cmdline (both binaries share it), so
+        # cleaning up tx would SIGKILL the paired rx. Anchor on the
+        # `tx_worker` binary name AND pass `--` before the pattern.
         try:
-            sweep_pat = f"--stream-id {stream_id}"
+            sweep_pat = f"tx_worker.*--stream-id {stream_id}"
             r = subprocess.run(
-                ["pkill", "-TERM", "-f", sweep_pat],
+                ["pkill", "-TERM", "-f", "--", sweep_pat],
                 capture_output=True, timeout=3,
             )
             if r.returncode == 0:
@@ -739,7 +764,7 @@ def run_stream(
                 import time as _t
                 _t.sleep(1.0)
                 subprocess.run(
-                    ["pkill", "-KILL", "-f", sweep_pat],
+                    ["pkill", "-KILL", "-f", "--", sweep_pat],
                     capture_output=True, timeout=3,
                 )
         except Exception as e:
@@ -895,13 +920,47 @@ def _resolve_tx_worker_bin() -> str:
     return os.path.abspath(os.path.join(os.getcwd(), "resources", "dpdk", "tx_worker", "build", "tx_worker"))
 
 def _iface_to_bdf(iface: str) -> Optional[str]:
-    """Turn 'enp13s0f0np0' into '0000:0d:00.0' via sysfs."""
+    """Turn 'enp13s0f0np0' into '0000:0d:00.0' via sysfs, falling back
+    to the admin bind-history JSON when the iface has already been
+    bound to vfio-pci (kernel netdev is gone).
+
+    v0.5.253 (audit DPDK-4): pre-fix a vfio-bound iface returned
+    ``None``, and the caller then dropped the ``-a <bdf>`` EAL arg —
+    ``RTE_ETH_FOREACH_DEV`` grabbed whichever DPDK port EAL enumerated
+    first, so on a host with >=2 vfio-bound NICs the stream went out
+    an arbitrary interface. The admin bind-history JSON records the
+    original iface name at bind time; we consult it as a fallback.
+    """
     try:
         dev = os.path.realpath(f"/sys/class/net/{iface}/device")
         bdf = os.path.basename(dev)
-        return bdf if ":" in bdf else None
+        if ":" in bdf:
+            return bdf
     except Exception:
-        return None
+        pass
+    # sysfs miss — try admin bind-history (kept in sync by the /api/dpdk/bind
+    # endpoint). Two candidate paths, same shape as run_tgen_server.
+    for path in (
+        "/var/lib/netgen-server/admin_bind_history.json",
+        "/tmp/netgen_admin_bind_history.json",
+    ):
+        try:
+            if not os.path.exists(path):
+                continue
+            import json as _json
+            with open(path, "r") as f:
+                history = _json.load(f) or {}
+            if not isinstance(history, dict):
+                continue
+            # history is {bdf: {"name": <pre-bind iface name>, ...}}.
+            for bdf, entry in history.items():
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("name") or "").strip() == str(iface).strip():
+                    return bdf
+        except Exception as _e:
+            LOG.debug("[dpdk] bind-history lookup for %s failed: %s", iface, _e)
+    return None
 
 def _bdf_numa_node(bdf: str) -> int:
     try:
@@ -1004,10 +1063,22 @@ def _resolve_l2_l3_l4(stream_data: Dict[str, Any]) -> Dict[str, Any]:
     from utils.vlan_helpers import resolve_tx_vlan_id
     vlan_id = resolve_tx_vlan_id(stream_data)
 
-    try:
-        frame_size = int(stream_data.get("frame_size", 64))
-    except Exception:
-        frame_size = 64
+    # v0.5.253 (audit DPDK-8): fall back to protocol_selection.frame_size
+    # for parity with _resolve_target_pps and resolve_actual_tx_cores.
+    # Pre-fix, a stream whose dialog stored frame size only under
+    # protocol_selection got `--size 64` on the wire while the pps math
+    # (and auto-tx-cores calc) used the real size — same class of bug
+    # as v0.5.121 (VLAN under protocol_selection).
+    ps = stream_data.get("protocol_selection", {}) or {}
+    frame_size = 64
+    for _src in (stream_data.get("frame_size"), ps.get("frame_size")):
+        if _src in (None, ""):
+            continue
+        try:
+            frame_size = int(_src)
+            break
+        except Exception:
+            pass
 
     return dict(
         src_mac=src_mac, dst_mac=dst_mac,
@@ -1147,7 +1218,9 @@ def _resolve_count_flags(stream_data: Dict[str, Any]) -> list:
     return out
 
 
-def _resolve_target_pps(stream_data: Dict[str, Any]) -> int:
+def _resolve_target_pps(stream_data: Dict[str, Any],
+                        iface: Optional[str] = None,
+                        frame_size: Optional[int] = None) -> int:
     """
     Convert your rate selection into a numeric PPS for tx_worker (0 = flood).
     Supports:
@@ -1156,6 +1229,12 @@ def _resolve_target_pps(stream_data: Dict[str, Any]) -> int:
       - Load (%)
       - "Line Rate" => 0
       Reads from stream_rate_control, top-level fields, protocol_selection, and tx_rate.
+
+    v0.5.253 (audit DPDK-2): accepts an optional ``iface`` + ``frame_size``.
+    Load (%) mode multiplies against the interface's actual line-rate PPS
+    when ``iface`` is provided; without it (legacy callers) it falls back
+    to the historical 1 GbE baseline (1.25 Mpps at 100%). Pre-fix, Load=50
+    on a 100 G NIC returned 625 kpps — ~120x low — with no warning.
     """
     rc = stream_data.get("stream_rate_control", {}) or {}
     ps = stream_data.get("protocol_selection", {}) or {}
@@ -1220,7 +1299,16 @@ def _resolve_target_pps(stream_data: Dict[str, Any]) -> int:
                         ps.get("stream_load_percentage"),
                         tr.get("percent"),
                         default=0)
-        # naive 1GbE baseline: 100% ≈ 1.25 Mpps
+        # v0.5.253 (audit DPDK-2): scale off the interface's actual
+        # line-rate PPS when we know it. `_compute_line_pps` reads
+        # `/sys/class/net/<iface>/speed` and returns 1 Mpps as a safe
+        # fallback if that read fails. Only callers that omit `iface`
+        # (legacy: unit tests, hand-rolled callers) get the old 1 GbE
+        # baseline.
+        if iface:
+            fs = int(frame_size) if (frame_size and frame_size > 0) else 64
+            base_pps = _compute_line_pps(iface, fs)
+            return int((base_pps * load) / 100)
         return int((1_250_000 * load) / 100)
 
     return 0

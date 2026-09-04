@@ -30,7 +30,70 @@ GUI shows it with a "Bind anyway" escape hatch.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+import os
+from typing import Iterable, List, Optional, Set
+
+
+def _resolve_underlying_ifaces(iface: str) -> Set[str]:
+    """v0.5.253 (audit DPDK-6): return the set of physical interfaces
+    that ``iface`` sits on top of, PLUS ``iface`` itself.
+
+    Handles VLAN sub-interfaces (``eno1.100`` → ``{"eno1.100", "eno1"}``)
+    and bond masters (``bond0`` with slaves ``eno1``/``eno2`` →
+    ``{"bond0", "eno1", "eno2"}``), and bridge masters. Best-effort:
+    on read failure returns ``{iface}`` alone.
+
+    Pre-fix, ``check_bind_safe`` did plain string equality between the
+    candidate iface and ``default_route_iface`` / ``ssh_client_iface``.
+    Management on ``eno1.100`` with candidate ``eno1`` slipped through
+    — the operator's ``eno1`` bind then killed the VLAN child and
+    booted them off the box.
+    """
+    out: Set[str] = {iface}
+    if not iface:
+        return out
+    base = "/sys/class/net"
+    # VLAN sub-interface: /sys/class/net/<if>/proc/net/vlan/<if> exists;
+    # more reliably, /proc/net/vlan/<if> exists with "Device: <parent>".
+    try:
+        vlan_path = f"/proc/net/vlan/{iface}"
+        if os.path.exists(vlan_path):
+            with open(vlan_path, "r") as f:
+                for line in f:
+                    if line.strip().startswith("Device:"):
+                        parent = line.split(":", 1)[1].strip()
+                        if parent:
+                            out.add(parent)
+                        break
+    except Exception:
+        pass
+    # Bond master: /sys/class/net/<bond>/bonding/slaves lists slaves.
+    try:
+        slaves_path = f"{base}/{iface}/bonding/slaves"
+        if os.path.exists(slaves_path):
+            with open(slaves_path, "r") as f:
+                for s in f.read().split():
+                    if s:
+                        out.add(s)
+    except Exception:
+        pass
+    # Bridge master: /sys/class/net/<br>/brif/* are the bridge ports.
+    try:
+        brif_dir = f"{base}/{iface}/brif"
+        if os.path.isdir(brif_dir):
+            for e in os.listdir(brif_dir):
+                if e:
+                    out.add(e)
+    except Exception:
+        pass
+    # Every other lower_* link (macvlan, team, veth stack…).
+    try:
+        for e in os.listdir(f"{base}/{iface}"):
+            if e.startswith("lower_"):
+                out.add(e[len("lower_"):])
+    except Exception:
+        pass
+    return out
 
 
 def check_bind_safe(
@@ -53,8 +116,20 @@ def check_bind_safe(
     if not iface:
         return None
 
-    # Management interface — two ways to detect it.
-    if default_route_iface and iface == str(default_route_iface).strip():
+    # v0.5.253 (audit DPDK-6): resolve the mgmt/SSH ifaces to their
+    # underlying physical devices before the equality check. Binding
+    # the *parent* of a VLAN/bond/bridge disables every child that
+    # sits on top of it — same lockout risk as binding the child.
+    def _mgmt_hits(mgmt: str) -> bool:
+        mgmt = str(mgmt).strip()
+        if not mgmt:
+            return False
+        if mgmt == iface:
+            return True
+        # mgmt could sit on top of iface (mgmt=eno1.100, iface=eno1).
+        return iface in _resolve_underlying_ifaces(mgmt)
+
+    if default_route_iface and _mgmt_hits(default_route_iface):
         return (
             f"'{iface}' carries the default route — binding it to "
             f"vfio-pci would drop all kernel networking on this host "
@@ -63,7 +138,7 @@ def check_bind_safe(
             f"mean it and have console access."
         )
 
-    if ssh_client_iface and iface == str(ssh_client_iface).strip():
+    if ssh_client_iface and _mgmt_hits(ssh_client_iface):
         return (
             f"'{iface}' is the interface your SSH session is connected "
             f"over — binding it would kill the connection. Bind from "

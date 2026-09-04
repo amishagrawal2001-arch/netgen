@@ -56,9 +56,13 @@ _WORKER_BINS = ("tx_worker", "rx_worker")
 # in the netgen launcher's cmdline. See run_tgen_server.py around
 # the `tx_worker` spawn (and the rx_worker mirror).
 _RE_STREAM_ID = re.compile(
-    r"--stream[-_]id[\s=]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-    r"[0-9a-f]{4}-[0-9a-f]{12})",
-    re.IGNORECASE,
+    # v0.5.253 (audit DPDK-7): accept any non-space token, not just
+    # strict UUID form. Pre-fix, a tx_worker started with a non-UUID
+    # --stream-id (integration test slug, hand-invoked debug run,
+    # API-direct caller) had stream_id=None, and `find_orphans`
+    # short-circuits `not w.stream_id` → the legitimate worker got
+    # classified as an orphan and Stop-All SIGKILLed it.
+    r"--stream[-_]id[\s=]+(\S+)",
 )
 _RE_PCI_BDF = re.compile(
     # Accept BOTH the canonical domain-prefixed form

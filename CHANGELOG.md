@@ -2,6 +2,116 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.253] - 2026-09-04
+
+**DPDK tx_worker audit — 8 correctness fixes across
+`utils/dpdk_tx_worker.py`, `utils/dpdk_tx_worker_multi.py`,
+`utils/dpdk_bind_safety.py`, and `utils/dpdk_orphans.py`.**
+
+Post-v0.5.252 review agent surveyed the DPDK TX subsystem
+(single-instance launcher, multi-instance variant, orchestrator,
+bind-safety guards, orphan reaper). Eight confirmed findings; all
+fixed in this ship. Two are silent hugepage / friendly-fire bugs
+that operators have been feeling for months without a smoking gun.
+
+**Tier-1 — silent friendly-fire:**
+
+- **DPDK-1: post-run orphan reaper was a silent no-op AND, if
+  "fixed" naively, would kill the paired rx_worker.** The reaper
+  ran `pkill -TERM -f "--stream-id <sid>"` — without a `--`
+  separator `pkill` treats the pattern as an unknown long option
+  and exits rc=2, so the `if r.returncode == 0` guard never fired
+  and the whole reaper (SIGTERM + SIGKILL escalation) never ran.
+  Adding just `--` re-opens the v0.5.119 regression: the pattern
+  also matches the rx_worker cmdline (both binaries share
+  `--stream-id`), so cleaning up tx would friendly-fire rx.
+  Mirrored the pre-launch sweep (line 480) exactly: anchor on
+  `tx_worker.*--stream-id <sid>` AND pass `--` before the pattern.
+
+**Tier-2 — operator-visible malfunctions:**
+
+- **DPDK-2: Load-% rate hardcoded to 1 GbE baseline.** The rate
+  resolver computed Load-% as `(1_250_000 * load) / 100` with a
+  literal `naive 1GbE baseline` comment. On a 100 G NIC, Load=50
+  returned 625 kpps instead of ~74 Mpps — 120x low, silently. On
+  400 G, 480x low. `_resolve_target_pps` now accepts optional
+  `iface` + `frame_size` and, when supplied, scales off the
+  interface's actual link-rate PPS via `_compute_line_pps`. All
+  four call sites (`resolve_actual_tx_cores`, single-instance
+  launcher, multi-instance launcher, RX-queue auto-scaler in
+  `run_tgen_server`) plumb the interface through.
+- **DPDK-3: multi-instance stop used SIGTERM; tx_worker.c only
+  handles SIGINT → hugepage leak on every Start/Stop cycle.**
+  `tx_worker.c` installs `signal(SIGINT, handle_sigint)` only;
+  SIGTERM hits the kernel default action so the DPDK cleanup path
+  (`rte_eth_dev_stop` / `rte_eth_dev_close` / `rte_eal_cleanup`)
+  never runs. The `--file-prefix` hugepage segment leaks until
+  reboot. Added `start_new_session=True` at Popen and switched
+  stop / failure-cleanup to `killpg(pgid, SIGINT)` with a
+  SIGKILL escalation after 3 s — matches the single-instance
+  path in `dpdk_tx_worker.run_stream`.
+- **DPDK-4: vfio-bound iface → `_iface_to_bdf` returned None →
+  `-a <bdf>` dropped → tx_worker grabbed an arbitrary port.**
+  Once an iface is bound to `vfio-pci` the kernel netdev goes
+  away and `/sys/class/net/<if>/device` no longer exists, so the
+  sysfs walk returns None. The launcher then omitted `-a` from
+  the EAL argv and `RTE_ETH_FOREACH_DEV(port_id) { break; }`
+  in tx_worker.c grabbed whichever port EAL enumerated first —
+  on a host with ≥2 vfio-bound NICs, the stream transmitted out
+  a random interface silently. `_iface_to_bdf` now falls back to
+  the admin bind-history JSON (`/var/lib/netgen-server/
+  admin_bind_history.json`, with the `/tmp/` sibling for
+  ephemeral installs) which records the pre-bind iface name.
+- **DPDK-5: multi-instance skipped LD_LIBRARY_PATH auto-discovery.**
+  The single-instance launcher spent ~90 lines locating
+  `librte_*.so` via pkg-config, common paths, and `ldconfig -p`
+  — precisely because a freshly-built tx_worker often links
+  against a DPDK version off the default library search path
+  (see the docstring on `.so.22` vs `.so.24`). Multi-instance
+  did only `os.environ.copy()`; on the very same hosts the
+  single-instance fix was written for, multi-instance died at
+  load-time with `error while loading shared libraries:
+  librte_ethdev.so.XX`. Extracted the discovery into
+  `resolve_dpdk_ld_library_path()` and called it from both.
+- **DPDK-6: bind-safety guards missed VLAN / bond / bridge
+  parents.** `check_bind_safe` did plain string equality between
+  the candidate iface and `default_route_iface` /
+  `ssh_client_iface`. When mgmt runs on `eno1.100` (VLAN sub-if),
+  `bond0` (with `eno1`/`eno2` slaves), or `br-mgmt` (with `eno1`
+  as a bridge port), binding the physical parent `eno1` slipped
+  through the check and killed the mgmt path. Added
+  `_resolve_underlying_ifaces` (reads `/proc/net/vlan/<if>`,
+  `/sys/class/net/<bond>/bonding/slaves`, `/sys/class/net/<br>/
+  brif/*`, and `lower_*` links) and both mgmt checks now consult
+  it.
+
+**Tier-3 — edge-case correctness:**
+
+- **DPDK-7: orphan-reaper mis-classified non-UUID stream_ids.**
+  The `_RE_STREAM_ID` regex required strict 8-4-4-4-12 hex UUID
+  form; hand-invoked debug runs or integration tests with a
+  slug-style `--stream-id` matched nothing, and `find_orphans`
+  short-circuited `not w.stream_id` — the legitimate worker got
+  classified as an orphan and Stop-All SIGKILLed it. Regex now
+  accepts any non-space token; unattributed workers (no
+  `--stream-id` at all) still go through the operator confirm
+  dialog before being reaped.
+- **DPDK-8: `_resolve_l2_l3_l4` ignored `protocol_selection.
+  frame_size`.** Same class as v0.5.121 (VLAN mode). Every other
+  resolver (`_resolve_target_pps`, `resolve_actual_tx_cores`)
+  falls back to `protocol_selection.frame_size` when top-level
+  is missing; `_resolve_l2_l3_l4` (which actually populates
+  `--size` on the argv) only read top-level. Added the
+  fallback for symmetry — prevents a class of "one path sees
+  X, another sees 64" bugs.
+
+**Regression tests:** new `tests/test_v05253_dpdk_tx_audit.py`
+locks in all 8 fixes at the source level (pkill argv shape,
+`_compute_line_pps` scaling, multi-instance Popen kwargs, bind-
+history fallback path, `resolve_dpdk_ld_library_path` extraction,
+underlying-iface resolver, widened stream-id regex,
+`protocol_selection.frame_size` fallback).
+
 ## [0.5.252] - 2026-09-02
 
 **L2 emulation audit — 10 correctness fixes across

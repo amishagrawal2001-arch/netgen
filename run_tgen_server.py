@@ -973,7 +973,16 @@ def _maybe_start_dpdk_rx_for_stream(
     else:
         try:
             from utils.dpdk_tx_worker import _resolve_target_pps
-            _tgt_pps = int(_resolve_target_pps(stream_data) or 0)
+            # v0.5.253 (audit DPDK-2): pass iface + frame_size so the
+            # Load-% rate mode scales off the real link speed. Under-
+            # provisioning RX queues from a 120x-too-low pps estimate
+            # was the second-order symptom of the load-% baseline bug.
+            _ps = stream_data.get("protocol_selection", {}) or {}
+            try:
+                _fs = int(stream_data.get("frame_size") or _ps.get("frame_size") or 64)
+            except Exception:
+                _fs = 64
+            _tgt_pps = int(_resolve_target_pps(stream_data, iface=rx_interface, frame_size=_fs) or 0)
         except Exception:
             _tgt_pps = 0
         auto_rx_queues, auto_lcores = _auto_rx_queues_for_pps(_tgt_pps)

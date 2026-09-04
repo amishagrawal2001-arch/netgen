@@ -30,6 +30,7 @@ try:
         _file_prefix,
         _uuid,
         _safe_get_tx,
+        resolve_dpdk_ld_library_path,  # v0.5.253 (audit DPDK-5)
     )
 except ImportError:
     # Fallback if relative import fails
@@ -45,6 +46,7 @@ except ImportError:
         _file_prefix,
         _uuid,
         _safe_get_tx,
+        resolve_dpdk_ld_library_path,  # v0.5.253 (audit DPDK-5)
     )
 
 LOG = logging.getLogger("dpdk_multi")
@@ -127,8 +129,16 @@ def run_stream_multi_instance(
     stream_id = stream_data.get("stream_id", _uuid())
     stream_name = stream_data.get("name", "Unnamed")
     
-    # Calculate instance count
-    target_pps = _resolve_target_pps(stream_data)
+    # Calculate instance count.
+    # v0.5.253 (audit DPDK-2): plumb iface + frame_size so Load-% math
+    # scales off the real link speed. Compute frame_size the same way
+    # the single-instance launcher does before the resolve.
+    _ps_early = stream_data.get("protocol_selection", {}) or {}
+    try:
+        _fs_early = int(stream_data.get("frame_size") or _ps_early.get("frame_size") or 64)
+    except Exception:
+        _fs_early = 64
+    target_pps = _resolve_target_pps(stream_data, iface=interface, frame_size=_fs_early)
     if num_instances is None:
         num_instances = calculate_instance_count(target_pps, interface, stream_data)
     
@@ -302,6 +312,18 @@ def run_stream_multi_instance(
             if env:
                 child_env.update(env)
 
+            # v0.5.253 (audit DPDK-5): reuse the single-instance
+            # LD_LIBRARY_PATH discovery so multi-instance also finds
+            # librte_*.so on hosts where DPDK was rebuilt into a non-
+            # default path (srv06 after install_dpdk.sh). Pre-fix,
+            # multi-instance inherited only os.environ.copy() and
+            # died with "error while loading shared libraries:
+            # librte_ethdev.so.XX".
+            _current_ld = child_env.get("LD_LIBRARY_PATH", "")
+            _merged_ld = resolve_dpdk_ld_library_path(_current_ld)
+            if _merged_ld:
+                child_env["LD_LIBRARY_PATH"] = _merged_ld
+
             # v0.5.169: cgroup-track each instance under a unique
             # netgen-tx-<instance_id>.scope unit. systemd handles
             # name collisions if the same instance_id ever appears
@@ -323,13 +345,22 @@ def run_stream_multi_instance(
             # write(), freezing traffic silently. See the placeholder
             # comment above monitor_instances for the parallel note that
             # STAT lines are not being read here either.
+            #
+            # v0.5.253 (audit DPDK-3): start_new_session=True so we can
+            # killpg(pgid, SIGINT) on shutdown — tx_worker.c only
+            # installs a handler for SIGINT (not SIGTERM), and the
+            # default action for SIGTERM is immediate termination
+            # without running the DPDK cleanup path. That leaked the
+            # per-launch --file-prefix hugepage segment on every
+            # Start/Stop cycle.
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=child_env,
                 text=True,
-                bufsize=1
+                bufsize=1,
+                start_new_session=True,
             )
             processes.append({
                 "process": proc,
@@ -340,10 +371,18 @@ def run_stream_multi_instance(
             LOG.info("[dpdk-multi] Launched instance %d/%d: %s", i + 1, num_instances, instance_id)
         except Exception as e:
             LOG.error("[dpdk-multi] Failed to launch instance %d: %s", i, e)
-            # Cleanup already launched instances
+            # Cleanup already launched instances.
+            # v0.5.253 (audit DPDK-3): SIGINT via killpg (see the stop
+            # block below for the full rationale).
+            import signal as _sig
             for p in processes:
                 try:
-                    p["process"].terminate()
+                    _proc = p["process"]
+                    try:
+                        _pgid = os.getpgid(_proc.pid)
+                        os.killpg(_pgid, _sig.SIGINT)
+                    except Exception:
+                        _proc.send_signal(_sig.SIGINT)
                 except Exception:
                     pass
             return 4
@@ -419,17 +458,50 @@ def run_stream_multi_instance(
         LOG.info("[dpdk-multi] Interrupted, stopping all instances")
         stop_event.set()
     
-    # Cleanup: stop all instances
+    # Cleanup: stop all instances.
+    # v0.5.253 (audit DPDK-3): tx_worker.c only installs a signal
+    # handler for SIGINT (Ctrl-C); proc.terminate()'s SIGTERM has
+    # no handler, so the kernel's default action runs and the
+    # DPDK cleanup path (rte_eth_dev_stop / rte_eth_dev_close /
+    # rte_eal_cleanup) never executes — the hugepage segment
+    # backing this --file-prefix leaks on every Start/Stop cycle.
+    # Use killpg(pgid, SIGINT) so the whole process group (worker
+    # + any spawned helpers) gets the interrupt, and only escalate
+    # to SIGKILL after a 3s timeout. Mirrors the single-instance
+    # path in dpdk_tx_worker.run_stream.
+    import signal as _sig
     LOG.info("[dpdk-multi] Stopping all %d instance(s)", num_instances)
     for inst in processes:
         try:
             proc = inst["process"]
             if proc.poll() is None:
-                proc.terminate()
+                _pgid = None
+                try:
+                    _pgid = os.getpgid(proc.pid)
+                except Exception:
+                    _pgid = None
+                try:
+                    if _pgid is not None:
+                        os.killpg(_pgid, _sig.SIGINT)
+                    else:
+                        proc.send_signal(_sig.SIGINT)
+                except Exception:
+                    proc.send_signal(_sig.SIGINT)
                 try:
                     proc.wait(timeout=3.0)
                 except Exception:
-                    proc.kill()
+                    LOG.warning(
+                        "[dpdk-multi] instance %s pid=%s did not exit on "
+                        "SIGINT, escalating to SIGKILL",
+                        inst["instance_id"], proc.pid,
+                    )
+                    try:
+                        if _pgid is not None:
+                            os.killpg(_pgid, _sig.SIGKILL)
+                        else:
+                            proc.kill()
+                    except Exception:
+                        proc.kill()
         except Exception as e:
             LOG.warning("[dpdk-multi] Error stopping instance %s: %s", inst["instance_id"], e)
     
