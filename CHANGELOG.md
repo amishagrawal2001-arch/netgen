@@ -2,6 +2,59 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.268] - 2026-09-05
+
+**L2 emulation dialog — 5 default-value fixes.**
+
+The Add-Emulation dialog for LLDP had five hardcoded/incorrect
+defaults that made two-server BGP labs painful to configure and
+— worse — caused MAC-flap alarms on the switch when both hosts
+transmitted with the same synthetic src_mac. Screenshot triage:
+
+- **L2-B1: Interface field ignored the currently-selected TG
+  tab.** `_guess_default_iface` in
+  [widgets/l2_emulation_tab.py](widgets/l2_emulation_tab.py)
+  fell straight through to the first cached interface (usually
+  `ens1f0` on both hosts), even when the operator had clicked
+  a specific TG interface in the sidebar. Fix: read
+  `main_window.server_tree.selectedItems()` first and prefer
+  that (skipping the `TG <hostname>` group rows and any URL-
+  looking text), fall back to the cached list only when no
+  interface is selected.
+
+- **L2-B2: Port ID hardcoded to `"eth0"`.** LLDP TLVs need the
+  actual sending interface for the switch's LLDP table to make
+  sense; `eth0` is meaningless on a lab host that has
+  `ens1f0`/`ens2f0np0`/etc. Fix: seed Port ID from the
+  Interface field's initial value and keep them in sync via
+  `textChanged` — until the operator manually edits the Port
+  ID (`textEdited` flips a `_lldp_port_id_manually_edited`
+  latch), at which point the auto-sync stops.
+
+- **L2-B3: Chassis ID hardcoded to literal string
+  `"netgen-host"`.** Same value on every host = duplicate
+  Chassis ID advertisements = switch's LLDP neighbor table
+  collapses two ports into one entry. Fix: default to
+  `socket.gethostname()` (the client's hostname; the operator
+  can still override — this is a source-of-authority TLV).
+
+- **L2-B4: System Name hardcoded to `"netgen"`.** Same issue,
+  same fix: `socket.gethostname()`.
+
+- **L2-B5: Source MAC hardcoded to `00:11:22:33:44:02`.** THE
+  problem: two BGP peers in the same L2 domain both defaulted
+  to this MAC and the QFX5130 raised MAC-flap alarms as each
+  hop's LLDP frames re-learned the MAC on the opposite port.
+  Fix: default to blank with placeholder text "leave blank to
+  auto-derive from interface MAC" — server's `start_lldp`
+  handler already treats empty `src_mac` as "read the
+  interface's real MAC via `netifaces`". Submit path skips
+  `_validate_mac` when blank, mirroring the v0.5.252 VRRP
+  dialog treatment.
+
+Regression tests in
+`tests/test_v05268_l2_dialog_defaults.py`, all pass.
+
 ## [0.5.267] - 2026-09-05
 
 **DHCP monitor audit — 3 correctness fixes.**

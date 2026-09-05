@@ -400,9 +400,61 @@ class _L2ConfigDialog(QDialog):
     def _build_lldp_panel(self) -> QWidget:
         w = QGroupBox("LLDP parameters")
         f = QFormLayout(w)
-        self._lldp_chassis_id = QLineEdit("netgen-host")
-        self._lldp_port_id = QLineEdit("eth0")
-        self._lldp_system_name = QLineEdit("netgen")
+        # v0.5.268 (L2-B3 + L2-B4): default Chassis ID + System
+        # Name to the CLIENT hostname so two netgen boxes on the
+        # same broadcast domain don't both advertise "netgen-host"
+        # / "netgen" and fold together on neighbor switches.
+        import socket as _socket
+        try:
+            _client_host = _socket.gethostname() or "netgen-host"
+        except Exception:
+            _client_host = "netgen-host"
+        self._lldp_chassis_id = QLineEdit(_client_host)
+        self._lldp_chassis_id.setToolTip(
+            "LLDP Chassis ID TLV — locally unique per host. Two "
+            "netgen boxes with the same value fold into one neighbor "
+            "entry on the switch. Defaults to the client hostname."
+        )
+
+        # v0.5.268 (L2-B2): default Port ID to the current Interface
+        # field. LLDP's Port ID TLV is what `show lldp neighbors`
+        # on the peer switch displays for "connected port on the
+        # remote chassis" — hardcoding it to "eth0" always lied.
+        # Auto-track the Interface field via textChanged so the
+        # operator sees the right Port ID even if they change the
+        # interface after opening the dialog. Only auto-update when
+        # the operator hasn't manually edited Port ID.
+        _initial_port_id = (
+            self._iface_input.text().strip() if hasattr(self, "_iface_input") else ""
+        ) or "eth0"
+        self._lldp_port_id = QLineEdit(_initial_port_id)
+        self._lldp_port_id_manually_edited = False
+        self._lldp_port_id.setToolTip(
+            "LLDP Port ID TLV — the remote switch shows this in its "
+            "`show lldp neighbors` output as the port on our side. "
+            "Auto-tracks the Interface field unless you edit it."
+        )
+        def _mark_port_id_edited(_txt: str) -> None:
+            # Only fire on user-driven edits, not our own setText calls.
+            self._lldp_port_id_manually_edited = True
+        self._lldp_port_id.textEdited.connect(_mark_port_id_edited)
+        def _sync_port_id_from_iface(_iface_txt: str) -> None:
+            if self._lldp_port_id_manually_edited:
+                return
+            self._lldp_port_id.blockSignals(True)
+            try:
+                self._lldp_port_id.setText(_iface_txt.strip() or "eth0")
+            finally:
+                self._lldp_port_id.blockSignals(False)
+        if hasattr(self, "_iface_input"):
+            self._iface_input.textChanged.connect(_sync_port_id_from_iface)
+
+        self._lldp_system_name = QLineEdit(_client_host)
+        self._lldp_system_name.setToolTip(
+            "LLDP System Name TLV — displayed by neighbor switches "
+            "as the remote system name. Defaults to the client "
+            "hostname; override for lab identity strings."
+        )
         self._lldp_system_description = QLineEdit("Netgen L2 emulator")
         self._lldp_ttl = QSpinBox()
         self._lldp_ttl.setRange(0, 65535)
@@ -411,7 +463,25 @@ class _L2ConfigDialog(QDialog):
         self._lldp_interval.setRange(1.0, 3600.0)
         self._lldp_interval.setValue(30.0)
         self._lldp_interval.setSuffix(" s")
-        self._lldp_src_mac = QLineEdit("00:11:22:33:44:02")
+
+        # v0.5.268 (L2-B5): default Source MAC to blank so the
+        # server derives it from the interface's own MAC. The
+        # pre-fix hardcoded `00:11:22:33:44:02` was a
+        # documentation MAC — two netgen boxes on the same L2
+        # domain both emitted LLDP with it, causing MAC-flap
+        # alarms on the neighbor switch. Same fix pattern the
+        # v0.5.252 audit applied to the VRRP dialog's Source MAC
+        # (RFC 5798 auto-derive).
+        self._lldp_src_mac = QLineEdit("")
+        self._lldp_src_mac.setPlaceholderText(
+            "leave blank to auto-derive from interface MAC"
+        )
+        self._lldp_src_mac.setToolTip(
+            "Ethernet source MAC. Leave blank to use the interface's "
+            "own hardware address (recommended — prevents MAC-flap "
+            "alarms on switches when multiple netgen boxes share "
+            "an L2 domain)."
+        )
 
         f.addRow("Chassis ID:", self._lldp_chassis_id)
         f.addRow("Port ID:", self._lldp_port_id)
@@ -771,10 +841,17 @@ class _L2ConfigDialog(QDialog):
             })
         elif proto == "lldp":
             src_mac = self._lldp_src_mac.text().strip()
-            err = _validate_mac(src_mac)
-            if err:
-                _reject(f"Source MAC: {err}")
-                return
+            # v0.5.268 (L2-B5): blank Source MAC means "server
+            # derives from interface MAC" — same pattern the
+            # v0.5.252 audit applied to the VRRP dialog. Only
+            # run _validate_mac when the operator actually typed
+            # a MAC. The server's `start_lldp` handler treats
+            # missing/empty src_mac as auto-derive.
+            if src_mac:
+                err = _validate_mac(src_mac)
+                if err:
+                    _reject(f"Source MAC: {err}")
+                    return
             body.update({
                 "chassis_id": self._lldp_chassis_id.text().strip(),
                 "port_id": self._lldp_port_id.text().strip(),
@@ -1768,9 +1845,41 @@ class L2EmulationTab(QWidget):
         return n.startswith(("vrf-", "docker", "br-", "veth", "virbr", "tap", "tun"))
 
     def _guess_default_iface(self) -> str:
-        """Pick a sane default EGRESS interface for the dialog: the first
-        non-loopback, non-virtual interface from the first online server's
-        cached list. Falls back to eth0 if none is cached."""
+        """Pick a sane default EGRESS interface for the dialog.
+
+        v0.5.268 (L2-B1): prefer the interface the operator has
+        currently selected in the TG ID/Interface tree on the
+        Streams tab. Pre-fix `_guess_default_iface` always picked
+        the first non-loopback iface from the server's cached
+        list, silently overriding whatever the operator had
+        clicked in the tree. If they didn't notice, LLDP (or
+        LACP / VRRP / BFD / …) egressed the wrong port.
+
+        Fallback chain:
+        1. Currently-selected leaf item in `server_tree` whose
+           text is an interface name (not a "TG N" group row).
+        2. First non-loopback, non-virtual interface from the
+           first online server's cached list.
+        3. "eth0" as a last-resort literal.
+        """
+        # 1. TG-tab selection.
+        try:
+            mw = self._parent_window
+            tree = getattr(mw, "server_tree", None)
+            if tree is not None:
+                for item in (tree.selectedItems() or []):
+                    for col in (0, 1):
+                        _txt = (item.text(col) or "").strip()
+                        # Skip group rows like "TG 0", empty rows, and
+                        # server-address rows like "http://...:5050".
+                        if (_txt
+                                and not _txt.startswith(("TG ", "tg "))
+                                and "://" not in _txt
+                                and not self._skip_as_default_iface(_txt)):
+                            return _txt
+        except Exception:
+            pass
+        # 2. First cached interface.
         try:
             mw = self._parent_window
             servers = getattr(mw, "server_interfaces", []) or []
