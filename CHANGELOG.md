@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.263] - 2026-09-04
+
+**VXLAN deferred fixes — 5 correctness fixes in `utils/vxlan.py`.**
+
+Closes the 5 findings deferred from v0.5.259 (VXLAN-4/6/8/10/11).
+
+- **VXLAN-4: veth `.10/24` collision on host-net FRR containers.**
+  Pre-fix every device's veth got the hardcoded suffix `.10` in
+  the loopback subnet. On fabrics where multiple devices share
+  the loopback pool (common: 192.255.0.0/24), only the FIRST
+  device's `ip addr add` succeeded — every subsequent one hit
+  "File exists" (silently swallowed) → subsequent devices' L2
+  VNIs had no ARP entries → no Type-2 routes generated. Fix:
+  derive the suffix from an md5 hash of device_id, mapped into
+  `[11, 250]`.
+
+- **VXLAN-6: multi-peer VXLAN was single-peer.** Pre-fix only
+  `remote_peers[0]` was programmed as the VXLAN link's `remote`
+  attribute; every subsequent peer was silently dropped. In a
+  3+ VTEP fabric BUM traffic reached only peer[0]; MAC learning
+  + Type-2 route generation on the rest was blackhole. Fix: for
+  every additional peer, add a `bridge fdb append
+  00:00:00:00:00:00 dev <vxlan> dst <peer>` entry — RFC 7348
+  §4.2 head-end / ingress-replication.
+
+- **VXLAN-8: `startswith(('192.', '10.', '172.'))` VTEP allowlist
+  rejected legitimate deployments.** 9 sites. Rejected: CGNAT
+  (100.64/10), public unicast VTEPs, link-local (169.254/16).
+  Accepted: `172.0.0.0/8` non-RFC1918. New
+  `_is_plausible_vtep_ip(candidate, local_ip)` helper rejects
+  only the truly-invalid cases (empty, `0.0.0.0`, loopback,
+  multicast, unspecified, or the local VTEP itself) via
+  `ipaddress.ip_address()` classification. All 9 sites converted.
+
+- **VXLAN-10: IPv6 EVPN Type-2 routes silently ignored.** Every
+  Type-2 parser hardcoded `[32]` prefix length; IPv6 uses `[128]`
+  and colon-separated addresses. Dual-stack overlays half-worked
+  (IPv4 FDB populated, IPv6 hosts invisible). Fix: pre-compiled
+  regex accepts BOTH `[32]` and `[128]` prefix lengths + a
+  capture group that matches either IPv4 dotted-quad or IPv6
+  colon form. Applied at the primary Type-2 MAC-lookup site;
+  the Type-3 sites (VTEP announcement, always underlay-length)
+  intentionally left as-is.
+
+- **VXLAN-11: `veth{vni}` pair leaked in host-level teardown.**
+  Because the FRR container runs `--net=host`, the veths live
+  in the root namespace and outlive container deletion.
+  Pre-fix, every apply→teardown→re-apply cycle leaked one
+  `veth{vni}` pair — the `ip link` name space eventually
+  exhausted, AND the veth's IP address (see VXLAN-4) stayed
+  reserved so re-apply's `ip addr add` failed silently. Fix:
+  teardown now also deletes `veth{vni}` and `veth{vni}-peer`
+  from the host root ns.
+
+Regression tests in `tests/test_v05263_vxlan_deferred.py` (16
+tests), all pass. No regressions in the 30-test VXLAN-adjacent
+sweep.
+
 ## [0.5.262] - 2026-09-04
 
 **ARP deferred fixes — 6 correctness fixes.**

@@ -14,6 +14,42 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _is_plausible_vtep_ip(candidate: Optional[str],
+                          *, local_ip: Optional[str] = None) -> bool:
+    """v0.5.263 (audit VXLAN-8): return True iff ``candidate`` is a
+    plausible remote VTEP IP.
+
+    Pre-fix the sibling check at 9 call sites was
+    ``candidate.startswith(('192.', '10.', '172.'))`` — an accidental
+    allowlist that (a) REJECTED legitimate deployments: CGNAT
+    (100.64.0.0/10), public unicast VTEPs, link-local (169.254/16);
+    and (b) ACCEPTED `172.0.0.0/8` and `172.32.0.0`+ which aren't
+    RFC 1918. Any operator on those address ranges silently fell
+    back to `remote_ip` for FDB and the tunnel pointed at the wrong
+    VTEP.
+
+    Instead: reject only the truly-invalid cases — empty, `0.0.0.0`,
+    loopback (127/8), IPv6 loopback (::1), all-nodes/multicast, and
+    the LOCAL VTEP (the box we're on). Everything else is a
+    plausible remote.
+    """
+    if not candidate:
+        return False
+    s = str(candidate).strip()
+    if not s or s in ("0.0.0.0", "::", "::0"):
+        return False
+    if local_ip and s == str(local_ip).strip():
+        return False
+    try:
+        ip = ipaddress.ip_address(s)
+    except (ValueError, TypeError):
+        return False
+    # Explicitly bad address classes.
+    if ip.is_loopback or ip.is_multicast or ip.is_unspecified:
+        return False
+    return True
+
+
 def normalize_config(raw_config: Any) -> Dict[str, Any]:
     """Return a normalized VXLAN configuration dictionary."""
     if not raw_config:
@@ -589,7 +625,27 @@ def tear_down_vxlan_interface(
                 host_cleanup_success = True
         except Exception as bridge_exc:
             logger.debug("[VXLAN CLEANUP] Failed to remove host bridge %s: %s", bridge_name, bridge_exc)
-    
+
+    # v0.5.263 (audit VXLAN-11): also delete the veth{vni} pair
+    # that primary VXLAN setup created (utils/vxlan.py around
+    # line 1043). Because the FRR container runs `--net=host`,
+    # those veths live in the root namespace and outlive
+    # container deletion. Pre-fix, every apply→teardown→re-apply
+    # cycle leaked one veth{vni} pair — the `ip link` name
+    # space eventually exhausted AND the veth's IP address
+    # (see VXLAN-4) stayed reserved so re-apply's `ip addr add`
+    # failed with "File exists" (silently swallowed).
+    if vni:
+        for _veth in (f"veth{vni}", f"veth{vni}-peer"):
+            try:
+                if _interface_exists(_veth):
+                    _run(["ip", "link", "set", _veth, "down"])
+                    _run(["ip", "link", "del", _veth])
+                    logger.info("[VXLAN CLEANUP] Removed host veth %s", _veth)
+                    host_cleanup_success = True
+            except Exception as veth_exc:
+                logger.debug("[VXLAN CLEANUP] Failed to remove host veth %s: %s", _veth, veth_exc)
+
     return host_cleanup_success
 
 
@@ -865,7 +921,38 @@ def _ensure_vxlan_in_container_iproute(
                 raise
     # Bring up
     _container_ip(frr_manager, container_name, ["ip", "link", "set", iface, "up"])
-    
+
+    # v0.5.263 (audit VXLAN-6): head-end / ingress-replication BUM
+    # (RFC 7348 §4.2) needs one FDB entry per remote VTEP:
+    #   bridge fdb append 00:00:00:00:00:00 dev <vxlan> dst <peer>
+    # Pre-fix only remote_peers[0] was programmed as the VXLAN
+    # link's `remote` attribute — every other peer was silently
+    # dropped. In a 3+ VTEP fabric BUM traffic reached only the
+    # first peer; MAC learning + Type-2 route generation on the
+    # rest was blackhole.
+    _all_peers = list((vxlan_config or {}).get("remote_peers") or [])
+    _extra_peers = [p for p in _all_peers if p and p != remote_ip]
+    if _extra_peers and not use_multicast:
+        for _peer in _extra_peers:
+            try:
+                _container_ip(frr_manager, container_name, [
+                    "bridge", "fdb", "append",
+                    "00:00:00:00:00:00",
+                    "dev", iface,
+                    "dst", str(_peer),
+                ])
+                logger.info(
+                    "[VXLAN] head-end FDB entry: %s → %s (VNI %s)",
+                    iface, _peer, vni,
+                )
+            except Exception as _fdb_exc:
+                if "File exists" not in str(_fdb_exc):
+                    logger.warning(
+                        "[VXLAN] failed to add FDB entry for peer %s "
+                        "on %s (VNI %s): %s",
+                        _peer, iface, vni, _fdb_exc,
+                    )
+
     # Get VLAN ID from config if provided (for VLAN-aware mode)
     vlan_id = None
     if vxlan_config:
@@ -1056,15 +1143,27 @@ def _ensure_vxlan_in_container_iproute(
                 _container_ip(frr_manager, container_name, ["ip", "link", "set", veth_name, "up"])
                 _container_ip(frr_manager, container_name, ["ip", "link", "set", veth_peer, "up"])
                 
-                # Add IP address to veth interface to trigger MAC learning and route generation
-                # Use .10 as suffix (e.g., 192.255.0.10/24) to match the bridge subnet
-                # This helps generate ARP entries and Type-2 routes
+                # Add IP address to veth interface to trigger MAC learning and route generation.
+                # v0.5.263 (audit VXLAN-4): derive the last-octet
+                # from a stable hash of device_id so multiple
+                # devices with loopbacks in the same /24 (common in
+                # fabric loopback pools like 192.255.0.0/24) don't
+                # all collide on `<net>.10/24`. Pre-fix, only the
+                # first device's veth got the IP; every subsequent
+                # `ip addr add` failed with "File exists" (silently
+                # swallowed) → subsequent devices' L2 VNIs had no
+                # ARP entries → no Type-2 routes generated. Use a
+                # deterministic per-device suffix in [11, 250] to
+                # stay well clear of common .1 (gateway) and .10
+                # (legacy behavior for backward-compat when only one
+                # device is in the subnet).
                 try:
-                    # Derive veth IP from local_ip (VTEP IP) - use .10 as suffix
-                    # e.g., if local_ip is 192.255.0.1, use 192.255.0.10/24
-                    veth_ip = f"{local_ip.rsplit('.', 1)[0]}.10/24"
+                    import hashlib as _hashlib
+                    _digest = int(_hashlib.md5(str(device_id).encode()).hexdigest()[:8], 16)
+                    _suffix = 11 + (_digest % 240)  # [11, 250]
+                    veth_ip = f"{local_ip.rsplit('.', 1)[0]}.{_suffix}/24"
                     _container_ip(frr_manager, container_name, ["ip", "addr", "add", veth_ip, "dev", veth_name])
-                    logger.debug("[VXLAN] Added IP address %s to veth interface %s", veth_ip, veth_name)
+                    logger.debug("[VXLAN] Added IP address %s to veth interface %s (device=%s)", veth_ip, veth_name, device_id)
                 except Exception as veth_ip_exc:
                     if "File exists" not in str(veth_ip_exc):
                         logger.debug("[VXLAN] Could not add IP address to veth interface (non-critical): %s", veth_ip_exc)
@@ -1695,7 +1794,7 @@ def _ensure_vxlan_in_container_iproute(
                             from_match = re.search(r'from\s+(\d+\.\d+\.\d+\.\d+)', line, re.IGNORECASE)
                             if from_match:
                                 candidate_next_hop = from_match.group(1)
-                                if candidate_next_hop != local_ip and candidate_next_hop != '0.0.0.0' and candidate_next_hop.startswith(('192.', '10.', '172.')):
+                                if _is_plausible_vtep_ip(candidate_next_hop, local_ip=local_ip):
                                     bgp_next_hop = candidate_next_hop
                                     actual_vtep_ip = bgp_next_hop
                                     logger.info("[VXLAN] Using BGP next-hop %s as remote VTEP IP from Type-2 route", actual_vtep_ip)
@@ -1711,7 +1810,7 @@ def _ensure_vxlan_in_container_iproute(
                                     candidate_next_hop = ip_match.group(1)
                                     if (candidate_next_hop != local_ip and 
                                         candidate_next_hop != remote_ip and
-                                        candidate_next_hop.startswith(('192.', '10.', '172.'))):
+                                        _is_plausible_vtep_ip(candidate_next_hop, local_ip=local_ip)):
                                         if candidate_next_hop != '0.0.0.0':
                                             bgp_next_hop = candidate_next_hop
                                             actual_vtep_ip = bgp_next_hop
@@ -1735,7 +1834,7 @@ def _ensure_vxlan_in_container_iproute(
                                 candidate_next_hop = from_match.group(1)
                                 if (candidate_next_hop != local_ip and 
                                     candidate_next_hop != remote_ip and
-                                    candidate_next_hop.startswith(('192.', '10.', '172.'))):
+                                    _is_plausible_vtep_ip(candidate_next_hop, local_ip=local_ip)):
                                     if candidate_next_hop != '0.0.0.0':
                                         bgp_next_hop = candidate_next_hop
                                         actual_vtep_ip = bgp_next_hop
@@ -1782,7 +1881,7 @@ def _ensure_vxlan_in_container_iproute(
                                     # OrigIP is the actual VTEP IP
                                     if (orig_ip != local_ip and 
                                         orig_ip != '0.0.0.0' and
-                                        orig_ip.startswith(('192.', '10.', '172.'))):
+                                        _is_plausible_vtep_ip(orig_ip, local_ip=local_ip)):
                                         actual_vtep_ip = orig_ip
                                         logger.info("[VXLAN] Found actual VTEP IP %s from Type-3 route OrigIP (VNI=%s, EthTag=%s)", actual_vtep_ip, vni, eth_tag)
                                         
@@ -1809,7 +1908,7 @@ def _ensure_vxlan_in_container_iproute(
                                             # OrigIP is the actual VTEP IP
                                             if (orig_ip != local_ip and 
                                                 orig_ip != '0.0.0.0' and
-                                                orig_ip.startswith(('192.', '10.', '172.'))):
+                                                _is_plausible_vtep_ip(orig_ip, local_ip=local_ip)):
                                                 actual_vtep_ip = orig_ip
                                                 logger.info("[VXLAN] Found actual VTEP IP %s from Type-3 route OrigIP (fallback parsing)", actual_vtep_ip)
                                                 
@@ -1829,7 +1928,7 @@ def _ensure_vxlan_in_container_iproute(
                                         candidate_next_hop = parts[j+1]
                                         if (candidate_next_hop != local_ip and 
                                             candidate_next_hop != '0.0.0.0' and
-                                            candidate_next_hop.startswith(('192.', '10.', '172.'))):
+                                            _is_plausible_vtep_ip(candidate_next_hop, local_ip=local_ip)):
                                             bgp_next_hop = candidate_next_hop
                                             # Only use BGP next-hop as fallback if OrigIP not found
                                             if actual_vtep_ip == remote_ip or actual_vtep_ip is None:
@@ -2132,7 +2231,7 @@ def _ensure_vxlan_in_container_iproute(
                                         if str(eth_tag) != str(vni):
                                             logger.debug("[VXLAN] Type-3 route EthTag %s doesn't match VNI %s, skipping", eth_tag, vni)
                                             continue
-                                        if orig_ip != local_ip and orig_ip != '0.0.0.0' and orig_ip.startswith(('192.', '10.', '172.')):
+                                        if _is_plausible_vtep_ip(orig_ip, local_ip=local_ip):
                                             fdb_dst_ip = orig_ip
                                             actual_vtep_ip = orig_ip
                                             logger.info("[VXLAN] Extracted actual VTEP IP %s from Type-3 route OrigIP for FDB (VNI=%s)", fdb_dst_ip, vni)
@@ -2439,11 +2538,25 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
         # Format: [2]:[EthTag]:[48]:[MAC]:[32]:[IP]
         # Example: [2]:[5000]:[48]:[24:5d:92:a7:65:06]:[32]:[10.0.0.101]
         import re
+        # v0.5.263 (audit VXLAN-10): accept BOTH `[32]` (IPv4) and
+        # `[128]` (IPv6) prefix lengths and match either an IPv4
+        # dotted-quad or an IPv6 colon-separated address in the
+        # capture group. Pre-fix, every Type-2 parser hardcoded
+        # `[32]` — an IPv6 EVPN overlay's Type-2 routes were
+        # silently ignored, so dual-stack overlays half-worked
+        # (FDB populated for IPv4 hosts, no entries for IPv6 hosts).
+        _EVPN_T2_RE = re.compile(
+            r'\[2\]:\[(\d+)\]:\[48\]:\[([0-9a-fA-F:]+)\]:'
+            r'\[(?:32|128)\]:\[([0-9a-fA-F:.]+)\]'
+        )
+        _EVPN_T2_FALLBACK_RE = re.compile(
+            r'\[48\]:\[([0-9a-fA-F:]+)\]:\[(?:32|128)\]:\[([0-9a-fA-F:.]+)\]'
+        )
         for line in evpn_output.split('\n'):
             if remote_svi_ip in line and '[2]:' in line:
-                # Match Type-2 route with IP: [2]:[EthTag]:[48]:[MAC]:[32]:[IP]
-                # Extract MAC and IP from route string
-                match = re.search(r'\[2\]:\[(\d+)\]:\[48\]:\[([0-9a-fA-F:]+)\]:\[32\]:\[([0-9.]+)\]', line)
+                # Match Type-2 route with IP: [2]:[EthTag]:[48]:[MAC]:[32|128]:[IP]
+                # Extract MAC and IP from route string.
+                match = _EVPN_T2_RE.search(line)
                 if match:
                     eth_tag = match.group(1)
                     mac_str = match.group(2)
@@ -2461,12 +2574,12 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                             continue
                 else:
                     # Fallback: try to extract MAC from route parts manually
-                    # Format: [2]:[5000]:[48]:[24:5d:92:a7:65:06]:[32]:[10.0.0.101]
+                    # Format: [2]:[5000]:[48]:[24:5d:92:a7:65:06]:[32|128]:[<ip>]
                     parts = line.split()
                     for part in parts:
                         if '[2]:' in part and remote_svi_ip in part:
                             # Extract MAC from route string
-                            route_match = re.search(r'\[48\]:\[([0-9a-fA-F:]+)\]:\[32\]:\[([0-9.]+)\]', part)
+                            route_match = _EVPN_T2_FALLBACK_RE.search(part)
                             if route_match:
                                 mac_str = route_match.group(1)
                                 ip_str = route_match.group(2)
@@ -2578,7 +2691,7 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                                 if str(vni) == route_vni:
                                     # Get local IP to compare
                                     local_ip = config.get("local_ip", "")
-                                    if orig_ip != local_ip and orig_ip != '0.0.0.0' and orig_ip.startswith(('192.', '10.', '172.')):
+                                    if _is_plausible_vtep_ip(orig_ip, local_ip=local_ip):
                                         actual_vtep_ip = orig_ip
                                         logger.info("[VXLAN ARP/FDB] Using actual VTEP IP %s from Type-3 route OrigIP for FDB (VNI %s)", actual_vtep_ip, route_vni)
                                         break
@@ -2845,7 +2958,7 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                             if str(eth_tag) != str(vni):
                                 continue
                             local_ip = config.get("local_ip", "")
-                            if orig_ip != local_ip and orig_ip != '0.0.0.0' and orig_ip.startswith(('192.', '10.', '172.')):
+                            if _is_plausible_vtep_ip(orig_ip, local_ip=local_ip):
                                 actual_vtep_ip = orig_ip
                                 logger.info("[VXLAN ARP/FDB] Extracted VTEP IP %s from Type-3 route OrigIP (VNI=%s)", actual_vtep_ip, vni)
                                 break
