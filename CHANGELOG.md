@@ -2,6 +2,100 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.259] - 2026-09-04
+
+**VXLAN audit — 7 correctness fixes in `utils/vxlan.py`.**
+
+Follow-up on a long-untouched subsystem. Audit found 12
+findings (`utils/vxlan.py` is control-plane / kernel-interface
+lifecycle only — no packet-encap bugs to hunt; wire-format
+details are the Linux VXLAN driver's responsibility). 7 fixed
+here, 5 deferred (F4 veth IP collision, F6 multi-peer FDB
+loop, F8 VTEP allowlist, F10 IPv6 EVPN, F11 host cleanup
+veth leak — all substantial refactors that need lab
+verification before shipping).
+
+**HIGH severity — wire-affecting misconfiguration:**
+
+- **VXLAN-1: bridge MAC dropped top 8 bits of 24-bit VNI →
+  collisions.** Pre-fix `aa:bb:cc:00:{(vni>>8)&0xff}:{vni&0xff}`
+  encoded only bits 0-15 of a 24-bit VNI. VNI 5000 (0x001388)
+  and VNI 70536 (0x011388) both produced `aa:bb:cc:00:13:88`
+  — two bridges same MAC on the same host causes STP + remote-
+  VTEP learning chaos. Fix: `aa:bb:{high}:{mid}:{low}:01`
+  covers the full 24-bit space.
+
+- **VXLAN-2: VLAN SVI MAC arithmetic overflowed a byte →
+  malformed MAC.** `(vni & 0xff) + (vlan_id & 0xff)` for the
+  last octet — for VNI 5000 (low=0x88) + VLAN 200 (0xC8) that
+  is 0x150, which the `:02x` formatter emitted as 3 hex digits,
+  producing `aa:bb:cc:00:13:150` — invalid. `ip link set addr`
+  failed, "non-critical" swallow left the VLAN subinterface
+  with an arbitrary MAC. Fix: XOR instead of add.
+
+- **VXLAN-3: bridge SVI IP octet overflowed for VNI ≥ 156 →
+  invalid IPv4.** `f"10.0.{vni // 256}.{100 + (vni % 256)}/24"`
+  produced `10.0.0.256/24` (VNI 156), `10.0.19.336/24`
+  (VNI 5100). `ip addr add` rejected → SVI never came up →
+  L2 VNI never advertised Type-2 routes → silent EVPN
+  blackhole. Applied at 3 sites. Fix: bijective 24-bit VNI
+  spread across the /8 slot.
+
+- **VXLAN-9: hardcoded `192.168.0.1` in FDB cleanup deleted
+  legitimate entries.** A specific dev-lab IP leaked into
+  production code. Any customer whose remote VTEP was
+  legitimately `192.168.0.1` had their real FDB entry
+  deleted + rewritten every apply — flapping the data
+  path. Fix: delete the hardcoded string.
+
+- **VXLAN-12: substring match on BGP neighbor IP picked the
+  wrong VTEP MAC.** Plain `bgp_neighbor_ip in line` — BGP
+  neighbor `10.0.0.1` also matched lines for `10.0.0.10`,
+  `10.0.0.100`, `10.0.0.11`. The first matching line's MAC
+  was installed as the PERMANENT static ARP for the remote
+  VTEP → wrong destination MAC on every outer VXLAN frame
+  → underlay drops. Fix: word-boundary regex.
+
+**MEDIUM severity:**
+
+- **VXLAN-5: self-referencing assignment → UnboundLocalError
+  swallowed by outer except.** Copy-pasted at 3 sites:
+  `evpn_vni_output = ... if isinstance(...) else str(evpn_vni_output)`
+  — the `else` branch called `str()` on the very name being
+  assigned. Python marks the name local for the whole scope
+  so this raised on the fallback path (non-bytes .output);
+  the defensive-decode branch was dead. Fix:
+  `str(evpn_vni_result.output)` in the else branch (line 1299
+  already had this correct; 1814/2123/2537 didn't).
+
+- **VXLAN-7: multicast group `239.0.0.{vni % 255}` — collisions
+  + can produce network address.** `%255` (not %256) mapped
+  VNI 0/255/510 → `239.0.0.0` (network address, unusable).
+  Cross-VNI BUM flood collisions every 255 VNIs. Fix: full
+  24-bit VNI across the /8; avoid `.0` / `.255`. New helper
+  `_vxlan_default_mcast_group(vni)` is the single source of
+  truth used at both call sites.
+
+**Deferred (need lab verification):**
+
+- **VXLAN-4**: veth `.10/24` collision on host-net FRR
+  containers when fabric loopbacks share a subnet — needs
+  per-device host-suffix derivation.
+- **VXLAN-6**: multi-peer VXLAN only programs `remote_peers[0]`
+  as VTEP + FDB. For head-end replication (RFC 7348 §4.2) we
+  need `bridge fdb append 00:00:00:00:00:00 dev <vxlan> dst
+  <peer>` for each peer. Needs lab-verified refactor.
+- **VXLAN-8**: `startswith(('192.', '10.', '172.'))` VTEP-IP
+  allowlist rejects CGNAT (100.64/10) + public unicast + link-
+  local while accepting `172.0.0.0/8` non-RFC1918. 9 sites.
+- **VXLAN-10**: IPv6 EVPN Type-2 routes silently ignored —
+  every parser hardcodes `[32]` prefix length.
+- **VXLAN-11**: `veth{vni}` pair leaks on teardown — cleanup
+  removes the bridge but not the sibling veth.
+
+Regression tests in `tests/test_v05259_vxlan_audit.py` (10
+tests), all pass.
+
 ## [0.5.258] - 2026-09-04
 
 **ARP subsystem audit — 5 correctness fixes across

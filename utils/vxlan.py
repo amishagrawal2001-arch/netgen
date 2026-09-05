@@ -746,13 +746,28 @@ def _ensure_vxlan_in_container_iproute(
             cfg_multicast_group = vxlan_config.get("multicast_group") or vxlan_config.get("vxlan_multicast_group")
         # Default behavior: use unicast VXLAN when remote peers are provided (ingress replication).
         # Only fall back to multicast when explicitly requested or when no peers exist (legacy behavior).
+        # v0.5.259 (audit VXLAN-7): pre-fix used `239.0.0.{vni % 255}`
+        # (a) `%255` (not %256) mapped VNI 0/255/510 → `239.0.0.0`,
+        # the network address — unusable as a multicast group; and
+        # (b) cross-VNI collisions every 255 VNIs floods BUM
+        # traffic between unrelated tenants (peers filter by VNI
+        # but the CPU cost is real). Use the full 24-bit VNI across
+        # the /8 slot and avoid `.0` / `.255`.
+        def _vxlan_default_mcast_group(_v: int) -> str:
+            low = _v & 0xff
+            if low == 0:
+                low = 1
+            elif low == 255:
+                low = 254
+            return f"239.{(_v >> 16) & 0xff}.{(_v >> 8) & 0xff}.{low}"
+
         use_multicast = bool(cfg_multicast_group)
         if not cfg_remote_peers and not use_multicast:
-            cfg_multicast_group = f"239.0.0.{vni % 255}"
+            cfg_multicast_group = _vxlan_default_mcast_group(vni)
             use_multicast = True
-        
+
         if use_multicast:
-            multicast_group = cfg_multicast_group or f"239.0.0.{vni % 255}"
+            multicast_group = cfg_multicast_group or _vxlan_default_mcast_group(vni)
             base_cmd = [
                 "ip", "link", "add", iface, "type", "vxlan",
                 "id", str(vni),
@@ -986,10 +1001,15 @@ def _ensure_vxlan_in_container_iproute(
                     logger.warning("[VXLAN] Failed to configure VLAN-aware mode on bridge %s: %s", bridge_name, vlan_exc)
             
             # Set bridge MAC address (consistent MAC for stability)
-            # Format: aa:bb:cc:00:{vni_high_byte}:{vni_low_byte}
-            # For VNI 5000: aa:bb:cc:00:13:88 (5000 = 0x1388)
+            # v0.5.259 (audit VXLAN-1): encode all 24 bits of the VNI
+            # into the MAC. Pre-fix `aa:bb:cc:00:{(vni>>8)&0xff}:{vni&0xff}`
+            # dropped the top byte, so VNI 5000 (0x001388) and VNI
+            # 70536 (0x011388) both produced `aa:bb:cc:00:13:88` —
+            # two bridges with the same MAC on the same host cause
+            # STP + remote-VTEP learning chaos. Now: aa:bb:{high}:{mid}
+            # :{low}:01 uses the full 24-bit space.
             try:
-                bridge_mac = f"aa:bb:cc:00:{(vni >> 8) & 0xff:02x}:{vni & 0xff:02x}"
+                bridge_mac = f"aa:bb:{(vni >> 16) & 0xff:02x}:{(vni >> 8) & 0xff:02x}:{vni & 0xff:02x}:01"
                 _container_ip(frr_manager, container_name, ["ip", "link", "set", bridge_name, "addr", bridge_mac])
                 logger.debug("[VXLAN] Set bridge MAC address %s for %s", bridge_mac, bridge_name)
             except Exception as mac_exc:
@@ -1153,15 +1173,30 @@ def _ensure_vxlan_in_container_iproute(
                     if local_ip_obj in ipaddress.IPv4Network("192.255.0.0/16") or \
                        local_ip_obj in ipaddress.IPv4Network("192.168.0.0/16"):
                         # Use 10.0.0.0/24 for bridge SVI (different subnet)
-                        svi_ip_str = f"10.0.{vni // 256}.{100 + (vni % 256)}/24"
+                        # v0.5.259 (audit VXLAN-3): `100 + (vni % 256)` overflows the 0-255
+                        # byte range for vni % 256 >= 156, producing invalid IPs like
+                        # `10.0.0.256/24` (VNI 156) or `10.0.19.336/24` (VNI 5100).
+                        # `ip addr add` rejected these silently → SVI never came up
+                        # → EVPN Type-2 routes never advertised (silent blackhole).
+                        # Bijective mapping: full 24-bit VNI spread across the /8.
+                        svi_ip_str = f"10.{(vni >> 16) & 0xff}.{(vni >> 8) & 0xff}.{vni & 0xff}/24"
                     else:
                         # For other ranges, use a derived subnet
                         # Use 10.0.0.0/24 as base, vary based on VNI
-                        svi_ip_str = f"10.0.{vni // 256}.{100 + (vni % 256)}/24"
+                        # v0.5.259 (audit VXLAN-3): `100 + (vni % 256)` overflows the 0-255
+                        # byte range for vni % 256 >= 156, producing invalid IPs like
+                        # `10.0.0.256/24` (VNI 156) or `10.0.19.336/24` (VNI 5100).
+                        # `ip addr add` rejected these silently → SVI never came up
+                        # → EVPN Type-2 routes never advertised (silent blackhole).
+                        # Bijective mapping: full 24-bit VNI spread across the /8.
+                        svi_ip_str = f"10.{(vni >> 16) & 0xff}.{(vni >> 8) & 0xff}.{vni & 0xff}/24"
                     logger.info("[VXLAN] Using default bridge SVI subnet (separate from VTEP): %s", svi_ip_str)
                 except Exception:
-                    # Fallback: use a default subnet different from common loopback ranges
-                    svi_ip_str = f"10.0.{vni // 256}.{100 + (vni % 256)}/24"
+                    # Fallback: use a default subnet different from common loopback ranges.
+                    # v0.5.259 (audit VXLAN-3): use the bijective 24-bit
+                    # mapping here too so the exception path doesn't
+                    # regress to the overflow-prone `100 + (vni%256)`.
+                    svi_ip_str = f"10.{(vni >> 16) & 0xff}.{(vni >> 8) & 0xff}.{vni & 0xff}/24"
                     logger.info("[VXLAN] Using fallback bridge SVI IP: %s", svi_ip_str)
             
             # For VLAN-aware bridges, create a VLAN subinterface as the SVI (per FRR EVPN documentation)
@@ -1183,8 +1218,17 @@ def _ensure_vxlan_in_container_iproute(
                     
                     # Set unique MAC address for VLAN subinterface (per FRR docs recommendation)
                     try:
-                        # Use bridge MAC with VLAN ID in last octet for uniqueness
-                        vlan_svi_mac = f"aa:bb:cc:00:{(vni >> 8) & 0xff:02x}:{(vni & 0xff) + (vlan_id & 0xff):02x}"
+                        # Use bridge MAC with VLAN ID in last octet for uniqueness.
+                        # v0.5.259 (audit VXLAN-2): pre-fix used
+                        # `(vni & 0xff) + (vlan_id & 0xff)` for the last octet,
+                        # which overflows to 3+ hex digits for values > 255
+                        # (e.g. VNI 5000 low=0x88 + VLAN 200 = 0x150 → invalid
+                        # `aa:bb:cc:00:13:150`). `ip link set addr` failed and
+                        # the "non-critical" swallow below left the interface
+                        # with an arbitrary MAC. XOR keeps the last octet
+                        # inside the byte range while still varying with both
+                        # VNI and VLAN.
+                        vlan_svi_mac = f"aa:bb:cc:00:{(vni >> 8) & 0xff:02x}:{((vni & 0xff) ^ (vlan_id & 0xff)) & 0xff:02x}"
                         _container_ip(frr_manager, container_name, ["ip", "link", "set", vlan_svi_name, "addr", vlan_svi_mac])
                         logger.debug("[VXLAN] Set VLAN subinterface MAC address %s", vlan_svi_mac)
                     except Exception as mac_exc:
@@ -1811,7 +1855,7 @@ def _ensure_vxlan_in_container_iproute(
             try:
                 container = frr_manager.client.containers.get(container_name)
                 evpn_vni_result = container.exec_run(["vtysh", "-c", f"show evpn vni {vni} detail"])
-                evpn_vni_output = evpn_vni_result.output.decode("utf-8", errors="ignore") if isinstance(evpn_vni_result.output, bytes) else str(evpn_vni_output)
+                evpn_vni_output = evpn_vni_result.output.decode("utf-8", errors="ignore") if isinstance(evpn_vni_result.output, bytes) else str(evpn_vni_result.output)  # v0.5.259 (audit VXLAN-5): was `str(evpn_vni_output)` — self-reference → UnboundLocalError swallowed by outer except
                 
                 # Parse remote VTEPs from VNI details
                 # Format: "Remote VTEPs for this VNI:" followed by lines like "192.255.0.1 flood: -"
@@ -2120,7 +2164,7 @@ def _ensure_vxlan_in_container_iproute(
                         # Try to extract router ID from the route
                         # If that fails, try to get from EVPN VNI remote VTEPs
                         evpn_vni_result = container.exec_run(["vtysh", "-c", f"show evpn vni {vni} detail"])
-                        evpn_vni_output = evpn_vni_result.output.decode("utf-8", errors="ignore") if isinstance(evpn_vni_result.output, bytes) else str(evpn_vni_output)
+                        evpn_vni_output = evpn_vni_result.output.decode("utf-8", errors="ignore") if isinstance(evpn_vni_result.output, bytes) else str(evpn_vni_result.output)  # v0.5.259 (audit VXLAN-5): was `str(evpn_vni_output)` — self-reference → UnboundLocalError swallowed by outer except
                         
                         # Parse remote VTEPs from VNI details
                         # Format: "192.168.250.1 flood: HER" or "192.255.0.1 flood: -"
@@ -2169,7 +2213,18 @@ def _ensure_vxlan_in_container_iproute(
                                     break
                             
                             # If destination is wrong (BGP next-hop instead of actual VTEP, or 0.0.0.0), delete it
-                            if current_dst and current_dst != fdb_dst_ip and (current_dst == bgp_next_hop or current_dst == '192.168.0.1' or current_dst == '0.0.0.0'):
+                            # v0.5.259 (audit VXLAN-9): removed the
+                            # hardcoded '192.168.0.1' literal — a
+                            # specific dev-lab IP leaked into
+                            # production code. Any customer whose
+                            # legitimate remote VTEP was 192.168.0.1
+                            # had their real FDB entry deleted on
+                            # every apply, flapping the data path.
+                            # `current_dst != fdb_dst_ip` is
+                            # sufficient once the two intentional
+                            # sentinels (bgp_next_hop, 0.0.0.0) are
+                            # captured.
+                            if current_dst and current_dst != fdb_dst_ip and (current_dst == bgp_next_hop or current_dst == '0.0.0.0'):
                                 try:
                                     # Delete existing FDB entry
                                     del_cmd = ["bridge", "fdb", "del", remote_mac, "dev", vxlan_iface]
@@ -2534,7 +2589,7 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 if actual_vtep_ip == remote_ip:
                     try:
                         evpn_vni_result = container.exec_run(["vtysh", "-c", f"show evpn vni {vni} detail"])
-                        evpn_vni_output = evpn_vni_result.output.decode("utf-8", errors="ignore") if isinstance(evpn_vni_result.output, bytes) else str(evpn_vni_output)
+                        evpn_vni_output = evpn_vni_result.output.decode("utf-8", errors="ignore") if isinstance(evpn_vni_result.output, bytes) else str(evpn_vni_result.output)  # v0.5.259 (audit VXLAN-5): was `str(evpn_vni_output)` — self-reference → UnboundLocalError swallowed by outer except
                         import re
                         in_remote_vteps = False
                         for line in evpn_vni_output.split('\n'):
@@ -2712,9 +2767,22 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                                     neigh_result = container.exec_run(["ip", "neigh", "show", "dev", underlay_interface])
                                     neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
                                     
-                                    # Look for BGP neighbor IP or remote VTEP IP in ARP table
+                                    # Look for BGP neighbor IP or remote VTEP IP in ARP table.
+                                    # v0.5.259 (audit VXLAN-12): pre-fix used
+                                    # plain substring match, so BGP neighbor
+                                    # `10.0.0.1` also matched lines for
+                                    # `10.0.0.10`, `10.0.0.100`, `10.0.0.11`
+                                    # etc. The first ARP line that happened
+                                    # to contain the IP as a substring won,
+                                    # and its MAC was installed as the
+                                    # PERMANENT static ARP for the remote
+                                    # VTEP → wrong destination MAC on every
+                                    # outer VXLAN frame → underlay drops.
+                                    # Word-boundary regex fixes it.
+                                    _bgp_re = re.compile(rf'\b{re.escape(str(bgp_neighbor_ip))}\b')
+                                    _vtep_re = re.compile(rf'\b{re.escape(str(actual_vtep_ip))}\b')
                                     for line in neigh_output.split('\n'):
-                                        if bgp_neighbor_ip in line or actual_vtep_ip in line:
+                                        if _bgp_re.search(line) or _vtep_re.search(line):
                                             # Extract MAC address (format: "IP lladdr MAC ...")
                                             mac_match = re.search(r'lladdr\s+([0-9a-fA-F:]{17})', line)
                                             if mac_match:
