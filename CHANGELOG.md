@@ -2,6 +2,68 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.261] - 2026-09-04
+
+**RFC 2544 + latency deferred fixes — 4 correctness fixes.**
+
+Closes the 3 items deferred from v0.5.257 (RFC-5/6/9) and the
+1 from v0.5.260 (latency-8).
+
+- **RFC-5: mid-sleep cancel corrupts `last_good`.** Pre-fix, on
+  `stop_requested` firing mid-sleep the runner still called
+  `stream_tracker` `/stop`, read partial-window counters, and
+  fed them to `_decide_step` — which happily promoted `last_good`
+  to a value the DUT never actually sustained for the full trial.
+  A subsequent report row showed a bogus "max no-drop rate" for
+  a run the operator explicitly cancelled. Fix: track
+  `cancelled_mid_sleep` and skip `_decide_step` on that path;
+  set `diagnosis = "cancelled"` + break out of the search.
+  The per-frame-size row now reports the pre-iteration
+  `last_good` (the value that was actually verified before the
+  cancel).
+
+- **RFC-6: 500 ms flush window under-samples DPDK counters.**
+  Pre-fix a single `sleep(0.5)` between `/api/traffic/stop` and
+  `/api/streams/stats`. DPDK rx_worker + Scapy stream tracker
+  both poll at ~1 Hz, so 500 ms was often less than one
+  sample interval — an actually-clean trial could read
+  RX < TX (the last second not yet counted), get scored as
+  FAIL, halve `hi_pps` on a spurious loss, and skew the whole
+  binary search. Fix: poll every 250 ms and accept when TWO
+  consecutive samples' deltas are < 0.1%, capped at 3 s.
+
+- **RFC-9: fire-and-forget POST charges DPDK spin-up to
+  `duration_s`.** DPDK EAL init + queue setup takes 1-3 s
+  after `/api/traffic/start` returns; the runner then sleeps
+  `duration_s + 1.5`. `_decide_step`'s
+  `tx_pps_actual = tx / duration_s` used the nominal
+  duration — up to ~15% under-report at 10 s trials on slow
+  hosts, misfiring `tx_rate_limited` diagnoses on borderline
+  runs. Fix: measure the actual TX window with
+  `monotonic()` around the sleep and pass THAT to
+  `_decide_step`.
+
+- **latency-8: `enable_timestamps=True` silently ignored on
+  Scapy TX.** NLAT emission lives only in
+  `resources/dpdk/tx_worker/tx_worker.c`; the Scapy TX path
+  has never carried the header. Traffic templates set
+  `enable_timestamps=True` unconditionally when
+  `capture_latency` is requested — so any stream that fell
+  back to Scapy (explicit engine, DPDK compat rejected,
+  binary missing) got zero decoded latency samples with no
+  explanation. Fix: detect the mismatch in `start_traffic`'s
+  pre-flight and surface it via new response fields
+  `latency_capture_ignored: True` + human-readable
+  `latency_capture_reason` (mirrors the existing DPDK
+  fallback pattern the GUI already knows how to render as
+  a toast). Adding NLAT emission to Scapy TX left as
+  future work — the fast-path (DPDK) still does the right
+  thing; the fix here is that operators finally see WHY
+  the latency column stays empty on Scapy streams.
+
+Regression tests in `tests/test_v05261_rfc2544_latency_deferred.py`
+(12 tests), all pass.
+
 ## [0.5.260] - 2026-09-04
 
 **One-way latency sampler audit — 7 correctness fixes.**

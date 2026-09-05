@@ -2069,6 +2069,24 @@ def start_traffic():
             except Exception as _e:
                 logging.debug(f"[DPDK] pre-flight unavailable: {_e}")
 
+            # v0.5.261 (audit latency-8): NLAT timestamp emission is
+            # DPDK-only — `resources/dpdk/tx_worker/tx_worker.c`
+            # embeds the 16-byte NLAT header; the Scapy TX path does
+            # not. If the operator asked for `enable_timestamps=true`
+            # on a stream that ends up on Scapy (explicit engine
+            # choice, DPDK compat rejected, DPDK binary missing),
+            # the RX-side LatencySampler decodes zero NLAT frames
+            # and the latency column stays empty with no explanation.
+            # Surface the mismatch via a dedicated fallback reason so
+            # the GUI can render a "latency capture only works with
+            # DPDK" toast instead of leaving the operator to diff.
+            _ts_requested = bool(
+                stream_data.get("enable_timestamps")
+                or stream_data.get("latency_enabled")
+                or (stream_data.get("protocol_selection") or {}).get("enable_timestamps")
+            )
+            _latency_scapy_gap = _ts_requested and actual_engine != "dpdk"
+
             try:
                 result = launch_single_stream(stream_data, interface_name)
                 # Annotate the start response with the engine decision so
@@ -2081,6 +2099,21 @@ def start_traffic():
                     if actual_tx_cores is not None:
                         result["actual_tx_cores"] = actual_tx_cores
                         result["tx_cores_auto_picked"] = tx_cores_auto_picked
+                    # v0.5.261 (audit latency-8): loud, structured
+                    # signal so the GUI can render a toast.
+                    if _latency_scapy_gap:
+                        result["latency_capture_ignored"] = True
+                        result["latency_capture_reason"] = (
+                            "NLAT timestamp emission requires the DPDK "
+                            "tx_worker; this stream is on the Scapy path"
+                            + (f" (fallback: {fallback_reason})" if fallback_reason else "")
+                            + ". Enable DPDK for this stream to record "
+                            "one-way latency."
+                        )
+                        logging.warning(
+                            f"[LATENCY] '{stream_name}' enable_timestamps=true "
+                            f"but engine=Scapy — sampler will decode 0 NLAT frames."
+                        )
                     # v0.5.110: surface the RX-engine outcome alongside
                     # actual_engine. Symmetric to the TX side: if the
                     # operator picked rx_engine="dpdk" but the spawn
@@ -25580,7 +25613,17 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
         if capture_latency:
             stream_data["enable_timestamps"] = True
 
-        # Kick off the stream
+        # Kick off the stream.
+        # v0.5.261 (audit RFC-9): measure actual TX-window duration.
+        # Pre-fix `_decide_step`'s `tx_pps_actual = tx / duration_s`
+        # used the NOMINAL duration, but the fire-and-forget POST
+        # returns as soon as the tx_worker process is forked and
+        # DPDK EAL init + queue setup can take 1-3s. That fraction
+        # of `duration_s` didn't actually transmit, so `tx_pps_actual`
+        # under-reported the true rate and could spuriously trigger
+        # `tx_rate_limited`. Anchor a monotonic clock across the
+        # start→stop window and hand THAT to `_decide_step`.
+        tx_window_start = _t.monotonic()
         try:
             _req.post(f"{base_url}/api/traffic/start",
                       json={"streams": {f"Port:{tx_iface}": [stream_data]}},
@@ -25598,13 +25641,20 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
         # cancel flag in 0.5s slices so a /stop click takes effect
         # within ~half a second instead of waiting the full
         # duration_s+1.5s out.
+        # v0.5.261 (audit RFC-5): remember whether cancel fired during
+        # the sleep so the post-stop `_decide_step` path can be
+        # skipped — otherwise a partial-probe iteration corrupts
+        # `last_good` (the search "upgrades" `last_good` to a value
+        # the DUT never actually sustained for the full trial).
         slept = 0.0
         target = duration_s + 1.5
+        cancelled_mid_sleep = False
         while slept < target:
             _t.sleep(0.5)
             slept += 0.5
             with _RFC2544_LOCK:
                 if _RFC2544_STATE.get("stop_requested"):
+                    cancelled_mid_sleep = True
                     break
 
         # Stop and read final counters
@@ -25615,19 +25665,49 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
                       timeout=15)
         except Exception as e:
             logging.warning(f"[RFC 2544] stop failed: {e}")
-        _t.sleep(0.5)
+        tx_window_end = _t.monotonic()
+        actual_tx_window_s = max(0.001, tx_window_end - tx_window_start)
 
-        # Read tx/rx from the stats endpoint (status filter "all" so we
-        # catch the just-stopped stream)
-        try:
-            r = _req.get(f"{base_url}/api/streams/stats", params={"status": "all"}, timeout=10)
-            streams = r.json().get("active_streams", []) if r.ok else []
-            ours = next((s for s in streams if s.get("stream_id") == stream_id), None)
-            tx = int(ours.get("tx_count") or 0) if ours else 0
-            rx = int(ours.get("rx_count") or 0) if ours else 0
-        except Exception as e:
-            logging.warning(f"[RFC 2544] stats read failed: {e}")
-            tx = rx = 0
+        # v0.5.261 (audit RFC-6): pre-fix a single _t.sleep(0.5)
+        # before reading stats. The DPDK rx_worker + Scapy stream
+        # tracker both poll at ~1 Hz — 500 ms is often less than
+        # ONE sample interval, so RX under-counts and a 0%-loss
+        # trial gets downgraded to FAIL, halving hi_pps on a
+        # spurious loss. Instead poll every 250 ms and accept
+        # when TWO consecutive samples' tx/rx deltas are < 0.1%,
+        # capped at 3 s so a truly-dead stream doesn't wedge us.
+        def _read_stats_once():
+            try:
+                _r = _req.get(f"{base_url}/api/streams/stats",
+                              params={"status": "all"}, timeout=10)
+                _streams = _r.json().get("active_streams", []) if _r.ok else []
+                _ours = next((s for s in _streams if s.get("stream_id") == stream_id), None)
+                if _ours is None:
+                    return 0, 0
+                return int(_ours.get("tx_count") or 0), int(_ours.get("rx_count") or 0)
+            except Exception as _e:
+                logging.debug(f"[RFC 2544] stats read failed: {_e}")
+                return 0, 0
+
+        _prev_tx = _prev_rx = -1
+        tx = rx = 0
+        _wait_deadline = _t.monotonic() + 3.0
+        while _t.monotonic() < _wait_deadline:
+            _t.sleep(0.25)
+            _cur_tx, _cur_rx = _read_stats_once()
+            if _prev_tx >= 0:
+                _tx_delta = abs(_cur_tx - _prev_tx)
+                _rx_delta = abs(_cur_rx - _prev_rx)
+                _tx_stable = _cur_tx == 0 or (_tx_delta / max(1, _cur_tx)) < 0.001
+                _rx_stable = _cur_rx == 0 or (_rx_delta / max(1, _cur_rx)) < 0.001
+                if _tx_stable and _rx_stable:
+                    tx, rx = _cur_tx, _cur_rx
+                    break
+            _prev_tx, _prev_rx = _cur_tx, _cur_rx
+        else:
+            # Deadline reached without stable readings — take the
+            # last sample we saw so we still produce a result.
+            tx, rx = _cur_tx, _cur_rx
 
         # Clear the active-stream stash — the stream is stopped by now.
         with _RFC2544_LOCK:
@@ -25649,6 +25729,18 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
                 _RFC2544_STATE["current_step"]["iteration_count"] = len(attempts)
                 _RFC2544_STATE["current_step"]["last_attempt"] = attempts[-1]
 
+        # v0.5.261 (audit RFC-5): if the operator cancelled mid-sleep,
+        # this iteration didn't run for the full window. Its counters
+        # are a snapshot at an arbitrary point inside the trial —
+        # feeding them to `_decide_step` can promote `last_good` to
+        # a value the DUT never actually sustained for the whole
+        # duration. Skip the decide step, mark the diagnosis as
+        # cancelled, and break out of the search.
+        if cancelled_mid_sleep:
+            if diagnosis is None:
+                diagnosis = "cancelled"
+            break
+
         # v0.4.0 smart-search step. Replaces the naive
         #   if loss<=target: lo=trying else: hi=trying
         # with a check that also detects TX-rate-limit
@@ -25656,11 +25748,15 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
         # uses the actually-achieved rate as the new ceiling
         # instead of letting the search waste 10+ iterations
         # halving an unreachable rate.
+        # v0.5.261 (audit RFC-9): pass the ACTUAL TX-window duration
+        # (start→stop delta) so `tx_pps_actual = tx / duration_s`
+        # inside `_decide_step` isn't biased by DPDK EAL spin-up
+        # eating a chunk of the nominal duration.
         lo_pps, hi_pps, last_good, step_diag = _rfc2544_decide_step(
             tx=tx, rx=rx, trying_pps=trying_pps,
             lo_pps=lo_pps, hi_pps=hi_pps, last_good=last_good,
             target_loss_pct=target_loss_pct,
-            duration_s=duration_s,
+            duration_s=actual_tx_window_s,
         )
         if step_diag and diagnosis is None:
             # First diagnosis sticks — operator sees the explanation
