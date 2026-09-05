@@ -8007,6 +8007,46 @@ def add_static_route_background(device_id, device_name, gateway, container_name_
     logging.info(f"[ROUTE BG] Started background thread for {device_name}")
 
 
+def _arp_vrf_prefix(device_id):
+    """v0.5.258 (audit ARP-1): return ``["ip", "vrf", "exec", <vrf>]``
+    when ``device_id`` maps to a per-device Linux VRF, else ``[]``.
+    Empty tuple/list can be spread into the front of any argv so
+    the caller doesn't need to conditionally-wrap.
+
+    On multi-device deployments each device's addresses / routes /
+    neighbor entries live inside a per-device VRF (see
+    utils/frr_docker.FRRDockerManager.vrf_name_for_device). Bare
+    ``ip neigh show`` / ``ping`` in the default netns misses them.
+    ``get_device_arp_status`` (line 14587-14602) already resolves
+    the VRF via this helper's uninlined form; the sibling endpoints
+    ``check_arp_resolution``, ``check_arp_resolution_batch``,
+    ``send_arp_request_internal`` did not — same class of bug the
+    v0.5.193 fix originally patched only in ``get_device_arp_status``.
+    Missing here for years; operator-reported effect was "on-demand
+    Refresh ARP button reports FAIL while the DB monitor + gateway
+    both show resolved".
+    """
+    if not device_id:
+        return []
+    try:
+        from utils.frr_docker import FRRDockerManager
+        _vrf = FRRDockerManager().vrf_name_for_device(device_id)
+        if not _vrf:
+            return []
+        # Verify the VRF actually exists on the host — a stale name
+        # would send the prefix through with a bad VRF and every
+        # command below would fail with "device does not exist".
+        _check = subprocess.run(
+            ["ip", "-o", "link", "show", _vrf],
+            capture_output=True, text=True, timeout=2,
+        )
+        if _check.returncode == 0 and (_check.stdout or "").strip():
+            return ["ip", "vrf", "exec", _vrf]
+    except Exception as _e:
+        logging.debug(f"[ARP VRF] resolve for {device_id}: {_e}")
+    return []
+
+
 @app.route("/api/device/arp/check", methods=["POST"])
 def check_arp_resolution():
     """Check ARP resolution for a given IP address."""
@@ -8014,6 +8054,8 @@ def check_arp_resolution():
     ip_address = data.get("ip_address")
     interface = data.get("interface")  # Optional interface parameter
     vlan = data.get("vlan", "0")  # Optional VLAN parameter
+    # v0.5.258 (audit ARP-1): optional device_id → VRF exec prefix.
+    _vrf_prefix = _arp_vrf_prefix(data.get("device_id"))
     
     if not ip_address:
         return jsonify({"error": "IP address is required"}), 400
@@ -8052,19 +8094,22 @@ def check_arp_resolution():
             actual_interface = interface
             logging.debug(f"[{'NDP' if is_ipv6 else 'ARP'} CHECK] No VLAN configured (VLAN ID = 0) - using physical interface: {actual_interface}")
         
-        # Build command - check specific interface if provided, otherwise check all
+        # Build command - check specific interface if provided, otherwise check all.
+        # v0.5.258 (audit ARP-1): prepend the VRF exec prefix (empty
+        # list when no device_id or no VRF, so this is a no-op on
+        # single-device deployments).
         if is_ipv6:
             # Use IPv6 neighbor discovery commands
             if actual_interface:
-                cmd = ["ip", "-6", "neigh", "show", ip_address, "dev", actual_interface]
+                cmd = _vrf_prefix + ["ip", "-6", "neigh", "show", ip_address, "dev", actual_interface]
             else:
-                cmd = ["ip", "-6", "neigh", "show", ip_address]
+                cmd = _vrf_prefix + ["ip", "-6", "neigh", "show", ip_address]
         else:
             # Use IPv4 ARP commands
             if actual_interface:
-                cmd = ["ip", "neigh", "show", ip_address, "dev", actual_interface]
+                cmd = _vrf_prefix + ["ip", "neigh", "show", ip_address, "dev", actual_interface]
             else:
-                cmd = ["ip", "neigh", "show", ip_address]
+                cmd = _vrf_prefix + ["ip", "neigh", "show", ip_address]
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         
@@ -8324,23 +8369,36 @@ def send_arp_request_internal(data):
     device_ip = data.get("device_ip")
     interface = data.get("interface")
     vlan = data.get("vlan", "0")
-    
+
     if not target_ip:
         return {"error": "IP address is required"}
-    
+
     try:
         # If no device_ip provided, use target_ip
         if not device_ip:
             device_ip = target_ip
-        
+
+        # v0.5.258 (audit ARP-1): reverse-lookup device_id from
+        # device_ip so we can run inside the device's VRF. Multi-
+        # device deployments put each device's addresses / routes /
+        # neighbor entries in a per-device Linux VRF; bare ping /
+        # ip neigh in the default netns misses them.
+        _found_device_id = None
         # Find device interface if not provided
         if not interface:
             # Try to find in DEVICE_IP_MAPPING
             for ip_addr, (mapped_device_id, iface) in DEVICE_IP_MAPPING.items():
                 if ip_addr == device_ip:
                     interface = iface
+                    _found_device_id = mapped_device_id
                     break
-        
+        else:
+            for ip_addr, (mapped_device_id, iface) in DEVICE_IP_MAPPING.items():
+                if ip_addr == device_ip:
+                    _found_device_id = mapped_device_id
+                    break
+        _vrf_prefix = _arp_vrf_prefix(data.get("device_id") or _found_device_id)
+
         if not interface:
             return {"error": "Device interface not found"}
         
@@ -8376,19 +8434,22 @@ def send_arp_request_internal(data):
         except ValueError:
             return {"error": f"Invalid IP address: {target_ip}"}
         
+        # v0.5.258 (audit ARP-1): prepend VRF exec prefix to every
+        # subprocess call. Empty list on non-VRF deployments, so
+        # the argv is unchanged there.
         if is_ipv6:
             logging.info(f"[NDP REQUEST] Sending NDP request for {target_ip} from {device_ip} on {actual_interface}")
             # Use ping6 for IPv6
-            ping_cmd = ["ping6", "-I", actual_interface, "-c", "2", "-W", "3", target_ip]
-            ping_cmd_fallback = ["ping6", "-c", "2", "-W", "3", target_ip]
-            neigh_cmd = ["ip", "-6", "neigh", "show", target_ip]
+            ping_cmd = _vrf_prefix + ["ping6", "-I", actual_interface, "-c", "2", "-W", "3", target_ip]
+            ping_cmd_fallback = _vrf_prefix + ["ping6", "-c", "2", "-W", "3", target_ip]
+            neigh_cmd = _vrf_prefix + ["ip", "-6", "neigh", "show", target_ip]
             protocol_name = "NDP"
         else:
             logging.info(f"[ARP REQUEST] Sending ARP request for {target_ip} from {device_ip} on {actual_interface}")
             # Use ping for IPv4
-            ping_cmd = ["ping", "-I", actual_interface, "-c", "2", "-W", "3", target_ip]
-            ping_cmd_fallback = ["ping", "-c", "2", "-W", "3", target_ip]
-            neigh_cmd = ["ip", "neigh", "show", target_ip]
+            ping_cmd = _vrf_prefix + ["ping", "-I", actual_interface, "-c", "2", "-W", "3", target_ip]
+            ping_cmd_fallback = _vrf_prefix + ["ping", "-c", "2", "-W", "3", target_ip]
+            neigh_cmd = _vrf_prefix + ["ip", "neigh", "show", target_ip]
             protocol_name = "ARP"
         
         # Send ARP/NDP request using ping/ping6
@@ -8441,15 +8502,22 @@ def send_arp_request_internal(data):
                     "output": arp_output
                 }
         else:
-            # No neighbor entry found - ping was sent but no response
+            # No neighbor entry found - ping was sent but no response.
+            # v0.5.258 (audit ARP-6): ping-succeeded is a stronger
+            # signal than the neighbor table (which commits entries
+            # asynchronously — a ~50 ms lag on busy hosts, and we
+            # already saw the response). Pre-fix a race where the
+            # neigh table hadn't been updated yet returned FAIL
+            # despite ping showing the peer responsive.
             if ping_result.returncode == 0:
                 return {
-                    "success": False, 
-                    "status": f"{protocol_name} request sent but no {protocol_name} entry found"
+                    "success": True,
+                    "status": f"{protocol_name} request sent and peer responded "
+                              f"(neighbor table entry may still be committing)",
                 }
             else:
                 return {
-                    "success": False, 
+                    "success": False,
                     "status": f"{protocol_name} request failed: {ping_result.stderr}"
                 }
             
@@ -14558,15 +14626,27 @@ def get_device_arp_status(device_id):
                 if not out:
                     return False
                 # Line shape: "<ip> dev <iface> [lladdr <mac>] <STATE>"
-                # State is the LAST whitespace-separated token that
-                # matches a known kernel neighbor state.
-                last = out.splitlines()[0].split()
-                for tok in reversed(last):
-                    up = tok.upper()
-                    if up in _RESOLVED_NEIGH_STATES:
-                        return True
-                    if up in ("INCOMPLETE", "FAILED", "NONE"):
-                        return False
+                # v0.5.258 (audit ARP-5): walk every line, not just
+                # the first. `ip neigh show to <target>` can return
+                # multiple entries when the same address is reachable
+                # via multiple interfaces (dual-homed hosts, IPv6
+                # link-local gateways shared across NICs, provider
+                # bridges). Pre-fix, a stale INCOMPLETE on the first
+                # line masked a REACHABLE on the second — the
+                # v0.5.254 fallback then declared the gateway
+                # unresolved even though it was fine. Return True
+                # as soon as ANY line is in a resolved state;
+                # only return False when every line is FAILED /
+                # INCOMPLETE / NONE.
+                for line in out.splitlines():
+                    toks = line.split()
+                    for tok in reversed(toks):
+                        up = tok.upper()
+                        if up in _RESOLVED_NEIGH_STATES:
+                            return True
+                        if up in ("INCOMPLETE", "FAILED", "NONE"):
+                            break
+                # No resolved states anywhere in any line.
                 return False
             except Exception as _neigh_exc:
                 logging.debug(

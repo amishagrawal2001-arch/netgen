@@ -93,17 +93,36 @@ def generate_arp_packet(stream_data):
         vlan_tpid = 0x8100
 
     # Build ARP
+    # v0.5.258 (audit ARP-3): RFC 826 defines the ARP Request
+    # payload's target hardware address as "not known" → all zeros.
+    # Pre-fix we wrote target_mac (default ff:ff:ff:ff:ff:ff) into
+    # both Ether.dst (correct: L2 broadcast) AND ARP.hwdst
+    # (wrong: payload should be zeros). Some IDS/IPS classify
+    # `hwdst == ffffff…` in a Request as "malformed / ARP scan"
+    # and either drop the frame or generate an alert. Only clobber
+    # payload hwdst to zeros when the caller left it at the
+    # broadcast default; an explicitly-supplied hwdst wins.
+    arp_hwdst = target_mac
+    if op == 1 and not (arp_pd.get("arp_target_mac") or "").strip():
+        arp_hwdst = "00:00:00:00:00:00"
     arp = ARP(
         op=op,                  # 1=request, 2=reply
         hwsrc=sender_mac,
         psrc=sender_ip,
-        hwdst=target_mac,
+        hwdst=arp_hwdst,
         pdst=target_ip,
     )
 
     # Ether + optional Dot1Q
+    # v0.5.258 (audit ARP-2): apply vlan_tpid to the outer Ether
+    # type field. Pre-fix vlan_tpid was parsed but never used — a
+    # GUI-supplied 0x88A8 (802.1ad S-VLAN) or 0x9100 was silently
+    # dropped, so QinQ / provider-bridge switches configured to
+    # strip the outer 0x88A8 tag discarded the frame at ingress
+    # and ARP appeared to fail with no diagnostic.
     if vlan_tagged and vlan_id not in (None, "", 0, "0"):
-        pkt = Ether(src=eth_src, dst=eth_dst) / Dot1Q(vlan=int(vlan_id), prio=int(vlan_pcp), type=0x0806) / arp
+        pkt = Ether(src=eth_src, dst=eth_dst, type=vlan_tpid) / \
+              Dot1Q(vlan=int(vlan_id), prio=int(vlan_pcp), type=0x0806) / arp
     else:
         pkt = Ether(src=eth_src, dst=eth_dst, type=0x0806) / arp
 

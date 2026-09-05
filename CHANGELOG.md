@@ -2,6 +2,91 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.258] - 2026-09-04
+
+**ARP subsystem audit — 5 correctness fixes across
+`utils/arp.py`, `run_tgen_server.py`.**
+
+Follow-up to v0.5.254's gateway-color fix. Audit found 10
+findings; 5 fixed here (5 deferred: DB transactionality, IPv6
+NDP builder, event-log growth, diagnostic-vs-probe VRF syntax
+inconsistency, batch endpoint VRF — need bigger design or
+scope changes).
+
+**HIGH severity:**
+
+- **ARP-1: `check_arp_resolution`, `send_arp_request_internal`
+  VRF-blind — same class as v0.5.193 fix for
+  `get_device_arp_status`.** On multi-device deployments each
+  device's addresses / neighbor entries live inside a per-device
+  Linux VRF (`utils/frr_docker.FRRDockerManager.vrf_name_for_
+  device`). Pre-fix the sibling endpoints ran bare `ip neigh
+  show` / `ping -I` in the default netns and missed the entry;
+  UI on-demand refresh reported FAIL while the DB monitor +
+  gateway both showed resolved. New `_arp_vrf_prefix(device_id)`
+  helper returns `["ip","vrf","exec",<vrf>]` (empty on single-
+  device deployments so the argv is unchanged there). Both
+  endpoints now prepend it — `check_arp_resolution` reads
+  `device_id` from the request body; `send_arp_request_internal`
+  reverse-looks it up from `DEVICE_IP_MAPPING`. Batch endpoint
+  (`check_arp_resolution_batch`) deferred — needs caller-side
+  changes to send per-IP device_ids.
+
+- **ARP-2: `vlan_tpid` parsed but never applied to the frame.**
+  `utils/arp.py` set `vlan_tpid = int(vlan_tpid, 0)` from the
+  dialog then dropped the local. Scapy's default `Ether()/Dot1Q()`
+  hardcodes the outer type to 0x8100 (C-VLAN); an operator-supplied
+  0x88A8 (802.1ad S-VLAN) or 0x9100 was silently dropped, so QinQ
+  / provider-bridge switches configured to strip outer 0x88A8
+  discarded the frame at ingress. ARP appeared to fail with no
+  diagnostic. Fix: pass `type=vlan_tpid` into `Ether(...)`.
+
+**MEDIUM severity:**
+
+- **ARP-3: ARP Request payload `hwdst` was broadcast, not zeros
+  (RFC 826).** Pre-fix `hwdst=target_mac` unconditionally, and
+  `target_mac` defaulted to `ff:ff:ff:ff:ff:ff` for Requests.
+  RFC 826 defines the payload target hardware address in a Request
+  as "not known" → all zeros. Some IDS/IPS classify
+  `hwdst == ffffff…` as "malformed / ARP scan" and drop or alert.
+  Fix: only clobber payload `hwdst` to zeros for Requests where
+  the caller left `arp_target_mac` blank (explicit override
+  still wins). Ether.dst stays broadcast — the L2 destination
+  is correct.
+
+- **ARP-5: `_neigh_state_ok` only inspected the first line of
+  `ip neigh show` output.** Multi-homed hosts and IPv6 link-local
+  gateways shared across NICs produce multi-line output where
+  a stale INCOMPLETE on the first line can mask a REACHABLE on
+  the second. The v0.5.254 fallback then declared the gateway
+  unresolved even though it was fine. Fix: walk every line;
+  return True as soon as any is in a resolved state.
+
+- **ARP-6: `send_arp_request_internal` reported FAIL when ping
+  succeeded but neighbor table was still empty (async commit
+  lag).** Real race — kernel takes ~50 ms to commit the neighbor
+  entry on busy hosts, but ping just proved the peer responded.
+  Fix: if ping returncode == 0, return success regardless of
+  neigh table state.
+
+**Deferred:**
+
+- **ARP-4 / ARP-7** — race in `_update_device_arp_status`
+  (4 sequential DB writes not transactional). Needs
+  `device_db.transaction()` wrap + per-device lock.
+- **ARP-8** — diagnostic dump uses `ip -6 neigh show vrf <name>`
+  (netlink filter) while `_neigh_state_ok` uses
+  `ip vrf exec <name>` (no netlink scope). Cosmetic — both
+  paths inspect the same neighbor entries in practice.
+- **ARP-9** — no IPv6 NDP builder in `utils/arp.py`. Feature
+  gap, not a bug.
+- **ARP-10** — event log grows unbounded from per-poll rows.
+  Performance not correctness; needs dedup pattern from
+  `add_state_transition`.
+
+Regression tests in `tests/test_v05258_arp_audit.py` (11 tests),
+all pass. No regressions in the 45 ARP/VRF-adjacent tests.
+
 ## [0.5.257] - 2026-09-04
 
 **RFC 2544 throughput audit — 7 correctness fixes across the

@@ -150,10 +150,17 @@ def test_classifier_shape_matches_source():
     token wins even if a FAILED token appears elsewhere on the
     same line — never happens in real iproute2 output but the
     reversed-token walk should still terminate correctly).
+
+    v0.5.258 (audit ARP-5): the inner walk was changed from
+    `for tok in reversed(last)` (first-line only) to a
+    per-line + reversed-token nested pair so multi-line neigh
+    output is handled correctly. Both loops still walk tokens
+    in reverse.
     """
     body = _endpoint_body()
-    # Loop walks tokens in reverse order.
-    assert "for tok in reversed(last):" in body
+    # Per-line loop (v0.5.258) walks tokens in reverse.
+    assert "for tok in reversed(toks):" in body
+    assert "for line in out.splitlines():" in body
     # RESOLVED check happens BEFORE FAILED check on each token.
     resolved_check = body.find("if up in _RESOLVED_NEIGH_STATES:")
     failed_check = body.find('if up in ("INCOMPLETE", "FAILED", "NONE")')
