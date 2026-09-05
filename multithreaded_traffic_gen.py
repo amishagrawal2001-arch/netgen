@@ -607,11 +607,36 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
                            bool(sel.get("enforce_mac", False)), sel.get("direction", "either")):
             return False
 
-        if any(k in sel and sel[k] for k in ("src_ip", "dst_ip", "src_ip6", "dst_ip6")):
-            if not _ips_match(pkt, sel.get("src_ip"), sel.get("dst_ip"), sel.get("direction", "either")):
+        # v0.5.265 (audit stream-gen F6): pre-fix ran BOTH v4 and v6
+        # `_ips_match` when either selector field was populated —
+        # but a wire packet is either IPv4 OR IPv6, so exactly one
+        # match was against the wrong-family layer and returned
+        # False, dragging the AND-combined result to False. Any
+        # dual-stack stream config that populated both v4 and v6
+        # selectors got 0 tuple-matches (signature match papered
+        # over pure-Scapy streams; DPDK streams that relied on
+        # tuple fallback showed rx_count=0). Short-circuit by
+        # layer presence: only run the check that matches the
+        # packet's actual family.
+        _has_v4 = any(k in sel and sel[k] for k in ("src_ip", "dst_ip"))
+        _has_v6 = any(k in sel and sel[k] for k in ("src_ip6", "dst_ip6"))
+        if _has_v4 or _has_v6:
+            _dir = sel.get("direction", "either")
+            _pkt_is_v6 = pkt.haslayer(IPv6)
+            _pkt_is_v4 = pkt.haslayer(IP) and not _pkt_is_v6
+            if _pkt_is_v6 and _has_v6:
+                if not _ips_match(pkt, sel.get("src_ip6"), sel.get("dst_ip6"), _dir):
+                    return False
+            elif _pkt_is_v4 and _has_v4:
+                if not _ips_match(pkt, sel.get("src_ip"), sel.get("dst_ip"), _dir):
+                    return False
+            elif _pkt_is_v6 and _has_v4 and not _has_v6:
+                # Selector is IPv4-only but packet is IPv6 — no match.
                 return False
-            if not _ips_match(pkt, sel.get("src_ip6"), sel.get("dst_ip6"), sel.get("direction", "either")):
+            elif _pkt_is_v4 and _has_v6 and not _has_v4:
+                # Selector is IPv6-only but packet is IPv4 — no match.
                 return False
+            # If packet has neither IP layer, fall through to L4 check.
 
         l4 = (sel.get("l4") or "").lower()
         if l4 == "udp" or relaxed_now:
@@ -716,9 +741,16 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     }
     try:
         # Attach to the tracker entry so the REST handler can find it.
-        for s in tracker.active_streams:
-            if s.get("stream_id") == stream_id and \
-                    s.get("interface") == rx_interface:
+        # v0.5.265 (audit stream-gen F4): the tracker stores the TX
+        # interface in `interface`, not the RX iface. Pre-fix, the
+        # second predicate `s.get("interface") == rx_interface`
+        # NEVER matched — flow tracking requires
+        # rx_interface != interface — so `rx_debug` was never
+        # attached and the /api/streams/<id>/rx_debug REST handler
+        # always returned nothing. stream_id is unique across all
+        # streams; dropping the interface predicate is safe.
+        for s in list(tracker.active_streams):
+            if s.get("stream_id") == stream_id:
                 s["rx_debug"] = rx_debug
                 break
     except Exception:
@@ -859,6 +891,26 @@ def on_stream_stopped(interface, stream_id, reason="manual"):
     rx_interface = stream.get("rx_interface")
     flow_tracking_enabled = stream.get("flow_tracking_enabled", False)
 
+    # v0.5.265 (audit stream-gen F1): signal the RX sniffer / stopper
+    # thread that this stream is done. Pre-fix, `on_stream_stopped`
+    # removed the tracker row and slept 2 s but NEVER called
+    # `stop_event.set()`. The RX sniffer's `stopper()` thread was
+    # blocked on `stop_event.wait()`, so it only fired on the two
+    # Scapy paths that set the event before break (max-packets
+    # reached / duration expired). Every DPDK exit (success OR
+    # failure), every Scapy error path, and every operator Stop
+    # left the primary AsyncSniffer, the rescue AsyncSniffer, the
+    # daemon stopper thread, and the `_VLAN_SUBIF_REFS[<iface>.<vid>]`
+    # counter incremented FOREVER. Restart the same stream 30 times
+    # → 30 zombie sniffers on the same iface + a subif
+    # `_release_vlan_subif` will never delete.
+    _stop_evt = stream.get("stop_event")
+    if _stop_evt is not None:
+        try:
+            _stop_evt.set()
+        except Exception as _e:
+            logging.debug(f"[STREAM-STOP] stop_event.set() raised: {_e}")
+
     if flow_tracking_enabled and rx_interface != interface:
         logging.info(f"RX grace period 2s for stream '{stream_name}' on {rx_interface}")
         time.sleep(2)
@@ -936,17 +988,79 @@ def calculate_interval(rate_type, stream_data, default_size=64):
                 tx_rate.get("percent"),
                 default=0
             )
-            pps = int((125_000 * load) / 100)  # ~12.5 Mpps @ 100% on 1GbE → 125k per 1%
+            # v0.5.265 (audit stream-gen F2): scale from real link
+            # speed + frame size. Pre-fix `int((125_000 * load) / 100)`
+            # was two bugs in one: (a) the constant `125_000` is
+            # ~10x off from a 1 GbE line rate at 64 B (1.488 Mpps ≈
+            # 14 880 per 1%), and (b) it doesn't consider `frame_size`
+            # OR the actual iface speed — a 100 GbE Load-100% would
+            # produce ~64 Mbps L1 regardless. Same class the DPDK
+            # path fixed in v0.5.253. Mirror that logic here.
+            _iface_for_speed = (
+                stream_data.get("interface")
+                or stream_data.get("rx_port")
+                or ps.get("interface")
+                or ""
+            )
+            _speed_mbps = 0
+            try:
+                with open(f"/sys/class/net/{_iface_for_speed}/speed") as _sf:
+                    _v = int(_sf.read().strip())
+                    if _v > 0:
+                        _speed_mbps = _v
+            except Exception:
+                pass
+            _frame_size = pick_int(
+                stream_data.get("frame_size"),
+                ps.get("frame_size"),
+                default=default_size,
+            )
+            if _speed_mbps > 0:
+                _l1_bytes = max(60, int(_frame_size)) + 20  # preamble + IFG
+                _line_pps = max(1, (_speed_mbps * 1_000_000) // (_l1_bytes * 8))
+                pps = int((_line_pps * load) / 100)
+                logging.info(
+                    f"[Rate] Load %% mode: iface={_iface_for_speed} "
+                    f"speed={_speed_mbps}Mbps frame_size={_frame_size} "
+                    f"load={load}%% → line_pps={_line_pps:,} → pps={pps:,}"
+                )
+            else:
+                # Iface speed unknown — fall back to the pre-fix 1 GbE
+                # baseline with a corrected magnitude (1.488 Mpps @
+                # 64 B, ≈ 14 880 pps per 1%). Log a WARNING so the
+                # operator sees the fallback.
+                pps = int((14_880 * load) / 100)
+                logging.warning(
+                    f"[Rate] Load %% could not read link speed for "
+                    f"iface={_iface_for_speed!r} — falling back to 1 GbE "
+                    f"baseline. Resolved pps={pps:,}. Set the interface "
+                    f"correctly OR pass explicit PPS/Mbps for accuracy."
+                )
 
         elif rt == "Line Rate":
             pps = None
 
         if pps is None:
+            # "Line Rate" mode — TX loop is expected to fire in
+            # tight-loop batching mode (interval=0, batch=1 → hot
+            # loop). This is the intended behavior; DO NOT confuse
+            # with the pps<=0 case below.
             return 0.0, 1
 
         if pps <= 0:
-            logging.warning(f"[Rate] PPS is zero or invalid: {pps}")
-            return 0.0, 1
+            # v0.5.265 (audit stream-gen F3): pre-fix returned
+            # `(0.0, 1)` — the TX loop then never slept (interval
+            # was 0) and hot-spun sendp on a 1-packet batch, so
+            # "PPS=0 / Load=0%" (operator asked for NO traffic)
+            # actually saturated the interface. Signal "do not
+            # send" by returning batch_size=0; every send site
+            # guards on `if batch_size > 0` (F3 fix companion).
+            logging.warning(
+                f"[Rate] PPS is zero or invalid ({pps!r}) — stream "
+                "will not emit packets. Set a positive PPS / Mbps / "
+                "Load % OR pick 'Line Rate' to flood the interface."
+            )
+            return 1.0, 0
 
         # Optimized batch sizes for better performance
         # Larger batches reduce loop overhead and improve throughput
@@ -993,6 +1107,14 @@ def calculate_interval(rate_type, stream_data, default_size=64):
 # actual `ip link delete` runs only when the count reaches 0.
 _VLAN_SUBIF_REFS: dict = {}
 _VLAN_SUBIF_LOCK = threading.Lock()
+# v0.5.265 (audit stream-gen F5): remember which VLAN sub-interfaces
+# existed BEFORE we touched them so `_release_vlan_subif` doesn't
+# delete an operator's pre-existing sub-iface on refcount → 0.
+# Pre-fix, refcount always started at 0 on first ensure; the paired
+# release then unconditionally ran `ip link delete <sub>` — any
+# sub-iface the operator had provisioned (routing, MTU, IP config)
+# was destroyed silently on the first stream stop.
+_VLAN_SUBIF_EXISTING: set = set()
 
 
 def _ensure_vlan_rx_visible(rx_iface: str, vlan_id: int) -> str | None:
@@ -1011,16 +1133,28 @@ def _ensure_vlan_rx_visible(rx_iface: str, vlan_id: int) -> str | None:
         return None
     sub = f"{rx_iface}.{int(vlan_id)}"
     try:
-        # If it already exists, just bring it up
+        # If it already exists, just bring it up.
+        # v0.5.265 (audit F5): remember pre-existing subif on first
+        # sight so release doesn't destroy operator's own.
         rc = subprocess.run(["ip", "link", "show", sub], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if rc.returncode != 0:
+        already_existed = rc.returncode == 0
+        if not already_existed:
             subprocess.run(["ip", "link", "add", "link", rx_iface, "name", sub, "type", "vlan", "id", str(int(vlan_id))],
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["ip", "link", "set", sub, "up"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with _VLAN_SUBIF_LOCK:
+            _first_sight = sub not in _VLAN_SUBIF_REFS
             _VLAN_SUBIF_REFS[sub] = _VLAN_SUBIF_REFS.get(sub, 0) + 1
             new_count = _VLAN_SUBIF_REFS[sub]
-        logging.debug(f"[VLAN-subif] {sub} refcount={new_count} after ensure")
+            # v0.5.265 (audit stream-gen F5): only mark
+            # "operator-owned" on the FIRST ensure for a given name
+            # in this process. Later ensures for the same subif
+            # WILL see rc=0 from `ip link show` (because we created
+            # it on the first ensure), and that must NOT be
+            # interpreted as "operator owns it".
+            if already_existed and _first_sight:
+                _VLAN_SUBIF_EXISTING.add(sub)
+        logging.debug(f"[VLAN-subif] {sub} refcount={new_count} after ensure (first_sight={_first_sight}, pre-existing={already_existed})")
         return sub
     except Exception:
         return None
@@ -1123,9 +1257,14 @@ def _release_vlan_subif(sub: str) -> None:
         return
     with _VLAN_SUBIF_LOCK:
         count = _VLAN_SUBIF_REFS.get(sub, 0)
+        # v0.5.265 (audit stream-gen F5): if the subif existed
+        # BEFORE we first saw it, leave it alone — it belongs to
+        # the operator, not to us.
+        was_pre_existing = sub in _VLAN_SUBIF_EXISTING
         if count <= 1:
             _VLAN_SUBIF_REFS.pop(sub, None)
-            should_delete = True
+            _VLAN_SUBIF_EXISTING.discard(sub)
+            should_delete = not was_pre_existing
         else:
             _VLAN_SUBIF_REFS[sub] = count - 1
             should_delete = False
@@ -1138,6 +1277,11 @@ def _release_vlan_subif(sub: str) -> None:
             logging.info(f"[VLAN-subif] {sub} deleted (refcount reached 0)")
         except Exception as e:
             logging.warning(f"[VLAN-subif] delete failed for {sub}: {e}")
+    elif was_pre_existing and count <= 1:
+        logging.info(
+            f"[VLAN-subif] {sub} refcount reached 0 but PRE-EXISTED "
+            f"before this session — leaving alone (operator-owned)"
+        )
     else:
         logging.debug(f"[VLAN-subif] {sub} refcount={new_count} after release")
 
@@ -1635,6 +1779,22 @@ def generate_packets(stream_data, interface, stop_event):
         duration_mode = stream_data.get("stream_duration_mode", "Continuous")
         duration_seconds = int(stream_data.get("stream_duration_seconds") or 0) if duration_mode == "Seconds" else None
 
+    # v0.5.265 (audit stream-gen F8): a `Seconds` mode with
+    # duration_seconds <= 0 still sent exactly one batch before
+    # stopping because the elapsed-time check sits at the END of the
+    # TX loop body. The operator asked for zero duration and got a
+    # burst of `batch_size` packets. Promote to Continuous with a
+    # warning so the misconfiguration is visible instead of silent.
+    if duration_mode == "Seconds" and (duration_seconds is None or duration_seconds <= 0):
+        logging.warning(
+            f"[Duration] stream_id={stream_id} — duration_mode=Seconds with "
+            f"seconds={duration_seconds!r} (invalid). Falling back to "
+            f"Continuous mode; use Stop to end the stream. Fix the stream "
+            f"config to specify a positive duration."
+        )
+        duration_mode = "Continuous"
+        duration_seconds = None
+
     if str(stream_rate_type).strip().lower() == "line rate":
         requested = int(stream_data.get("batch_size", 512) or 512)
         cap = int(stream_data.get("batch_size_cap", 256) or 256)  # safe default
@@ -1820,9 +1980,15 @@ def generate_packets(stream_data, interface, stop_event):
                 for _ in range(batch_size):
                     to_send.append(add_sig(pkt.copy()))
 
-                sendp(to_send, iface=interface, verbose=False)
-                # Optimize: increment counter by batch_size instead of per-packet loop
-                stream_tracker.update_tx_by_id(interface, stream_id, count=len(to_send))
+                # v0.5.265 (audit stream-gen F3): guard on to_send so
+                # batch_size=0 (PPS=0 sentinel) doesn't sendp an
+                # empty list (Scapy tolerates but wastes a syscall).
+                # The RoCEv2 / ARP / Generic branches already have
+                # this guard; UEC was the outlier.
+                if to_send:
+                    sendp(to_send, iface=interface, verbose=False)
+                    # Optimize: increment counter by batch_size instead of per-packet loop
+                    stream_tracker.update_tx_by_id(interface, stream_id, count=len(to_send))
             except Exception as e:
                 logging.warning(f"[UEC] send failed: {e}")
 

@@ -46,6 +46,9 @@ def test_ensure_increments_refcount():
     # Reset state for the test
     with mtg._VLAN_SUBIF_LOCK:
         mtg._VLAN_SUBIF_REFS.clear()
+        # v0.5.265 (audit stream-gen F5): also clear the
+        # "operator-owned" set so state doesn't leak between tests.
+        mtg._VLAN_SUBIF_EXISTING.clear()
 
     with patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0)
@@ -68,6 +71,9 @@ def test_release_decrements_without_deleting_when_count_above_zero():
     import multithreaded_traffic_gen as mtg
     with mtg._VLAN_SUBIF_LOCK:
         mtg._VLAN_SUBIF_REFS.clear()
+        # v0.5.265 (audit stream-gen F5): also clear the
+        # "operator-owned" set so state doesn't leak between tests.
+        mtg._VLAN_SUBIF_EXISTING.clear()
         mtg._VLAN_SUBIF_REFS["eth0.10"] = 2
 
     delete_calls = []
@@ -94,6 +100,9 @@ def test_release_at_zero_actually_deletes():
     import multithreaded_traffic_gen as mtg
     with mtg._VLAN_SUBIF_LOCK:
         mtg._VLAN_SUBIF_REFS.clear()
+        # v0.5.265 (audit stream-gen F5): also clear the
+        # "operator-owned" set so state doesn't leak between tests.
+        mtg._VLAN_SUBIF_EXISTING.clear()
         mtg._VLAN_SUBIF_REFS["eth0.10"] = 1
 
     delete_calls = []
@@ -124,6 +133,9 @@ def test_release_unknown_subif_is_noop():
     import multithreaded_traffic_gen as mtg
     with mtg._VLAN_SUBIF_LOCK:
         mtg._VLAN_SUBIF_REFS.clear()
+        # v0.5.265 (audit stream-gen F5): also clear the
+        # "operator-owned" set so state doesn't leak between tests.
+        mtg._VLAN_SUBIF_EXISTING.clear()
 
     delete_calls = []
     def _track(cmd, *args, **kwargs):
@@ -154,15 +166,33 @@ def test_release_empty_string_or_none_no_crash():
 def test_two_streams_share_subif_neither_strands_other():
     """End-to-end scenario from the field: stream A + stream B both
     ensure eth0.10; either order of release leaves the OTHER stream's
-    sniffer with a live sub-iface to bind to."""
+    sniffer with a live sub-iface to bind to.
+
+    v0.5.265 (audit stream-gen F5): `ip link show` must return
+    rc != 0 on the FIRST call so `_ensure_vlan_rx_visible` treats
+    the subif as ephemeral (owned by us). Otherwise the new F5
+    pre-existing-protection kicks in and we correctly SKIP the
+    delete on release."""
     import multithreaded_traffic_gen as mtg
     with mtg._VLAN_SUBIF_LOCK:
         mtg._VLAN_SUBIF_REFS.clear()
+        # v0.5.265 (audit stream-gen F5): also clear the
+        # "operator-owned" set so state doesn't leak between tests.
+        mtg._VLAN_SUBIF_EXISTING.clear()
+        mtg._VLAN_SUBIF_EXISTING.clear()
 
     delete_calls = []
+    show_call_count = [0]
     def _track(cmd, *args, **kwargs):
         if "delete" in cmd:
             delete_calls.append(cmd)
+            return MagicMock(returncode=0)
+        # First `ip link show` = rc=1 (doesn't exist yet, we'll
+        # create it). Later shows can return 0 (exists — we just
+        # made it) which is what the second ensure would see.
+        if "show" in cmd:
+            show_call_count[0] += 1
+            return MagicMock(returncode=0 if show_call_count[0] > 1 else 1)
         return MagicMock(returncode=0)
 
     with patch("subprocess.run", side_effect=_track):

@@ -2,6 +2,110 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.265] - 2026-09-04
+
+**Stream generation audit — 7 correctness fixes in
+`multithreaded_traffic_gen.py`.**
+
+Audit found 10 findings; 7 fixed (3 deferred: rescue-sniffer
+dedup, DPDK-fallback selector rebuild, max_packets on DPDK path
+— all needing cross-file design).
+
+**Tier-1:**
+
+- **F1: RX sniffer + VLAN sub-iface leak on every DPDK exit +
+  every Scapy error path.** `on_stream_stopped` removed the
+  tracker row and slept 2 s but NEVER called `stop_event.set()`.
+  The RX sniffer's `stopper()` thread was blocked on
+  `stop_event.wait()`, so every exit path other than the two
+  Scapy paths that explicitly set the event before break left
+  the primary + rescue AsyncSniffer, the daemon stopper thread,
+  the `_seen_seqs_set`, AND the `_VLAN_SUBIF_REFS[<iface>.<vid>]`
+  counter incremented forever. Restart the same stream 30 times
+  → 30 zombie sniffers on the same interface + a subif
+  `_release_vlan_subif` would never delete. Fix: fold
+  `stop_event.set()` into `on_stream_stopped` so all callers
+  get it for free.
+
+- **F2: Load(%) rate math was ~10× off AND ignored link speed
+  + frame size.** Pre-fix `int((125_000 * load) / 100)` used a
+  1 GbE-shaped magic constant that was 10× off (1 GbE × 64 B ≈
+  1.488 Mpps, not 12.5 Mpps) and had no relationship to actual
+  interface speed or `frame_size`. Load 50% on a 100 GbE NIC
+  gave ~64 Mbps L1 regardless. Same class the DPDK path fixed
+  in v0.5.253. Now: read `/sys/class/net/<iface>/speed`, scale
+  by `frame_size + L1 overhead`; fall back to a corrected 1 GbE
+  baseline (14 880 pps per 1%) with a WARNING when speed can't
+  be determined.
+
+- **F3: `PPS=0` / `Load=0%` FLOODED the interface instead of
+  sending nothing.** `calculate_interval` returned `(0.0, 1)`;
+  the TX loop then never slept (`interval == 0` short-circuit)
+  and hot-spun `sendp` on a 1-packet batch. Operator asked for
+  no traffic → got line-rate flood. Now returns `(1.0, 0)` and
+  every send site guards on `if to_send:` (UEC branch needed
+  the guard added; the other 3 already had it). Loop sleeps
+  1 s between empty iterations — negligible CPU, operator can
+  Stop the stream.
+
+**Tier-2:**
+
+- **F4: `rx_debug` never attached to the tracker row — the
+  `/api/streams/<id>/rx_debug` endpoint always returned empty.**
+  Pre-fix predicate was `s.get("interface") == rx_interface` —
+  but the tracker stores the TX interface in `interface`, and
+  flow tracking requires `rx_interface != interface`. Predicate
+  NEVER matched. `stream_id` is already unique; dropped the
+  interface check. Also wrapped in `list(...)` so a concurrent
+  `add_stream` / `remove_stream_by_id` can't raise
+  `RuntimeError: dictionary changed size during iteration`.
+
+- **F5: `_ensure_vlan_rx_visible` deleted operator-owned pre-
+  existing sub-interfaces on refcount → 0.** Pre-fix refcount
+  always started at 0 the first time we saw a subif name,
+  regardless of whether the operator had already provisioned
+  it. First `_ensure` bumped ref to 1; the matching `_release`
+  dropped to 0 and unconditionally `ip link delete`d — killing
+  operator's routing / MTU / IP config silently. Fix: track
+  `_VLAN_SUBIF_EXISTING` set at first-sight; skip the delete
+  when the subif pre-existed our session.
+
+- **F6: Dual-stack IPv4+IPv6 selector rejected EVERY packet.**
+  `_tuple_match` ran BOTH v4 and v6 `_ips_match` calls when
+  either family had selector values — a wire packet is either
+  IPv4 or IPv6, so exactly one match was against the wrong
+  layer and returned False, dragging the AND-combined result
+  to False. Fix: short-circuit by packet layer presence (IPv6
+  path vs IPv4 path); when selector family doesn't match the
+  packet's family at all, return False cleanly.
+
+**Tier-3:**
+
+- **F8: `duration_mode="Seconds"` with `duration_seconds=0`
+  sent one batch before stopping.** The elapsed-time check
+  sits at the END of the TX loop body, so `elapsed >= 0` is
+  true on iteration 1 AFTER the send. Silent misconfiguration:
+  operator asks for zero duration and gets a burst of
+  `batch_size` packets. Now: reject at normalization, promote
+  to Continuous with a WARNING so the operator sees the
+  misconfig.
+
+**Deferred (need cross-file design):**
+
+- **F7**: rescue sniffer double-counts tuple-matched RX when
+  `_extract_seq` returns None. Needs a stable per-packet
+  fingerprint or a single-consumer shared queue.
+- **F9**: RX selector built once with `force_udp` from the DPDK
+  pre-flight; on `rc == 100` fallback to Scapy the BPF is
+  still UDP-filtered. Needs sniffer teardown+rebuild on
+  fallback.
+- **F10**: `max_packets` from stream_data honored on Scapy
+  only; DPDK worker uses its own `--count`. Needs argv
+  translation in the DPDK backend OR API-layer reject.
+
+Regression tests in `tests/test_v05265_stream_gen_audit.py`
+(16 tests), all pass. No regressions in the 326-test sweep.
+
 ## [0.5.264] - 2026-09-04
 
 **BGP + OSPF + ISIS monitor audit — 9 correctness fixes.**
