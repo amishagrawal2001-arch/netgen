@@ -312,6 +312,32 @@ class _L2ConfigDialog(QDialog):
         )
         top_form.addRow("Outer VLAN PCP:", self._outer_vlan_pcp_spin)
 
+        # v0.5.271 (L2-E1): scale count. When > 1 the server spawns
+        # N sessions on this interface with per-protocol identity
+        # increments (VRID++, group last-octet ++, discriminator ++,
+        # chassis-ID suffix, etc.). Capped at 500 server-side.
+        self._scale_count_spin = QSpinBox()
+        self._scale_count_spin.setRange(1, 500)
+        self._scale_count_spin.setValue(1)
+        self._scale_count_spin.setSpecialValueText("single session")
+        self._scale_count_spin.setToolTip(
+            "Emulate N instances of this protocol on the interface.\n"
+            "\n"
+            "The server increments per-protocol identity fields per "
+            "instance so N distinct rows land in the peer's state "
+            "table:\n"
+            "  • LLDP  — chassis_id/port_id/system_name gain a -N suffix\n"
+            "  • LACP  — system_mac last-octet + port_number ++\n"
+            "  • VRRP  — VRID + virtual_ips[last-octet] ++\n"
+            "  • IGMP  — group last-octet ++ (e.g. 239.1.1.1 → .N)\n"
+            "  • PIM   — src_ip last-octet + generation_id ++\n"
+            "  • BFD   — dst_ip + my_discriminator ++\n"
+            "\n"
+            "Per-instance failures don't abort the fan-out — the "
+            "operator gets back partial-success. Capped at 500."
+        )
+        top_form.addRow("Scale count:", self._scale_count_spin)
+
         outer.addWidget(common_box)
 
         # Per-protocol stack
@@ -968,6 +994,12 @@ class _L2ConfigDialog(QDialog):
             return
 
         body: Dict[str, Any] = {"iface": iface}
+        # v0.5.271 (L2-E1): scale count. Only include when > 1 so
+        # pre-v0.5.271 servers (which ignore the field) don't see
+        # a spurious count=1 in the request body.
+        _scale = int(self._scale_count_spin.value())
+        if _scale > 1:
+            body["count"] = _scale
         duration = self._duration_spin.value()
         if duration > 0:
             body["duration_s"] = duration
@@ -1986,13 +2018,50 @@ class L2EmulationTab(QWidget):
             keep(worker)
         except Exception:
             pass
+        # v0.5.271 (L2-E1): the scale response carries session_ids +
+        # count. When count > 1 (or diverges from the requested
+        # scale, i.e. partial-success), pop a short info dialog so
+        # the operator knows how many sessions actually landed and
+        # can spot fan-out failures immediately. Successful count=1
+        # keeps the pre-fix quiet path.
         worker.finished_ok.connect(
-            lambda _payload, _code: QTimer.singleShot(150, self.refresh)
+            lambda payload, _code: self._on_start_ok(payload)
         )
         worker.failed.connect(
             lambda msg, code, _proto=proto: self._on_start_failed(msg, code, _proto)
         )
         worker.start()
+
+    def _on_start_ok(self, payload: Dict[str, Any]) -> None:
+        """v0.5.271 (L2-E1): success dispatcher. For scaled starts
+        (`count > 1` in the response) pop an info box summarising
+        how many sessions came up; on partial success (fewer sids
+        than requested) escalate to warning styling so the operator
+        sees it. Always fires the 150ms refresh so the sessions
+        table populates."""
+        try:
+            spawned = int(payload.get("count") or 0)
+            requested = int(payload.get("requested") or 0)
+            sids = payload.get("session_ids") or []
+        except (TypeError, ValueError):
+            spawned = requested = 0
+            sids = []
+        if spawned > 1 or requested > 1:
+            if spawned < requested:
+                QMessageBox.warning(
+                    self, "Scale start partial",
+                    f"Requested {requested} sessions but the server "
+                    f"only spawned {spawned}. Check the L2 sessions "
+                    f"table's Last Error column and the server log "
+                    f"for the failed instances."
+                )
+            else:
+                QMessageBox.information(
+                    self, "Scale start OK",
+                    f"Spawned {spawned} sessions on the interface — "
+                    f"they appear in the L2 sessions table below."
+                )
+        QTimer.singleShot(150, self.refresh)
 
     def _on_start_failed(self, msg: str, http_code: int, proto: str) -> None:
         """v0.3.8: dispatcher for the async start POST's failed

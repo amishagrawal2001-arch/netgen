@@ -2,6 +2,49 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.271] - 2026-09-05
+
+**L2/multicast emulation — scale (N-instance) support.**
+
+Emulate N distinct instances of a protocol from one dialog Start
+click instead of clicking Start N times. Cap: 500 sessions per
+interface (past that the operator should be using DPDK, not
+scapy). Per-instance failures don't abort the fan-out — partial-
+success comes back with the shorter session_ids list.
+
+- **L2-E1: `Scale count` field in Common Settings.** New spinbox
+  (1-500, default 1 = single session) beside Duration / VLAN.
+  Tooltip enumerates the per-protocol identity increments so the
+  operator sees at a glance what changes per instance:
+  * LLDP  — chassis_id / port_id / system_name gain `-N` suffix
+  * LACP  — system_mac last-octet ++ and port_number ++
+  * VRRP  — VRID ++ (wraps at 255, skips 0), virtual_ips last-octet ++
+  * IGMP  — group last-octet ++ (239.1.1.1 → .2, .3, .4…)
+  * PIM   — src_ip last-octet ++ and generation_id ++
+  * BFD   — dst_ip + my_discriminator ++
+
+- **Server: `count` accepted on `/api/l2/<proto>/start`.** When
+  count > 1 the server calls the new `utils.l2_protocols.
+  start_scaled(proto, iface, count, base_kwargs)` helper which
+  loops the per-protocol factory N times, computing the n-th
+  session's kwargs via a small increment table. Returns:
+  `{"session_ids": [...], "count": N, "requested": N,
+    "session_id": <first>}` — `session_id` kept for pre-v0.5.271
+  client back-compat. Client shows a summary MessageBox
+  ("Spawned N sessions on the interface") on success, or a
+  warning ("Requested N, spawned M") on partial-success.
+
+- **Backwards compatibility:** count absent or 1 takes the exact
+  pre-v0.5.271 single-session code path — same kwargs, same
+  registry entry, same response shape.
+
+Every session lands in the same `_SESSIONS` registry so they
+show as distinct rows in the L2 sessions table and stop
+individually or via `stop_all_sessions` unchanged.
+
+Regression tests in `tests/test_v05271_l2_scale.py`
+(source-level + fan-out unit tests). Source-level verified only.
+
 ## [0.5.270] - 2026-09-05
 
 **L2 emulation "why don't I see it" diagnostics.**

@@ -127,6 +127,35 @@ def _l2_start_impl(protocol):
     # add fields to a factory.
     kwargs = {k: body[k] for k in allowed_keys if k in body}
 
+    # v0.5.271: scale support. `count` in the body triggers the
+    # fan-out helper `start_scaled` which spawns N sessions with
+    # per-protocol identity increments (VRID, group, discriminator,
+    # etc.). count=1 (default when the field is absent or invalid)
+    # takes the single-session path so pre-v0.5.271 clients see
+    # the same {"session_id": ...} shape they always did.
+    try:
+        count = int(body.get("count") or 1)
+    except (TypeError, ValueError):
+        count = 1
+    if count > 1:
+        try:
+            sids = _l2.start_scaled(proto, iface, count, kwargs)
+        except ValueError as exc:
+            return jsonify({"error": f"scale rejected: {exc}"}), 400
+        except Exception as exc:
+            logging.error(f"[L2] start_scaled({proto}) failed: {exc}")
+            return jsonify({"error": str(exc)}), 500
+        return jsonify({
+            "session_ids": sids,
+            "count":       len(sids),
+            "requested":   count,
+            "protocol":    proto,
+            "iface":       iface,
+            # session_id kept so pre-v0.5.271 clients that only read
+            # this field see the first spawned id (backwards-compat).
+            "session_id":  sids[0] if sids else None,
+        }), 200
+
     try:
         sid = factory(iface=iface, **kwargs)
     except TypeError as exc:

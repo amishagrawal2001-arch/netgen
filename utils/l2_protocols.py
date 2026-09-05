@@ -1228,6 +1228,245 @@ def start_bfd(
 
 
 # ====================================================================
+# Scale / multi-instance emulation (v0.5.271)
+# ====================================================================
+#
+# Real network testing wants N of everything: 100 LACP LAGs against
+# a switch stack, 1000 IGMP joiners exercising a snooping table, a
+# fleet of VRRP masters across VRIDs 1-64, dozens of BFD peer
+# emulations with distinct discriminators, etc. Pre-v0.5.271 the
+# operator had to click Start N times.
+#
+# Design: fan-out on the server side. The single-session factories
+# stay unchanged (backwards-compat); a bulk helper loops them N
+# times, computing per-iteration kwargs from a per-protocol
+# increment table. Each spawned session lands in the same registry
+# and shows up as its own row in list_sessions() — the operator can
+# still stop them individually or all-at-once.
+
+
+def _increment_last_octet(value: str, offset: int) -> str:
+    """Add `offset` to the last dotted octet of a dotted-quad IPv4
+    address (or the last colon-group of a MAC / IPv6-ish string),
+    wrapping at 255. Used by every scaled protocol that increments
+    a group / vrid / target IP / neighbor address.
+
+    Examples:
+      _increment_last_octet("239.1.1.1",   4) -> "239.1.1.5"
+      _increment_last_octet("192.168.1.100", 3) -> "192.168.1.103"
+      _increment_last_octet("00:11:22:33:44:01", 2) -> "00:11:22:33:44:03"
+
+    Returns the input verbatim on any parse failure so a scale
+    fan-out doesn't collapse into a stack trace.
+    """
+    if not value or offset == 0:
+        return value
+    try:
+        # MAC (5 colons) — increment last hex byte, wrap at 0xff.
+        if value.count(":") == 5:
+            parts = value.split(":")
+            last = (int(parts[-1], 16) + offset) & 0xff
+            parts[-1] = f"{last:02x}"
+            return ":".join(parts)
+        # IPv4 dotted-quad — increment last decimal octet, wrap at 255.
+        if value.count(".") == 3:
+            parts = value.split(".")
+            last = (int(parts[-1]) + offset) & 0xff
+            parts[-1] = str(last)
+            return ".".join(parts)
+    except (ValueError, IndexError):
+        pass
+    return value
+
+
+# Per-protocol scale increment functions. Each takes (base_kwargs
+# dict, iteration index n, iface_str) and returns a NEW kwargs dict
+# for the n-th session. iteration 0 == the base (unchanged) so a
+# count=1 call is byte-identical to a single-session call.
+
+
+def _scale_kwargs_lldp(base: Dict[str, Any], n: int, iface: str) -> Dict[str, Any]:
+    """LLDP: N distinct advertisers. Chassis-ID and Port-ID get a
+    "-N" suffix so the switch's neighbor table shows N distinct
+    entries. src_mac (when set) increments last octet — leave blank
+    to let the server derive from the iface for iteration 0 and
+    increment_last_octet for the rest."""
+    k = dict(base)
+    if n == 0:
+        return k
+    _sfx = f"-{n + 1}"
+    if k.get("chassis_id"):
+        k["chassis_id"] = f"{k['chassis_id']}{_sfx}"
+    if k.get("port_id"):
+        k["port_id"] = f"{k['port_id']}{_sfx}"
+    if k.get("system_name"):
+        k["system_name"] = f"{k['system_name']}{_sfx}"
+    if k.get("src_mac"):
+        k["src_mac"] = _increment_last_octet(k["src_mac"], n)
+    return k
+
+
+def _scale_kwargs_lacp(base: Dict[str, Any], n: int, iface: str) -> Dict[str, Any]:
+    """LACP: N distinct LAG Actor identities. system_mac + port_number
+    increment; key stays constant (same LAG group)."""
+    k = dict(base)
+    if n == 0:
+        return k
+    if k.get("system_mac"):
+        k["system_mac"] = _increment_last_octet(k["system_mac"], n)
+    if k.get("port_number") is not None:
+        k["port_number"] = int(k["port_number"]) + n
+    return k
+
+
+def _scale_kwargs_vrrp(base: Dict[str, Any], n: int, iface: str) -> Dict[str, Any]:
+    """VRRP: N distinct virtual routers. VRID + virtual_ips increment;
+    the RFC 5798 virtual MAC follows automatically because it's
+    derived from VRID at emit time."""
+    k = dict(base)
+    if n == 0:
+        return k
+    if k.get("vrid") is not None:
+        # VRIDs are 1-255; wrap at 255 (skip 0 which is reserved).
+        v = int(k["vrid"]) + n
+        v = ((v - 1) % 255) + 1
+        k["vrid"] = v
+    if k.get("virtual_ips"):
+        k["virtual_ips"] = [
+            _increment_last_octet(vip, n) for vip in k["virtual_ips"]
+        ]
+    if k.get("src_mac"):
+        k["src_mac"] = _increment_last_octet(k["src_mac"], n)
+    return k
+
+
+def _scale_kwargs_igmp(base: Dict[str, Any], n: int, iface: str) -> Dict[str, Any]:
+    """IGMP: N distinct group joins. group last-octet increments."""
+    k = dict(base)
+    if n == 0:
+        return k
+    if k.get("group"):
+        k["group"] = _increment_last_octet(k["group"], n)
+    if k.get("src_mac"):
+        k["src_mac"] = _increment_last_octet(k["src_mac"], n)
+    return k
+
+
+def _scale_kwargs_pim(base: Dict[str, Any], n: int, iface: str) -> Dict[str, Any]:
+    """PIM Hello: N distinct neighbors on the segment. Each Hello
+    presents a distinct src_ip + src_mac + generation_id so the
+    peer PIM daemon sees N distinct routers."""
+    k = dict(base)
+    if n == 0:
+        return k
+    if k.get("src_ip"):
+        k["src_ip"] = _increment_last_octet(k["src_ip"], n)
+    if k.get("src_mac"):
+        k["src_mac"] = _increment_last_octet(k["src_mac"], n)
+    if k.get("generation_id") is not None:
+        # 32-bit field; xor a per-session salt so restart-detection
+        # doesn't false-trigger.
+        k["generation_id"] = (int(k["generation_id"]) + n) & 0xffffffff
+    return k
+
+
+def _scale_kwargs_bfd(base: Dict[str, Any], n: int, iface: str) -> Dict[str, Any]:
+    """BFD: N distinct peer sessions. dst_ip + my_discriminator +
+    (when set) dst_mac all increment; the src side stays on this
+    host's iface (only one host)."""
+    k = dict(base)
+    if n == 0:
+        return k
+    if k.get("dst_ip"):
+        k["dst_ip"] = _increment_last_octet(k["dst_ip"], n)
+    if k.get("dst_mac"):
+        k["dst_mac"] = _increment_last_octet(k["dst_mac"], n)
+    if k.get("my_discriminator") is not None:
+        k["my_discriminator"] = (int(k["my_discriminator"]) + n) & 0xffffffff
+    return k
+
+
+_SCALE_INCREMENTERS = {
+    "lldp": _scale_kwargs_lldp,
+    "lacp": _scale_kwargs_lacp,
+    "vrrp": _scale_kwargs_vrrp,
+    "igmp": _scale_kwargs_igmp,
+    "pim":  _scale_kwargs_pim,
+    "bfd":  _scale_kwargs_bfd,
+}
+
+
+# Hard ceiling — 500 sessions/interface is already 500 threads +
+# 500 sendp() calls per interval. Beyond that the operator wants
+# DPDK, not scapy. Keeps a runaway `count=99999` from OOM'ing the
+# server.
+MAX_SCALE_COUNT = 500
+
+
+def start_scaled(protocol: str, iface: str, count: int,
+                 base_kwargs: Dict[str, Any]) -> List[str]:
+    """Spawn `count` instances of `protocol` on `iface`, incrementing
+    the protocol-appropriate identity fields per instance.
+
+    Returns the list of session IDs (length == count). `count=1`
+    is byte-identical to a single-session factory call — same
+    kwargs, same registry entry — so the scale path is safe as
+    the default.
+
+    Raises `ValueError` on unknown protocol; caps count at
+    `MAX_SCALE_COUNT` and logs a warning if the caller asked for
+    more. Per-instance factory failures are logged but do NOT
+    abort the fan-out — the operator gets back a shorter list
+    of session_ids (a partial-success). This matches the
+    v0.5.264 monitor-per-neighbor semantic (one dead peer
+    doesn't stop the rest).
+    """
+    proto = (protocol or "").lower().strip()
+    incrementer = _SCALE_INCREMENTERS.get(proto)
+    if incrementer is None:
+        raise ValueError(f"unknown protocol for scale: {protocol!r}")
+    factory_map = {
+        "lldp": start_lldp,
+        "lacp": start_lacp,
+        "vrrp": start_vrrp,
+        "igmp": start_igmp,
+        "pim":  start_pim_hello,
+        "bfd":  start_bfd,
+    }
+    factory = factory_map[proto]
+    try:
+        n_want = max(1, int(count))
+    except (TypeError, ValueError):
+        n_want = 1
+    if n_want > MAX_SCALE_COUNT:
+        logger.warning(
+            "[L2] start_scaled(%s) capped from %d → %d (MAX_SCALE_COUNT)",
+            proto, n_want, MAX_SCALE_COUNT,
+        )
+        n_want = MAX_SCALE_COUNT
+    sids: List[str] = []
+    for n in range(n_want):
+        kw = incrementer(base_kwargs, n, iface)
+        try:
+            sids.append(factory(iface=iface, **kw))
+        except Exception as exc:
+            logger.warning(
+                "[L2] start_scaled(%s) iter %d/%d failed: %s",
+                proto, n + 1, n_want, exc,
+            )
+    if not sids:
+        raise RuntimeError(
+            f"start_scaled({protocol}, count={n_want}) — every "
+            f"iteration failed; see server log."
+        )
+    logger.info(
+        "[L2] start_scaled(%s) spawned %d/%d sessions on %s",
+        proto, len(sids), n_want, iface,
+    )
+    return sids
+
+
+# ====================================================================
 # Frame preview (v0.2.84) — pure synchronous frame-build for the GUI
 # ====================================================================
 #
