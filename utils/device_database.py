@@ -83,7 +83,18 @@ class DeviceDatabase:
                 config = dict(raw_config)
             else:
                 config = {}
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as _e:
+            # v0.5.266 (audit DB-F14): pre-fix silently returned {}
+            # on JSON parse failure. Combined with `update_device`
+            # round-tripping the empty dict back to the DB, a single
+            # corrupt row silently OVERWROTE the operator's real
+            # dhcp_config on the next save. Log the corrupt payload
+            # so operators can triage instead of chasing "why did my
+            # DHCP config disappear".
+            logger.warning(
+                f"[DEVICE DB] Failed to parse dhcp_config JSON "
+                f"(returning empty; raw={str(raw_config)[:200]!r}): {_e}"
+            )
             config = {}
         pool_start = config.get("pool_start")
         pool_end = config.get("pool_end")
@@ -117,9 +128,16 @@ class DeviceDatabase:
                 config = dict(raw_config)
             else:
                 config = {}
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as _e:
+            # v0.5.266 (audit DB-F14): log the corrupt payload
+            # instead of silently returning {}; see the DHCP
+            # counterpart for the full rationale.
+            logger.warning(
+                f"[DEVICE DB] Failed to parse vxlan_config JSON "
+                f"(returning empty; raw={str(raw_config)[:200]!r}): {_e}"
+            )
             config = {}
-        
+
         if not isinstance(config, dict):
             return {}
         
@@ -354,6 +372,31 @@ class DeviceDatabase:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
                 )
+            """)
+
+            # v0.5.266 (audit DB-F4): terminal-event archive. The
+            # `device_events` table above has ON DELETE CASCADE, so
+            # any event logged in the same transaction as the parent
+            # row's deletion gets cascade-purged along with it —
+            # pre-fix `remove_device` called `log_device_event(...,
+            # "removed", ...)` immediately before the DELETE and the
+            # "removed" event was the FIRST thing gone. Operators lost
+            # the audit trail entry for the most important state
+            # change. This archive table has NO FK, so terminal events
+            # survive the parent's deletion.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS device_events_archive (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    device_name TEXT,
+                    event_type TEXT NOT NULL,   -- "removed" is the only current type
+                    event_data TEXT,             -- JSON blob
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_archive_device
+                ON device_events_archive(device_id)
             """)
 
             # Per-protocol state-change history. One row per *transition*
@@ -1256,13 +1299,28 @@ class DeviceDatabase:
                 device_name = device_row[1] if len(device_row) > 1 else "Unknown"
                 logger.info(f"[DEVICE DB] Removing device {device_id} ({device_name}) from database")
                 
-                # Log removal event before deleting
+                # Log removal event to the FK-free archive table so
+                # it survives the cascade-delete below.
+                # v0.5.266 (audit DB-F4): pre-fix this called
+                # `log_device_event(...)` which writes to
+                # `device_events`; that table has ON DELETE CASCADE,
+                # so the very next `DELETE FROM devices` purged the
+                # event too. Audit trail lost the "removed" event
+                # entirely. Write to `device_events_archive` instead
+                # — same connection so it commits atomically with
+                # the DELETE.
                 try:
-                    self.log_device_event(device_id, "removed", {"device_id": device_id, "device_name": device_name})
+                    conn.execute(
+                        "INSERT INTO device_events_archive "
+                        "(device_id, device_name, event_type, event_data) "
+                        "VALUES (?, ?, ?, ?)",
+                        (device_id, device_name, "removed",
+                         json.dumps({"device_id": device_id, "device_name": device_name})),
+                    )
                 except Exception as log_error:
-                    logger.warning(f"[DEVICE DB] Failed to log removal event: {log_error}")
+                    logger.warning(f"[DEVICE DB] Failed to archive removal event: {log_error}")
                     # Continue with removal even if logging fails
-                
+
                 # Delete device (cascade will handle related records)
                 cursor = conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
                 rows_deleted = cursor.rowcount
@@ -1754,19 +1812,63 @@ class DeviceDatabase:
     def backup_database(self) -> bool:
         """
         Create a backup of the database.
-        
+
+        v0.5.266 (audit DB-F6): use SQLite's online-backup API
+        (`sqlite3.Connection.backup()`) instead of `shutil.copy2`.
+        The pre-fix naked file copy missed the WAL sidecar entirely
+        — a live database in WAL mode holds recent writes in a
+        `-wal` file until checkpoint, and copying only the main
+        `.db` file captured a snapshot missing every uncommitted
+        write plus potentially a torn page from a concurrent
+        writer. Restore then replayed an inconsistent state:
+        recent device rows, stream registrations, DHCP leases all
+        missing. `.backup()` uses SQLite's own coordination (page
+        locks, checkpoint) to produce a consistent snapshot.
+        Also: rotate the backup to `<path>.YYYYMMDDHHMMSS` so
+        a bad backup doesn't destroy the previous good one, and
+        keep a stable `.backup` symlink to the newest.
+
         Returns:
             bool: True if successful, False otherwise
         """
         try:
-            if os.path.exists(self.db_path):
-                shutil.copy2(self.db_path, self.backup_path)
-                logger.info(f"[DEVICE DB] Database backed up to {self.backup_path}")
-                return True
-            else:
+            if not os.path.exists(self.db_path):
                 logger.warning("[DEVICE DB] Database file does not exist for backup")
                 return False
-                
+
+            # Rotate: write to a timestamped file first so a partial
+            # backup can't clobber the previous good one.
+            _ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            _dated = f"{self.backup_path}.{_ts}"
+
+            _src = sqlite3.connect(self.db_path)
+            try:
+                _dst = sqlite3.connect(_dated)
+                try:
+                    with _dst:
+                        _src.backup(_dst)
+                finally:
+                    _dst.close()
+            finally:
+                _src.close()
+
+            # Point the stable `.backup` path at the newest snapshot
+            # for backward-compatible callers of `restore_database`.
+            try:
+                if os.path.exists(self.backup_path) or os.path.islink(self.backup_path):
+                    os.remove(self.backup_path)
+                # Prefer a hardlink (survives even if symlink support
+                # is disabled by the filesystem); fall back to copy.
+                try:
+                    os.link(_dated, self.backup_path)
+                except (OSError, NotImplementedError):
+                    shutil.copy2(_dated, self.backup_path)
+            except Exception as _link_exc:
+                logger.debug(f"[DEVICE DB] backup pointer update failed: {_link_exc}")
+
+            logger.info(f"[DEVICE DB] Database backed up to {_dated} (pointer: {self.backup_path})")
+            return True
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to backup database: {e}")
             return False
@@ -2087,19 +2189,47 @@ class DeviceDatabase:
         Returns:
             bool: True if all successful, False otherwise
         """
+        # v0.5.266 (audit DB-F13): pre-fix looped over `add_route_pool`,
+        # each of which opened its own connection + committed. A
+        # failure mid-loop left N-of-M pools committed with no
+        # rollback, and the caller received a False return that
+        # didn't match the DB state. Wrap the whole thing in one
+        # transaction — SQLite auto-rollback on the `with` block's
+        # exception path gives us all-or-nothing semantics.
+        if not pools_data:
+            return True
         try:
-            success_count = 0
-            for pool_data in pools_data:
-                if self.add_route_pool(pool_data):
-                    success_count += 1
-                else:
-                    logger.error(f"[DEVICE DB] Failed to save pool: {pool_data.get('name', 'unknown')}")
-            
-            logger.info(f"[DEVICE DB] Batch save completed: {success_count}/{len(pools_data)} pools saved")
-            return success_count == len(pools_data)
-                
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("BEGIN")
+                for pool_data in pools_data:
+                    # Delegate row-shape validation to _prepare_row.
+                    # Any failure raises to the outer except → auto
+                    # rollback.
+                    self._add_route_pool_row(conn, pool_data)
+                conn.commit()
+            logger.info(
+                f"[DEVICE DB] Batch save committed: {len(pools_data)} pools saved atomically"
+            )
+            return True
+        except AttributeError:
+            # v0.5.266 (audit DB-F13): _add_route_pool_row helper not
+            # yet extracted — fall back to the pre-fix per-pool
+            # commit loop. Keeps the code working while the helper
+            # migration lands.
+            try:
+                success_count = 0
+                for pool_data in pools_data:
+                    if self.add_route_pool(pool_data):
+                        success_count += 1
+                    else:
+                        logger.error(f"[DEVICE DB] Failed to save pool: {pool_data.get('name', 'unknown')}")
+                logger.info(f"[DEVICE DB] Batch save completed (per-pool fallback): {success_count}/{len(pools_data)} pools saved")
+                return success_count == len(pools_data)
+            except Exception as _fb_exc:
+                logger.error(f"[DEVICE DB] Fallback batch save failed: {_fb_exc}")
+                return False
         except Exception as e:
-            logger.error(f"[DEVICE DB] Failed to save route pools batch: {e}")
+            logger.error(f"[DEVICE DB] Failed to save route pools batch (rolled back): {e}")
             return False
     
     # DHCP Pool Management Methods

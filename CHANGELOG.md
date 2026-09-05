@@ -2,6 +2,115 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.266] - 2026-09-05
+
+**Device + Stream DB layer audit — 5 correctness fixes.**
+
+Audit found 15 findings across `utils/device_database.py` +
+`utils/stream_database.py`. 5 fixed here — the safe / low-risk
+subset. 10 deferred as they need staged rollout with schema
+migrations or concurrency-model changes (see "Deferred" below).
+
+**Tier-1:**
+
+- **DB-F1: `cleanup_old_stopped_streams` operator-precedence bug
+  DELETED Running streams.** SQL `AND` binds tighter than `OR`, so
+  the pre-fix `WHERE status='Stopped' AND (stopped_at IS NOT NULL
+  AND stopped_at<X) OR (stopped_at IS NULL AND updated_at<X)`
+  parsed as `(status='Stopped' AND ...) OR (stopped_at IS NULL
+  AND updated_at<X)`. The second OR-branch had NO status filter
+  — ANY stream (including Running streams whose `stopped_at` is
+  naturally NULL) with `updated_at` older than the window got
+  silently deleted. A stream whose stats-collector paused for an
+  hour vanished from the DB while still on the wire. Fix:
+  parenthesize both OR-branches under a single
+  `status='Stopped'` guard.
+
+**Tier-2:**
+
+- **DB-F4: `remove_device` cascade-deleted the "removed" event
+  in the same breath.** `device_events` has ON DELETE CASCADE on
+  `device_id`; the pre-fix flow called
+  `log_device_event(device_id, "removed", ...)` immediately
+  before `DELETE FROM devices WHERE device_id=?`. The FK cascade
+  purged the event row along with the parent → the audit trail
+  LOST the removal event, the single most important entry
+  operators want when a device disappears mysteriously. Fix:
+  new `device_events_archive` table (no FK) that survives the
+  parent's deletion; `remove_device` INSERTs the terminal event
+  there in the same transaction as the DELETE.
+
+- **DB-F6: `backup_database` used `shutil.copy2` on the live
+  WAL DB → inconsistent snapshot + backup overwrite.** SQLite
+  in WAL mode holds recent writes in the `-wal` sidecar until
+  checkpoint; a naked file copy misses everything since the
+  last checkpoint AND can catch a torn page mid-write.
+  `restore_database` then replayed an inconsistent snapshot
+  (recent devices / streams / DHCP leases missing). Also: the
+  fixed `.backup` path meant every backup overwrote the
+  previous good one. Fix: use SQLite's online-backup API
+  (`sqlite3.Connection.backup()`) for a consistent snapshot;
+  write to `<path>.YYYYMMDDHHMMSS` first, then update the
+  stable `.backup` pointer (hardlink preferred; copy fallback)
+  so a partial/bad backup can't destroy the previous good one.
+
+**Tier-3:**
+
+- **DB-F13: `save_route_pools_batch` wasn't a batch.** The pre-fix
+  loop called `add_route_pool` per pool, each opening its own
+  connection + committing. A failure mid-loop left N-of-M pools
+  committed with no rollback, and the caller's `False` return
+  didn't match the DB state. Fix: single connection +
+  `BEGIN`/commit around the whole loop → all-or-nothing
+  semantics via SQLite auto-rollback on the `with` exception
+  path.
+
+- **DB-F14: `_prepare_dhcp_config` / `_prepare_vxlan_config`
+  silently swallowed JSON parse errors → operator config lost
+  on the next save round-trip.** Pre-fix on
+  `json.JSONDecodeError` the helpers returned `{}` with no
+  logger.warning; the caller's next `update_device` then wrote
+  `{}` back to the DB. A single corrupt row propagated the
+  empty dict through UI → save → DB, erasing the operator's
+  real config. Fix: log a WARNING with the corrupt payload
+  (truncated to 200 chars) + device_id context so the row
+  can be triaged before more damage.
+
+**Deferred (staged rollout / schema-migration required):**
+
+- **DB-F2** — `_run_migrations` swallow-and-continue harness.
+  The v0.5.220 outage class. Needs granular per-step
+  try/except + an `add_column_if_not_exists` helper.
+- **DB-F3** — `update_device_statistics` is a "time-series
+  API" implemented as one-row-per-device. Historical trend UI
+  silently broken. Fix requires deciding the semantic
+  (latest-snapshot vs true time-series) AND a schema change
+  (`UNIQUE(device_id)` or drop the SELECT gate).
+- **DB-F5** — `PRAGMA foreign_keys` not enabled per-connection
+  → orphan `device_dhcp_pools` / `device_route_pools` rows.
+  Needs a `_connect()` helper adopted at every write site
+  (~40 call sites).
+- **DB-F7 / DB-F8** — `update_stream_statistics` SELECT-then-
+  UPDATE race + `register_stream` counter zero-out during
+  active read. Needs `BEGIN IMMEDIATE` transaction gating.
+- **DB-F9** — `add_device` / `update_device` split parent row
+  write from `log_device_event` across two transactions.
+  Needs `log_device_event` to accept an optional `conn`.
+- **DB-F10** — `add_state_transition` TOCTOU dedup under
+  WAL. Needs a partial UNIQUE index or `BEGIN IMMEDIATE`.
+- **DB-F11** — Mixed timestamp formats (SQLite `CURRENT_
+  TIMESTAMP` vs Python ISO) break SQL `datetime()`
+  comparisons at window edges. Needs one-format-only migration.
+- **DB-F12** — SQL string interpolation in `datetime('-{}
+  hours')`. Callers pass int today; a future config-driven
+  refactor risks injection. Change to bind param.
+- **DB-F15** — `attach_dhcp_pools_to_device` `INSERT OR
+  IGNORE` silently drops duplicates + destructive DELETE
+  with no-op guard missing.
+
+Regression tests in `tests/test_v05266_db_layer_audit.py` (13
+tests), all pass. 45 DB-adjacent tests pass, 0 regressions.
+
 ## [0.5.265] - 2026-09-04
 
 **Stream generation audit — 7 correctness fixes in

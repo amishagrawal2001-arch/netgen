@@ -522,12 +522,25 @@ class StreamDatabase:
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
-                # Delete stopped streams that haven't been updated in the specified time
+                # v0.5.266 (audit DB-F1): SQL operator-precedence bug —
+                # AND binds tighter than OR, so the pre-fix WHERE
+                # clause parsed as `(status='Stopped' AND stopped_at
+                # IS NOT NULL AND stopped_at < X) OR (stopped_at IS
+                # NULL AND updated_at < X)`. The second OR-branch
+                # had NO status filter, so ANY stream — Running
+                # streams whose stopped_at is naturally NULL — with
+                # updated_at older than the window got silently
+                # deleted. A stream whose collector paused for an
+                # hour vanished from the DB while still on the wire.
+                # Parenthesize both OR-branches under a single
+                # status='Stopped' guard.
                 cursor = conn.execute("""
                     DELETE FROM streams
                     WHERE status = 'Stopped'
-                    AND (stopped_at IS NOT NULL AND stopped_at < datetime('now', '-' || ? || ' hours'))
-                    OR (stopped_at IS NULL AND updated_at < datetime('now', '-' || ? || ' hours'))
+                      AND (
+                            (stopped_at IS NOT NULL AND stopped_at < datetime('now', '-' || ? || ' hours'))
+                         OR (stopped_at IS NULL     AND updated_at < datetime('now', '-' || ? || ' hours'))
+                          )
                 """, (hours, hours))
                 deleted = cursor.rowcount
                 conn.commit()
