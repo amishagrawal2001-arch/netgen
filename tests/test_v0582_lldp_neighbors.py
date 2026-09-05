@@ -101,11 +101,15 @@ def test_installer_writes_lldpd_config_file():
 
 
 def test_install_dpdk_apt_deps_includes_lldpd():
+    """v0.5.256 (drift): v0.5.192 split the apt batch into
+    `deps_required` + `deps_optional`. lldpd lives in
+    `deps_required` (it's tiny + not universe-gated). Match the
+    variable holding the actual package list, not the
+    `deps_install_cmd=$apt_common $deps_required` variable-ref."""
     sh = _DPDK_SH.read_text()
-    # The apt-get install line.
-    m = re.search(r"deps_install_cmd=.*$", sh, re.MULTILINE)
-    assert m and "lldpd" in m.group(0), (
-        "install_dpdk.sh apt deps list missing lldpd"
+    m = re.search(r'deps_required=["\']([^"\']+)["\']', sh)
+    assert m and "lldpd" in m.group(1), (
+        "install_dpdk.sh deps_required list missing lldpd"
     )
 
 

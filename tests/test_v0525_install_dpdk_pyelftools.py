@@ -33,49 +33,58 @@ _INSTALL_DPDK = (
 )
 
 
-def test_apt_install_includes_pyelftools():
-    """The deps_install_cmd line must include python3-pyelftools.
-    Without it, DPDK 23.11 meson setup fails with 'missing python
-    module: elftools' at step 5."""
+def _all_deps() -> str:
+    """v0.5.256 (drift): v0.5.192 refactored install_dpdk.sh to
+    split `deps_install_cmd` into two shell variables — `deps_required`
+    (all-or-fail) and `deps_optional` (best-effort, for AF_XDP on
+    boxes without Ubuntu universe). Concatenate both here so tests
+    can assert "any package the script tries to install" without
+    caring which batch it lives in."""
     src = _INSTALL_DPDK.read_text()
-    # Find the deps_install_cmd assignment.
-    m = re.search(r'deps_install_cmd=["\']([^"\']+)["\']', src)
-    assert m, "deps_install_cmd assignment not found in install_dpdk.sh"
-    apt_cmd = m.group(1)
+    parts = []
+    for var in ("deps_required", "deps_optional"):
+        m = re.search(rf'{var}=["\']([^"\']+)["\']', src)
+        if m:
+            parts.append(m.group(1))
+    return " ".join(parts)
+
+
+def test_apt_install_includes_pyelftools():
+    """The apt list must include python3-pyelftools. Without it,
+    DPDK 23.11 meson setup fails with 'missing python module:
+    elftools' at step 5."""
+    apt_cmd = _all_deps()
     assert "python3-pyelftools" in apt_cmd, (
-        "deps_install_cmd is missing python3-pyelftools. DPDK 23.11's "
-        "buildtools/meson.build:58 hard-requires the `elftools` "
-        "Python module — meson setup fails immediately without it. "
-        f"Current apt list:\n  {apt_cmd}"
+        "install_dpdk.sh apt list missing python3-pyelftools. "
+        "DPDK 23.11's buildtools/meson.build:58 hard-requires the "
+        "`elftools` Python module — meson setup fails immediately "
+        f"without it. Current apt list:\n  {apt_cmd}"
     )
 
 
 def test_pyelftools_in_core_batch_not_mlx5_batch():
     """v0.5.27 update: mlx5_install_cmd moved to install_rdma.sh
     along with the rest of the RDMA stack. This test now just
-    confirms pyelftools is in deps_install_cmd (the only batch left
-    in install_dpdk.sh). Pre-v0.5.27 this test also enforced
-    pyelftools NOT being in the mlx5 batch — moot now that the
-    batch is gone."""
+    confirms pyelftools is somewhere in the deps batches (the only
+    ones left in install_dpdk.sh). Pre-v0.5.27 this test also
+    enforced pyelftools NOT being in the mlx5 batch — moot now
+    that the batch is gone."""
     src = _INSTALL_DPDK.read_text()
     # mlx5_install_cmd MUST be gone — that's v0.5.27's contract.
     assert "mlx5_install_cmd" not in src, (
         "mlx5_install_cmd resurrected in install_dpdk.sh — moved to "
         "install_rdma.sh in v0.5.27. See test_v0527_rdma_install_split."
     )
-    # And pyelftools must be in the (sole) core batch.
-    m = re.search(r'deps_install_cmd=["\']([^"\']+)["\']', src)
-    assert m and "python3-pyelftools" in m.group(1), (
-        "python3-pyelftools missing from deps_install_cmd"
+    # And pyelftools must be in one of the batches.
+    assert "python3-pyelftools" in _all_deps(), (
+        "python3-pyelftools missing from install_dpdk.sh deps"
     )
 
 
 def test_apt_install_preserves_core_dpdk_deps():
     """Sanity check on the rest of the batch — guards against a
     refactor that drops other deps while adding pyelftools."""
-    src = _INSTALL_DPDK.read_text()
-    m = re.search(r'deps_install_cmd=["\']([^"\']+)["\']', src)
-    apt_cmd = m.group(1)
+    apt_cmd = _all_deps()
     # v0.5.27: libibverbs-dev, rdma-core, perftest moved to
     # install_rdma.sh. Mellanox MOFED-optional libmlx5-dev moved
     # there too. install_dpdk.sh's required list is now DPDK-only.

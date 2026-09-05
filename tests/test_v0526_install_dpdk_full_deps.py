@@ -70,10 +70,22 @@ OPTIONAL_V0526 = [
 
 
 def _apt_command() -> str:
+    """v0.5.256 (drift): v0.5.192 split `deps_install_cmd` into two
+    shell variables — `deps_required` (strict) and `deps_optional`
+    (AF_XDP, best-effort). Return the union so tests can check
+    "any package the installer attempts" without caring which
+    batch it lives in."""
     src = _INSTALL_DPDK.read_text()
-    m = re.search(r'deps_install_cmd=["\']([^"\']+)["\']', src)
-    assert m, "deps_install_cmd assignment not found"
-    return m.group(1)
+    parts = []
+    for var in ("deps_required", "deps_optional"):
+        m = re.search(rf'{var}=["\']([^"\']+)["\']', src)
+        if m:
+            parts.append(m.group(1))
+    assert parts, (
+        "install_dpdk.sh has neither deps_required nor deps_optional — "
+        "the whole batch layout changed; update this helper."
+    )
+    return " ".join(parts)
 
 
 def test_all_mandatory_packages_present():
