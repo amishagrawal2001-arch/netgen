@@ -7,6 +7,7 @@ import threading
 import time
 import logging
 import requests
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +15,24 @@ import queue
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# v0.5.264 (audit BGP-F2 + BGP-F3): sibling of v0.5.262 ARP fixes.
+# Serialize per-device DB writes and dedup log_device_event by
+# transition. `_update_device_bgp_status` runs a 4-write sequence
+# (statistics, devices row, event log, state transition) on
+# separate connections; a concurrent writer (monitor pass +
+# on-demand refresh / manual-override toggle) can interleave and
+# produce torn state. Event log unconditionally per-poll at 10s×
+# 100 devices was ~864k rows/day.
+_BGP_WRITE_LOCKS: Dict[str, threading.Lock] = defaultdict(threading.Lock)
+_BGP_WRITE_LOCKS_META_LOCK = threading.Lock()
+_LAST_BGP_STATE_LOGGED: Dict[str, str] = {}
+_LAST_BGP_STATE_LOGGED_LOCK = threading.Lock()
+
+
+def _bgp_write_lock_for(device_id: str) -> threading.Lock:
+    with _BGP_WRITE_LOCKS_META_LOCK:
+        return _BGP_WRITE_LOCKS[device_id]
 
 def _default_self_url():
     """Same as utils.arp_monitor._default_self_url — keeps the BGP
@@ -165,31 +184,81 @@ class BGPStatusMonitor:
     def _check_single_device_bgp_status(self, device: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Check BGP status for a single device."""
         device_id = device['device_id']
-        
+
         try:
             # Call the server's BGP status API
             response = requests.get(
                 f"{self.server_url}/api/bgp/status/{device_id}",
                 timeout=10
             )
-            
+
             if response.status_code == 200:
                 data = response.json()
                 neighbors = data.get('neighbors', [])
-                
-                # Determine overall BGP status and separate IPv4/IPv6 status
+
+                # v0.5.264 (audit BGP-F1): parity with OSPF's v0.5.206
+                # container-missing → synthesize Down. Pre-fix, when
+                # `get_bgp_status` caught `docker.errors.NotFound` it
+                # returned `{"status":"error"}`; the endpoint saw
+                # `status != 'success'`, kept `neighbors_data=[]` and
+                # returned 200 with `bgp_state="Unknown"`. The monitor
+                # then wrote Unknown to the DB unchanged — a device
+                # whose FRR container was removed sat at
+                # `bgp_state=Unknown` forever, hiding the "container
+                # gone" transition. Detect the pattern here and
+                # promote it to a Down synth so the DB reflects
+                # reality.
+                _inner = data.get('bgp_status') or {}
+                _container_missing = (
+                    _inner.get('status') == 'error'
+                    and not neighbors
+                )
+                if _container_missing:
+                    logger.info(
+                        f"[BGP MONITOR] Device {device_id} container missing "
+                        f"— synthesizing Down status to clear stale DB"
+                    )
+                    return {
+                        'bgp_established': False,
+                        'bgp_ipv4_established': False,
+                        'bgp_ipv6_established': False,
+                        'bgp_ipv4_state': 'Down',
+                        'bgp_ipv6_state': 'Down',
+                        'bgp_state': 'Down',
+                        'bgp_neighbors': [],
+                        'last_check': datetime.now(timezone.utc).isoformat(),
+                        'total_neighbors': 0,
+                    }
+
+                # Determine overall BGP status and separate IPv4/IPv6 status.
+                # v0.5.264 (audit BGP-F8): use a fixed state RANKING
+                # rather than "last-neighbor wins". Pre-fix, when no
+                # neighbor was Established, `bgp_state` was assigned
+                # the LAST iterated neighbor's state — arbitrary
+                # from vtysh output order, so a flapping peer could
+                # flip the top-level `bgp_state` between Idle /
+                # Connect / Active even when the fabric hadn't
+                # changed. Rank: Established > Active/OpenSent/
+                # OpenConfirm > Connect > Idle > everything else.
+                _STATE_RANK = {
+                    "Established": 0,
+                    "OpenConfirm": 1, "OpenSent": 2, "Active": 3,
+                    "Connect": 4, "Idle": 5,
+                }
+                _best_rank = 99
+                _best_state = "Unknown"
+
                 bgp_established = False
                 bgp_ipv4_established = False
                 bgp_ipv6_established = False
-                bgp_state = "Unknown"
                 bgp_ipv4_state = "Unknown"
                 bgp_ipv6_state = "Unknown"
                 bgp_neighbors = []
-                
+
                 for neighbor in neighbors:
                     neighbor_ip = neighbor.get('neighbor_ip', '')
                     neighbor_state = neighbor.get('state', 'Unknown')
-                    
+
                     neighbor_status = {
                         'neighbor_ip': neighbor_ip,
                         'neighbor_as': neighbor.get('neighbor_as'),
@@ -197,16 +266,12 @@ class BGPStatusMonitor:
                         'uptime': neighbor.get('uptime')
                     }
                     bgp_neighbors.append(neighbor_status)
-                    
+
                     # Determine if this is IPv4 or IPv6 based on IP address
                     is_ipv6 = ':' in neighbor_ip
-                    
-                    # Check if any neighbor is established (overall status)
+
                     if neighbor_state == 'Established':
                         bgp_established = True
-                        bgp_state = "Established"
-                        
-                        # Set protocol-specific status
                         if is_ipv6:
                             bgp_ipv6_established = True
                             bgp_ipv6_state = "Established"
@@ -219,11 +284,18 @@ class BGPStatusMonitor:
                             bgp_ipv6_state = neighbor_state
                         else:
                             bgp_ipv4_state = neighbor_state
-                        
-                        # Set overall state if not already established
-                        if not bgp_established:
-                            bgp_state = neighbor_state
-                
+
+                    # Rank this neighbor's state against the best-so-far.
+                    _rank = _STATE_RANK.get(neighbor_state, 90)
+                    if _rank < _best_rank:
+                        _best_rank = _rank
+                        _best_state = neighbor_state
+
+                # Overall bgp_state = best-ranked observed state
+                # (Established wins; otherwise the highest peer
+                # progress); "Unknown" only if no neighbors listed.
+                bgp_state = _best_state if bgp_neighbors else "Unknown"
+
                 return {
                     'bgp_established': bgp_established,
                     'bgp_ipv4_established': bgp_ipv4_established,
@@ -254,7 +326,14 @@ class BGPStatusMonitor:
             return None
     
     def _update_device_bgp_status(self, device_id: str, bgp_status: Dict[str, Any]):
-        """Update BGP status in the database."""
+        """Update BGP status in the database.
+
+        v0.5.264 (audit BGP-F2): per-device write lock serialises
+        the 4-write sequence so a concurrent writer (on-demand
+        refresh, manual-override toggle) can't interleave.
+        """
+        _lock = _bgp_write_lock_for(device_id)
+        _lock.acquire()
         try:
             # Check if there's a manual override in place
             device_data = self.device_db.get_device(device_id)
@@ -315,16 +394,27 @@ class BGPStatusMonitor:
             
             self.device_db.update_device(device_id, update_data)
             
-            # Log BGP status event
-            self.device_db.log_device_event(device_id, "bgp_status_check", {
-                'bgp_established': bgp_status['bgp_established'],
-                'bgp_ipv4_established': bgp_status['bgp_ipv4_established'],
-                'bgp_ipv6_established': bgp_status['bgp_ipv6_established'],
-                'bgp_ipv4_state': bgp_status['bgp_ipv4_state'],
-                'bgp_ipv6_state': bgp_status['bgp_ipv6_state'],
-                'total_neighbors': bgp_status['total_neighbors'],
-                'neighbors': bgp_status['bgp_neighbors']
-            })
+            # Log BGP status event.
+            # v0.5.264 (audit BGP-F3): dedup against the last-logged
+            # bgp_state per device — steady-state Established polls
+            # at 10s x 100 devices produced ~864k rows/day pre-fix.
+            _cur_state = bgp_status.get('bgp_state') or "Unknown"
+            with _LAST_BGP_STATE_LOGGED_LOCK:
+                _prev_state = _LAST_BGP_STATE_LOGGED.get(device_id)
+                _should_log = _prev_state != _cur_state
+                if _should_log:
+                    _LAST_BGP_STATE_LOGGED[device_id] = _cur_state
+            if _should_log:
+                self.device_db.log_device_event(device_id, "bgp_status_check", {
+                    'bgp_established': bgp_status['bgp_established'],
+                    'bgp_ipv4_established': bgp_status['bgp_ipv4_established'],
+                    'bgp_ipv6_established': bgp_status['bgp_ipv6_established'],
+                    'bgp_ipv4_state': bgp_status['bgp_ipv4_state'],
+                    'bgp_ipv6_state': bgp_status['bgp_ipv6_state'],
+                    'total_neighbors': bgp_status['total_neighbors'],
+                    'neighbors': bgp_status['bgp_neighbors'],
+                    'transition_from': _prev_state,
+                })
 
             # Per-protocol state-history timeline (de-dupes against last row,
             # so steady-state Established polls don't bloat the table).
@@ -346,7 +436,9 @@ class BGPStatusMonitor:
             
         except Exception as e:
             logger.error(f"[BGP MONITOR] Error updating BGP status for device {device_id}: {e}")
-    
+        finally:
+            _lock.release()
+
     def force_check_all(self):
         """Force an immediate BGP status check for all devices."""
         if not self.is_running:

@@ -3,6 +3,53 @@ import subprocess
 import threading
 from typing import Dict, Any, Optional
 
+
+def container_exec_with_timeout(container, cmd, timeout_sec: float = 5.0):
+    """v0.5.264 (audit BGP/OSPF/ISIS monitor F5): module-scope
+    wrapper around ``docker-py``'s ``container.exec_run`` that
+    enforces a timeout via a threading.Thread.join().
+
+    Pre-fix, ``get_ospf_status`` called raw ``container.exec_run``
+    which has NO timeout — a hung containerd or an ospfd stuck in
+    a syscall pinned the Flask worker forever. The monitor's outer
+    ``requests.get(..., timeout=10)`` returned after 10 s but the
+    worker kept running the hung exec and could never serve
+    another request. With 5 workers and a couple of misbehaving
+    containers, netgen-server locked up.
+
+    Returns ``None`` on timeout so callers can treat "hung
+    container" the same as "container missing" and synthesize a
+    Down state, per the v0.5.206 pattern.
+
+    Note: an internal helper of the same shape exists inside
+    ``configure_ospf_neighbor`` (line ~157). That one is kept for
+    now to avoid touching the OSPF configure path; new callers
+    should use this module-scope function.
+    """
+    result = [None]
+    exception = [None]
+
+    def _run_exec():
+        try:
+            result[0] = container.exec_run(cmd)
+        except Exception as _e:
+            exception[0] = _e
+
+    _t = threading.Thread(target=_run_exec, daemon=True)
+    _t.start()
+    _t.join(timeout=timeout_sec)
+
+    if _t.is_alive():
+        logging.warning(
+            "[OSPF] container.exec_run timeout after %ss for cmd=%r "
+            "— treating as unreachable",
+            timeout_sec, cmd,
+        )
+        return None
+    if exception[0]:
+        raise exception[0]
+    return result[0]
+
 OSPF_INSTANCES = {}
 
 
@@ -1115,7 +1162,13 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
         _scope_suffix = f" {_scope}" if _scope else ""
 
         # Get IPv4 OSPF neighbors
-        result_ipv4 = container.exec_run(f"vtysh -c 'show ip ospf{_scope_suffix} neighbor'")
+        # v0.5.264 (audit F5): wrap with a 5s timeout so a hung
+        # container doesn't wedge the Flask worker.
+        result_ipv4 = container_exec_with_timeout(
+            container, f"vtysh -c 'show ip ospf{_scope_suffix} neighbor'", timeout_sec=5,
+        )
+        if result_ipv4 is None:
+            return None
         if result_ipv4.exit_code == 0:
             output_ipv4 = result_ipv4.output.decode()
             
@@ -1157,7 +1210,11 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
         
         # Get IPv6 OSPF neighbors
         # OSPF6 syntax for VRF: `show ipv6 ospf6 vrf <name> neighbor`
-        result_ipv6 = container.exec_run(f"vtysh -c 'show ipv6 ospf6{_scope_suffix} neighbor'")
+        result_ipv6 = container_exec_with_timeout(
+            container, f"vtysh -c 'show ipv6 ospf6{_scope_suffix} neighbor'", timeout_sec=5,
+        )
+        if result_ipv6 is None:
+            return None
         if result_ipv6.exit_code == 0:
             output_ipv6 = result_ipv6.output.decode()
             
@@ -1197,11 +1254,19 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
                         })
         
         # Get OSPF summary for IPv4
-        result_ipv4_summary = container.exec_run(f"vtysh -c 'show ip ospf{_scope_suffix}'")
+        result_ipv4_summary = container_exec_with_timeout(
+            container, f"vtysh -c 'show ip ospf{_scope_suffix}'", timeout_sec=5,
+        )
+        if result_ipv4_summary is None:
+            return None
         ospf_ipv4_summary = result_ipv4_summary.output.decode() if result_ipv4_summary.exit_code == 0 else ""
         
         # Get OSPF summary for IPv6
-        result_ipv6_summary = container.exec_run(f"vtysh -c 'show ipv6 ospf6{_scope_suffix}'")
+        result_ipv6_summary = container_exec_with_timeout(
+            container, f"vtysh -c 'show ipv6 ospf6{_scope_suffix}'", timeout_sec=5,
+        )
+        if result_ipv6_summary is None:
+            return None
         ospf_ipv6_summary = result_ipv6_summary.output.decode() if result_ipv6_summary.exit_code == 0 else ""
         logging.debug(f"[OSPF STATUS] IPv6 summary exit_code: {result_ipv6_summary.exit_code}, output length: {len(ospf_ipv6_summary)}")
         

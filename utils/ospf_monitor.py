@@ -8,6 +8,7 @@ import time
 import logging
 import requests
 import json
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +16,19 @@ import queue
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# v0.5.264 (audit OSPF-F2 + OSPF-F3): sibling of v0.5.262 ARP fixes.
+# Per-device write lock + log_device_event dedup — see bgp_monitor
+# for the full rationale.
+_OSPF_WRITE_LOCKS: Dict[str, threading.Lock] = defaultdict(threading.Lock)
+_OSPF_WRITE_LOCKS_META_LOCK = threading.Lock()
+_LAST_OSPF_STATE_LOGGED: Dict[str, str] = {}
+_LAST_OSPF_STATE_LOGGED_LOCK = threading.Lock()
+
+
+def _ospf_write_lock_for(device_id: str) -> threading.Lock:
+    with _OSPF_WRITE_LOCKS_META_LOCK:
+        return _OSPF_WRITE_LOCKS[device_id]
 
 def _default_self_url():
     """Same pattern as utils.arp_monitor / utils.bgp_monitor — keeps
@@ -129,7 +143,14 @@ class OSPFStatusMonitor:
                     except Exception:
                         protocols = []
                 
-                if "OSPF" in protocols:
+                # v0.5.264 (audit OSPF-F6): filter on status=='Running'
+                # to mirror BGP/ARP. Pre-fix, stopped devices were
+                # polled every 10s → the /api/ospf/status endpoint
+                # returns 404, the monitor synthesises Down, and the
+                # DB got clobbered on every tick. Combined with the
+                # event-log bloat (F3) that was ~86k stale rows/day
+                # per stopped device.
+                if "OSPF" in protocols and device.get("status") == "Running":
                     ospf_devices.append(device)
             
             return ospf_devices
@@ -244,7 +265,13 @@ class OSPFStatusMonitor:
             return None
     
     def _update_device_ospf_status(self, device_id: str, ospf_status: Dict[str, Any]):
-        """Update OSPF status in database for a device."""
+        """Update OSPF status in database for a device.
+
+        v0.5.264 (audit OSPF-F2): per-device write lock serialises
+        the 4-write sequence.
+        """
+        _lock = _ospf_write_lock_for(device_id)
+        _lock.acquire()
         try:
             # Check if there's a manual override in place
             device_data = self.device_db.get_device(device_id)
@@ -323,13 +350,23 @@ class OSPFStatusMonitor:
             result = self.device_db.update_device(device_id, update_data)
             logger.info(f"[OSPF MONITOR] Database update result: {result}")
             
-            # Log OSPF status event
-            self.device_db.log_device_event(device_id, "ospf_status_check", {
-                'ospf_established': ospf_established,
-                'ospf_state': ospf_state,
-                'total_neighbors': len(neighbors),
-                'neighbors': neighbors
-            })
+            # Log OSPF status event.
+            # v0.5.264 (audit OSPF-F3): dedup against the last-logged
+            # ospf_state per device to bound event-log growth.
+            _cur_state = ospf_state or "Unknown"
+            with _LAST_OSPF_STATE_LOGGED_LOCK:
+                _prev_state = _LAST_OSPF_STATE_LOGGED.get(device_id)
+                _should_log = _prev_state != _cur_state
+                if _should_log:
+                    _LAST_OSPF_STATE_LOGGED[device_id] = _cur_state
+            if _should_log:
+                self.device_db.log_device_event(device_id, "ospf_status_check", {
+                    'ospf_established': ospf_established,
+                    'ospf_state': ospf_state,
+                    'total_neighbors': len(neighbors),
+                    'neighbors': neighbors,
+                    'transition_from': _prev_state,
+                })
 
             # Per-protocol state-history timeline (de-dup'd against last row).
             try:
@@ -352,7 +389,9 @@ class OSPFStatusMonitor:
             logger.error(f"[OSPF MONITOR] Error updating OSPF status for device {device_id}: {e}")
             import traceback
             logger.error(f"[OSPF MONITOR] Traceback: {traceback.format_exc()}")
-    
+        finally:
+            _lock.release()
+
     def force_check_all(self):
         """Force an immediate OSPF status check for all devices."""
         if not self.is_running:

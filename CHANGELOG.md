@@ -2,6 +2,103 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.264] - 2026-09-04
+
+**BGP + OSPF + ISIS monitor audit — 9 correctness fixes.**
+
+Follow-up on 3 sibling routing-protocol monitors that share
+shape with the ARP monitor (fixed in v0.5.258 + v0.5.262).
+
+**Tier-1:**
+
+- **BGP-F1: container-missing → "Down" synthesis (v0.5.206
+  parity gap).** OSPF got this fix; BGP never did.
+  `get_bgp_status` catches `docker.errors.NotFound` and returns
+  `{"status":"error"}`; the endpoint keeps `neighbors_data=[]`
+  and returns 200 with `bgp_state="Unknown"`. Monitor now
+  detects the `bgp_status.status == 'error'` + empty-neighbors
+  pattern and synthesizes a full Down state — devices whose
+  FRR container gets removed now transition to Down in the DB
+  instead of staying Unknown forever.
+
+- **F2 + F3 (BGP + OSPF + ISIS): per-device write lock + event
+  log dedup.** All three monitors do a 4-write DB sequence per
+  poll (statistics, devices row, event log, state transition)
+  with no serialisation — same shape as the ARP-4/7 fix in
+  v0.5.262. Added per-file `_&lt;PROTO&gt;_WRITE_LOCKS` +
+  `_&lt;proto&gt;_write_lock_for(device_id)` + `_LAST_&lt;PROTO&gt;_STATE_
+  LOGGED` dict. `log_device_event` now fires ONLY on state
+  transition — pre-fix at 10s × 100 devices × 3 protocols this
+  was ~2.6M rows/day dominating `device_events` growth.
+
+- **ISIS-F4: parallel polling via ThreadPoolExecutor.** BGP
+  and OSPF use a 5-worker pool; ISIS was `for device in ...:
+  check(...)`. At 100 devices × ~2s per `exec_run` (two docker
+  execs per check), a pass took 3+ minutes — never catching up
+  with the 10s interval, `/api/isis/monitor/force-check` from
+  the Flask thread blocked the request for the same duration.
+  New `max_workers=5` constructor arg + mirror of BGP's
+  `as_completed` pattern in main loop + `force_check`.
+
+- **OSPF-F5: `get_ospf_status` used raw `container.exec_run`
+  with no timeout — wedged Flask workers on hung containers.**
+  docker-py's `container.exec_run()` has no default timeout;
+  a hung containerd or ospfd stuck in a syscall pinned the
+  caller forever. The monitor's outer `requests.get(...,
+  timeout=10)` returned, but the Flask worker kept running
+  the hung exec and could never serve another request. With
+  5 workers + a couple of misbehaving containers, netgen-
+  server locked up. New module-scope
+  `container_exec_with_timeout(container, cmd, timeout_sec=5)`
+  (thread-based join-with-timeout, mirrors the internal
+  helper inside `configure_ospf_neighbor`). Applied to all 4
+  primary vtysh calls in `get_ospf_status`.
+
+**Tier-2:**
+
+- **OSPF-F6 + ISIS-F6: filter on `status == 'Running'`.** BGP
+  and ARP already filter; OSPF and ISIS didn't. Pre-fix,
+  stopped devices were polled every tick — OSPF got 404 → Down
+  synth → DB clobbered every 10s, ISIS burned the sequential
+  poll budget on them, and both amplified the F3 event-log
+  bloat.
+
+- **ISIS-F7: `isis_established` only when adjacency is Up.**
+  Pre-fix `get_isis_status` appended every circuit to
+  `neighbors[]` regardless of adjacency state, then set
+  `isis_established = True` if `neighbors[]` was non-empty. An
+  admin-up interface with NO L1/L2 peer heard-from turned the
+  UI chip green and set the DB `isis_established` flag. Now:
+  read `circuit.adjacencies[].state` (FRR JSON), fall back to
+  `interface.state == 'Up' AND non-empty system_id` when the
+  new field is absent. Only mark Established when at least one
+  adjacency is actually Up.
+
+- **BGP-F8: `bgp_state` is now rank-based, not order-dependent.**
+  Pre-fix when no neighbor was Established, `bgp_state` was
+  assigned the LAST iterated neighbor's state — arbitrary
+  from vtysh output order. Two devices with peers `(Idle,
+  Active, Connect)` could end up with different `bgp_state`
+  values in the DB; a flapping peer could flip the top-level
+  state back and forth. New fixed rank:
+  Established > OpenConfirm > OpenSent > Active > Connect >
+  Idle > everything else. Top-level `bgp_state` = best-ranked
+  observed state.
+
+- **ISIS-F9: `check_existing_containers` prefix-match cross-
+  wired devices.** Pre-fix the fallback did
+  `container_id_part.startswith(device_id)` — on any
+  deployment with prefix-shared device ids (e.g. `abc123` /
+  `abc1234`), the container `ostg-frr-abc1234` matched the
+  SHORTER device first, and that wrong device's ISIS status
+  got synced from a container it didn't own. Container names
+  are deterministic `ostg-frr-{device_id}`; exact-match is
+  sufficient. Fallback removed.
+
+Regression tests in `tests/test_v05264_bgp_ospf_isis_monitor_audit.py`
+(21 tests), all pass. No regressions in the 68-test
+monitor-adjacent sweep.
+
 ## [0.5.263] - 2026-09-04
 
 **VXLAN deferred fixes — 5 correctness fixes in `utils/vxlan.py`.**

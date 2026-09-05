@@ -7,23 +7,44 @@ Monitors ISIS status and updates the database periodically.
 import logging
 import json
 import time
+import threading
+from collections import defaultdict
 from typing import Dict, List, Any
 from datetime import datetime, timezone
 from threading import Thread, Event
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
+
+# v0.5.264 (audit ISIS-F2 + ISIS-F3): sibling of v0.5.262 ARP fixes.
+# Per-device write lock + log_device_event dedup.
+_ISIS_WRITE_LOCKS: Dict[str, threading.Lock] = defaultdict(threading.Lock)
+_ISIS_WRITE_LOCKS_META_LOCK = threading.Lock()
+_LAST_ISIS_STATE_LOGGED: Dict[str, str] = {}
+_LAST_ISIS_STATE_LOGGED_LOCK = threading.Lock()
+
+
+def _isis_write_lock_for(device_id: str) -> threading.Lock:
+    with _ISIS_WRITE_LOCKS_META_LOCK:
+        return _ISIS_WRITE_LOCKS[device_id]
 
 class ISISMonitor:
     """ISIS status monitor that runs in background."""
     
-    def __init__(self, device_db):
+    def __init__(self, device_db, max_workers: int = 5):
         """
         Initialize ISIS monitor.
-        
+
         Args:
             device_db: DeviceDatabase instance
+            max_workers: v0.5.264 (audit ISIS-F4) parallel worker
+                count for the per-tick check. Pre-fix ISIS polled
+                sequentially — 100 devices × ~2s each = 3+ min per
+                pass, never catching up with the 10s interval.
+                Matches BGP/OSPF's default of 5.
         """
         self.device_db = device_db
+        self.max_workers = max_workers
         self.monitoring_active = False
         self.monitor_thread = None
         self.stop_event = Event()
@@ -109,24 +130,38 @@ class ISISMonitor:
                             if isis_config:
                                 has_isis_config = True
                     
-                    # Include device if it has ISIS protocol or ISIS config
-                    # This ensures we check devices with ISIS enabled, even if config is empty
-                    # and can clear stale status from database
-                    if has_isis_protocol or has_isis_config:
+                    # Include device if it has ISIS protocol or ISIS config.
+                    # v0.5.264 (audit ISIS-F6): filter on status=='Running'
+                    # to mirror BGP/ARP. Pre-fix, stopped devices were
+                    # polled every tick and produced Down synths that
+                    # clobbered the DB + inflated the event log.
+                    if (has_isis_protocol or has_isis_config) and device.get("status") == "Running":
                         isis_devices.append(device)
-                
+
                 if isis_devices:
                     logger.info(f"[ISIS MONITOR] Checking ISIS status for {len(isis_devices)} devices")
-                    
-                    for device in isis_devices:
-                        if self.stop_event.is_set():
-                            break
-                            
-                        device_id = device.get("device_id")
-                        device_name = device.get("device_name") or device.get("Device Name", "Unknown")
-                        
-                        if device_id:
-                            self._check_device_isis_status(device_id, device_name)
+
+                    # v0.5.264 (audit ISIS-F4): parallel polling. Pre-fix
+                    # was `for device in isis_devices: check(...)` — with
+                    # 100 devices at ~2s per exec_run, one pass took 3+
+                    # minutes, far past the 10s check_interval. Mirror
+                    # BGP/OSPF's ThreadPoolExecutor pattern.
+                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                        futures = {}
+                        for device in isis_devices:
+                            if self.stop_event.is_set():
+                                break
+                            device_id = device.get("device_id")
+                            device_name = device.get("device_name") or device.get("Device Name", "Unknown")
+                            if not device_id:
+                                continue
+                            futures[executor.submit(self._check_device_isis_status, device_id, device_name)] = device_id
+                        for fut in as_completed(futures):
+                            _did = futures[fut]
+                            try:
+                                fut.result()
+                            except Exception as _fe:
+                                logger.error(f"[ISIS MONITOR] Check failed for {_did}: {_fe}")
                 
                 logger.info(f"[ISIS MONITOR] Periodic ISIS status check completed for {len(isis_devices)} devices")
                 
@@ -218,7 +253,15 @@ class ISISMonitor:
             logger.error(f"[ISIS MONITOR] Error checking ISIS status for device {device_id}: {e}")
     
     def _update_device_isis_status(self, device_id: str, isis_status: Dict[str, Any]):
-        """Update ISIS status in database for a device."""
+        """Update ISIS status in database for a device.
+
+        v0.5.264 (audit ISIS-F2): per-device write lock serialises
+        the 4-write sequence so concurrent writers (monitor pass +
+        force_check + manual-override toggle) don't produce torn
+        state.
+        """
+        _lock = _isis_write_lock_for(device_id)
+        _lock.acquire()
         try:
             # Check if there's a manual override in place
             device_data = self.device_db.get_device(device_id)
@@ -292,15 +335,25 @@ class ISISMonitor:
             result = self.device_db.update_device(device_id, update_data)
             logger.info(f"[ISIS MONITOR] Database update result: {result}")
             
-            # Log ISIS status event
-            self.device_db.log_device_event(device_id, "isis_status_check", {
-                'isis_running': isis_running,
-                'isis_established': isis_established,
-                'isis_state': isis_state,
-                'total_neighbors': len(neighbors),
-                'neighbors': neighbors,
-                'areas': areas
-            })
+            # Log ISIS status event.
+            # v0.5.264 (audit ISIS-F3): dedup against the last-logged
+            # isis_state per device.
+            _cur_state = isis_state or "Unknown"
+            with _LAST_ISIS_STATE_LOGGED_LOCK:
+                _prev_state = _LAST_ISIS_STATE_LOGGED.get(device_id)
+                _should_log = _prev_state != _cur_state
+                if _should_log:
+                    _LAST_ISIS_STATE_LOGGED[device_id] = _cur_state
+            if _should_log:
+                self.device_db.log_device_event(device_id, "isis_status_check", {
+                    'isis_running': isis_running,
+                    'isis_established': isis_established,
+                    'isis_state': isis_state,
+                    'total_neighbors': len(neighbors),
+                    'neighbors': neighbors,
+                    'areas': areas,
+                    'transition_from': _prev_state,
+                })
 
             # Per-protocol state-history timeline (de-dup'd against last row).
             try:
@@ -324,7 +377,9 @@ class ISISMonitor:
             logger.error(f"[ISIS MONITOR] Error updating ISIS status for device {device_id}: {e}")
             import traceback
             logger.error(f"[ISIS MONITOR] Traceback: {traceback.format_exc()}")
-    
+        finally:
+            _lock.release()
+
     # Compatibility with the other monitors (ARP / BGP / OSPF / DHCP)
     # which expose `is_running`. Lets /api/monitors/health treat all
     # five uniformly instead of special-casing IS-IS.
@@ -377,16 +432,29 @@ class ISISMonitor:
                         if isis_config:
                             has_isis_config = True
                 
-                if has_isis_protocol or has_isis_config:
+                # v0.5.264 (audit ISIS-F6): filter on status=='Running'.
+                if (has_isis_protocol or has_isis_config) and device.get("status") == "Running":
                     isis_devices.append(device)
-            
+
             if isis_devices:
                 logger.info(f"[ISIS MONITOR] Force checking ISIS status for {len(isis_devices)} devices")
-                for device in isis_devices:
-                    device_id = device.get("device_id")
-                    device_name = device.get("device_name") or device.get("Device Name", "Unknown")
-                    if device_id:
-                        self._check_device_isis_status(device_id, device_name)
+                # v0.5.264 (audit ISIS-F4): parallel force-check so
+                # /api/isis/monitor/force-check doesn't wedge the Flask
+                # thread for ~2s × N devices.
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    futures = {}
+                    for device in isis_devices:
+                        device_id = device.get("device_id")
+                        device_name = device.get("device_name") or device.get("Device Name", "Unknown")
+                        if not device_id:
+                            continue
+                        futures[executor.submit(self._check_device_isis_status, device_id, device_name)] = device_id
+                    for fut in as_completed(futures):
+                        _did = futures[fut]
+                        try:
+                            fut.result()
+                        except Exception as _fe:
+                            logger.error(f"[ISIS MONITOR] Force-check failed for {_did}: {_fe}")
                 logger.info(f"[ISIS MONITOR] Force check completed for {len(isis_devices)} devices")
             else:
                 logger.info("[ISIS MONITOR] No ISIS devices found for force check")
@@ -436,25 +504,22 @@ class ISISMonitor:
                         matched_device = None
                         matched_device_id = None
                         
-                        # First try exact match
+                        # v0.5.264 (audit ISIS-F9): exact match ONLY.
+                        # Pre-fix the `startswith(device_id)` fallback
+                        # cross-matched devices whose IDs share a
+                        # prefix (e.g. `abc123` and `abc1234`) — the
+                        # loop's dict-iteration-order determined the
+                        # winner, so a container `ostg-frr-abc1234`
+                        # got bound to the shorter `abc123` device
+                        # and that wrong device's ISIS status got
+                        # synced from a container it doesn't own.
+                        # Container names are deterministic
+                        # (`ostg-frr-{device_id}` from
+                        # `frr_docker._get_container_name`), so the
+                        # exact-match branch is sufficient.
                         if container_id_part in device_id_map:
                             matched_device = device_id_map[container_id_part]
                             matched_device_id = container_id_part
-                        else:
-                            # Try to find device where container_id_part starts with device_id
-                            # or device_id is at the beginning of container_id_part
-                            for device_id, device in device_id_map.items():
-                                # Container name format is: ostg-frr-{device_id}
-                                # So container_id_part should match device_id exactly
-                                if container_id_part == device_id:
-                                    matched_device = device
-                                    matched_device_id = device_id
-                                    break
-                                # Also check if container_id_part starts with device_id (in case of additional suffixes)
-                                elif container_id_part.startswith(device_id):
-                                    matched_device = device
-                                    matched_device_id = device_id
-                                    break
                         
                         if not matched_device or not matched_device_id:
                             logger.debug(f"[ISIS MONITOR] Container {container_name} (extracted ID: {container_id_part}) does not match any device in database")

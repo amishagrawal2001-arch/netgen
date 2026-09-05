@@ -137,9 +137,39 @@ def get_isis_status(device_id: str, device_name: str, container_id: str) -> Dict
                     for circuit in circuits:
                         interface_info = circuit.get("interface", {})
                         adj_info = circuit.get("adj", "")
-                        
+
+                        # v0.5.264 (audit ISIS-F7): the circuit's
+                        # `interface.state` is the LINK admin state
+                        # (Up on any admin-up L2 iface, no matter
+                        # whether an ISIS adjacency actually formed).
+                        # An admin-up interface with no adjacency
+                        # heard-from produces a `state: "Up"` here.
+                        # Determine per-adjacency Up-ness by
+                        # checking the adjacency's own state
+                        # (isisd's JSON exposes it under
+                        # `adjacencies[].state` on newer FRR; when
+                        # missing, fall back to the presence of a
+                        # non-empty system_id — an isolated circuit
+                        # has adj == "").
+                        _adj_list = circuit.get("adjacencies") or []
+                        _adj_state = None
+                        if _adj_list and isinstance(_adj_list, list):
+                            first = _adj_list[0] or {}
+                            _adj_state = str(first.get("state") or "").strip()
+                        # Explicit Up flags: FRR variants use "Up",
+                        # "Init", "Down", "Failed". Treat only "Up"
+                        # as established. When _adj_state is None
+                        # (older isisd JSON), fall back to system_id
+                        # non-empty AS a weak signal — but ONLY
+                        # combined with iface state Up.
+                        _iface_state_up = str(interface_info.get("state") or "").strip() == "Up"
+                        if _adj_state:
+                            _neigh_up = _adj_state == "Up"
+                        else:
+                            _neigh_up = _iface_state_up and bool(adj_info)
+
                         neighbor_info = {
-                            "state": "Up" if interface_info.get("state") == "Up" else "Down",
+                            "state": "Up" if _neigh_up else "Down",
                             "type": "ISIS",
                             "interface": interface_info.get("name", ""),
                             "area": area.get("area", ""),
@@ -155,11 +185,16 @@ def get_isis_status(device_id: str, device_name: str, container_id: str) -> Dict
                             "ipv6_link_local": interface_info.get("ipv6-link-local", {}).get("ipv6", ""),
                             "ipv6_global": interface_info.get("ipv6-global", {}).get("ipv6", "")
                         }
-                        
+
                         isis_status["neighbors"].append(neighbor_info)
-                
-                # Set ISIS established if we have neighbors
-                if isis_status["neighbors"]:
+
+                # v0.5.264 (audit ISIS-F7): only mark Established
+                # when at least one adjacency is actually Up. Pre-fix
+                # ANY listed circuit (even admin-up-with-no-peer)
+                # flipped isis_established → True, turning the UI
+                # chip green on isolated interfaces.
+                _any_up = any(n.get("state") == "Up" for n in isis_status["neighbors"])
+                if _any_up:
                     isis_status["isis_established"] = True
                     isis_status["isis_state"] = "Established"
                 else:
