@@ -2,6 +2,67 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.256] - 2026-09-04
+
+**netgen-install shim: shell+Python polyglot so `bin/netgen-install`
+runs from any extract path, not just `/opt/netgen-server`.**
+
+Pre-fix the tarball's build step 5 (`.github/workflows/build-server-
+tarball.yml`) rewrote the shebang to hardcoded absolute path:
+```
+#!/opt/netgen-server/netgen-venv/bin/python
+```
+
+That works when — and only when — the operator extracts the
+tarball to `/opt/netgen-server` per the README. But operators
+routinely extract to `/tmp` first (permissions test, staging,
+or a `-C /opt` argument that succeeded to a different path than
+expected), then run `bin/netgen-install` from wherever they
+extracted. The kernel reads the shebang, cannot find the path,
+and reports `No such file or directory` with no clue about
+where to look. Operator-reported on srv06 — the workaround was
+to bypass the shim entirely and `pip install --force-reinstall
+--no-deps` the wheel.
+
+Fix — shell + Python polyglot at tarball-build time:
+```sh
+#!/bin/sh
+"exec" "$(cd "$(dirname "$0")" && pwd)/../netgen-venv/bin/python3" "$0" "$@"
+```
+
+Line 1 tells the kernel to load `/bin/sh` (always present).
+Line 2 is BOTH a valid shell command (execs the bundled Python
+found via relative path from the script's own directory) AND
+a valid Python expression (adjacent-concatenated string
+literals — Python treats it as a lone string statement). After
+`exec`, Python reads the file from the top; line 1 is a
+comment, line 2 becomes `__doc__`, line 3+ is the real code.
+
+Result: `bin/netgen-install` now finds its bundled Python
+regardless of extract path. Operators who extract to `/tmp` get
+a clean Python-level error (which now includes a preflight
+warning about the non-canonical install root and a `mv` command
+to fix it) instead of the kernel's opaque `No such file`.
+
+Also added a `_preflight` check that refuses to install when
+`install_root` isn't `/opt/netgen-server` unless the operator
+passes `--force`. The systemd unit hard-codes the ExecStart path,
+so installing from a `/tmp/*` extract produces a unit that
+breaks on reboot / tmp cleanup — the warning catches that before
+the operator has committed to it.
+
+No changes to netgen-upgrade / netgen-uninstall in this ship —
+the same build step applies the polyglot to all three shim
+scripts uniformly.
+
+Regression tests in `tests/test_v05256_shim_polyglot.py` (7
+tests) pin: (1) the workflow's sed pattern matches the polyglot
+shape not the old absolute-path shebang; (2) the source
+`bin/netgen-install` still parses as valid Python (the polyglot
+is added at build-time only); (3) the preflight warning fires
+on a non-canonical install root; (4) INSTALL_ROOT_DEFAULT is
+still `/opt/netgen-server` (the canonical anchor).
+
 ## [0.5.255] - 2026-09-04
 
 **DPDK rx_worker audit — 7 correctness fixes across

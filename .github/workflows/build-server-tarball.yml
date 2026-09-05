@@ -367,16 +367,42 @@ jobs:
             fi
             cp "$src" "$dst"
             chmod 0755 "$dst"
-            # The shebang line in source uses `#!/usr/bin/env python3`
-            # for dev-convenience. At tarball-build time we rewrite
-            # to the bundled venv's python so the script picks the
-            # right interpreter even if /usr/bin/env python3 doesn't
-            # exist on the target. The veny's `python` is a relative
-            # symlink, so it resolves correctly regardless of where
-            # the operator extracts the tarball.
-            sed -i '1s|.*|#!/opt/netgen-server/netgen-venv/bin/python|' "$dst"
-            # Sanity check the rewrite landed.
-            head -1 "$dst"
+            # v0.5.256 fix: the pre-v0.5.256 rewrite baked in the
+            # absolute path `#!/opt/netgen-server/netgen-venv/bin/
+            # python`. That works when — and only when — the operator
+            # extracts the tarball to /opt/netgen-server, per the
+            # README. But operators routinely extract to /tmp first
+            # (permissions test, staging, or the README's `-C /opt`
+            # command silently succeeded to a different path), then
+            # run `bin/netgen-install` from the extract dir. The
+            # kernel reads the shebang, can't find /opt/netgen-server/
+            # netgen-venv/bin/python, and reports "No such file or
+            # directory" with no helpful clue about where to look.
+            #
+            # Fix: shell + Python polyglot. Line 1 = `#!/bin/sh`, so
+            # the kernel loads sh regardless of install path. Line 2
+            # is BOTH a valid shell command (execs the bundled Python
+            # found via relative path from THIS script's own dir) AND
+            # a valid Python expression (adjacent-concatenated string
+            # literals; interpreter is happy). After `exec`, Python
+            # reads the file from the top; line 1 is a comment, line
+            # 2 is a lone string expression, line 3+ is the real code.
+            #
+            # Works at ANY extract path — the shim finds its own
+            # bundled Python via `$(dirname "$0")/../netgen-venv/bin/
+            # python3`. If the operator extracts to /tmp/netgen-server,
+            # bin/netgen-install now runs; the Python code then warns
+            # about the non-canonical location + writes the systemd
+            # unit against wherever they are.
+            {
+              echo '#!/bin/sh'
+              echo '"exec" "$(cd "$(dirname "$0")" && pwd)/../netgen-venv/bin/python3" "$0" "$@"'
+              tail -n +2 "$src"  # drop the source's `#!/usr/bin/env python3` shebang
+            } > "$dst"
+            chmod 0755 "$dst"
+            # Sanity check the rewrite landed AND the shim still runs
+            # under the bundled Python at the canonical install path.
+            head -2 "$dst"
           done
 
           # 6. README + VERSION stamp so the tarball is self-documenting.

@@ -175,6 +175,37 @@ def _preflight(install_root: Path, *, force: bool) -> None:
     is wrong"."""
     logger.info("[PRE-FLIGHT] Checking environment...")
 
+    # 0. v0.5.256: warn if the operator extracted to a non-canonical
+    #    location. The v0.5.256 shim-polyglot fix (see build-server-
+    #    tarball.yml step 5) means bin/netgen-install now runs from
+    #    ANY extract path — but the systemd unit + PATH symlinks +
+    #    tarball README all assume /opt/netgen-server. Running from
+    #    elsewhere works but produces a systemd unit that references
+    #    a probably-temporary path (breaks on reboot / /tmp cleanup).
+    canonical = Path(INSTALL_ROOT_DEFAULT)
+    if install_root.resolve() != canonical.resolve():
+        logger.warning(
+            f"  - Install root {install_root} is NOT the documented "
+            f"canonical location {canonical}."
+        )
+        logger.warning(
+            f"    The systemd unit will hard-code ExecStart=."
+            f"{install_root}/netgen-venv/bin/ostg-server — if you "
+            f"extracted to /tmp or another impermanent path, the "
+            f"unit will break on reboot / cleanup."
+        )
+        logger.warning(
+            f"    Recommended: `sudo mv {install_root} {canonical} "
+            f"&& sudo {canonical}/bin/netgen-install`"
+        )
+        if not force:
+            logger.error(
+                f"    Refusing to install from a non-canonical "
+                f"location. Override with --force if you really mean "
+                f"it and understand the systemd unit ties to this path."
+            )
+            sys.exit(8)
+
     # 1. OS supported?
     distro, version = _detect_distro()
     logger.info(f"  - OS: {distro} {version}")
