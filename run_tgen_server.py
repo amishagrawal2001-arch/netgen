@@ -26182,15 +26182,25 @@ def preflight_check():
 # interface with timestamp-tagged traffic spins one up. Idle samplers stay
 # alive (negligible cost; sniff thread with bpf "udp and dst port 4791").
 
-_LATENCY_SAMPLERS = {}            # {iface_name: LatencySampler}
+_LATENCY_SAMPLERS = {}            # {(iface_name, udp_port): LatencySampler}
 _LATENCY_SAMPLERS_LOCK = __import__("threading").Lock()
 
 
 def _get_or_start_latency_sampler(iface, udp_port=4791):
-    """Return a running LatencySampler for the given iface. Starts one if
-    none exists yet. Returns None if scapy/libpcap unavailable."""
+    """Return a running LatencySampler for the given iface + port.
+    Starts one if none exists yet. Returns None if scapy/libpcap
+    unavailable.
+
+    v0.5.260 (audit latency-7): cache key is (iface, udp_port),
+    not iface alone. Pre-fix the second request for the same
+    iface with a DIFFERENT udp_port silently returned the cached
+    sampler still filtering on the old port, so the operator's
+    new-port test decoded zero NLAT frames while the sampler
+    saw traffic on the original port.
+    """
+    key = (iface, int(udp_port) if udp_port is not None else None)
     with _LATENCY_SAMPLERS_LOCK:
-        s = _LATENCY_SAMPLERS.get(iface)
+        s = _LATENCY_SAMPLERS.get(key)
         if s is not None:
             return s
         try:
@@ -26202,8 +26212,8 @@ def _get_or_start_latency_sampler(iface, udp_port=4791):
             s = LatencySampler(iface=iface, udp_port=udp_port,
                                window_size=10000)
             s.start()
-            _LATENCY_SAMPLERS[iface] = s
-            logging.info(f"[LATENCY] started sampler on {iface}")
+            _LATENCY_SAMPLERS[key] = s
+            logging.info(f"[LATENCY] started sampler on {iface} udp_port={udp_port}")
             return s
         except Exception as e:
             logging.warning(f"[LATENCY] failed to start sampler on {iface}: {e}")
@@ -26277,14 +26287,20 @@ def latency_stop():
     stopped = []
     with _LATENCY_SAMPLERS_LOCK:
         if iface:
-            s = _LATENCY_SAMPLERS.pop(iface, None)
-            if s:
-                s.stop()
-                stopped.append(iface)
+            # v0.5.260 (audit latency-7): cache is keyed by
+            # (iface, udp_port). An iface-only stop request means
+            # "stop every sampler on this iface regardless of port".
+            _keys_to_stop = [k for k in _LATENCY_SAMPLERS.keys()
+                             if isinstance(k, tuple) and k[0] == iface]
+            for k in _keys_to_stop:
+                s = _LATENCY_SAMPLERS.pop(k, None)
+                if s:
+                    s.stop()
+                    stopped.append(f"{k[0]}:{k[1]}")
         else:
             for name, s in list(_LATENCY_SAMPLERS.items()):
                 s.stop()
-                stopped.append(name)
+                stopped.append(f"{name[0]}:{name[1]}" if isinstance(name, tuple) else str(name))
             _LATENCY_SAMPLERS.clear()
     return jsonify({"ok": True, "stopped": stopped})
 

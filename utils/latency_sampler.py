@@ -18,10 +18,17 @@ packet, and computes
 It maintains a rolling sample window and computes min / avg / p50 /
 p99 / max + sample count + frames-with-magic / frames-without ratio.
 
-Same-host loopback (TX iface == RX iface or two ports of the same NIC)
-gives accurate one-way latency directly. Cross-host requires PTP- or
-NTP-synced clocks on both ends; without that, only relative drift is
-meaningful.
+v0.5.260 (audit latency-3): Same-host loopback (TX iface == RX iface
+or two ports of the same NIC) gives accurate one-way latency directly.
+
+Cross-host measurement is currently NOT SUPPORTED. `CLOCK_MONOTONIC`
+is a per-host free-running counter since kernel boot; PTP4L /
+phc2sys / ntpd never touch it. The delta between two hosts'
+`CLOCK_MONOTONIC` reads is `(rx_boot_epoch - tx_boot_epoch) +
+true_latency + drift` — the boot-epoch term is unbounded and
+unfixable. A cross-host result carries no semantic meaning.
+Switching TX + RX to `CLOCK_TAI` (PTP-syncable via `phc2sys -O -37`)
+would enable it; that's a future ship.
 
 Two usage modes:
 
@@ -77,26 +84,54 @@ class LatencyStats:
     samples_seen: int = 0
     samples_decoded: int = 0     # frames with valid NLAT magic
     samples_skipped: int = 0     # non-NLAT or too-short payloads
-    # Latencies in nanoseconds. deque(maxlen=window_size) for O(1) rolling.
+    # v0.5.260 (audit latency-4): separate "no NLAT magic" from
+    # "NLAT valid but latency out of range" so operators can tell
+    # clock skew from wrong-port / wrong-magic. Pre-fix both were
+    # bucketed as samples_skipped — cross-host runs (bad clocks)
+    # looked identical to "no NLAT frames arriving" (wrong port).
+    samples_impossible_latency: int = 0
     _latencies: deque = field(default_factory=lambda: deque(maxlen=10000))
 
     def add(self, latency_ns: int):
         self._latencies.append(latency_ns)
         self.samples_decoded += 1
 
+    def reset(self):
+        """v0.5.260 (audit latency-6): clear the rolling window +
+        counters so a caller (e.g. RFC 2544 per-iteration snapshot)
+        can measure a fresh sample without the previous iteration's
+        samples still in the 10K bucket. Preserves the deque's
+        maxlen. Thread-safe via deque.clear() which is C-side
+        atomic under the GIL."""
+        self._latencies.clear()
+        self.samples_seen = 0
+        self.samples_decoded = 0
+        self.samples_skipped = 0
+        self.samples_impossible_latency = 0
+
     def snapshot(self) -> dict:
-        n = len(self._latencies)
+        # v0.5.260 (audit latency-2): snapshot the deque via .copy()
+        # before iterating. Pre-fix `sorted(self._latencies)` raced
+        # the sniff thread — once the deque was full every append
+        # was a pop-left + push-right, mutating during iteration
+        # → CPython's iterator raised
+        # `RuntimeError: deque mutated during iteration` under
+        # any real load. .copy() is C-side atomic under the GIL
+        # so no lock is needed.
+        snap = self._latencies.copy()
+        n = len(snap)
         if n == 0:
             return {
                 "samples_seen": self.samples_seen,
                 "samples_decoded": self.samples_decoded,
                 "samples_skipped": self.samples_skipped,
+                "samples_impossible_latency": self.samples_impossible_latency,
                 "window_samples": 0,
                 "min_us": None, "avg_us": None, "p50_us": None,
                 "p95_us": None, "p99_us": None, "max_us": None,
             }
         # Sort once for percentile reads — at window_size=10K this is cheap.
-        sorted_ns = sorted(self._latencies)
+        sorted_ns = sorted(snap)
         # Percentile index — nearest-rank method. `min(n-1, ...)` guards
         # the empty/one-sample edge so we don't IndexError on n==1.
         def _pct(p: float) -> float:
@@ -105,6 +140,7 @@ class LatencyStats:
             "samples_seen": self.samples_seen,
             "samples_decoded": self.samples_decoded,
             "samples_skipped": self.samples_skipped,
+            "samples_impossible_latency": self.samples_impossible_latency,
             "window_samples": n,
             "min_us":  sorted_ns[0] / 1000.0,
             "avg_us":  sum(sorted_ns) / n / 1000.0,
@@ -132,6 +168,15 @@ class LatencySampler:
                  window_size: int = 10000):
         self.iface = iface
         self.udp_port = udp_port  # None = all UDP
+        # v0.5.260 (audit latency-5): expose sampler lifecycle to
+        # `.stats()` callers. Pre-fix a sampler that died on start
+        # (missing iface, scapy import failure, permission denied)
+        # returned clean zeros forever with no signal — operator
+        # couldn't tell "sampler running, no NLAT frames arriving"
+        # from "sampler already dead". Now `status` is one of
+        # "starting" / "running" / "iface_not_found" / "scapy_missing"
+        # / "crashed:<msg>", surfaced in every stats() response.
+        self.status: str = "starting"
         self.stats_obj = LatencyStats()
         self.stats_obj._latencies = deque(maxlen=window_size)
         # v0.3.5: per-stream histograms keyed by extracted stream_id.
@@ -159,7 +204,12 @@ class LatencySampler:
             self._thread.join(timeout=timeout)
 
     def stats(self) -> dict:
-        return self.stats_obj.snapshot()
+        # v0.5.260 (audit latency-5): fold `status` into the response
+        # so callers can tell a healthy sampler with no traffic from
+        # a dead sampler returning zeros.
+        out = self.stats_obj.snapshot()
+        out["status"] = self.status
+        return out
 
     # v0.3.5: per-stream snapshot. Returns ``{stream_id: snapshot_dict}``
     # for every stream the sampler has decoded NLAT + signature for in
@@ -216,11 +266,25 @@ class LatencySampler:
             return
         rx_ns = time.monotonic_ns()
         latency_ns = rx_ns - tx_ns
-        # Clamp negative latencies — they happen only with clock skew across
-        # hosts; on same-host loopback they shouldn't occur. Treat negative
-        # as "decode mismatch" rather than a real measurement.
+        # v0.5.260 (audit latency-4): bucket clock-skew clamps in
+        # `samples_impossible_latency`, NOT samples_skipped. Pre-fix
+        # a cross-host run with unsynced clocks (see the module
+        # docstring — CLOCK_MONOTONIC can't be PTP-synced) decoded
+        # every packet fine but every latency was negative or >60s;
+        # they got bucketed as "no NLAT magic" and the operator
+        # reasonably concluded "wrong port / TX not emitting" when
+        # the real cause was clock skew.
         if latency_ns < 0 or latency_ns > 60 * 10**9:  # >60s = nonsense
-            self.stats_obj.samples_skipped += 1
+            self.stats_obj.samples_impossible_latency += 1
+            # Log once every 1000 impossible latencies so the operator
+            # sees WHY packets are landing in the impossible bucket.
+            if self.stats_obj.samples_impossible_latency % 1000 == 1:
+                LOG.warning(
+                    "[lat] impossible latency %d ns for %s — likely "
+                    "cross-host clock skew (see module docstring on "
+                    "CLOCK_MONOTONIC limits)",
+                    latency_ns, self.iface,
+                )
             return
         self.stats_obj.add(latency_ns)
 
@@ -247,13 +311,18 @@ class LatencySampler:
                 self._get_or_create_stream_stats(sid).add(latency_ns)
 
     def _run(self):
+        # v0.5.260 (audit latency-5): every early-return path updates
+        # self.status so callers see a specific reason instead of
+        # opaque zeros.
         try:
             from scapy.all import sniff
         except Exception as e:
+            self.status = f"crashed:scapy_missing:{e}"
             LOG.error("scapy unavailable: %s", e)
             return
         # Friendly check before scapy blows up with "Interface not found"
         if not _iface_exists(self.iface):
+            self.status = "iface_not_found"
             available = _list_local_interfaces()
             LOG.error(
                 "Interface %r not found on this host (%s).\n"
@@ -269,14 +338,22 @@ class LatencySampler:
             return
         bpf = f"udp and dst port {self.udp_port}" if self.udp_port else "udp"
         LOG.info(f"[lat] sniffing {self.iface}  filter='{bpf}'  window={self.stats_obj._latencies.maxlen}")
+        self.status = "running"
         # Sniff with stop_filter so we can shut down cleanly.
-        sniff(
-            iface=self.iface,
-            filter=bpf,
-            prn=self._on_packet,
-            store=False,
-            stop_filter=lambda _p: self._stop_event.is_set(),
-        )
+        try:
+            sniff(
+                iface=self.iface,
+                filter=bpf,
+                prn=self._on_packet,
+                store=False,
+                stop_filter=lambda _p: self._stop_event.is_set(),
+            )
+        except Exception as e:
+            self.status = f"crashed:{e}"
+            LOG.error("[lat] sniff on %s died: %s", self.iface, e)
+            return
+        # Clean exit via stop_filter.
+        self.status = "stopped"
 
 
 # -------------------------------------------------------------- helpers

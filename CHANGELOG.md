@@ -2,6 +2,78 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.260] - 2026-09-04
+
+**One-way latency sampler audit — 7 correctness fixes.**
+
+Follow-up on the NLAT header + latency sampler added in
+`e2b9072b` / `80b44c2e`. 8 findings; 7 fixed here (F1 already
+landed in v0.5.257 since it was really an RFC 2544 caller bug).
+
+**MEDIUM-HIGH (real races / semantic bugs):**
+
+- **latency-2: `sorted(self._latencies)` raced the sniff thread
+  → `RuntimeError: deque mutated during iteration` under load.**
+  Once the deque was full every `append` from `_on_packet`
+  became a pop-left + push-right, which is a mutation; CPython's
+  deque iterator checks the mutation counter and raises. Test
+  repro at 8-writer stress hit 6/450k iterations. Fix:
+  `sorted(self._latencies.copy())` — `deque.copy()` is C-side
+  atomic under the GIL. Removed the docstring claim that
+  sorted() was atomic (it isn't).
+
+- **latency-3: docstring lied about cross-host support.**
+  `CLOCK_MONOTONIC` is a per-host free-running counter since
+  kernel boot; PTP4L / phc2sys / ntpd never touch it. The delta
+  across hosts includes an unbounded `(rx_boot_epoch -
+  tx_boot_epoch)` term. Cross-host measurement is currently
+  NOT SUPPORTED. Docstring updated to say so; a future ship
+  can switch TX + RX to CLOCK_TAI for real cross-host.
+
+**MEDIUM:**
+
+- **latency-4: negative and >60 s latencies bucketed as "no NLAT
+  magic".** Cross-host runs (bad clocks) looked identical to
+  "wrong port / TX not emitting". New separate counter
+  `samples_impossible_latency` + a rate-limited WARNING log
+  (once per 1000 impossible samples) with the module docstring
+  reference.
+
+- **latency-5: sniff thread died silently on missing iface;
+  cached dead sampler returned zeros forever.** New `status`
+  field on LatencySampler ("starting" / "running" /
+  "iface_not_found" / "scapy_missing" / "crashed:..." /
+  "stopped"), folded into every `.stats()` response. Operator
+  can now tell "healthy but idle" from "dead + never notified".
+
+- **latency-6: 10K rolling window misrepresented the RFC 2544
+  per-frame-size latency report.** At 1 Mpps for 100 s, the
+  reported p50/p95/p99 reflected only the last ~10 ms of the
+  last iteration. New `LatencyStats.reset()` method that RFC
+  2544 (or any windowed caller) can invoke at the start of
+  each measurement to snapshot a fresh interval. Full RFC 2544
+  integration deferred — needs the runner to call `reset()`
+  at each iteration.
+
+- **latency-7: `_get_or_start_latency_sampler` cache keyed by
+  iface only.** Second request with a different `udp_port`
+  silently returned the wrong-port sampler and decoded zero
+  NLAT frames for the operator's port change. Fix: key by
+  `(iface, udp_port)` tuple. Stop endpoint updated to walk
+  all keys for a given iface (drops all ports at once, matches
+  the pre-fix iface-scoped behavior).
+
+**Deferred (need bigger design):**
+
+- **latency-8**: `enable_timestamps=True` silently ignored on
+  Scapy TX path. Fix requires either refusing the flag at
+  start_traffic (small) or adding NLAT emission to Scapy TX
+  (big). Left for next ship — the RFC 2544 runner uses DPDK
+  by default so this doesn't bite the primary use case.
+
+Regression tests in `tests/test_v05260_latency_audit.py` (14
+tests), all pass.
+
 ## [0.5.259] - 2026-09-04
 
 **VXLAN audit — 7 correctness fixes in `utils/vxlan.py`.**
