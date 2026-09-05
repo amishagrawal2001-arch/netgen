@@ -25422,6 +25422,29 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
     last_good = 0
     diagnosis = None  # set by _rfc2544_decide_step on TX-rate-limit
 
+    # v0.5.257 (audit RFC-2): auto-clamp resolution_pps per frame size.
+    # RFC 2544 §26.1 recommends ~1% of link rate resolution. Pre-fix
+    # the default 100_000 pps resolution exceeded the theoretical
+    # line-rate at 1G × 1518B (~81k pps) and 10G × 9000B, making
+    # the loop guard `hi - lo > resolution` false on entry —
+    # last_good stayed 0 and the frame size reported FAIL despite
+    # a fully working DUT.
+    _clamped_resolution = min(int(resolution_pps), max(1, hi_pps // 100))
+    if _clamped_resolution != int(resolution_pps):
+        logging.info(
+            f"[RFC 2544] resolution_pps {resolution_pps:,} > 1% of "
+            f"line_pps {hi_pps:,} for frame_size={frame_size}B; "
+            f"clamped to {_clamped_resolution:,}"
+        )
+    resolution_pps = _clamped_resolution
+
+    # v0.5.257 (audit RFC-3): first iteration probes the full line
+    # rate (RFC 2544 §26.1 says the search SHOULD start at max
+    # theoretical rate and halve only on loss). Pre-fix trying_pps
+    # was always (lo+hi)//2, so a DUT that sustains full line rate
+    # got reported at line_pps - resolution_pps instead of line_pps
+    # — non-compliant with the spec.
+    first_probe = True
     while hi_pps - lo_pps > resolution_pps:
         # Cooperative cancel check between iterations — /api/rfc2544/stop
         # flips this flag; we bail out cleanly without firing another
@@ -25431,9 +25454,13 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
                 logging.info("[RFC 2544] stop_requested honored — aborting search")
                 break
 
-        trying_pps = (lo_pps + hi_pps) // 2
-        if trying_pps == 0:
-            trying_pps = max(resolution_pps, 1)
+        if first_probe:
+            trying_pps = hi_pps
+            first_probe = False
+        else:
+            trying_pps = (lo_pps + hi_pps) // 2
+            if trying_pps == 0:
+                trying_pps = max(resolution_pps, 1)
 
         with _RFC2544_LOCK:
             _RFC2544_STATE["current_step"] = {
@@ -25560,6 +25587,15 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
             # in the per-frame-size progress entry.
             diagnosis = step_diag
 
+    # v0.5.257 (audit RFC-8): the "tx_rate_limited" diagnosis was
+    # sticky per frame size — even when the collapsed search then
+    # found a legitimate non-zero last_good UNDER the TX ceiling,
+    # the row still labeled itself "TX rate limited" and the operator
+    # dismissed the number as invalid. Only surface a diagnosis when
+    # the search actually failed to find any passing rate.
+    if diagnosis == "tx_rate_limited" and last_good > 0:
+        diagnosis = None
+
     return last_good, attempts, diagnosis
 
 
@@ -25574,11 +25610,33 @@ def _rfc2544_thread(params):
         resolution_pps = int(params.get("resolution_pps", 100000))
         link_mbps = int(params.get("link_speed_mbps", 0))
         if link_mbps <= 0:
-            # Read from sysfs
+            # v0.5.257 (audit RFC-1 + RFC-4): read from sysfs, then
+            # HARD-VALIDATE the value is positive. Pre-fix, the
+            # `except Exception: link_mbps = 100000` fallback fired
+            # for interfaces where the sysfs read failed OR returned
+            # a valid-but-nonsense `-1` (driver reports "Unknown!" on
+            # down links, some virtual devices). The result was line
+            # rate silently assumed to be 100 G regardless of reality,
+            # so pct_of_line_rate reported nonsense percentages and
+            # a 400 G NIC only ever converged at 25% of true rate.
+            # Refuse to start the search rather than fabricating a
+            # baseline — the operator sees an explicit error and can
+            # supply link_speed_mbps in the request body.
+            _sysfs_ok = False
             try:
-                link_mbps = int(open(f"/sys/class/net/{tx_iface}/speed").read().strip())
+                _v = int(open(f"/sys/class/net/{tx_iface}/speed").read().strip())
+                if _v > 0:
+                    link_mbps = _v
+                    _sysfs_ok = True
             except Exception:
-                link_mbps = 100000  # safe default
+                pass
+            if not _sysfs_ok:
+                raise RuntimeError(
+                    f"Could not determine link speed for {tx_iface} "
+                    f"(sysfs read failed or returned <= 0). Pass "
+                    f"`link_speed_mbps` in the request body — "
+                    f"defaulting to 100 G is misleading."
+                )
 
         for fs in frame_sizes:
             # Stop between frame sizes if the user clicked Stop.
@@ -25615,7 +25673,15 @@ def _rfc2544_thread(params):
                 try:
                     s = _get_or_start_latency_sampler(rx_iface)
                     if s is not None:
-                        latency = s.snapshot()
+                        # v0.5.257 (audit latency-1): LatencySampler
+                        # exposes `.stats()`; there is no `.snapshot()`
+                        # method (that lives on the inner LatencyStats
+                        # dataclass). Pre-fix every call raised
+                        # AttributeError which the outer except
+                        # swallowed → 100% of RFC 2544 latency
+                        # columns silently showed None despite
+                        # capture_latency=True.
+                        latency = s.stats()
                 except Exception as _le:
                     logging.warning(f"[RFC 2544] latency snapshot for {rx_iface} failed: {_le}")
             with _RFC2544_LOCK:
@@ -25672,6 +25738,21 @@ def rfc2544_start():
         if not data.get("ip_src") or not data.get("ip_dst"):
             return jsonify({"ok": False, "error": "ip_src and ip_dst required"}), 400
 
+        # v0.5.257 (audit RFC-7): reject an explicit empty
+        # frame_sizes list. Pre-fix `setdefault` only applied when
+        # the key was ABSENT; an operator/API caller passing
+        # `frame_sizes: []` (perhaps from a broken client wizard)
+        # skipped the loop entirely — the test returned instantly
+        # with an empty progress list and running=False, and the
+        # wizard's status showed a spinning "Done — 0/7" forever.
+        _fs = data.get("frame_sizes")
+        if _fs is not None and (not isinstance(_fs, list) or not _fs):
+            return jsonify({
+                "ok": False,
+                "error": "frame_sizes must be a non-empty list (or "
+                         "omitted to accept the RFC 2544 default set).",
+            }), 400
+
         # v0.4.0 reachability pre-flight. Best-effort ICMP ping to the
         # destination IP catches the classic "peer doesn't exist" case
         # (RX=0, every probe shows 100% loss) before burning 60+
@@ -25684,8 +25765,19 @@ def rfc2544_start():
         # On ping failure we don't block; we surface a "warning"
         # field in the response so the client can show a confirm
         # dialog. Use ``confirm_unreachable=true`` to override.
+        #
+        # v0.5.257 (audit RFC-10): the pre-fix guard
+        # `(data.get("rx_iface") or data.get("tx_iface")) != data.get("tx_iface")`
+        # treated a BLANK rx_iface as loopback and skipped the ping.
+        # But a blank rx_iface just means "read stats from the tx
+        # NIC's kernel counters" — the destination IP is still on
+        # a remote peer that we WANT to ping. Fix: only skip the
+        # ping when rx_iface is explicitly the SAME as tx_iface
+        # (an actual loopback config).
+        _rx = data.get("rx_iface")
+        _same_iface_loopback = (_rx and _rx == data.get("tx_iface"))
         if (not data.get("skip_reachability_probe")
-                and (data.get("rx_iface") or data.get("tx_iface")) != data.get("tx_iface")
+                and not _same_iface_loopback
                 and not data.get("confirm_unreachable")):
             reachable, reach_msg = _rfc2544_check_reachable(
                 data.get("ip_dst", ""), data.get("tx_iface", ""),

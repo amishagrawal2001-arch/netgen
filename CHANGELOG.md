@@ -2,6 +2,107 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.257] - 2026-09-04
+
+**RFC 2544 throughput audit — 7 correctness fixes across the
+runner in `run_tgen_server.py`.**
+
+Follow-up audit on `511ec884` RFC 2544 implementation. 10
+findings; 7 fixed here (3 deferred: mid-sleep-cancel corruption,
+DPDK stats flush window, spin-up-time counter accuracy — need
+careful design, tracked separately). Also folded in the HIGH
+finding from the one-way latency audit (`.snapshot()` vs
+`.stats()`) since it's a caller bug in this file's RFC 2544 loop.
+
+**Tier-1 (silent wrong-result / silent-fail):**
+
+- **RFC-1: link_speed defaulted to 100 Gbps on any sysfs read
+  failure.** The client wizard never sends `link_speed_mbps`, and
+  the server's `except Exception: link_mbps = 100000` fallback
+  fired for interfaces where the file was missing (DPDK-bound,
+  virtio) OR returned a valid-but-nonsense `-1` (down link,
+  driver reports "Unknown!"). Result: `line_pps`, `pct_of_line_rate`,
+  and the tx_rate_limited 10% threshold all used a fabricated
+  baseline — a 400 G NIC only ever converged at 25% of true rate
+  while reporting "100% of line rate". Fix: read sysfs, hard-
+  validate `> 0`; refuse to start with an explicit error if we
+  can't determine the real speed. Operator supplies
+  `link_speed_mbps` in the request body to override.
+
+- **RFC-2: resolution_pps 100k > line_pps for slow-link/large-frame
+  combos → search exits before probing, reports 0 pps FAIL.** At
+  1 G × 1518 B the theoretical line_pps ≈ 81 k pps; with
+  `hi_pps=81k, lo_pps=0, resolution=100k`, the while-loop guard
+  is false on entry, `last_good` stays 0, the row reports FAIL
+  despite a fully working DUT. Fix: auto-clamp `resolution_pps`
+  to `max(1, line_pps // 100)` per frame size (RFC 2544 §26.1
+  recommends ~1% of link rate resolution).
+
+**Tier-2 (operator-visible malfunctions):**
+
+- **RFC-3: binary search never actually probed the full line
+  rate.** Pre-fix `trying_pps = (lo+hi)//2` from the very first
+  iteration, so the best possible reported max was `line_pps -
+  resolution_pps`. RFC 2544 §26.1 explicitly says the search
+  SHOULD start at max theoretical rate and halve only on loss.
+  Fix: first iteration probes `hi_pps` directly; bisect only
+  from the midpoint after the first non-passing probe.
+
+- **RFC-4: sysfs `-1` propagated as `link_mbps = -1` →
+  `line_pps = 1` → all rows FAIL.** Rolled into RFC-1 (both fixed
+  by the "> 0 guard" — the pre-fix bare `int(...)` accepted -1
+  as a valid integer, so the except-clause never fired).
+
+- **RFC-8: `tx_rate_limited` diagnosis sticky per frame size even
+  when the collapsed search then found a legitimate non-zero
+  rate under the TX ceiling.** Operator saw "TX rate limited"
+  beside a real number and dismissed the number as invalid. Fix:
+  only surface the diagnosis when `last_good == 0` (search never
+  found a passing rate).
+
+- **latency-1: `LatencySampler.snapshot()` doesn't exist — every
+  RFC 2544 latency column was silently None.** `LatencySampler`
+  exposes `.stats()`; the `snapshot()` method lives on the inner
+  `LatencyStats` dataclass, not the sampler wrapper. Every
+  invocation raised `AttributeError`, caught + logged as
+  "latency snapshot failed", and `latency=None` was set. Fix:
+  call `.stats()`. RFC 2544 §26.2 latency reporting now
+  actually populates.
+
+**Tier-3 (edge cases):**
+
+- **RFC-7: empty `frame_sizes` list bypassed validation → thread
+  ran 0 iterations, wizard span forever.** `setdefault` only
+  applied when the key was ABSENT; an explicit
+  `frame_sizes: []` slipped through, the for-loop didn't enter,
+  running-flag flipped false, but the wizard's status showed
+  "Done — 0/7". Fix: reject non-list or empty `frame_sizes` with
+  HTTP 400 up front.
+
+- **RFC-10: reachability guard treated blank `rx_iface` as
+  loopback → skipped the ping.** Pre-fix guard:
+  `(rx_iface or tx_iface) != tx_iface` — a blank `rx_iface`
+  substituted to `tx_iface`, comparison was False, skip. But
+  blank rx_iface just means "read stats from tx NIC's kernel
+  counters" — the destination IP is still remote and we WANT
+  to ping it. Fix: skip only when `rx_iface == tx_iface`
+  explicitly (real loopback config), never on blank.
+
+**Deferred (need careful design):**
+
+- **RFC-5** — mid-sleep cancel updates `last_good` from a
+  partial-probe. Needs a `cancelled` diagnosis path.
+- **RFC-6** — 500 ms flush window after `/api/traffic/stop`
+  under-samples DPDK counters (background poller is ~1 Hz).
+  Needs "wait for two consecutive stable samples" logic.
+- **RFC-9** — `_req.post("/api/traffic/start")` is fire-and-
+  forget; DPDK spin-up (1-3 s) is charged against `duration_s`.
+  Needs to measure the actual TX window vs the nominal duration.
+
+Regression tests in `tests/test_v05257_rfc2544_audit.py` (12
+tests) pin the shape of every fix. 12 pass, 0 pre-existing
+regressions in the RFC 2544-adjacent test set.
+
 ## [0.5.256] - 2026-09-04
 
 **netgen-install shim: shell+Python polyglot so `bin/netgen-install`
