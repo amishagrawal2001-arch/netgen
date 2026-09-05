@@ -97,8 +97,11 @@ def test_bfd_dst_mac_default_blank_and_arp_resolved():
     body = L2[idx:end]
     assert 'dst_mac: str = "",' in body
     assert "_resolve_dst_mac(iface, dst_ip)" in body
-    # Warning-log when ARP resolve fails so operator sees why.
-    assert "could not resolve dst_mac" in body
+    # Diagnostic surfaced when ARP resolve fails. v0.5.270 (L2-D4)
+    # changed the wording to "ARP resolve … failed" and moved it
+    # into _arp_fail_diag which is also seeded into
+    # counters.last_error — that test lives in the v0.5.270 suite.
+    assert "ARP resolve" in body
 
 
 def test_bfd_src_mac_default_blank_and_iface_derived():

@@ -1117,17 +1117,17 @@ def start_bfd(
         _iface_mac(iface) or "00:11:22:33:44:06"
     )
     eff_dst_mac = (dst_mac or "").strip().lower()
+    _arp_fail_diag: Optional[str] = None
     if not eff_dst_mac:
         eff_dst_mac = _resolve_dst_mac(iface, dst_ip) or "00:11:22:33:44:07"
         if eff_dst_mac == "00:11:22:33:44:07":
-            logger.warning(
-                "[L2 BFD] could not resolve dst_mac for %s on %s "
-                "(ARP miss); falling back to documentation MAC — "
-                "the peer will not see the frame. Bring up the "
-                "peer's IP + run a ping/ARP first, then restart "
-                "the session.",
-                dst_ip, iface,
+            _arp_fail_diag = (
+                f"ARP resolve for {dst_ip} on {iface} failed at "
+                f"session start; using documentation MAC — peer will "
+                f"NOT see frames. Ping the peer to populate the "
+                f"neighbor cache, then restart this session."
             )
+            logger.warning("[L2 BFD] %s", _arp_fail_diag)
 
     sid = str(_uuid.uuid4())
     config = {
@@ -1207,6 +1207,17 @@ def start_bfd(
         )
 
     _register_and_start(sess, _factory, interval_s, duration_s)
+    # v0.5.270 (L2-D4): seed counters.last_error with the ARP-fail
+    # diagnostic BEFORE the first sendp — the client's L2 sessions
+    # table polls at 3s cadence and the operator sees the warning
+    # immediately in the Last Error column, instead of having to
+    # SSH to the server to read the log. The next successful sendp
+    # would normally clear last_error but doesn't in the current
+    # loop, so this stays visible until the operator stops + fixes
+    # + restarts.
+    if _arp_fail_diag:
+        with sess.lock:
+            sess.counters.last_error = _arp_fail_diag
     logger.info(
         f"[L2] BFD started session={sid} iface={iface} "
         f"state={state} my_disc=0x{int(my_discriminator):08x} "

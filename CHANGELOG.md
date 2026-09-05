@@ -2,6 +2,55 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.270] - 2026-09-05
+
+**L2 emulation "why don't I see it" diagnostics.**
+
+Follow-up to v0.5.269. The v0.5.269 audit turned up 9 correctness
+fixes but three "won't ever transit" situations remained where the
+operator's expectation and protocol reality diverged. This ship
+closes those by surfacing what's happening — no silent fails.
+
+- **L2-D1: LACP dialog warning banner.** LACP now shows an inline
+  amber banner explaining that LACPDUs (dst 01:80:c2:00:00:02)
+  are IEEE 802.1D reserved and get filtered by every bridge in
+  the path — the test only works netgen↔switch or back-to-back
+  netgen↔netgen. Pre-fix the operator had to know 802.1D from
+  memory; now the panel says it.
+
+- **L2-D2: IGMP snooping-behavior note.** IGMP dialog now shows
+  a blue info banner explaining that switches with snooping
+  enabled forward multicast for group G only to ports that have
+  themselves sent a Report for G. Verify via
+  `show ip igmp snooping groups` on the switch — `tcpdump` on
+  a non-joined peer port will NOT see these reports. This was
+  the second-most-common "I don't see it" case: v0.5.269
+  L2-C1 fixed the RA-drop-at-switch cause; L2-D2 documents the
+  next-layer cause the operator hits next.
+
+- **L2-D3: PIM peer-requirement note.** PIM dialog now shows a
+  blue info banner explaining that Hello-only adjacency requires
+  the peer to have PIM enabled on the receiving interface (frr
+  `pimd`, Cisco `ip pim sparse-mode`). `tcpdump`-only peers see
+  the Hello but never reply — verify via
+  `show ip pim neighbor` on the actual PIM peer.
+
+- **L2-D4: BFD ARP-resolve failure surfaced immediately.** When
+  `dst_mac` auto-resolve fails at session start (peer's IP not
+  in the neighbor cache and ARP probe returned no answer),
+  v0.5.269 logged the fallback-to-doc-MAC warning to the server
+  log only — the operator had to SSH to see it. Now the same
+  diagnostic seeds `counters.last_error` at session start, so
+  the client's L2 sessions table shows it in the Last Error
+  column on the very next 3s poll:
+  `ARP resolve for 10.0.0.2 on ens1f0 failed at session start;
+  using documentation MAC — peer will NOT see frames. Ping
+  the peer to populate the neighbor cache, then restart this
+  session.`
+
+Regression tests in `tests/test_v05270_l2_diagnostics.py`;
+existing L2 tests unchanged. Source-level verification only.
+
 ## [0.5.269] - 2026-09-05
 
 **L2 emulation "peer doesn't see the packets" fixes.**

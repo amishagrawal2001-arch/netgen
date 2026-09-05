@@ -373,7 +373,36 @@ class _L2ConfigDialog(QDialog):
     # ------------------------------------------------------------------
     def _build_lacp_panel(self) -> QWidget:
         w = QGroupBox("LACP parameters")
-        f = QFormLayout(w)
+        _outer = QVBoxLayout(w)
+        # v0.5.270 (L2-D1): in-dialog warning banner. LACPDUs are
+        # sent to 01:80:c2:00:00:02 which is inside the IEEE 802.1D
+        # "reserved" range 01:80:c2:00:00:00-0F — bridges filter this
+        # entire block per §7.12.6. Frames egress fine but the FIRST
+        # switch consumes them into its own LACP state machine
+        # instead of forwarding. Two netgen boxes on either side of
+        # a switch will never see each other's LACPDUs; the only
+        # valid topologies are:
+        #   • netgen ↔ switch (LAG negotiation with the switch)
+        #   • netgen ↔ back-to-back netgen (direct cable, no bridge)
+        _warn = QLabel(
+            "⚠ <b>Bridge-consumed protocol.</b> LACPDUs (dst "
+            "01:80:c2:00:00:02) are IEEE 802.1D reserved and filtered "
+            "by every bridge in the path. This test only works "
+            "netgen↔switch (LAG partner mode) or back-to-back "
+            "netgen↔netgen. Two netgen boxes across a switch will "
+            "not see each other's LACPDUs — expected, not a bug."
+        )
+        _warn.setTextFormat(Qt.RichText)
+        _warn.setWordWrap(True)
+        _warn.setStyleSheet(
+            "background-color: #fef3c7; border: 1px solid #f59e0b; "
+            "color: #92400e; padding: 6px 10px; border-radius: 4px; "
+            "font-size: 11px;"
+        )
+        _outer.addWidget(_warn)
+        _form_holder = QWidget()
+        f = QFormLayout(_form_holder)
+        _outer.addWidget(_form_holder)
         # v0.5.269 (L2-C7): default blank → server derives System MAC
         # from the egress interface. Same MAC-flap prevention pattern
         # v0.5.268 (L2-B5) applied to LLDP: two netgen boxes trunked
@@ -629,7 +658,36 @@ class _L2ConfigDialog(QDialog):
 
     def _build_igmp_panel(self) -> QWidget:
         w = QGroupBox("IGMP parameters")
-        f = QFormLayout(w)
+        _outer = QVBoxLayout(w)
+        # v0.5.270 (L2-D2): snooping-behavior note. IGMP Reports and
+        # Queries reach the switch's snooping table (that's what
+        # v0.5.269 L2-C1's Router Alert fix restored) but they do
+        # NOT auto-flood to other listening ports — a switch with
+        # IGMP snooping ON forwards multicast for group G only to
+        # ports that already sent a Report for G. So "tcpdump on
+        # box B" won't see box A's IGMP reports unless box B has
+        # ALSO sent a Report for the same group (i.e. joined). This
+        # is switch behavior, not a netgen bug.
+        _note = QLabel(
+            "ℹ <b>IGMP snooping note.</b> Switches with snooping "
+            "enabled forward multicast for group <i>G</i> only to "
+            "ports that already sent a Report for <i>G</i>. Verify "
+            "via <code>show ip igmp snooping groups</code> on the "
+            "switch — <code>tcpdump</code> on a non-joined peer "
+            "port will not see these reports. See "
+            "<i>Also emit Query</i> below to prime snooping tables."
+        )
+        _note.setTextFormat(Qt.RichText)
+        _note.setWordWrap(True)
+        _note.setStyleSheet(
+            "background-color: #dbeafe; border: 1px solid #3b82f6; "
+            "color: #1e40af; padding: 6px 10px; border-radius: 4px; "
+            "font-size: 11px;"
+        )
+        _outer.addWidget(_note)
+        _form_holder = QWidget()
+        f = QFormLayout(_form_holder)
+        _outer.addWidget(_form_holder)
         self._igmp_version = QComboBox()
         self._igmp_version.addItem("v1 (RFC 1112)", 1)
         self._igmp_version.addItem("v2 (RFC 2236)", 2)
@@ -676,7 +734,36 @@ class _L2ConfigDialog(QDialog):
 
     def _build_pim_panel(self) -> QWidget:
         w = QGroupBox("PIM Hello parameters")
-        f = QFormLayout(w)
+        _outer = QVBoxLayout(w)
+        # v0.5.270 (L2-D3): peer-requirement note. PIM Hello only
+        # produces observable results on a peer router that has PIM
+        # enabled on the receiving interface AND uses a PIM daemon
+        # (frr's pimd, Cisco `ip pim sparse-mode`). tcpdump on a
+        # peer box sees the frames (all-PIM-routers is
+        # 01:00:5e:00:00:0d — flood-forwarded by non-snooping
+        # switches) but no adjacency forms without a PIM stack on
+        # the other side to reply. Neighbor-discovery is Hello-only
+        # here; Register/Join/Prune are not implemented.
+        _note = QLabel(
+            "ℹ <b>Peer requirement.</b> A neighbor adjacency only "
+            "forms if the peer has PIM enabled on its receiving "
+            "interface (frr <code>pimd</code>, Cisco "
+            "<code>ip pim sparse-mode</code>). "
+            "<code>tcpdump</code>-only receivers see the Hello but "
+            "never reply. Verify via <code>show ip pim neighbor</code> "
+            "on the peer."
+        )
+        _note.setTextFormat(Qt.RichText)
+        _note.setWordWrap(True)
+        _note.setStyleSheet(
+            "background-color: #dbeafe; border: 1px solid #3b82f6; "
+            "color: #1e40af; padding: 6px 10px; border-radius: 4px; "
+            "font-size: 11px;"
+        )
+        _outer.addWidget(_note)
+        _form_holder = QWidget()
+        f = QFormLayout(_form_holder)
+        _outer.addWidget(_form_holder)
         self._pim_hold_time = QSpinBox()
         self._pim_hold_time.setRange(0, 65535)
         self._pim_hold_time.setValue(105)
