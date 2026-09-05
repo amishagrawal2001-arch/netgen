@@ -7,6 +7,7 @@ import threading
 import time
 import logging
 import requests
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +15,35 @@ import queue
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# v0.5.262 (audit ARP-4 + ARP-7): serialize DB writes per device_id
+# so the 4-write update sequence in `_update_device_arp_status`
+# can't interleave with a concurrent on-demand refresh writer for
+# the same device. Prior to the lock two writers could produce
+# torn state where `devices.arp_ipv4_resolved` disagreed with
+# `device_statistics.arp_ipv4_resolved`.
+_ARP_WRITE_LOCKS: Dict[str, threading.Lock] = defaultdict(threading.Lock)
+_ARP_WRITE_LOCKS_META_LOCK = threading.Lock()
+
+
+def _arp_write_lock_for(device_id: str) -> threading.Lock:
+    """Return the process-wide lock for a given device_id. The
+    per-key `defaultdict` is not thread-safe against concurrent
+    key creation, so we guard the "create-or-return" step with a
+    tiny meta-lock. The actual lock is held OUTSIDE the meta-lock,
+    so contention is per-device."""
+    with _ARP_WRITE_LOCKS_META_LOCK:
+        return _ARP_WRITE_LOCKS[device_id]
+
+
+# v0.5.262 (audit ARP-10): dedup `log_device_event` against the
+# last logged arp_status per device_id. Pre-fix every 30s poll
+# wrote one row per device — 288k rows/day at 100 devices; the
+# `device_events` table dominated DB size within weeks. The
+# state-history table already dedup's via `add_state_transition`;
+# do the same here so events are emitted only on transition.
+_LAST_ARP_STATUS_LOGGED: Dict[str, str] = {}
+_LAST_ARP_STATUS_LOGGED_LOCK = threading.Lock()
 
 def _default_self_url():
     """Default self-loopback URL the monitors call back into.
@@ -219,55 +249,78 @@ class ARPStatusMonitor:
             return None
     
     def _update_device_arp_status(self, device_id: str, arp_status: Dict[str, Any]):
-        """Update ARP status in the database."""
-        try:
-            # Update device statistics
-            self.device_db.update_device_statistics(device_id, {
-                'arp_resolved': arp_status['arp_resolved'],
-                'arp_ipv4_resolved': arp_status['arp_ipv4_resolved'],
-                'arp_ipv6_resolved': arp_status['arp_ipv6_resolved'],
-                'arp_gateway_resolved': arp_status['arp_gateway_resolved'],
-                'last_arp_check': arp_status['last_check']
-            })
-            
-            # Update main devices table with ARP status
-            self.device_db.update_device(device_id, {
-                'arp_ipv4_resolved': arp_status['arp_ipv4_resolved'],
-                'arp_ipv6_resolved': arp_status['arp_ipv6_resolved'],
-                'arp_gateway_resolved': arp_status['arp_gateway_resolved'],
-                'arp_status': arp_status['arp_status'],
-                'last_arp_check': arp_status['last_check']
-            })
-            
-            # Log ARP status event
-            self.device_db.log_device_event(device_id, "arp_status_check", {
-                'arp_resolved': arp_status['arp_resolved'],
-                'arp_ipv4_resolved': arp_status['arp_ipv4_resolved'],
-                'arp_ipv6_resolved': arp_status['arp_ipv6_resolved'],
-                'arp_gateway_resolved': arp_status['arp_gateway_resolved'],
-                'arp_status': arp_status['arp_status'],
-                'details': arp_status['details']
-            })
+        """Update ARP status in the database.
 
-            # Per-protocol state-history timeline (de-dup'd against last row).
+        v0.5.262 (audit ARP-4 + ARP-7): the 4 writes below (device
+        statistics, devices row, event log, state transition) each
+        hold their own connection + transaction. Interleaved writers
+        (monitor + on-demand refresh for the same device) can leave
+        torn state where the two tables disagree. Serialize per
+        device_id so a single writer completes its 4 steps before
+        another starts.
+        """
+        _lock = _arp_write_lock_for(device_id)
+        with _lock:
             try:
-                self.device_db.add_state_transition(
-                    device_id,
-                    "arp",
-                    arp_status.get('arp_status') or "Unknown",
-                    detail={
-                        "ipv4": arp_status.get('arp_ipv4_resolved'),
-                        "ipv6": arp_status.get('arp_ipv6_resolved'),
-                        "gateway": arp_status.get('arp_gateway_resolved'),
-                    },
-                )
-            except Exception as _e:
-                logger.debug(f"[ARP MONITOR] state-history insert skipped: {_e}")
+                # Update device statistics
+                self.device_db.update_device_statistics(device_id, {
+                    'arp_resolved': arp_status['arp_resolved'],
+                    'arp_ipv4_resolved': arp_status['arp_ipv4_resolved'],
+                    'arp_ipv6_resolved': arp_status['arp_ipv6_resolved'],
+                    'arp_gateway_resolved': arp_status['arp_gateway_resolved'],
+                    'last_arp_check': arp_status['last_check']
+                })
 
-            logger.debug(f"[ARP MONITOR] Updated ARP status for device {device_id}: {arp_status['arp_status']}")
-            
-        except Exception as e:
-            logger.error(f"[ARP MONITOR] Error updating ARP status for device {device_id}: {e}")
+                # Update main devices table with ARP status
+                self.device_db.update_device(device_id, {
+                    'arp_ipv4_resolved': arp_status['arp_ipv4_resolved'],
+                    'arp_ipv6_resolved': arp_status['arp_ipv6_resolved'],
+                    'arp_gateway_resolved': arp_status['arp_gateway_resolved'],
+                    'arp_status': arp_status['arp_status'],
+                    'last_arp_check': arp_status['last_check']
+                })
+
+                # v0.5.262 (audit ARP-10): dedup log_device_event —
+                # only write when arp_status actually changed since
+                # the last logged event for this device_id. Pre-fix
+                # this fired every 30 s per device regardless of
+                # state, dominating device_events table growth.
+                current_status = arp_status.get('arp_status') or "Unknown"
+                with _LAST_ARP_STATUS_LOGGED_LOCK:
+                    _prev_logged = _LAST_ARP_STATUS_LOGGED.get(device_id)
+                    _should_log = _prev_logged != current_status
+                    if _should_log:
+                        _LAST_ARP_STATUS_LOGGED[device_id] = current_status
+                if _should_log:
+                    self.device_db.log_device_event(device_id, "arp_status_check", {
+                        'arp_resolved': arp_status['arp_resolved'],
+                        'arp_ipv4_resolved': arp_status['arp_ipv4_resolved'],
+                        'arp_ipv6_resolved': arp_status['arp_ipv6_resolved'],
+                        'arp_gateway_resolved': arp_status['arp_gateway_resolved'],
+                        'arp_status': arp_status['arp_status'],
+                        'details': arp_status['details'],
+                        'transition_from': _prev_logged,
+                    })
+
+                # Per-protocol state-history timeline (de-dup'd against last row).
+                try:
+                    self.device_db.add_state_transition(
+                        device_id,
+                        "arp",
+                        arp_status.get('arp_status') or "Unknown",
+                        detail={
+                            "ipv4": arp_status.get('arp_ipv4_resolved'),
+                            "ipv6": arp_status.get('arp_ipv6_resolved'),
+                            "gateway": arp_status.get('arp_gateway_resolved'),
+                        },
+                    )
+                except Exception as _e:
+                    logger.debug(f"[ARP MONITOR] state-history insert skipped: {_e}")
+
+                logger.debug(f"[ARP MONITOR] Updated ARP status for device {device_id}: {arp_status['arp_status']}")
+
+            except Exception as e:
+                logger.error(f"[ARP MONITOR] Error updating ARP status for device {device_id}: {e}")
     
     def force_check_all(self):
         """Force an immediate ARP status check for all devices."""

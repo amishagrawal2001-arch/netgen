@@ -17,7 +17,7 @@ import subprocess
 import re
 import random
 import ipaddress
-from collections import Counter
+from collections import Counter, defaultdict
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 from multithreaded_traffic_gen import generate_packets, on_stream_stopped, stream_tracker, start_rx_counter
@@ -8186,33 +8186,64 @@ def check_arp_resolution():
 
 @app.route("/api/device/arp/check/batch", methods=["POST"])
 def check_arp_resolution_batch():
-    """Check ARP resolution for multiple IP addresses in a single request (batching optimization)."""
+    """Check ARP resolution for multiple IP addresses in a single request (batching optimization).
+
+    v0.5.262 (audit ARP batch VRF): optional ``device_id_by_ip``
+    mapping in the body — ``{"10.0.0.5": "device-abc-123", ...}``.
+    When supplied, each IP is queried inside its device's VRF via
+    ``ip vrf exec <vrf>`` (see _arp_vrf_prefix). Without it we fall
+    back to the pre-fix single-fetch behavior which only sees the
+    default netns's neighbor table — missing every entry for
+    multi-device VRF deployments.
+    """
     data = request.get_json()
     ip_addresses = data.get("ip_addresses", [])
-    
+    # Optional per-IP device_id map. Empty dict = legacy path.
+    device_id_by_ip = data.get("device_id_by_ip") or {}
+    if not isinstance(device_id_by_ip, dict):
+        device_id_by_ip = {}
+
     if not ip_addresses:
         return jsonify({"error": "IP addresses list is required"}), 400
-    
+
     results = {}
     try:
-        # Get all ARP entries at once
-        result = subprocess.run(["ip", "neigh", "show"], 
-                              capture_output=True, text=True, timeout=5)
-        
+        # v0.5.262: if any IP has a device_id → VRF, we need
+        # per-VRF probes because netlink neighbor queries don't
+        # cross VRF boundaries. Group by VRF prefix and fetch
+        # once per unique VRF.
+        by_prefix: Dict[tuple, list] = defaultdict(list)
+        for ip in ip_addresses:
+            dev_id = device_id_by_ip.get(ip)
+            prefix = tuple(_arp_vrf_prefix(dev_id)) if dev_id else tuple()
+            by_prefix[prefix].append(ip)
+
         arp_entries = {}
-        if result.returncode == 0 and result.stdout.strip():
-            # Parse all ARP entries
-            for line in result.stdout.strip().split('\n'):
-                if line.strip():
-                    parts = line.split()
-                    if len(parts) >= 1:
-                        ip = parts[0]
-                        arp_entries[ip] = line
-        
-        # Check each requested IP
+        for prefix, ips in by_prefix.items():
+            _cmd = list(prefix) + ["ip", "neigh", "show"]
+            try:
+                _r = subprocess.run(
+                    _cmd, capture_output=True, text=True, timeout=5,
+                )
+                if _r.returncode == 0 and (_r.stdout or "").strip():
+                    for _line in _r.stdout.strip().split("\n"):
+                        _parts = _line.split()
+                        if _parts:
+                            # Namespace-scope the key by prefix so
+                            # two different VRFs with the same IP
+                            # don't overwrite each other.
+                            arp_entries[(prefix, _parts[0])] = _line
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:
+                continue
+
+        # Check each requested IP against its VRF-scoped entries.
         for ip_address in ip_addresses:
-            if ip_address in arp_entries:
-                arp_output = arp_entries[ip_address]
+            dev_id = device_id_by_ip.get(ip_address)
+            prefix = tuple(_arp_vrf_prefix(dev_id)) if dev_id else tuple()
+            arp_output = arp_entries.get((prefix, ip_address), "")
+            if arp_output:
                 if "REACHABLE" in arp_output or "STALE" in arp_output:
                     results[ip_address] = {"resolved": True, "status": "ARP resolved", "output": arp_output}
                 elif "INCOMPLETE" in arp_output or "FAILED" in arp_output:
@@ -8223,9 +8254,9 @@ def check_arp_resolution_batch():
                     results[ip_address] = {"resolved": False, "status": "ARP unknown state", "output": arp_output}
             else:
                 results[ip_address] = {"resolved": False, "status": "No ARP entry found", "output": ""}
-        
+
         return jsonify({"results": results, "total": len(ip_addresses)}), 200
-            
+
     except subprocess.TimeoutExpired:
         # Return partial results on timeout
         return jsonify({"results": results, "total": len(ip_addresses), "error": "Timeout"}), 200
@@ -14796,10 +14827,23 @@ def get_device_arp_status(device_id):
                             # Diagnostic dump — surfaces the actual
                             # entry state so the operator can tell
                             # INCOMPLETE from FAILED from no-entry.
-                            neigh_cmd = ["ip", "-6", "neigh", "show"]
-                            if ping_prefix:
-                                neigh_cmd += ["vrf", ping_prefix[3]]
-                            neigh_cmd += [ipv6_target]
+                            # v0.5.262 (audit ARP-8): use `ip vrf exec`
+                            # instead of the `vrf <name>` netlink
+                            # filter. The two syntaxes select
+                            # DIFFERENT sets of neighbor entries
+                            # (`ip vrf exec` runs the command inside
+                            # the VRF's routing context; `vrf <name>`
+                            # filters netlink to interfaces enslaved
+                            # to that VRF via master). Under some
+                            # kernel versions they disagree, producing
+                            # a "resolved" boolean that says True
+                            # while `details.ipv6_neigh` says "no
+                            # entry" — hard for operators to
+                            # diagnose. `_neigh_state_ok` already
+                            # uses `ip vrf exec`; match it here.
+                            neigh_cmd = list(ping_prefix) + [
+                                "ip", "-6", "neigh", "show", "to", ipv6_target,
+                            ]
                             neigh_result = subprocess.run(
                                 neigh_cmd, capture_output=True, text=True, timeout=5
                             )

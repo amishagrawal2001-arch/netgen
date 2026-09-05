@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.262] - 2026-09-04
+
+**ARP deferred fixes — 6 correctness fixes.**
+
+Closes the ARP-4 / ARP-7 / ARP-8 / ARP-9 / ARP-10 findings from
+v0.5.258 plus the batch-endpoint VRF gap noted alongside.
+
+- **ARP-4 + ARP-7: per-device write lock + `log_device_event`
+  dedup.** Pre-fix `_update_device_arp_status` fired 4 writes
+  per poll per device (statistics, devices row, event log,
+  state transition) each on its own connection. Two writers
+  (monitor + on-demand refresh for the same device_id) could
+  interleave and leave torn state where the two tables
+  disagreed on `arp_ipv4_resolved`. New process-wide
+  `_ARP_WRITE_LOCKS: dict[device_id, Lock]` (created lazily
+  under a meta-lock) serializes the whole 4-write sequence
+  per device.
+
+- **ARP-10: `log_device_event` dedup by transition.** Pre-fix
+  every 30 s poll wrote one row per device regardless of
+  state — 288k rows/day at 100 devices, dominating the
+  `device_events` table within weeks. New in-process
+  `_LAST_ARP_STATUS_LOGGED` keyed by device_id: only log
+  when arp_status changed vs the previous logged event.
+  The state-history timeline (`add_state_transition`) already
+  dedup'd; this brings the event log to parity.
+
+- **ARP-8: unified VRF probe syntax in IPv6 diagnostic dump.**
+  Pre-fix the diagnostic call used `ip -6 neigh show vrf
+  <name>` (netlink filter — matches only interfaces enslaved
+  to the VRF via `master`) while `_neigh_state_ok` used
+  `ip vrf exec <vrf>` (runs in VRF's routing context, doesn't
+  scope netlink queries). Under some kernel versions the two
+  syntaxes select DIFFERENT neighbor entries, so the
+  `arp_ipv6_resolved` bool could say True while
+  `details.ipv6_neigh` said "no entry". Both now use
+  `ip vrf exec` uniformly.
+
+- **ARP-9: added IPv6 NDP builder to `utils/arp.py`.**
+  `generate_ndp_packet(stream_data)` emits Neighbor
+  Solicitation (op=Request → NS) or Neighbor Advertisement
+  (op=Reply → NA) per RFC 4861. NS goes to the solicited-node
+  multicast `ff02::1:ff<low-24>` (RFC 4291 §2.7.1) with L2
+  dst `33:33:ff:xx:xx:xx` (RFC 2464 §7); NA is unicast with
+  `NDOptDstLLAddr`. `hlim=255` enforced per RFC 4861 §7.1.1.
+  VLAN handling matches the ARP path. Callers that get an
+  IPv6 target from the GUI's ARP dialog now have a real
+  builder instead of a silent scapy validation failure.
+
+- **Batch endpoint VRF (`/api/device/arp/check/batch`)**:
+  new optional `device_id_by_ip` mapping in the request body.
+  When supplied, IPs are grouped by their device's VRF prefix
+  and one `ip vrf exec <vrf> ip neigh show` is fetched per
+  unique VRF; entries are namespace-scoped in the lookup dict
+  so two VRFs with the same IP don't collide. Empty mapping
+  = legacy behavior (single fetch in default netns).
+
+Regression tests in `tests/test_v05262_arp_deferred.py` (14
+tests), all pass. No regressions in the 68-test ARP/VRF sweep.
+
 ## [0.5.261] - 2026-09-04
 
 **RFC 2544 + latency deferred fixes — 4 correctness fixes.**
