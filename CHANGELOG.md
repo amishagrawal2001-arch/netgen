@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.267] - 2026-09-05
+
+**DHCP monitor audit — 3 correctness fixes.**
+
+Audit of the 4th sibling monitor (after ARP/BGP/OSPF/ISIS). 6
+findings; 3 fixed. Deferred F2 (IPv6 snapshot), F3 (parallel
+polling), F5 (per-device write lock) — F3 + F5 need a proper
+`_check_one_device` method extraction (the existing loop uses
+`continue` throughout).
+
+**Tier-2:**
+
+- **DHCP-mon F1: `dhcp_last_error` never cleared on client-mode
+  lease recovery.** Server-mode monitor got this fix in
+  v0.5.229 monitor-2 (line ~494); client-mode branch didn't.
+  `get_dhcp_client_snapshot` doesn't include the field in its
+  template, so a stale "Lease timeout" string stuck in
+  `dhcp_last_error` even after subsequent polls observed a
+  healthy Leased state — UI tooltip lied about a currently-
+  healthy client. Fix: when snapshot is Leased + running, add
+  `dhcp_last_error=""` to the write payload.
+
+- **DHCP-mon F4: `/api/device/dhcp/restart` didn't stamp
+  `dhcp_manual_override` → monitor could clobber the restart's
+  success state.** `start_dhcp_client` / `start_dhcp_server`
+  both clear the override flag when they run, so an ensure
+  ends with the flag clear. If the monitor's poll landed
+  between the restart endpoint's ensure and its `get_device`
+  read, the monitor wrote the pre-restart snapshot AFTER the
+  endpoint returned "restarted" — the UI regressed silently
+  for up to `check_interval` seconds. Fix: re-stamp the
+  override with a fresh timestamp AFTER `ensure_dhcp_services`
+  returns success; monitor's `_manual_override_active`
+  window (120 s) then skips this device for one tick.
+
+**Tier-3:**
+
+- **DHCP-mon F6: `_get_client_devices` operator-precedence
+  trap.** The ternary vs `or` parsed as
+  `((.get("mode") if isinstance(...) else None) or ...)` but
+  was WRITTEN as
+  `(.get("mode") if isinstance(...) else (None or ...))` —
+  when `dhcp_config` was a dict WITHOUT a "mode" key
+  (`dhcp_mode` column carries the mode instead — see the same
+  pattern in `_get_dhcp_devices`), the ternary returned None
+  and `.lower()` raised AttributeError. Dead-code today (no
+  in-tree callers) but the whole point of a back-compat shim
+  is external callers. Rewrote to an explicit block with
+  correct operator grouping matching `_get_dhcp_devices`
+  line 198-202.
+
+**Deferred (need more scaffolding):**
+
+- **DHCP-mon F2**: IPv6-only / dual-stack DHCP client
+  misreported as `Requesting` forever. `get_dhcp_client_
+  snapshot` only calls `_parse_ipv4` — an IPv6 client with a
+  valid v6 lease + dhclient-6 running produces
+  `dhcp_state=Requesting` in perpetuity because `ip_info` is
+  None. Needs `_parse_ipv6` in the snapshot function AND
+  parallel `ipv6_address/mask/gateway` field plumbing.
+- **DHCP-mon F3**: parallel polling via ThreadPoolExecutor —
+  sibling parity with BGP/OSPF/ISIS (v0.5.264). The existing
+  `_check_clients` uses `continue` throughout the loop body,
+  which means a proper extraction to a per-device helper is
+  needed. Punted to next ship.
+- **DHCP-mon F5**: per-device write lock. Same
+  `_DHCP_WRITE_LOCKS` module-level dict as the siblings —
+  but the natural place to hold it is around the entire
+  per-device block, which is F3's extraction. Bundle with F3.
+
+Regression tests in `tests/test_v05267_dhcp_monitor_audit.py`
+(9 tests), all pass.
+
 ## [0.5.266] - 2026-09-05
 
 **Device + Stream DB layer audit — 5 correctness fixes.**

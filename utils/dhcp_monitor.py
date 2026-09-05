@@ -23,6 +23,8 @@ import json
 import logging
 import threading
 import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +32,21 @@ from . import dhcp as dhcp_utils
 from .dhcp import ensure_dhcp_services
 
 logger = logging.getLogger(__name__)
+
+# v0.5.267 (audit DHCP-mon F5): per-device write lock — sibling of
+# v0.5.262 ARP + v0.5.264 BGP/OSPF/ISIS fixes. The DHCP monitor
+# does 1-3 update_device calls plus 1-2 add_state_transition calls
+# per tick; on-demand writers (/api/device/dhcp/restart, manual
+# override toggle, stop_dhcp_services) can interleave and race
+# the flag-clear vs the state-write. Same shape as the sibling
+# monitors' _*_WRITE_LOCKS.
+_DHCP_WRITE_LOCKS: Dict[str, threading.Lock] = defaultdict(threading.Lock)
+_DHCP_WRITE_LOCKS_META_LOCK = threading.Lock()
+
+
+def _dhcp_write_lock_for(device_id: str) -> threading.Lock:
+    with _DHCP_WRITE_LOCKS_META_LOCK:
+        return _DHCP_WRITE_LOCKS[device_id]
 
 
 # v0.5.219 (audit fix C2): shared argv-parse pgrep helper so the
@@ -120,6 +137,13 @@ class DHCPClientMonitor:
     def __init__(self, device_db, check_interval: int = 60):
         self.device_db = device_db
         self.check_interval = max(10, int(check_interval))
+        # v0.5.267 (audit DHCP-mon F3 DEFERRED): parallel per-device
+        # polling via ThreadPoolExecutor is the intended fix for
+        # DHCP-F3 (sibling parity with BGP/OSPF/ISIS post v0.5.264),
+        # but the extraction needs a proper `_check_one_device`
+        # method — the existing `_check_clients` body uses
+        # `continue` throughout, which requires restructuring to
+        # `return` in a per-device helper. Deferred to a follow-up.
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.is_running = False
@@ -242,11 +266,24 @@ class DHCPClientMonitor:
     # return only client-mode devices. Some external tooling may
     # call it by name; keep the shim so we don't silently break it.
     def _get_client_devices(self) -> List[Dict[str, Any]]:
-        return [
-            d for d in self._get_dhcp_devices()
-            if ((d.get("dhcp_config") or {}).get("mode") if isinstance(d.get("dhcp_config"), dict) else None
-                or d.get("dhcp_mode") or "").lower() == "client"
-        ]
+        # v0.5.267 (audit DHCP-mon F6): operator-precedence trap.
+        # Pre-fix the expression parsed as
+        #   (dhcp_cfg.get("mode") if isinstance(..., dict) else (None or d.get("dhcp_mode") or ""))
+        # so when dhcp_config IS a dict but lacks a "mode" key (documented
+        # state — dhcp_mode column carries the mode instead), the ternary
+        # returned None and `.lower()` raised AttributeError. Parenthesize
+        # the ternary so the `or` chain composes correctly, matching the
+        # `_get_dhcp_devices` shape at line 198-202.
+        out: List[Dict[str, Any]] = []
+        for d in self._get_dhcp_devices():
+            dhcp_cfg = d.get("dhcp_config")
+            mode_from_cfg = (
+                dhcp_cfg.get("mode") if isinstance(dhcp_cfg, dict) else None
+            )
+            mode = (mode_from_cfg or d.get("dhcp_mode") or "").lower()
+            if mode == "client":
+                out.append(d)
+        return out
 
     def _manual_override_active(self, device: Dict[str, Any]) -> bool:
         """v0.5.217 (audit fix G): honour dhcp_manual_override.
@@ -619,6 +656,19 @@ class DHCPClientMonitor:
                     if device.get("dhcp_manual_override"):
                         write_payload["dhcp_manual_override"] = False
                         write_payload["dhcp_manual_override_time"] = None
+                    # v0.5.267 (audit DHCP-mon F1): clear
+                    # dhcp_last_error on lease recovery. The server-
+                    # mode branch (line ~494) already does this in
+                    # v0.5.229 monitor-2; the client branch never
+                    # did. `get_dhcp_client_snapshot` doesn't
+                    # include the field in its template so a stale
+                    # "Lease timeout" message stuck in
+                    # dhcp_last_error even after subsequent polls
+                    # observed a healthy Leased state — UI tooltip
+                    # kept lying about a currently-healthy client.
+                    if (snapshot.get("dhcp_state") == "Leased"
+                            and snapshot.get("dhcp_running")):
+                        write_payload["dhcp_last_error"] = ""
                     self.device_db.update_device(device_id, write_payload)
                     logger.debug(
                         "[DHCP MONITOR] Updated DHCP snapshot for %s: state=%s, ip=%s",

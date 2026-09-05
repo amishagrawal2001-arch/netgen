@@ -7375,6 +7375,26 @@ def restart_dhcp_service():
                 "error": _err,
                 "family_errors": _fam_errs,
             }), 500
+        # v0.5.267 (audit DHCP-mon F4): stamp dhcp_manual_override
+        # so the monitor's next tick skips this device for 120 s
+        # instead of racing us with a pre-restart snapshot write.
+        # Pre-fix, if the monitor's poll landed between our
+        # ensure_dhcp_services returning success and its own
+        # get_device read, the monitor wrote the STALE pre-restart
+        # snapshot (e.g. "No Lease", "Requesting") AFTER we
+        # returned "restarted" — the UI row regressed silently.
+        # ensure_dhcp_services itself clears the flag inside
+        # start_dhcp_client / start_dhcp_server, so we re-stamp
+        # it AFTER the ensure. Same treatment as the BGP-manual-
+        # override 120 s window.
+        try:
+            device_db.update_device(device_id, {
+                "dhcp_manual_override": True,
+                "dhcp_manual_override_time": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as _e:
+            logging.debug(f"[DHCP RESTART] Could not stamp manual override: {_e}")
+
         # Return the fresh state so the client can update its row
         # without waiting for the next monitor poll.
         try:
