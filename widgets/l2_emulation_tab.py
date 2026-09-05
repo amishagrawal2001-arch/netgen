@@ -203,7 +203,15 @@ class _L2ConfigDialog(QDialog):
     """
 
     PROTOCOLS = [
-        ("lacp", "LACP — Slow Protocols LAG partner"),
+        # v0.5.269 (L2-C9): the "consumed by switch" note surfaces
+        # a common lab-test surprise — LACPDUs are dropped by IEEE
+        # 802.1D bridge filtering at the first switch (dst MAC
+        # 01:80:c2:00:00:02 is in the reserved 802.1D range) so an
+        # operator running two netgen boxes on either side of a
+        # switch will not see LACPDUs cross. Same class as STP —
+        # LACP terminates on the switch's PAgP/LACP module, it
+        # doesn't transit.
+        ("lacp", "LACP — Slow Protocols LAG partner (bridge-consumed)"),
         ("lldp", "LLDP — Neighbour discovery advertiser"),
         ("vrrp", "VRRP — First-hop redundancy"),
         ("igmp", "IGMP — Multicast group reports"),
@@ -366,7 +374,23 @@ class _L2ConfigDialog(QDialog):
     def _build_lacp_panel(self) -> QWidget:
         w = QGroupBox("LACP parameters")
         f = QFormLayout(w)
-        self._lacp_system_mac = QLineEdit("00:11:22:33:44:01")
+        # v0.5.269 (L2-C7): default blank → server derives System MAC
+        # from the egress interface. Same MAC-flap prevention pattern
+        # v0.5.268 (L2-B5) applied to LLDP: two netgen boxes trunked
+        # into the same switch with the shared documentation MAC
+        # 00:11:22:33:44:01 both looked like the same LACP Actor,
+        # and the switch's LAG state machine collapsed both ports
+        # into one bundle candidate.
+        self._lacp_system_mac = QLineEdit("")
+        self._lacp_system_mac.setPlaceholderText(
+            "leave blank to auto-derive from interface MAC"
+        )
+        self._lacp_system_mac.setToolTip(
+            "LACP Actor System MAC — must be locally unique per host, "
+            "otherwise the switch's LAG state machine treats two "
+            "boxes as one Actor and neither aggregates. Leave blank "
+            "to source from the egress interface's hardware address."
+        )
         self._lacp_system_priority = QSpinBox()
         self._lacp_system_priority.setRange(0, 65535)
         self._lacp_system_priority.setValue(32768)
@@ -514,7 +538,19 @@ class _L2ConfigDialog(QDialog):
         self._vrrp_virtual_ips.setPlaceholderText(
             "Comma-separated virtual IPs (e.g. 192.168.1.254,192.168.1.253)"
         )
-        self._vrrp_src_ip = QLineEdit("10.0.0.1")
+        # v0.5.269 (L2-C4): blank Source IP → server auto-derives from
+        # egress interface's primary IPv4. Real FRR/keepalived peers
+        # RPF-check the advertisement — hardcoded 10.0.0.1 that doesn't
+        # match the iface got dropped as "unknown source".
+        self._vrrp_src_ip = QLineEdit("")
+        self._vrrp_src_ip.setPlaceholderText(
+            "leave blank to auto-derive from interface primary IPv4"
+        )
+        self._vrrp_src_ip.setToolTip(
+            "RFC 5798 §5.2.4: source IP is the master's physical IP, "
+            "not the virtual IP. Real VRRP peers RPF-check this. Leave "
+            "blank so the server reads the egress interface's IP."
+        )
         self._vrrp_src_mac = QLineEdit("")
         self._vrrp_src_mac.setPlaceholderText(
             "auto — VRRP virtual MAC 00:00:5e:00:01:<vrid> (leave blank)"
@@ -611,8 +647,20 @@ class _L2ConfigDialog(QDialog):
             "(default: 0x12 Report for v1, 0x16 for v2, 0x22 for v3 "
             "— override to 0x17 for Leave or 0x11 for Query)"
         )
-        self._igmp_src_ip = QLineEdit("10.0.0.10")
-        self._igmp_src_mac = QLineEdit("00:11:22:33:44:04")
+        # v0.5.269 (L2-C4/C5): blank defaults → server auto-derives
+        # from egress iface. Snooping switches with
+        # `router-alert-check` (Cisco default) also drop reports where
+        # the source doesn't map back to a directly-connected host —
+        # a hardcoded 10.0.0.10 that isn't on any port silently
+        # failed. See utils.l2_protocols._iface_primary_ipv4.
+        self._igmp_src_ip = QLineEdit("")
+        self._igmp_src_ip.setPlaceholderText(
+            "leave blank to auto-derive from interface primary IPv4"
+        )
+        self._igmp_src_mac = QLineEdit("")
+        self._igmp_src_mac.setPlaceholderText(
+            "leave blank to auto-derive from interface MAC"
+        )
         self._igmp_interval = QDoubleSpinBox()
         self._igmp_interval.setRange(1.0, 3600.0)
         self._igmp_interval.setValue(60.0)
@@ -643,8 +691,20 @@ class _L2ConfigDialog(QDialog):
             "0xFFFFFFFF. Used by neighbors to detect a router restart "
             "(value should change every time the PIM daemon comes up)."
         )
-        self._pim_src_ip = QLineEdit("10.0.0.20")
-        self._pim_src_mac = QLineEdit("00:11:22:33:44:05")
+        # v0.5.269 (L2-C4/C5): blank defaults → server auto-derives
+        # from egress iface. RFC 7761 §4.3 requires PIM Hellos to be
+        # sourced from the router's interface IP; a hardcoded
+        # 10.0.0.20 that isn't on the peer's subnet gets logged as
+        # "PIM Hello from non-directly-connected neighbor" and
+        # ignored.
+        self._pim_src_ip = QLineEdit("")
+        self._pim_src_ip.setPlaceholderText(
+            "leave blank to auto-derive from interface primary IPv4"
+        )
+        self._pim_src_mac = QLineEdit("")
+        self._pim_src_mac.setPlaceholderText(
+            "leave blank to auto-derive from interface MAC"
+        )
         self._pim_interval = QDoubleSpinBox()
         self._pim_interval.setRange(1.0, 3600.0)
         self._pim_interval.setValue(30.0)
@@ -676,10 +736,39 @@ class _L2ConfigDialog(QDialog):
             "peer sees us as alive; Down = simulate us going down."
         )
 
-        self._bfd_src_ip = QLineEdit("10.0.0.1")
+        # v0.5.269 (L2-C2/C3/C5): blank defaults → server auto-derives
+        # addressing from the egress interface.
+        #  * src_ip  → iface primary IPv4 (RFC 5881 §5 peer-verify)
+        #  * src_mac → iface MAC (MAC-flap prevention)
+        #  * dst_mac → ARP-resolve dst_ip via `ip neigh` + scapy ARP
+        # The pre-fix hardcoded 10.0.0.1 / .2 / doc MACs never matched
+        # the operator's real interface, so the peer BFD daemon
+        # either rejected the frame or the switch dropped it before
+        # reaching the peer.
+        self._bfd_src_ip = QLineEdit("")
+        self._bfd_src_ip.setPlaceholderText(
+            "leave blank to auto-derive from interface primary IPv4"
+        )
         self._bfd_dst_ip = QLineEdit("10.0.0.2")
-        self._bfd_src_mac = QLineEdit("00:11:22:33:44:06")
-        self._bfd_dst_mac = QLineEdit("00:11:22:33:44:07")
+        self._bfd_dst_ip.setToolTip(
+            "Peer's IP address. Required — the server ARP-resolves "
+            "this to a real MAC when Destination MAC is blank."
+        )
+        self._bfd_src_mac = QLineEdit("")
+        self._bfd_src_mac.setPlaceholderText(
+            "leave blank to auto-derive from interface MAC"
+        )
+        self._bfd_dst_mac = QLineEdit("")
+        self._bfd_dst_mac.setPlaceholderText(
+            "leave blank to ARP-resolve Destination IP on the interface"
+        )
+        self._bfd_dst_mac.setToolTip(
+            "Peer's MAC. Leave blank so the server runs `ip neigh get "
+            "<dst_ip>` (falling back to a scapy ARP probe) at session "
+            "start — the pre-fix hardcoded 00:11:22:33:44:07 never "
+            "matched any real peer, so frames were flood-forwarded "
+            "by the switch or dropped by ingress ACLs."
+        )
 
         self._bfd_my_disc = QLineEdit("0x11111111")
         self._bfd_my_disc.setPlaceholderText("Hex (0x…) or decimal — non-zero")
@@ -826,10 +915,14 @@ class _L2ConfigDialog(QDialog):
 
         if proto == "lacp":
             mac = self._lacp_system_mac.text().strip()
-            err = _validate_mac(mac)
-            if err:
-                _reject(f"System MAC: {err}")
-                return
+            # v0.5.269 (L2-C7): blank System MAC = server auto-derives
+            # from interface MAC; only validate when the operator
+            # typed something.
+            if mac:
+                err = _validate_mac(mac)
+                if err:
+                    _reject(f"System MAC: {err}")
+                    return
             body.update({
                 "system_mac": mac,
                 "system_priority": self._lacp_system_priority.value(),
@@ -893,10 +986,13 @@ class _L2ConfigDialog(QDialog):
                     _reject(f"Virtual IP: {err}")
                     return
             src_ip = self._vrrp_src_ip.text().strip()
-            err = _validate_ip(src_ip, family=ip_family)
-            if err:
-                _reject(f"Source IP: {err}")
-                return
+            # v0.5.269 (L2-C4): blank Source IP = server auto-derives
+            # from iface primary IPv4; only validate when set.
+            if src_ip:
+                err = _validate_ip(src_ip, family=ip_family)
+                if err:
+                    _reject(f"Source IP: {err}")
+                    return
             # v0.5.252 (audit L2-2): blank Source MAC is the documented
             # auto-derive path (placeholder + tooltip both say "leave
             # blank to use RFC 5798 00:00:5e:00:01:<vrid>"), so only
@@ -931,16 +1027,20 @@ class _L2ConfigDialog(QDialog):
                 if err:
                     _reject(f"Group: {err}")
                     return
+            # v0.5.269 (L2-C4/C5): blank = server auto-derives from
+            # egress iface; only validate when set.
             src_ip = self._igmp_src_ip.text().strip()
-            err = _validate_ip(src_ip, family="v4")
-            if err:
-                _reject(f"Source IP: {err}")
-                return
+            if src_ip:
+                err = _validate_ip(src_ip, family="v4")
+                if err:
+                    _reject(f"Source IP: {err}")
+                    return
             src_mac = self._igmp_src_mac.text().strip()
-            err = _validate_mac(src_mac)
-            if err:
-                _reject(f"Source MAC: {err}")
-                return
+            if src_mac:
+                err = _validate_mac(src_mac)
+                if err:
+                    _reject(f"Source MAC: {err}")
+                    return
             body.update({
                 "version": self._igmp_version.currentData(),
                 "group": group,
@@ -977,16 +1077,20 @@ class _L2ConfigDialog(QDialog):
                     f"(0x00000000 to 0xFFFFFFFF)."
                 )
                 return
+            # v0.5.269 (L2-C4/C5): blank = server auto-derives from
+            # egress iface; only validate when set.
             src_ip = self._pim_src_ip.text().strip()
-            err = _validate_ip(src_ip, family="v4")
-            if err:
-                _reject(f"Source IP: {err}")
-                return
+            if src_ip:
+                err = _validate_ip(src_ip, family="v4")
+                if err:
+                    _reject(f"Source IP: {err}")
+                    return
             src_mac = self._pim_src_mac.text().strip()
-            err = _validate_mac(src_mac)
-            if err:
-                _reject(f"Source MAC: {err}")
-                return
+            if src_mac:
+                err = _validate_mac(src_mac)
+                if err:
+                    _reject(f"Source MAC: {err}")
+                    return
             body.update({
                 "hold_time": self._pim_hold_time.value(),
                 "dr_priority": self._pim_dr_priority.value(),
@@ -1024,26 +1128,35 @@ class _L2ConfigDialog(QDialog):
             # v0.2.81: validate the 4 BFD address fields. "any"
             # family — both v4 and v6 are valid for single-hop BFD;
             # the BFD code paths support both.
+            # v0.5.269 (L2-C2/C3/C5): blank fields are the documented
+            # auto-derive signal (server pulls src_ip/src_mac from
+            # the iface and ARP-resolves dst_mac from dst_ip). Only
+            # validate what the operator actually typed. dst_ip is
+            # still required because that's the peer address we
+            # cannot infer.
             src_ip = self._bfd_src_ip.text().strip()
-            err = _validate_ip(src_ip)
-            if err:
-                _reject(f"Source IP: {err}")
-                return
+            if src_ip:
+                err = _validate_ip(src_ip)
+                if err:
+                    _reject(f"Source IP: {err}")
+                    return
             dst_ip = self._bfd_dst_ip.text().strip()
             err = _validate_ip(dst_ip)
             if err:
                 _reject(f"Destination IP: {err}")
                 return
             src_mac = self._bfd_src_mac.text().strip()
-            err = _validate_mac(src_mac)
-            if err:
-                _reject(f"Source MAC: {err}")
-                return
+            if src_mac:
+                err = _validate_mac(src_mac)
+                if err:
+                    _reject(f"Source MAC: {err}")
+                    return
             dst_mac = self._bfd_dst_mac.text().strip()
-            err = _validate_mac(dst_mac)
-            if err:
-                _reject(f"Destination MAC: {err}")
-                return
+            if dst_mac:
+                err = _validate_mac(dst_mac)
+                if err:
+                    _reject(f"Destination MAC: {err}")
+                    return
             body.update({
                 "state":                    self._bfd_state.currentData(),
                 "src_ip":                   src_ip,

@@ -116,11 +116,12 @@ def test_lldp_system_name_no_longer_hardcoded_string():
 
 
 def test_lldp_src_mac_default_is_blank():
-    assert "v0.5.268 (L2-B5)" in L2
-    idx = L2.find("v0.5.268 (L2-B5)")
+    # v0.5.269 also references "L2-B5" in the LACP comment; anchor
+    # to the LLDP-specific comment header so this test keeps its
+    # original meaning as more markers land in the file.
+    idx = L2.find("v0.5.268 (L2-B5): default Source MAC to blank")
+    assert idx > 0, "LLDP-specific L2-B5 marker missing"
     body = L2[idx:idx + 1500]
-    # Default is a blank string, with placeholder text pointing at
-    # the server's auto-derive behavior.
     assert 'self._lldp_src_mac = QLineEdit("")' in body
     assert "leave blank to auto-derive from interface MAC" in body
 

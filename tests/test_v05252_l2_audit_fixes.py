@@ -104,12 +104,21 @@ def test_igmpv2_general_query_targets_all_hosts():
 
 def test_igmpv3_report_includes_router_alert():
     """IGMPv3 messages MUST carry an IP Router Alert option per
-    RFC 3376 §4. Pre-fix used `options=[]`."""
+    RFC 3376 §4. Pre-fix used `options=[]`.
+
+    v0.5.269 (L2-C1): the RA option is now shared across v1/v2/v3
+    via a single `_ra = [IPOption_Router_Alert()]` list hoisted to
+    the top of the IGMP `_factory`. Assert both marker (L2-4 anchor
+    for continuity) AND that the v3 IP layer references `_ra` in
+    its `options=` slot."""
     idx = L2.find("v0.5.252 (audit L2-4)")
     assert idx > 0
-    body = L2[idx:idx + 1000]
-    assert "IPOption_Router_Alert" in body
-    assert "options=[IPOption_Router_Alert()]" in body
+    body = L2[idx:idx + 1200]
+    # The RA options list applied to the v3 IP header.
+    assert "options=_ra" in body
+    # And the list itself is defined at the top of _factory (found
+    # once in the module and shared across v1/v2/v3).
+    assert "_ra = [IPOption_Router_Alert()]" in L2
 
 
 # --- L2-5: stop_session returns snapshot ---------------------------
@@ -218,17 +227,26 @@ def test_stop_session_only_evicts_on_clean_exit():
 
 
 def test_lacp_preview_default_state_matches_live_emitter():
-    """Both default to 0x05 (Activity | Aggregation)."""
-    # Live emitter's default is at start_lacp; preview at _lacpdu.
-    # We only check the preview here — the live emitter's default
-    # is exercised by the existing test_l2_emulation_qinq.py suite.
-    idx = L2.find('actor_state=int(b.get("state") or 0x05)')
-    assert idx > 0, "LACP preview default_state not fixed"
-    # And the pre-fix 0x3d is gone from the preview.
+    """Both default to 0x05 (Activity | Aggregation).
+
+    v0.5.269 (L2-C6): the Timeout=Short bit (0x02) is now OR'd
+    into `actor_state` when `fast=True` to match the live emitter,
+    so the preview slice includes the OR'd expression rather than
+    the bare `0x05` literal."""
     _preview_start = L2.find("def _lacpdu(b):")
     _preview_end = L2.find("\ndef ", _preview_start + 1)
     _preview_body = L2[_preview_start:_preview_end]
+    # Marker still present.
     assert "audit L2-9" in _preview_body
+    # Default state 0x05 still the base (untouched by v0.5.269).
+    assert 'b.get("state") or 0x05' in _preview_body
+    # The pre-fix 0x3d literal must not resurface in a live line
+    # of the preview (comments referencing it as history are fine).
+    live_lines = [
+        ln for ln in _preview_body.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    assert not any("0x3d" in ln for ln in live_lines)
 
 
 # --- L2-10: _run_periodic drift compensation -----------------------

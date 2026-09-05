@@ -41,6 +41,118 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------- iface auto-derive helpers
+#
+# v0.5.269: shared helpers so every emitter can accept blank src_mac /
+# src_ip / dst_mac and back-fill from the real interface state, instead
+# of hardcoded documentation values that (a) cause MAC-flap alarms when
+# two netgen boxes share an L2 domain and (b) get silently dropped by
+# real BFD/VRRP/PIM/IGMP daemons that compare the packet's source
+# against what they've been configured to expect.
+#
+# All three helpers return None on failure so the caller can either
+# fall back to a hardcoded value or surface a diagnostic — they never
+# raise, so pre-existing test paths that pass explicit values still
+# work unchanged.
+
+
+def _iface_mac(iface: str) -> Optional[str]:
+    """Return the MAC address of the given interface as a colon-
+    separated lowercase string, or None if it can't be read.
+
+    Prefers netifaces (installed as a scapy dep) over parsing
+    /sys/class/net so the same code path works on macOS lab hosts
+    where /sys doesn't exist."""
+    try:
+        import netifaces
+        addrs = netifaces.ifaddresses(iface)
+        link = addrs.get(netifaces.AF_LINK) or addrs.get(17) or []
+        for entry in link:
+            addr = (entry.get("addr") or "").strip().lower()
+            if addr and addr.count(":") == 5:
+                return addr
+    except Exception as exc:
+        logger.debug(f"[L2] _iface_mac({iface!r}) netifaces failed: {exc}")
+    # Linux /sys fallback (macOS has no /sys/class/net).
+    try:
+        from pathlib import Path
+        p = Path(f"/sys/class/net/{iface}/address")
+        if p.exists():
+            v = p.read_text().strip().lower()
+            if v and v.count(":") == 5:
+                return v
+    except Exception:
+        pass
+    return None
+
+
+def _iface_primary_ipv4(iface: str) -> Optional[str]:
+    """Return the first non-loopback IPv4 address bound to `iface`, or
+    None. Used to auto-derive `src_ip` for VRRP/IGMP/PIM/BFD when the
+    operator left it blank — real daemons on the peer side compare
+    the packet's source IP against their neighbor config and silently
+    drop mismatches."""
+    try:
+        import netifaces
+        addrs = netifaces.ifaddresses(iface)
+        v4 = addrs.get(netifaces.AF_INET) or addrs.get(2) or []
+        for entry in v4:
+            addr = (entry.get("addr") or "").strip()
+            if addr and not addr.startswith("127."):
+                return addr
+    except Exception as exc:
+        logger.debug(
+            f"[L2] _iface_primary_ipv4({iface!r}) netifaces failed: {exc}"
+        )
+    return None
+
+
+def _resolve_dst_mac(iface: str, dst_ip: str,
+                     probe_timeout_s: float = 2.0) -> Optional[str]:
+    """Resolve the peer's MAC for `dst_ip`, first consulting the
+    kernel's ARP cache (`ip neigh get`) and falling back to a scapy
+    ARP probe on `iface`. Returns lowercase colon MAC or None.
+
+    v0.5.269: BFD's `start_bfd` accepts blank `dst_mac` and calls this
+    helper — hardcoding a documentation MAC (00:11:22:33:44:07) meant
+    the frame never reached the intended peer because the switch's
+    MAC table had never learned that address on any port. Neighbor-
+    resolution here is one-shot at session-start; if the peer's MAC
+    changes mid-session the operator restarts the session.
+    """
+    if not dst_ip:
+        return None
+    # Kernel ARP cache first — cheap, no wire traffic.
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ip", "neigh", "get", str(dst_ip), "dev", iface],
+            capture_output=True, text=True, timeout=1.5,
+        )
+        # Output format: "10.0.0.2 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
+        for tok in (out.stdout or "").split():
+            if tok.count(":") == 5 and all(len(x) == 2 for x in tok.split(":")):
+                return tok.lower()
+    except Exception as exc:
+        logger.debug(f"[L2] `ip neigh get {dst_ip}` failed: {exc}")
+    # Fallback: scapy ARP request (Linux only in practice; macOS
+    # lab hosts should always have the neighbor in cache from the
+    # first-connection PING the operator runs).
+    try:
+        from scapy.all import Ether, ARP, srp
+        ans, _ = srp(
+            Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(dst_ip)),
+            iface=iface, timeout=probe_timeout_s, verbose=False,
+        )
+        for _, rcv in ans:
+            hw = (rcv.hwsrc or "").strip().lower()
+            if hw:
+                return hw
+    except Exception as exc:
+        logger.debug(f"[L2] scapy ARP probe for {dst_ip} on {iface}: {exc}")
+    return None
+
+
 # ---------------------------------------------------------------- counters
 
 
@@ -340,7 +452,7 @@ def start_lacp(
     iface: str,
     *,
     system_priority: int = 32768,
-    system_mac: str = "00:11:22:33:44:01",
+    system_mac: str = "",   # v0.5.269: blank → auto-derive from iface MAC
     key: int = 1,
     port_priority: int = 32768,
     port_number: int = 1,
@@ -359,15 +471,38 @@ def start_lacp(
     §6.4.2.3: 0x01=Activity, 0x02=Timeout, 0x04=Aggregation,
     0x08=Synchronization, 0x10=Collecting, 0x20=Distributing,
     0x40=Defaulted, 0x80=Expired.
+
+    v0.5.269 (L2-C6): `fast=True` implicitly OR's the Timeout (0x02)
+    bit into `state` if the caller didn't set it. Without it, the
+    LAG partner reads Timeout=Long from our LACPDU and starts its
+    Received-machine 90-second timer while we send at 1-second
+    cadence — a mismatch that doesn't drop the LAG but wastes time
+    on lab convergence tests. IEEE 802.1AX §6.4.4.2 says the sender
+    must set Timeout=Short whenever it wants to be polled at PDU_FAST.
+
+    v0.5.269 (L2-C7): blank `system_mac` → auto-derived from the
+    interface's own MAC via `_iface_mac(iface)`. Two netgen boxes
+    trunked into the same switch with the same hardcoded
+    00:11:22:33:44:01 both looked like the same LACP Actor to the
+    switch and the LAG never converged. Falls back to the pre-fix
+    documentation MAC only if the interface can't be read.
     """
+    # v0.5.269 (L2-C7): auto-derive system_mac when blank.
+    eff_system_mac = (system_mac or "").strip().lower()
+    if not eff_system_mac:
+        eff_system_mac = _iface_mac(iface) or "00:11:22:33:44:01"
+    # v0.5.269 (L2-C6): make sure Timeout=Short is set with fast=1s.
+    eff_state = int(state)
+    if fast:
+        eff_state |= 0x02
     sid = str(uuid.uuid4())
     config = {
         "system_priority": int(system_priority),
-        "system_mac": system_mac,
+        "system_mac": eff_system_mac,
         "key": int(key),
         "port_priority": int(port_priority),
         "port_number": int(port_number),
-        "state": int(state),
+        "state": eff_state,
         "fast": bool(fast),
         "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
         "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
@@ -378,24 +513,29 @@ def start_lacp(
     def _factory():
         from scapy.contrib.lacp import SlowProtocol, LACP
         # Slow Protocols dest MAC + ethertype (0x8809) + subtype
+        # v0.5.269: use eff_system_mac (iface-derived) + eff_state
+        # (Timeout=Short OR'd if fast) — see docstring.
         return (
-            _l2_hdr(system_mac, "01:80:c2:00:00:02", 0x8809, vlan_id, vlan_pcp,
+            _l2_hdr(eff_system_mac, "01:80:c2:00:00:02", 0x8809, vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
             / SlowProtocol(subtype=0x01)
             / LACP(
                 version=1,
                 actor_system_priority=system_priority,
-                actor_system=system_mac,
+                actor_system=eff_system_mac,
                 actor_key=key,
                 actor_port_priority=port_priority,
                 actor_port_number=port_number,
-                actor_state=state,
+                actor_state=eff_state,
             )
         )
 
     interval = 1.0 if fast else 30.0
     _register_and_start(sess, _factory, interval, duration_s)
-    logger.info(f"[L2] LACP started session={sid} iface={iface} fast={fast}")
+    logger.info(
+        f"[L2] LACP started session={sid} iface={iface} fast={fast} "
+        f"system_mac={eff_system_mac} state=0x{eff_state:02x}"
+    )
     return sid
 
 
@@ -510,7 +650,7 @@ def start_vrrp(
     virtual_ips: Optional[List[str]] = None,
     interval_s: float = 1.0,
     duration_s: Optional[float] = None,
-    src_ip: str = "10.0.0.1",
+    src_ip: str = "",   # v0.5.269 (L2-C4): blank → auto-derive from iface
     src_mac: Optional[str] = None,   # None/"" → derive the VRRP virtual MAC
     family: str = "ipv4",   # "ipv4" or "ipv6" (v3 only)
     auth_type: int = 0,    # RFC 3768 §5.3.6: 0=None, 1=Simple, 2=IPAH (v2 only)
@@ -549,6 +689,22 @@ def start_vrrp(
     virtual_ips = virtual_ips or ["192.168.1.254"]
     # Default to the virtual router MAC unless the caller forced one.
     eff_src_mac = (src_mac or "").strip() or _vrrp_virtual_mac(vrid, family)
+    # v0.5.269 (L2-C4): blank src_ip → auto-derive from the interface's
+    # primary IPv4. RFC 5798 §5.2.4 says the source IP is the "physical
+    # IP address" — a hardcoded 10.0.0.1 that doesn't match the iface
+    # gets dropped by any FRR/keepalived peer that RPF-checks the
+    # advertisement (or logs "VRRP_Instance: received advert from
+    # unknown source"). Falls back to 10.0.0.1 for the pre-fix
+    # behavior when the interface has no v4 address.
+    eff_src_ip = (src_ip or "").strip()
+    if not eff_src_ip:
+        _fam = str(family).lower()
+        if _fam == "ipv4":
+            eff_src_ip = _iface_primary_ipv4(iface) or "10.0.0.1"
+        else:
+            # v6: no auto-derive yet — keep the previous behavior. A
+            # follow-up can add _iface_primary_ipv6.
+            eff_src_ip = "10.0.0.1"
     # v0.2.83: pack auth_data into the two 4-byte VRRPv2 auth fields.
     # NUL-pad if shorter than 8 bytes; truncate if longer. Encoded as
     # network-byte-order 32-bit integers since scapy's auth1/auth2
@@ -565,7 +721,7 @@ def start_vrrp(
         "virtual_ips": list(virtual_ips),
         "interval_s": float(interval_s),
         "duration_s": duration_s,
-        "src_ip": src_ip, "src_mac": eff_src_mac,
+        "src_ip": eff_src_ip, "src_mac": eff_src_mac,
         "family": family.lower(),
         "auth_type": int(auth_type),
         "auth_data": (auth_data or ""),  # store the operator's input
@@ -592,7 +748,7 @@ def start_vrrp(
         # the parent layer's protocol number.
         if family.lower() == "ipv6" and version == 3:
             from scapy.layers.inet6 import IPv6
-            ip_layer = IPv6(src=src_ip, dst="ff02::12", hlim=255, nh=112)
+            ip_layer = IPv6(src=eff_src_ip, dst="ff02::12", hlim=255, nh=112)
             return (
                 _l2_hdr(eff_src_mac, "33:33:00:00:00:12", 0x86dd, vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
@@ -602,7 +758,7 @@ def start_vrrp(
                     addrlist=virtual_ips, adv=int(interval_s * 100),
                 )
             )
-        ip_layer = IP(src=src_ip, dst="224.0.0.18", ttl=255, proto=112)
+        ip_layer = IP(src=eff_src_ip, dst="224.0.0.18", ttl=255, proto=112)
         if version == 2:
             # v0.2.83: RFC 3768 §5.3.6 authentication. auth_type 0 (None)
             # zeroes auth1+auth2 — what scapy does anyway. auth_type 1
@@ -662,8 +818,8 @@ def start_igmp(
     type_code: Optional[int] = None,
     interval_s: float = 60.0,
     duration_s: Optional[float] = None,
-    src_ip: str = "10.0.0.10",
-    src_mac: str = "00:11:22:33:44:04",
+    src_ip: str = "",   # v0.5.269 (L2-C4): blank → iface primary IPv4
+    src_mac: str = "",  # v0.5.269 (L2-C5): blank → iface MAC
     vlan_id: Optional[int] = None,   # 802.1Q inner tag; None/0 = untagged
     vlan_pcp: int = 0,               # 802.1p inner priority (0-7)
     outer_vlan_id: Optional[int] = None,  # 802.1ad outer (S-VLAN); None/0 = single-tagged
@@ -680,7 +836,24 @@ def start_igmp(
     instead — useful for switch IGMP-snooping tests. For v1 Queries,
     set ``type_code=0x11`` AND ``group="0.0.0.0"`` (General Query);
     the destination is auto-set to ALL-SYSTEMS (224.0.0.1).
+
+    v0.5.269 (L2-C1): every IGMP frame — v1, v2 AND v3 — now carries
+    the IP Router Alert option (RFC 2236 §2, RFC 3376 §4). Pre-fix
+    only v3 set it; v1/v2 reports without RA are silently dropped by
+    every switch running `ip igmp snooping router-alert-check`
+    (Cisco default) or `igmp-snooping router-alert-check` (Junos).
+    v0.5.269 (L2-C4/C5): `src_ip` / `src_mac` default to blank —
+    server auto-derives from the interface's primary IPv4 + MAC so
+    the emitted report actually looks like it came from this host.
     """
+    # v0.5.269 (L2-C4/C5): auto-derive src_ip and src_mac from the
+    # interface when the operator leaves them blank.
+    eff_src_ip = (src_ip or "").strip() or (
+        _iface_primary_ipv4(iface) or "10.0.0.10"
+    )
+    eff_src_mac = (src_mac or "").strip().lower() or (
+        _iface_mac(iface) or "00:11:22:33:44:04"
+    )
     sid = str(uuid.uuid4())
     config = {
         "version": int(version),
@@ -688,7 +861,7 @@ def start_igmp(
         "type_code": type_code,
         "interval_s": float(interval_s),
         "duration_s": duration_s,
-        "src_ip": src_ip, "src_mac": src_mac,
+        "src_ip": eff_src_ip, "src_mac": eff_src_mac,
         "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
         "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
     }
@@ -705,25 +878,22 @@ def start_igmp(
         # their IP said 224.0.0.22 — a mismatched frame that IGMP-snooping
         # switches process on the wrong multicast MAC (or drop). Bug fix:
         # match L2 to L3 per version.
+        # v0.5.269 (L2-C1): every IGMP message (v1/v2/v3) MUST carry
+        # the IP Router Alert option — RFC 2236 §2 for v1/v2, RFC 3376
+        # §4 for v3. Load once at the top so all three branches use
+        # the same option list.
+        from scapy.layers.inet import IPOption_Router_Alert
+        _ra = [IPOption_Router_Alert()]
         if version == 3:
             from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr, IGMPv3gr
             t = type_code if type_code is not None else 0x22
             rec = IGMPv3gr(rtype=2, maddr=group)  # MODE_IS_EXCLUDE
             # v0.5.252 (audit L2-4): RFC 3376 §4 REQUIRES the IP
-            # Router Alert option on every IGMPv3 message ("Every
-            # IGMP message described in this document is sent with
-            # an IP Router Alert option [RFC-2113] in its IP
-            # header"). Pre-fix used `options=[]` so real multicast
-            # routers (Cisco/Juniper/FRR) that don't fall back to
-            # snooping-only ignored our reports and the group state
-            # never updated — silent-fail on any join/leave test.
-            # Router Alert = option type 148, length 4, value 0.
-            from scapy.layers.inet import IPOption_Router_Alert
+            # Router Alert option on every IGMPv3 message.
             return (
-                _l2_hdr(src_mac, _ipv4_mcast_mac("224.0.0.22"), 0x0800, vlan_id, vlan_pcp,
+                _l2_hdr(eff_src_mac, _ipv4_mcast_mac("224.0.0.22"), 0x0800, vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
-                / IP(src=src_ip, dst="224.0.0.22", ttl=1,
-                     options=[IPOption_Router_Alert()])
+                / IP(src=eff_src_ip, dst="224.0.0.22", ttl=1, options=_ra)
                 / IGMPv3(type=t)
                 / IGMPv3mr(numgrp=1, records=[rec])
             )
@@ -737,12 +907,15 @@ def start_igmp(
             # The scapy IGMP layer's mrcode field is RFC-2236 v2
             # max-resp-time; v1 spec says it's reserved/zero, so we
             # force mrcode=0 to be RFC-conformant.
+            # v0.5.269 (L2-C1): RA option needed even for v1 —
+            # snooping switches that hold v1 hosts also enforce
+            # router-alert-check on the IPv4 header.
             t = type_code if type_code is not None else 0x12
             ip_dst = "224.0.0.1" if t == 0x11 else group
             return (
-                _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800,
+                _l2_hdr(eff_src_mac, _ipv4_mcast_mac(ip_dst), 0x0800,
                         vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
-                / IP(src=src_ip, dst=ip_dst, ttl=1)
+                / IP(src=eff_src_ip, dst=ip_dst, ttl=1, options=_ra)
                 / IGMP(type=t, mrcode=0, gaddr=group)
             )
         # v2 (RFC 2236): the established default path.
@@ -764,10 +937,15 @@ def start_igmp(
             ip_dst = "224.0.0.1"
         else:
             ip_dst = group
+        # v0.5.269 (L2-C1): RFC 2236 §2 requires the IP Router Alert
+        # option on every IGMP v2 report / query. Snooping switches
+        # with `router-alert-check` (Cisco default) drop reports that
+        # lack it. This was the root cause of "reports emit but the
+        # switch's IGMP-snooping table never populates".
         return (
-            _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800, vlan_id, vlan_pcp,
+            _l2_hdr(eff_src_mac, _ipv4_mcast_mac(ip_dst), 0x0800, vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
-            / IP(src=src_ip, dst=ip_dst, ttl=1)
+            / IP(src=eff_src_ip, dst=ip_dst, ttl=1, options=_ra)
             / IGMP(type=t, gaddr=group)
         )
 
@@ -796,15 +974,28 @@ def start_pim_hello(
     generation_id: int = 0xABCDEF01,
     interval_s: float = 30.0,
     duration_s: Optional[float] = None,
-    src_ip: str = "10.0.0.20",
-    src_mac: str = "00:11:22:33:44:05",
+    src_ip: str = "",   # v0.5.269 (L2-C4): blank → iface primary IPv4
+    src_mac: str = "",  # v0.5.269 (L2-C5): blank → iface MAC
     vlan_id: Optional[int] = None,   # 802.1Q inner tag; None/0 = untagged
     vlan_pcp: int = 0,               # 802.1p inner priority (0-7)
     outer_vlan_id: Optional[int] = None,  # 802.1ad outer (S-VLAN); None/0 = single-tagged
     outer_vlan_pcp: int = 0,              # outer priority (0-7); QinQ only
 ) -> str:
     """Spawn a PIM Hello emitter — registers us as a PIM neighbour
-    on the segment without actually doing Join/Prune."""
+    on the segment without actually doing Join/Prune.
+
+    v0.5.269 (L2-C4/C5): `src_ip` / `src_mac` default to blank; server
+    auto-derives from the interface. A hardcoded 10.0.0.20 source made
+    the peer PIM router log "PIM Hello from non-directly-connected
+    neighbor" and refuse to form adjacency when the interface's
+    subnet didn't overlap.
+    """
+    eff_src_ip = (src_ip or "").strip() or (
+        _iface_primary_ipv4(iface) or "10.0.0.20"
+    )
+    eff_src_mac = (src_mac or "").strip().lower() or (
+        _iface_mac(iface) or "00:11:22:33:44:05"
+    )
     sid = str(uuid.uuid4())
     config = {
         "hold_time": int(hold_time),
@@ -812,7 +1003,7 @@ def start_pim_hello(
         "generation_id": int(generation_id),
         "interval_s": float(interval_s),
         "duration_s": duration_s,
-        "src_ip": src_ip, "src_mac": src_mac,
+        "src_ip": eff_src_ip, "src_mac": eff_src_mac,
         "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
         "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
     }
@@ -827,9 +1018,9 @@ def start_pim_hello(
         # PIMv2HelloHoldtime.fields_desc etc.
         return (
             # PIM all-routers multicast: 224.0.0.13, MAC 01:00:5e:00:00:0d
-            _l2_hdr(src_mac, "01:00:5e:00:00:0d", 0x0800, vlan_id, vlan_pcp,
+            _l2_hdr(eff_src_mac, "01:00:5e:00:00:0d", 0x0800, vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
-            / IP(src=src_ip, dst="224.0.0.13", ttl=1, proto=103)
+            / IP(src=eff_src_ip, dst="224.0.0.13", ttl=1, proto=103)
             / PIMv2Hdr(type=0)   # 0 = Hello
             / PIMv2Hello(
                 option=[
@@ -868,10 +1059,10 @@ def start_pim_hello(
 def start_bfd(
     iface: str,
     *,
-    src_ip: str = "10.0.0.1",
+    src_ip: str = "",   # v0.5.269 (L2-C2): blank → iface primary IPv4
     dst_ip: str = "10.0.0.2",
-    src_mac: str = "00:11:22:33:44:06",
-    dst_mac: str = "00:11:22:33:44:07",
+    src_mac: str = "",  # v0.5.269 (L2-C5): blank → iface MAC
+    dst_mac: str = "",  # v0.5.269 (L2-C3): blank → ARP-resolve dst_ip
     my_discriminator: int = 0x11111111,
     your_discriminator: int = 0,
     state: int = 3,                       # 0=AdminDown 1=Down 2=Init 3=Up
@@ -895,15 +1086,53 @@ def start_bfd(
     going down; tweak intervals for sub-second BFD (e.g. interval_s=0.1
     + desired_min_tx_us=100000).
 
+    v0.5.269 (L2-C2/C3/C5): auto-derive addressing when the caller
+    leaves fields blank:
+
+    * ``src_ip=""`` — read the interface's primary IPv4 via
+      ``_iface_primary_ipv4``. Real BFD daemons (FRR bfdd, Cisco IOS
+      XR, JunOS) verify the packet's source matches the configured
+      peer address, so a hardcoded 10.0.0.1 that doesn't live on the
+      iface got dropped BEFORE the session ever came Up.
+    * ``src_mac=""`` — read the iface hardware MAC. Prevents MAC-flap
+      alarms when multiple netgen hosts on the same L2 share the
+      hardcoded 00:11:22:33:44:06.
+    * ``dst_mac=""`` — ARP-resolve ``dst_ip`` (kernel `ip neigh`
+      cache first, scapy ARP probe as fallback). The pre-fix default
+      00:11:22:33:44:07 was a documentation MAC never in any real
+      switch's MAC table, so the frame egressed the iface, hit the
+      switch, and got flood-forwarded to every port (or dropped if
+      the switch enforced ingress ACLs).
+
     Returns session_id.
     """
     import struct
     import uuid as _uuid
 
+    # v0.5.269 (L2-C2/C3/C5): auto-derive addressing from the iface.
+    eff_src_ip = (src_ip or "").strip() or (
+        _iface_primary_ipv4(iface) or "10.0.0.1"
+    )
+    eff_src_mac = (src_mac or "").strip().lower() or (
+        _iface_mac(iface) or "00:11:22:33:44:06"
+    )
+    eff_dst_mac = (dst_mac or "").strip().lower()
+    if not eff_dst_mac:
+        eff_dst_mac = _resolve_dst_mac(iface, dst_ip) or "00:11:22:33:44:07"
+        if eff_dst_mac == "00:11:22:33:44:07":
+            logger.warning(
+                "[L2 BFD] could not resolve dst_mac for %s on %s "
+                "(ARP miss); falling back to documentation MAC — "
+                "the peer will not see the frame. Bring up the "
+                "peer's IP + run a ping/ARP first, then restart "
+                "the session.",
+                dst_ip, iface,
+            )
+
     sid = str(_uuid.uuid4())
     config = {
-        "src_ip": src_ip, "dst_ip": dst_ip,
-        "src_mac": src_mac, "dst_mac": dst_mac,
+        "src_ip": eff_src_ip, "dst_ip": dst_ip,
+        "src_mac": eff_src_mac, "dst_mac": eff_dst_mac,
         "my_discriminator": int(my_discriminator),
         "your_discriminator": int(your_discriminator),
         "state": int(state),
@@ -952,6 +1181,13 @@ def start_bfd(
         int(required_min_echo_rx_us) & 0xffffffff,
     )
 
+    # v0.5.269 (L2-C8): RFC 5881 §4 requires the src UDP port to be
+    # "unique" per session-pair. Hardcoded 49152 collided when two
+    # BFD emitters ran to the same peer. Use a session-stable random
+    # source port from the ephemeral range [49152, 65535].
+    import random as _random
+    _sport = _random.SystemRandom().randint(49152, 65535)
+
     def _factory():
         from scapy.layers.inet import IP, UDP
         from scapy.packet import Raw
@@ -960,19 +1196,22 @@ def start_bfd(
         # directly-connected link (no router could have decremented it).
         # An ephemeral source port keeps the path through any stateful
         # NAT/conntrack stable for the session lifetime.
+        # v0.5.269: use auto-derived src_mac / dst_mac / src_ip.
         return (
-            _l2_hdr(src_mac, dst_mac, 0x0800,
+            _l2_hdr(eff_src_mac, eff_dst_mac, 0x0800,
                     vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
-            / IP(src=src_ip, dst=dst_ip, ttl=255)
-            / UDP(sport=49152, dport=int(dst_udp_port))
+            / IP(src=eff_src_ip, dst=dst_ip, ttl=255)
+            / UDP(sport=_sport, dport=int(dst_udp_port))
             / Raw(load=bfd_payload)
         )
 
     _register_and_start(sess, _factory, interval_s, duration_s)
     logger.info(
         f"[L2] BFD started session={sid} iface={iface} "
-        f"state={state} my_disc=0x{int(my_discriminator):08x}"
+        f"state={state} my_disc=0x{int(my_discriminator):08x} "
+        f"src_ip={eff_src_ip} src_mac={eff_src_mac} dst_mac={eff_dst_mac} "
+        f"sport={_sport}"
     )
     return sid
 
@@ -1050,7 +1289,10 @@ def _lacpdu(b):
         # wire showed different actor_state bytes when the body
         # dict omitted `state` — the "preview matches wire"
         # invariant was violated on any partial-body call.
-        actor_state=int(b.get("state") or 0x05),
+        # v0.5.269 (L2-C6): mirror the live path — with fast=True the
+        # Timeout=Short bit (0x02) is OR'd into state so preview
+        # matches the wire's actor_state byte.
+        actor_state=(int(b.get("state") or 0x05) | (0x02 if b.get("fast") else 0)),
     )
 
 
@@ -1125,7 +1367,12 @@ def _vrrp_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
 
 
 def _igmp_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
-    from scapy.layers.inet import IP
+    from scapy.layers.inet import IP, IPOption_Router_Alert
+    # v0.5.269 (L2-C1): preview must match the live IGMP emitter,
+    # which now attaches the IP Router Alert option on every version
+    # (RFC 2236 §2 for v1/v2, RFC 3376 §4 for v3). Pre-fix preview
+    # matched the pre-v0.5.269 live path: RA on v3 only, none on v2.
+    _ra = [IPOption_Router_Alert()]
     version = int(b.get("version") or 2)
     group = b.get("group") or "239.1.1.1"
     src_ip = b.get("src_ip") or "10.0.0.10"
@@ -1138,7 +1385,7 @@ def _igmp_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
         return (
             _l2_hdr(src_mac, _ipv4_mcast_mac("224.0.0.22"), 0x0800,
                     vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
-            / IP(src=src_ip, dst="224.0.0.22", ttl=1, options=[])
+            / IP(src=src_ip, dst="224.0.0.22", ttl=1, options=_ra)
             / IGMPv3(type=int(t))
             / IGMPv3mr(numgrp=1, records=[rec])
         )
@@ -1149,7 +1396,7 @@ def _igmp_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
         return (
             _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800,
                     vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
-            / IP(src=src_ip, dst=ip_dst, ttl=1)
+            / IP(src=src_ip, dst=ip_dst, ttl=1, options=_ra)
             / IGMP(type=int(t), mrcode=0, gaddr=group)
         )
     t = type_code if type_code is not None else 0x16
@@ -1157,7 +1404,7 @@ def _igmp_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
     return (
         _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800,
                 vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
-        / IP(src=src_ip, dst=ip_dst, ttl=1)
+        / IP(src=src_ip, dst=ip_dst, ttl=1, options=_ra)
         / IGMP(type=int(t), gaddr=group)
     )
 

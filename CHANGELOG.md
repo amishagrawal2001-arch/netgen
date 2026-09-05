@@ -2,6 +2,95 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.269] - 2026-09-05
+
+**L2 emulation "peer doesn't see the packets" fixes.**
+
+Follow-up to v0.5.268's dialog defaults. Operator reported that
+LLDP worked but LACP / VRRP / IGMP / PIM / BFD packets "aren't
+received." Audit turned up nine correctness issues across the
+five non-LLDP emitters. All fixed:
+
+**Tier-1 — silent drops the peer never surfaces:**
+
+- **L2-C1: IGMPv2 (and v1) missing IP Router Alert option.**
+  RFC 2236 §2 MUST — every IGMPv2 report / query carries the
+  RA option in the IPv4 header. Snooping switches with
+  `router-alert-check` (Cisco default, JunOS default) silently
+  drop reports without it. Only the v3 branch had the RA (fixed
+  in v0.5.252 L2-4). Now v1/v2/v3 all attach it — hoisted the
+  option list to a single `_ra = [IPOption_Router_Alert()]`
+  at the top of the IGMP `_factory` so preview and wire match.
+
+- **L2-C2: BFD `src_ip` default `10.0.0.1` didn't match the
+  interface.** Real BFD daemons (FRR bfdd, Cisco IOS XR, JunOS)
+  verify the packet's source matches the configured peer address
+  and drop the frame BEFORE the session comes Up. Fix: blank
+  default → server reads iface primary IPv4 via `netifaces`
+  (new `_iface_primary_ipv4` helper).
+
+- **L2-C3: BFD `dst_mac` default `00:11:22:33:44:07` was a doc
+  MAC no switch had ever learned.** Frame either flooded to
+  every port on the L2 or got dropped by ingress ACLs. Fix:
+  blank default → server ARP-resolves `dst_ip` via
+  `ip neigh get` (kernel cache), falling back to a scapy ARP
+  probe on the iface. On resolve failure, logs a warning and
+  falls back to the documentation MAC so the session still
+  starts — the operator can `ping` the peer, then restart.
+
+**Tier-2 — RFC-required but peer might tolerate:**
+
+- **L2-C4: VRRP / IGMP / PIM `src_ip` hardcoded to
+  10.0.0.[1/10/20].** RFC 5798 §5.2.4 (VRRP) says the source
+  is the master's physical IP; RFC 7761 §4.3 (PIM) says
+  Hellos are sourced from the router's iface IP; RFC 2236 §3
+  (IGMP) implies the same. Peers log "unknown source" and
+  don't form adjacency. Fix: blank defaults across all three.
+
+- **L2-C5: `src_mac` hardcoded across LACP/IGMP/PIM/BFD.**
+  Same MAC-flap risk v0.5.268 L2-B5 fixed for LLDP — two
+  netgen boxes on the same L2 domain both emit with the
+  documentation MAC, the switch's MAC table oscillates
+  between two ports. Fix: blank defaults → iface MAC.
+
+- **L2-C6: LACP `fast=True` didn't OR the Timeout=Short (0x02)
+  bit into `actor_state`.** IEEE 802.1AX §6.4.4.2 requires
+  Timeout=Short when the sender wants PDU_FAST cadence. Peer
+  read our Long_Timeout and computed a 90-second detection
+  window while we sent at 1-second cadence — LAG converges
+  but wastes time on convergence tests. Fix: `eff_state |=
+  0x02` when fast. Preview also updated to match.
+
+- **L2-C7: LACP `system_mac` hardcoded to
+  00:11:22:33:44:01.** Two netgen boxes trunked into the
+  same switch both looked like the same LACP Actor; the
+  switch's LAG state machine treated them as one Actor. Fix:
+  blank default → iface MAC.
+
+**Tier-3 — nice-to-have:**
+
+- **L2-C8: BFD source UDP port hardcoded to 49152.** RFC 5881
+  §4 says the source port must be "unique" for the peer pair.
+  Two BFD emitters to the same peer collided on the same
+  demux 5-tuple. Fix: session-stable random port from the
+  ephemeral [49152, 65535] range, computed once per session.
+
+**Client:**
+
+- **L2-C9: LACP dropdown label now reads "(bridge-consumed)"**
+  so the operator sees at protocol-select time that LACPDUs
+  (dst 01:80:c2:00:00:02) are IEEE 802.1D reserved and get
+  filtered at the first switch — a common lab surprise when
+  testing two netgen boxes through a switch.
+
+- Dialog defaults across all 5 non-LLDP protocols now blank
+  with placeholder text (`leave blank to auto-derive from
+  interface …`); submit paths skip `_validate_mac` /
+  `_validate_ip` when blank.
+
+Regression tests in `tests/test_v05269_l2_emit_fixes.py`
+(pytest source-level checks); no hardware verification yet.
+
 ## [0.5.268] - 2026-09-05
 
 **L2 emulation dialog — 5 default-value fixes.**
