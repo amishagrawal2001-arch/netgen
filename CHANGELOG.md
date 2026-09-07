@@ -2,6 +2,55 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.272] - 2026-09-07
+
+**BGP state "Idle" false-positive + IPv4 gateway ARP diagnostic.**
+
+Operator screenshot showed all four BGP peers as Idle in the netgen
+UI while the QFX5130 (`show bgp summary`) reported all four
+Established with 2d21h+ uptime. Same operator saw both IPv4
+Gateway cells orange even though BGP was clearly transiting them.
+Two independent bugs surfaced by one report:
+
+- **BGP-G1: `get_device_bgp_status` uptime-shape check missed
+  long-running sessions.** FRR's `show bgp summary` renders
+  Up/Down time in three shapes depending on duration:
+  * `< 24 h`  → `HH:MM:SS`  (has colons)
+  * `< 7 d`   → `XdYYhZZm`  (**no colons**)
+  * `>= 7 d`  → `XwYdZZh`   (**no colons**)
+
+  The pre-fix parser gated the "session is up" inference on
+  `":" in uptime` — so any peer Established longer than a day
+  fell through to `state = "Unknown"`. The [BGP monitor's
+  ranking table][bgp_monitor] then coerced that to whatever the
+  DB last held (typically `"Idle"` from initial state), and the
+  UI painted a bogus orange row. Fix: drop the colon
+  requirement — a numeric `parts[9]` (prefix count) with any
+  non-sentinel uptime (`00:00:00` / `never` / empty rejected)
+  means Established. Same fix applied to the last-resort
+  fallback branch below.
+
+- **ARP-G2: IPv4 gateway diagnostic missing when both ping and
+  ARP fallback fail.** The v0.5.254 fallback correctly consults
+  `ip neigh show` when ping fails (Junos QFX IRB gateways filter
+  ICMP echo under default filters). But when BOTH ping and the
+  neigh fallback fail — meaning `arp_gateway_resolved=False` —
+  the response body carried only `gateway_ping_error` for IPv4,
+  while the IPv6 branch already dumped the raw `ip neigh` output
+  under `details.ipv6_neigh`. Operator couldn't tell
+  `INCOMPLETE` (ARP request unanswered) from `FAILED` (peer
+  went away) from `no entry` (ARP not attempted, e.g. wrong
+  VRF / interface). Fix: add the same `ip neigh show`
+  diagnostic dump for the IPv4 gateway path, keyed
+  `details.gateway_neigh`. Parity with IPv6.
+
+[bgp_monitor]: utils/bgp_monitor.py
+
+Regression tests in `tests/test_v05272_bgp_uptime_arp_diag.py`.
+Source-level verified only — needs srv06 (or the QFX5130 lab
+that produced the screenshot) to confirm the state parser now
+reports Established for the reproducible 2d21h+ uptimes.
+
 ## [0.5.271] - 2026-09-05
 
 **L2/multicast emulation — scale (N-instance) support.**

@@ -12793,22 +12793,50 @@ def get_device_bgp_status(device_id):
                     # parts[8] = uptime (00:05:55)
                     # parts[9] = State/PfxRcd (0 = prefix count when Established, or state name when not Established)
                     uptime = parts[8] if len(parts) > 8 else "00:00:00"
-                    
+
                     # Look for state in the remaining parts - usually contains parentheses or state name
                     state = "Unknown"
+                    # v0.5.272 (BGP-G1): uptime-shape helper. FRR's
+                    # `show bgp summary` renders Up/Down time in
+                    # DIFFERENT formats based on how long the session
+                    # has been up:
+                    #   < 24 h  → "HH:MM:SS"           (has colons)
+                    #   < 7 d   → "XdYYhZZm"          (NO colons)
+                    #   >= 7 d  → "XwYdZZh"           (NO colons)
+                    # The pre-fix check `":" in uptime` narrowed
+                    # "session is up" to only the first bucket —
+                    # every peer that had been Established for more
+                    # than a day left `state = "Unknown"` here, then
+                    # fell through to the monitor's default rendering
+                    # and the UI painted a bogus Idle/orange row while
+                    # the router's `show bgp summary` said Establ.
+                    # New rule: any non-empty, non-sentinel uptime
+                    # counts as up. The prefix-count int(parts[9])
+                    # check is the primary signal; uptime is only
+                    # used to reject sentinel values.
+                    def _uptime_indicates_up(_u: str) -> bool:
+                        if not _u:
+                            return False
+                        _u = _u.strip()
+                        return _u not in ("00:00:00", "never", "0", "-")
                     # First check parts[9] - it could be a state name (Idle, Active, etc.) or a number (prefix count when Established)
                     if len(parts) > 9:
                         # Check if parts[9] is a number (prefix count) - if so, state is Established
                         try:
                             prefix_count = int(parts[9])
-                            # If it's a number and we have a valid uptime, the state is Established
-                            if uptime != "00:00:00" and ":" in uptime:
+                            # If parts[9] is a number, this row is a
+                            # per-neighbor summary in the "up" state
+                            # — FRR only renders a numeric prefix
+                            # count when the session is Established
+                            # (Idle / Active / etc. all render as
+                            # state names, not integers).
+                            if _uptime_indicates_up(uptime):
                                 state = "Established"
                                 logging.debug(f"[BGP STATUS] Detected Established state for {neighbor_ip} (prefix count: {prefix_count}, uptime: {uptime})")
                         except ValueError:
                             # parts[9] is not a number, so it's likely a state name
                             state = parts[9]
-                    
+
                     # If state is still "Unknown", check remaining parts for state indicators
                     if state == "Unknown":
                         for i in range(9, len(parts)):
@@ -12818,15 +12846,18 @@ def get_device_bgp_status(device_id):
                             elif parts[i] in ['Established', 'Active', 'Idle', 'Connect', 'OpenSent', 'OpenConfirm', 'OpenWait']:
                                 state = parts[i]
                                 break
-                    
+
                     # Special handling for (Policy) state - this indicates BGP is established
                     if state == "(Policy)":
                         state = "Established"
                         logging.info(f"[BGP STATUS] Mapped (Policy) to Established for {neighbor_ip}")
-                    
-                    # If state is still "Unknown" and we have uptime, check if session is actually established
-                    # by looking at the uptime - if it's not "00:00:00" or "never", the session is likely established
-                    if state == "Unknown" and uptime != "00:00:00" and uptime != "never" and ":" in uptime:
+
+                    # v0.5.272 (BGP-G1): same uptime-shape fix on the
+                    # last-resort fallback. Was `":" in uptime` here
+                    # too — sessions running longer than 24 h fell
+                    # through to state="Unknown" then flapped to
+                    # Idle in the monitor's ranking table.
+                    if state == "Unknown" and _uptime_indicates_up(uptime):
                         # If we have a valid uptime (not 00:00:00 or never), the BGP session is likely Established
                         # even if the summary shows "N/A" for state
                         state = "Established"
@@ -14897,6 +14928,32 @@ def get_device_arp_status(device_id):
                         err = (result.stderr or result.stdout or "").strip()[:200]
                         if err:
                             arp_results["details"]["gateway_ping_error"] = err
+                        # v0.5.272 (ARP-G2): parity with the IPv6
+                        # branch — dump the actual `ip neigh show`
+                        # output when BOTH ping and neigh check fail
+                        # so the operator can distinguish
+                        # INCOMPLETE (ARP request unanswered) from
+                        # FAILED (peer went away) from no-entry
+                        # (ARP not attempted, e.g. wrong VRF /
+                        # wrong interface). Pre-fix the client only
+                        # saw `arp_gateway_resolved=False` with no
+                        # diagnostic, so debugging required SSH to
+                        # the netgen server.
+                        try:
+                            neigh_cmd = list(ping_prefix) + [
+                                "ip", "neigh", "show", "to", ipv4_gateway,
+                            ]
+                            neigh_result = subprocess.run(
+                                neigh_cmd, capture_output=True,
+                                text=True, timeout=5,
+                            )
+                            arp_results["details"]["gateway_neigh"] = (
+                                (neigh_result.stdout or "").strip() or "no entry"
+                            )
+                        except Exception as neigh_exc:
+                            arp_results["details"]["gateway_neigh"] = (
+                                f"error: {neigh_exc}"
+                            )
             except Exception as e:
                 arp_results["details"]["gateway_ping"] = f"error: {e}"
         
