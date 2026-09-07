@@ -2,6 +2,53 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.276] - 2026-09-07
+
+**OSPF JSON parser: fix v0.5.274 regression (per-VRF envelope not
+unwrapped → "No Neighbors" for IPv4 while switch sees Full).**
+
+Operator upgraded to v0.5.274, saw:
+- OSPF tab: `device1 IPv4 → No Neighbors`, `device1 IPv6 → Full`,
+  same pattern on `device2`.
+- QFX side: `show ospf neighbor` → both devices Full on
+  `irb.100` / `irb.200`.
+
+Root cause: **my v0.5.274 rewrite forgot the per-VRF envelope**.
+`show ip ospf vrf <name> neighbor json` wraps the answer as
+`{<vrf-name>: {"neighbors": {...}}}`. The BGP helper handles
+this via `_unwrap_vrf` (v0.5.273). The OSPF helper I wrote in
+v0.5.274 read `.get("neighbors")` off the OUTER dict — always
+`None` in the VRF-scoped case — so every IPv4 session reported
+zero neighbors. IPv6 kept working because `show ipv6 ospf6 vrf
+<name> neighbor json` on this operator's FRR version doesn't
+wrap the same way (or the fallback path fired for v6 only).
+
+- **OSPF-J2**: new `_ospf_unwrap_vrf_envelope(payload)` helper.
+  If `neighbors` is at top-level (single-scope query), returns
+  payload unchanged. If the payload is a VRF envelope
+  (`{<vrf>: {"neighbors": ...}}`), merges the inner `neighbors`
+  values across all VRF children into `{"neighbors": ...}` at
+  top-level. Applied to BOTH v4 and v6 parsers.
+
+The text-parser fallback was correct — but it never fired
+because the JSON queries returned exit_code=0 with parseable
+(but wrongly-structured-for-my-parser) JSON. So the fallback
+didn't kick in, and the empty parse looked like "OSPF is up
+but has zero neighbors" — a valid state per the parser
+contract.
+
+Regression tests in `tests/test_v05276_ospf_vrf_envelope.py` —
+recorded FRR JSON fixtures with the `{<vrf>: {"neighbors": ...}}`
+wrapping for both AFs, plus back-compat check that top-level
+`neighbors` still parses. Full OSPF/BGP/FRR regression:
+331 passed.
+
+Ship recommendation: **immediate upgrade** for anyone on
+v0.5.274 running per-device VRFs (the default deployment model
+since v0.5.193). Anyone still on v0.5.273 or older is
+unaffected — the text-parser they were using worked correctly
+against the VRF envelope.
+
 ## [0.5.275] - 2026-09-07
 
 **DHCP server: fix "pool IP configured but not reachable" — four

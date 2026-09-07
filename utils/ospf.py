@@ -1139,6 +1139,48 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
         logging.error(f"[OSPF STOP] Error stopping OSPF: {e}")
         return False
 
+def _ospf_unwrap_vrf_envelope(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """v0.5.276 (OSPF-J2): strip FRR's per-VRF envelope on
+    ``show ip ospf vrf <name> neighbor json``.
+
+    When the query is scoped to a VRF (which every per-device
+    deployment does — see _ospf_show_scope), FRR wraps the answer
+    as ``{<vrf-name>: {"neighbors": {...}}}``. Pre-fix
+    ``_parse_ospf_v4_neighbors_json`` read ``.get("neighbors")``
+    off the outer dict and got None → every OSPFv4 session
+    reported "No Neighbors" while the switch showed Full.
+
+    Same pattern the BGP JSON helper's ``_unwrap_vrf`` handles at
+    ``utils/frr_docker.py`` — OSPF got skipped in the v0.5.274
+    rewrite. If the payload already has a top-level ``neighbors``
+    key (single-scope query), it's returned unchanged.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    # Already unwrapped — top-level `neighbors` present.
+    if "neighbors" in payload:
+        return payload
+    # VRF-envelope shape: exactly one key whose value contains
+    # `neighbors`. Merge every child dict's neighbors (should only
+    # be one VRF in our per-device model, but merge defensively).
+    merged_neighbors: Any = None
+    for _vrf, obj in payload.items():
+        if not isinstance(obj, dict):
+            continue
+        _inner = obj.get("neighbors")
+        if _inner is None:
+            continue
+        if merged_neighbors is None:
+            merged_neighbors = _inner
+        elif isinstance(merged_neighbors, dict) and isinstance(_inner, dict):
+            merged_neighbors.update(_inner)
+        elif isinstance(merged_neighbors, list) and isinstance(_inner, list):
+            merged_neighbors = merged_neighbors + _inner
+    if merged_neighbors is not None:
+        return {"neighbors": merged_neighbors}
+    return payload
+
+
 def _parse_ospf_v4_neighbors_json(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """v0.5.274 (OSPF-J1): parse the neighbor list out of FRR's
     ``show ip ospf <vrf> neighbor json`` payload.
@@ -1168,10 +1210,15 @@ def _parse_ospf_v4_neighbors_json(payload: Dict[str, Any]) -> List[Dict[str, Any
     adjacency, all typed ``IPv4`` and keyed with the original
     router-id — same shape as the text parser produced, so
     downstream callers need no changes.
+
+    v0.5.276 (OSPF-J2): VRF-scoped queries wrap the answer in
+    ``{<vrf-name>: {...}}`` — unwrapped by ``_ospf_unwrap_vrf_envelope``
+    before neighbor extraction.
     """
     out: List[Dict[str, Any]] = []
     if not isinstance(payload, dict):
         return out
+    payload = _ospf_unwrap_vrf_envelope(payload)
     _neighbors = payload.get("neighbors") or {}
     if not isinstance(_neighbors, dict):
         return out
@@ -1226,10 +1273,14 @@ def _parse_ospf_v6_neighbors_json(payload: Dict[str, Any]) -> List[Dict[str, Any
 
     Same-shape output as `_parse_ospf_v4_neighbors_json` so the
     caller can flat-concatenate the two lists.
+
+    v0.5.276 (OSPF-J2): VRF-scoped queries wrap the answer — same
+    treatment as the v4 helper.
     """
     out: List[Dict[str, Any]] = []
     if not isinstance(payload, dict):
         return out
+    payload = _ospf_unwrap_vrf_envelope(payload)
     _neighbors = payload.get("neighbors") or []
     if not isinstance(_neighbors, list):
         return out
