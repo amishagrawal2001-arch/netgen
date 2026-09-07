@@ -15150,12 +15150,21 @@ def get_device_arp_status(device_id):
                     # `ping` when arping isn't installed (some
                     # container/host base images ship without
                     # iputils-arping).
-                    _iface_for_arp = (
-                        device.get("server_interface")
-                        or f"vlan{device.get('vlan')}"
-                        if device.get("vlan") and device.get("vlan") != "0"
-                        else device.get("server_interface")
-                    ) or ""
+                    # v0.5.279 (ARP-H6): pick the vlan sub-interface
+                    # FIRST when the device has a VLAN. Pre-fix the
+                    # ternary parsed as `(server_interface or
+                    # "vlan{vlan}") if vlan else server_interface`
+                    # — so when server_interface held the parent NIC
+                    # (ens1f0) AND vlan was set, arping went out
+                    # UNTAGGED, never reached the tagged VLAN's
+                    # switch-side IRB, neigh cache stayed empty.
+                    # Devices with only server_interface (no VLAN)
+                    # keep the plain-NIC path.
+                    _vlan = str(device.get("vlan") or "0").strip()
+                    if _vlan and _vlan != "0":
+                        _iface_for_arp = f"vlan{_vlan}"
+                    else:
+                        _iface_for_arp = device.get("server_interface") or ""
                     _warm_kind = "skip"
                     if _iface_for_arp:
                         try:

@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.279] - 2026-09-07
+
+**Gateway-orange class, take 7: my own v0.5.278 introduced an
+operator-precedence bug in the arp-warm interface selection.**
+
+Post-v0.5.278 the operator saw device1 gateway green (BGP
+short-circuit fired) but device2 gateway still orange, even
+though both are BGP peers with the switch reporting both
+Established. Ping from switch to 192.168.10.2 (device2 IP)
+succeeds.
+
+Root cause: my v0.5.278 (ARP-H3) `_iface_for_arp` derivation
+used a broken ternary::
+
+    _iface_for_arp = (
+        device.get("server_interface")
+        or f"vlan{device.get('vlan')}"
+        if device.get("vlan") and device.get("vlan") != "0"
+        else device.get("server_interface")
+    ) or ""
+
+Python parses this as ``(server_interface or "vlan{vlan}") if
+vlan else server_interface`` — so when ``server_interface``
+held the parent NIC (e.g. ``ens1f0``) AND vlan was set, arping
+went out **untagged** and never reached the tagged VLAN's
+switch-side IRB. Untagged frames on a trunk port with no
+native VLAN are dropped; the neigh cache stayed empty.
+
+device1 got green by luck: v0.5.278's ARP-H5 (BGP-established
+short-circuit) fired for it because ``bgp_established=True`` was
+in the DB. device2's DB row missed the short-circuit somehow
+(maybe a BGP-monitor race that we haven't diagnosed), so it
+fell through to ARP-H3's arp-warm — which then failed silently
+because arping was on the wrong interface.
+
+- **ARP-H6**: rewritten as a clear ``if`` block. When a device
+  has a non-zero VLAN, the arp-warm always targets ``vlan<ID>``;
+  only untagged (no-VLAN) devices use ``server_interface``
+  directly. This puts arping on the same subinterface the
+  gateway lives on, so the ARP reply populates the neigh
+  cache and the next check flips gateway green.
+
+Regression tests in `tests/test_v05279_arp_iface_ternary.py`
+including the operator's exact scenario (VLAN 200 + parent NIC
+in server_interface). Full ARP/DHCP/BGP regression: 418 passed.
+
+Ship recommendation: immediate upgrade for anyone still on
+v0.5.278 with orange gateways for VLAN-tagged BGP peers whose
+BGP monitor DB row missed the short-circuit condition.
+
 ## [0.5.278] - 2026-09-07
 
 **Gateway-orange class, take 6: v0.5.277 didn't stick for BGP-peer
