@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.277] - 2026-09-07
+
+**Gateway-orange class, take 5: flip ARP check from ping-first to
+neigh-first. Fix VRF-detect Docker init race.**
+
+Operator report: `Devices` tab shows IPv4 Gateway ORANGE for
+BGP peers device1 (192.168.0.1) and device2 (192.168.10.1)
+even though ping works. The DHCP-server device3
+(172.16.30.1) shows green.
+
+This bug class has re-opened four times:
+- v0.5.254 — Junos IRB drops ICMP, added `ip neigh` fallback
+- v0.5.258 — walk every neigh line, not just first
+- v0.5.262 — parity VRF for the v6 diag dump
+- v0.5.272 — dump neigh output on double-fail
+
+Every time, the fix layered onto **ping-primary + neigh-secondary**.
+Ping keeps finding new failure modes; the neigh table doesn't.
+This ship flips the ordering.
+
+- **ARP-H1: neigh-first for IPv4 gateway.** New order:
+  1. Consult `ip neigh show to <gw>` (via VRF). Any resolved
+     state → `arp_gateway_resolved=True`. Done.
+  2. Missing / INCOMPLETE / FAILED → send one ping as
+     **arp-warm** (the kernel's ARP request is the side effect
+     we want; ping's exit code is IRRELEVANT — Junos may drop
+     the echo but still answer ARP).
+  3. Re-check neigh. Resolved → True.
+  4. Still not resolved → False, dump raw `ip neigh show`
+     output into `details.gateway_neigh` so the operator can
+     tell INCOMPLETE (peer not answering ARP) from no-entry
+     (wrong VRF / interface / subnet).
+  `details.gateway_check_path` records which step won
+  (`neigh_cache_hit` / `neigh_after_arp_warm` /
+  `neigh_still_incomplete`).
+
+- **ARP-H2: VRF-detect Docker init race.** Pre-fix created a
+  fresh `FRRDockerManager()` (→ `docker.from_env()` connect)
+  on every ARP-status call, then netlink-probed with a **2 s**
+  timeout. Under load the Docker connect alone can exceed 2 s,
+  the outer try/except swallowed the exception, `ping_prefix`
+  stayed empty, and the endpoint ran ping in the default netns
+  — which fails with "Network is unreachable" for any device
+  whose gateway lives only in the VRF's routing table. Silent
+  orange for every BGP peer whose VRF setup was intact. Fix:
+  use the module-level `frr_manager` lazy proxy (cached after
+  first call, no per-call Docker connect) and raise the
+  netlink probe timeout to **5 s**. Log a warning when a
+  derived VRF name doesn't resolve to an interface, so the
+  operator knows the endpoint probed the wrong context.
+
+Why device3 was green: it was the recently-fixed DHCP-server
+device from v0.5.275 which added a gratuitous ARP on anchor
+add — the switch's MAC table was already primed and the neigh
+cache had a fresh REACHABLE entry that survived the timing
+race. Device1/2 got their neigh entries only via BGP peering
+traffic, which ages STALE fast and can miss the 30 s poll
+window between refreshes.
+
+Regression tests in `tests/test_v05277_arp_neigh_first.py`
+(neigh-first ordering + VRF-detect helper switch + details
+diagnostics). Full ARP/DHCP/BGP regression: 391 passed.
+
+Ship recommendation: **immediate upgrade** for anyone with
+per-device VRFs (default since v0.5.193) seeing orange
+gateways for working sessions.
+
 ## [0.5.276] - 2026-09-07
 
 **OSPF JSON parser: fix v0.5.274 regression (per-VRF envelope not

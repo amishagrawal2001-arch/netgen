@@ -14918,19 +14918,43 @@ def get_device_arp_status(device_id):
         # ARP probe with `ip vrf exec <vrf-name>` so probes run in
         # the right routing context. Falls back to default netns
         # when no VRF is wired up (single-device legacy path).
+        # v0.5.277 (ARP-H2): VRF detection was creating a fresh
+        # FRRDockerManager() (→ docker.from_env()) on EVERY call and
+        # timed the netlink probe at 2s. Under load the Docker
+        # daemon connect can take >2s, the outer try/except swallows
+        # the timeout, ping_prefix stays empty, and the endpoint
+        # runs ping in the default netns which fails with "Network
+        # is unreachable" (no route in default table). Silent-orange
+        # for BGP peers whose VRF is intact. Fix: use the module-
+        # level `frr_manager` proxy (lazy Docker connect, cached
+        # after first call) and give the netlink probe 5s.
         ping_prefix: list = []
         try:
-            from utils.frr_docker import FRRDockerManager
-            _vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+            from utils.frr_docker import frr_manager as _frr
+            _vrf_name = _frr.vrf_name_for_device(device_id)
             if _vrf_name:
                 _check = subprocess.run(
                     ["ip", "-o", "link", "show", _vrf_name],
-                    capture_output=True, text=True, timeout=2,
+                    capture_output=True, text=True, timeout=5,
                 )
                 if _check.returncode == 0 and (_check.stdout or "").strip():
                     ping_prefix = ["ip", "vrf", "exec", _vrf_name]
                     logging.debug(
                         f"[ARP STATUS] device {device_id}: probing inside {_vrf_name}"
+                    )
+                else:
+                    # VRF name derived but interface not present —
+                    # surface this so an operator seeing orange for
+                    # a device with a working BGP session knows the
+                    # ARP endpoint saw NO VRF context, not a
+                    # neighbor-table miss.
+                    logging.warning(
+                        f"[ARP STATUS] device {device_id}: derived "
+                        f"vrf name {_vrf_name!r} but "
+                        f"`ip link show` returned "
+                        f"exit={_check.returncode}; probing in "
+                        f"default netns (this will fail if the "
+                        f"gateway subnet only lives in the VRF)"
                     )
         except Exception as _vrf_exc:
             logging.warning(f"[ARP STATUS] VRF lookup failed for {device_id}: {_vrf_exc}")
@@ -15045,56 +15069,73 @@ def get_device_arp_status(device_id):
                 arp_results["details"]["ipv6_ping_target"] = ipv6_gateway or ipv6_address
 
         # Check gateway connectivity (subprocess already at module scope — see IPv4 note)
+        # v0.5.277 (ARP-H1): NEIGH-FIRST ordering. This class of bug
+        # has been re-opened four times (v0.5.254, v0.5.258, v0.5.262,
+        # v0.5.272) because ping was primary. Every time the primary
+        # fails silently — ping_prefix mis-detected, Junos ICMP
+        # filter, kernel timing race, VRF cgroup transition — the UI
+        # painted orange even though `ip neigh show` had a REACHABLE
+        # entry. The neighbor table IS the L2 forwarding state; if
+        # the MAC is there we can forward frames, which is what
+        # "resolved" means. Ping's role is arp-warm (poke the peer
+        # so the kernel populates the neighbor cache) — it stopped
+        # being a good proxy for reachability years ago. New order:
+        #   1) Consult neigh table. Resolved state → True. Done.
+        #   2) Missing / INCOMPLETE / FAILED → send one ping as
+        #      arp-warm (kernel sends ARP request as a side effect,
+        #      updates the neigh table).
+        #   3) Re-check neigh. Resolved → True. Done.
+        #   4) Still not resolved → False, dump the raw `ip neigh
+        #      show` output into details for the operator.
+        # `details.gateway_check_path` records which step won so the
+        # operator can see whether the neigh cache hit or arp-warm
+        # was needed.
         if ipv4_gateway:
             try:
-                result = subprocess.run(ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_gateway],
-                                      capture_output=True, text=True, timeout=5)
-                ping_ok = result.returncode == 0
-                arp_results["details"]["gateway_ping"] = "success" if ping_ok else "failed"
-                if ping_ok:
-                    arp_results["arp_gateway_resolved"] = True
+                _resolved_via = None
+                if _neigh_state_ok(ipv4_gateway, family="ipv4"):
+                    _resolved_via = "neigh_cache_hit"
                 else:
-                    # v0.5.254: the important one — Juniper QFX IRB
-                    # gateways in the srv06 lab drop ICMPv4 echo
-                    # under default filters, but ARP works and BGP
-                    # comes up. Pre-fix the "IPv4 Gateway" cell went
-                    # orange while BGP was clearly UP through it.
+                    # arp-warm: send a ping to trigger ARP resolution
+                    # via the kernel, then re-check the neighbor table.
+                    # The ping's exit code is IRRELEVANT — Junos may
+                    # drop the echo but still answer ARP, and we only
+                    # need the ARP handshake to populate the table.
+                    _warm = subprocess.run(
+                        ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_gateway],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    arp_results["details"]["gateway_arp_warm"] = (
+                        "ping-ok" if _warm.returncode == 0 else "ping-fail"
+                    )
                     if _neigh_state_ok(ipv4_gateway, family="ipv4"):
-                        arp_results["arp_gateway_resolved"] = True
-                        arp_results["details"]["gateway_neigh_fallback"] = "resolved via ip neigh"
-                    else:
-                        arp_results["arp_gateway_resolved"] = False
-                        err = (result.stderr or result.stdout or "").strip()[:200]
-                        if err:
-                            arp_results["details"]["gateway_ping_error"] = err
-                        # v0.5.272 (ARP-G2): parity with the IPv6
-                        # branch — dump the actual `ip neigh show`
-                        # output when BOTH ping and neigh check fail
-                        # so the operator can distinguish
-                        # INCOMPLETE (ARP request unanswered) from
-                        # FAILED (peer went away) from no-entry
-                        # (ARP not attempted, e.g. wrong VRF /
-                        # wrong interface). Pre-fix the client only
-                        # saw `arp_gateway_resolved=False` with no
-                        # diagnostic, so debugging required SSH to
-                        # the netgen server.
-                        try:
-                            neigh_cmd = list(ping_prefix) + [
-                                "ip", "neigh", "show", "to", ipv4_gateway,
-                            ]
-                            neigh_result = subprocess.run(
-                                neigh_cmd, capture_output=True,
-                                text=True, timeout=5,
-                            )
-                            arp_results["details"]["gateway_neigh"] = (
-                                (neigh_result.stdout or "").strip() or "no entry"
-                            )
-                        except Exception as neigh_exc:
-                            arp_results["details"]["gateway_neigh"] = (
-                                f"error: {neigh_exc}"
-                            )
+                        _resolved_via = "neigh_after_arp_warm"
+                arp_results["arp_gateway_resolved"] = (_resolved_via is not None)
+                arp_results["details"]["gateway_check_path"] = (
+                    _resolved_via or "neigh_still_incomplete"
+                )
+                if not arp_results["arp_gateway_resolved"]:
+                    # Dump the raw neigh output so operators can
+                    # distinguish INCOMPLETE (peer not answering ARP)
+                    # from no-entry (ARP not attempted — usually wrong
+                    # VRF / interface / subnet).
+                    try:
+                        neigh_cmd = list(ping_prefix) + [
+                            "ip", "neigh", "show", "to", ipv4_gateway,
+                        ]
+                        neigh_result = subprocess.run(
+                            neigh_cmd, capture_output=True,
+                            text=True, timeout=5,
+                        )
+                        arp_results["details"]["gateway_neigh"] = (
+                            (neigh_result.stdout or "").strip() or "no entry"
+                        )
+                    except Exception as neigh_exc:
+                        arp_results["details"]["gateway_neigh"] = (
+                            f"error: {neigh_exc}"
+                        )
             except Exception as e:
-                arp_results["details"]["gateway_ping"] = f"error: {e}"
+                arp_results["details"]["gateway_check_error"] = f"{e}"
         
         # v0.5.193: `requires_ipv6` must be gated by whether an IPv6
         # address is actually configured on the device — protocol

@@ -68,14 +68,20 @@ def test_bgp_state_parser_documents_three_frr_uptime_shapes():
 
 
 def test_ipv4_gateway_dumps_neigh_when_both_ping_and_neigh_fail():
-    """v0.5.272 (ARP-G2): parity with the IPv6 branch — the IPv4
-    gateway path must dump the raw `ip neigh show` output into
-    details.gateway_neigh when both ping and the neigh fallback
-    fail. Pre-fix only IPv6 carried this diagnostic; IPv4 left
-    the operator flying blind."""
-    idx = SRV.find("v0.5.272 (ARP-G2)")
-    assert idx > 0, "ARP-G2 marker missing"
-    body = SRV[idx:idx + 2000]
+    """v0.5.272 (ARP-G2): the IPv4 gateway path must dump the raw
+    `ip neigh show` output into details.gateway_neigh when the
+    check remains unresolved (post-arp-warm). Pre-v0.5.272 the
+    IPv4 branch had no diagnostic; the operator was flying blind.
+
+    v0.5.277 (ARP-H1): the check order flipped from ping-first
+    to neigh-first with ping as arp-warm secondary, and the
+    diagnostic dump moved to run whenever the gateway is
+    still-unresolved (regardless of which specific path failed).
+    Anchor to the v0.5.277 marker since the block was rewritten;
+    the diagnostic behavior it guaranteed is preserved."""
+    idx = SRV.find("v0.5.277 (ARP-H1)")
+    assert idx > 0, "ARP-H1 (successor to ARP-G2) marker missing"
+    body = SRV[idx:idx + 4000]
     # The subprocess call runs `ip neigh show to <gateway>` under
     # the same VRF prefix used by everything else in the endpoint.
     assert 'list(ping_prefix)' in body
@@ -86,29 +92,28 @@ def test_ipv4_gateway_dumps_neigh_when_both_ping_and_neigh_fail():
 
 
 def test_ipv4_gateway_neigh_dump_only_runs_on_arp_fail():
-    """The neigh dump must NOT run on the happy path (ping ok, or
-    ping fail + neigh fallback succeeded). That would be wasted
-    subprocess overhead + noisy details for every poll."""
-    # Anchor the slice on the `if ipv4_gateway:` block so the
-    # search sees the whole branch: happy path (ping ok), fallback
-    # (neigh ok), and double-failure (dump lands here).
+    """The neigh dump must NOT run on the happy path (neigh cache
+    hit, or neigh resolved after arp-warm). Waste-of-cycles +
+    noisy details on every 30s poll otherwise.
+
+    v0.5.277 (ARP-H1): dump is gated by
+    `if not arp_results["arp_gateway_resolved"]:` — an explicit
+    guard rather than being nested in an else-branch. Same
+    invariant, cleaner structure."""
     branch_idx = SRV.find("# Check gateway connectivity")
     assert branch_idx > 0
     branch_end = SRV.find("# v0.5.193: `requires_ipv6`", branch_idx)
     body = SRV[branch_idx:branch_end]
-    # arp_gateway_resolved is set to False in the double-fail
-    # branch; the neigh dump must appear AFTER that assignment.
-    gate_idx = body.find('arp_results["arp_gateway_resolved"] = False')
-    dump_idx = body.find('"gateway_neigh"')
-    assert 0 < gate_idx < dump_idx, (
-        "the neigh dump must be nested inside the double-failure "
-        "branch (after arp_gateway_resolved=False)"
+    # The dump is guarded by `if not arp_results["arp_gateway_
+    # resolved"]:` — it never runs on the resolved path.
+    guard_idx = body.find(
+        'if not arp_results["arp_gateway_resolved"]:'
     )
-    # And the marker for the v0.5.272 fix itself sits between the
-    # False assignment and the dump — so the reader hits the
-    # rationale before the mechanics.
-    marker_idx = body.find("v0.5.272 (ARP-G2)")
-    assert gate_idx < marker_idx < dump_idx
+    dump_idx = body.find('"gateway_neigh"')
+    assert 0 < guard_idx < dump_idx, (
+        "the neigh dump must be nested inside "
+        "`if not arp_results['arp_gateway_resolved']:`"
+    )
 
 
 # --- Metadata ----------------------------------------------------

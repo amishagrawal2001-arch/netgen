@@ -84,7 +84,12 @@ def _run_arp_status(device, vrf_name, subprocess_side_effect):
 
 
 def _fake_iface_up(cmd):
-    """Return a subprocess-like object for ip link show + ping calls."""
+    """Return a subprocess-like object for ip link show + ping calls.
+
+    v0.5.277 (ARP-H1): also handles `ip neigh show` — pre-fix mock
+    only mocked ping/link, but the endpoint now consults neigh FIRST
+    (with ping as arp-warm). Return a REACHABLE entry so the neigh
+    path resolves True."""
     class R:
         def __init__(self, rc=0, out="", err=""):
             self.returncode = rc
@@ -96,6 +101,17 @@ def _fake_iface_up(cmd):
     if cmd[:3] == ["ip", "-o", "link"]:
         # VRF existence probe — say yes.
         return R(0, f"13: {cmd[-1]}: <NOARP,MASTER,UP,LOWER_UP>", "")
+    # v0.5.277: `ip neigh show to <ip>` — the new primary reachability
+    # check. Also handle the VRF-wrapped `ip vrf exec vrf-X ip neigh
+    # show to <ip>` form. Answer REACHABLE so the neigh path wins.
+    if "neigh" in cmd and "show" in cmd:
+        # Extract target IP (last positional after `to`).
+        _target = cmd[-1]
+        return R(
+            0,
+            f"{_target} dev vlan10 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n",
+            "",
+        )
     if "ping" in cmd[0] or cmd[0] == "ping":
         return R(0, "1 received", "")
     if len(cmd) > 3 and cmd[3] == "ping":
