@@ -4674,7 +4674,31 @@ def apply_device():
                 else:
                     # VLAN interface already exists - verify it's linked to correct parent
                     link_output = check_result.stdout
-                    if f"@{interface_normalized}" in link_output or f"link/{interface_normalized}" in link_output:
+                    # v0.5.275 (DHCP-J4): anchor the parent-name
+                    # match so it isn't a raw substring test — an
+                    # existing `vlan10@ens2f0` (parent ens2f0)
+                    # would falsely match a current apply for
+                    # ens2f0np0 (`"ens2f0" in "ens2f0np0"`), skip
+                    # the different-parent fallback, and reuse the
+                    # wrong subif silently. `ip -o link show`
+                    # output has the parent as `vlan10@<parent>:`
+                    # or `link/<parent>` followed by whitespace or
+                    # end-of-line, so require the trailing
+                    # word-boundary character too.
+                    def _parent_link_matches(_out: str, _parent: str) -> bool:
+                        # Look for `@<parent>:` (colon terminator in
+                        # `ip link show` output) or `link/<parent> `
+                        # (space in `ip -o link` output). Neither
+                        # accepts `<parent>` as a prefix of a longer
+                        # interface name.
+                        return (
+                            f"@{_parent}:" in _out
+                            or f"@{_parent}@" in _out
+                            or f"link/{_parent} " in _out
+                            or _out.rstrip().endswith(f"@{_parent}")
+                            or _out.rstrip().endswith(f"link/{_parent}")
+                        )
+                    if _parent_link_matches(link_output, interface_normalized):
                         # CRITICAL: Use just the interface name (without @parent) for commands
                         # Linux shows it as vlan{vlan}@{parent} in ip link show, but commands use just the name
                         iface_name_for_commands = vlan_name_only
@@ -5874,11 +5898,37 @@ def apply_device():
                     logging.debug(f"[DHCP APPLY] Unable to retrieve FRR container during apply for {device_id}: {container_exc}")
                     container_for_dhcp = None
 
-                logging.info(f"[DHCP APPLY] Calling ensure_dhcp_services for device {device_id} with mode={dhcp_apply_mode}, container={'present' if container_for_dhcp else 'None'}")
+                # v0.5.275 (DHCP-J1): hand off the ACTUAL kernel
+                # interface name, not the display form. When the
+                # parent-mismatch fallback (line ~4687) fired for
+                # this device, `iface_name_for_commands` was set to
+                # the disambiguated name `vlan{ID}-{parent}` and
+                # `result["actual_vlan_interface"]` recorded it.
+                # `iface_name` stayed as `vlan{ID}@{parent}` (the
+                # display form). `_normalize_iface_name` strips
+                # only the `@…` suffix — so the display form maps
+                # to `vlan{ID}` which resolves to a DIFFERENT
+                # kernel interface (the stale one that had the
+                # parent mismatch in the first place). Result:
+                # dnsmasq bound to the wrong subif, anchor IP
+                # landed there, tcpdump on the actual current subif
+                # saw zero packets. Fix: prefer the disambiguated
+                # name when the fallback fired, else the base
+                # commands name that skips the display suffix.
+                _dhcp_iface = (
+                    result.get("actual_vlan_interface")
+                    or iface_name_for_commands
+                )
+                logging.info(
+                    f"[DHCP APPLY] Calling ensure_dhcp_services for "
+                    f"device {device_id} with mode={dhcp_apply_mode}, "
+                    f"iface={_dhcp_iface!r} (display was {iface_name!r}), "
+                    f"container={'present' if container_for_dhcp else 'None'}"
+                )
                 dhcp_apply_result = ensure_dhcp_services(
                     device_db,
                     device_id,
-                    iface_name,
+                    _dhcp_iface,
                     dhcp_config,
                     container=container_for_dhcp,
                     force_client_restart=(dhcp_apply_mode == "client"),

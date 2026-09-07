@@ -2,6 +2,69 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.275] - 2026-09-07
+
+**DHCP server: fix "pool IP configured but not reachable" — four
+plumbing bugs on the anchor path.**
+
+Operator on srv06 reported: device configured VLAN 10 + DHCP
+server mode; `ip addr show vlan10` shows the anchor IP present,
+but `tcpdump -ni vlan10 icmp` sees zero packets in either
+direction and `ip vrf exec vrf-<dev> ping <switch>` gets 100%
+loss. Switch trunk was correct, BGP over other VLANs on the
+same trunk was fine. Four plumbing bugs found:
+
+- **DHCP-J1: `ensure_dhcp_services` was handed the display form of
+  the interface name.** In `/api/device/apply` the code kept two
+  variables: `iface_name = "vlan<ID>@<parent>"` (display form for
+  logs / DB tracking) and `iface_name_for_commands = "vlan<ID>"`
+  (the actual kernel interface name). When the parent-mismatch
+  fallback fired (existing `vlan<ID>` on a different parent), it
+  set `iface_name_for_commands = "vlan<ID>-<parent>"` AND stored
+  the disambiguated name in `result["actual_vlan_interface"]` —
+  but `iface_name` stayed at the display form. Line 5881 passed
+  `iface_name` into `ensure_dhcp_services`. `_normalize_iface_name`
+  strips only the `@…` suffix, mapping the display form back to
+  the bare `vlan<ID>` — resolving to the STALE subif that had the
+  parent mismatch in the first place. Result: dnsmasq bound to
+  the wrong subif, anchor IP added there, tcpdump on the actually-
+  active subif saw zero packets. Fix: pass
+  `result.get("actual_vlan_interface") or iface_name_for_commands`.
+
+- **DHCP-J2: post-add VRF connected-route verification.** `ip addr
+  add <ip>/<mask> dev <iface>` on a VRF-slaved interface SHOULD
+  auto-install the connected route into the enslaved table, but
+  when the interface is moved into the VRF AFTER an earlier
+  `ip addr add` (or the kernel misses the trigger), the route
+  can sit in the main table 254 and nothing in the VRF has a
+  path to the pool subnet. `_ensure_ipv4_address` now runs a
+  post-check via `ip route show <subnet> vrf <vrf>` and
+  explicitly installs the connected route if missing. New helpers:
+  `_detect_iface_vrf` + `_vrf_has_connected_route`.
+
+- **DHCP-J3: gratuitous ARP on anchor add.** Without an unsolicited
+  ARP, upstream switches only populate their MAC table when
+  netgen sends its first frame with the anchor's src IP — often
+  minutes after startup (first DHCPOFFER). Meanwhile pings from
+  the switch to the anchor fail because the switch MAC table is
+  empty for that VLAN. `_ensure_ipv4_address` now runs
+  `arping -c 2 -A -w 3 -I <iface> <server_ip>` so the switch
+  learns netgen's MAC on the correct port immediately. Failure
+  logged, not fatal (iputils-arping may not be installed).
+
+- **DHCP-J4: parent-name substring match false-positive.** Line
+  4677 tested `f"@{interface_normalized}" in link_output` — an
+  unanchored substring. `"ens2f0" in "ens2f0np0"` is True, so an
+  existing `vlan10@ens2f0` would falsely match an apply for
+  `ens2f0np0`, skip the different-parent fallback, and reuse the
+  wrong subif. New `_parent_link_matches` helper anchors the
+  match to `@<parent>:` / `link/<parent> ` (word-boundary
+  terminators from `ip link show` output).
+
+Regression tests in `tests/test_v05275_dhcp_iface_plumbing.py`
+(source-level assertions on the four fix sites). Source-level
+verified only — srv06 lab is the natural verification target.
+
 ## [0.5.274] - 2026-09-07
 
 **OSPF state parser: FRR structured JSON as primary path (parity

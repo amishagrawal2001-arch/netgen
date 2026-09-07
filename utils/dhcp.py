@@ -1063,24 +1063,144 @@ def _ensure_ipv4_address(
             ["ip", "-4", "addr", "add", f"{server_ip}/{mask_bits}", "dev", interface],
             timeout=5, container=container,
         )
-        if result.returncode == 0:
-            logger.info("[DHCP] Assigned IPv4 %s/%s to %s for dnsmasq bind",
-                        server_ip, mask_bits, interface)
-            return server_ip
-        # `File exists` = already assigned; treat as success.
+        _added_ok = (result.returncode == 0)
         stderr = (result.stderr or "").lower()
-        if "file exists" in stderr or "already assigned" in stderr:
-            return server_ip
-        logger.warning(
-            "[DHCP] Failed to assign IPv4 %s/%s to %s: %s",
-            server_ip, mask_bits, interface, result.stderr,
-        )
+        _already_ok = ("file exists" in stderr or "already assigned" in stderr)
+        if _added_ok:
+            logger.info(
+                "[DHCP] Assigned IPv4 %s/%s to %s for dnsmasq bind",
+                server_ip, mask_bits, interface,
+            )
+        elif not _already_ok:
+            logger.warning(
+                "[DHCP] Failed to assign IPv4 %s/%s to %s: %s",
+                server_ip, mask_bits, interface, result.stderr,
+            )
+            return None
+        # From here on we know the IP is on the interface — either
+        # we just added it OR it was there already. Fall through to
+        # the v0.5.275 post-add plumbing.
+
+        # v0.5.275 (DHCP-J2): verify the connected route landed in
+        # the VRF's routing table. `ip addr add` on a VRF-slaved
+        # interface SHOULD auto-install the connected route into
+        # the enslaved table, but if the interface was moved into
+        # the VRF AFTER an earlier `ip addr add` (or if the kernel
+        # missed the trigger), the route can sit in the main table
+        # 254 and nothing in the VRF has a path to the pool subnet.
+        # Symptom the operator saw: netgen host cannot ping the
+        # switch's gateway IP from inside the device's VRF because
+        # there's no route to the pool subnet in that VRF's
+        # table. Post-check + explicit install if missing.
+        try:
+            _vrf_name = _detect_iface_vrf(interface, container=container)
+            if _vrf_name:
+                _has = _vrf_has_connected_route(
+                    _vrf_name, str(pool_network), interface,
+                    container=container,
+                )
+                if not _has:
+                    logger.info(
+                        "[DHCP] VRF %s missing connected %s dev %s "
+                        "(kernel auto-install didn't fire) — "
+                        "installing explicitly",
+                        _vrf_name, pool_network, interface,
+                    )
+                    _run_command(
+                        [
+                            "ip", "route", "add",
+                            str(pool_network), "dev", interface,
+                            "proto", "kernel", "scope", "link",
+                            "src", server_ip, "vrf", _vrf_name,
+                        ],
+                        timeout=5, container=container,
+                    )
+        except Exception as _route_exc:
+            logger.debug(
+                "[DHCP] VRF connected-route post-check failed for "
+                "%s on %s: %s",
+                pool_network, interface, _route_exc,
+            )
+
+        # v0.5.275 (DHCP-J3): send a gratuitous ARP so upstream
+        # switches learn our MAC on this port immediately. Without
+        # this the switch's MAC table only populates when netgen
+        # sends its first frame with this src IP — which may not
+        # happen until the first DHCPOFFER, minutes after startup.
+        # Meanwhile pings + reachability checks from the switch to
+        # the anchor IP fail because the switch has nothing in its
+        # MAC table for that VLAN and rate-limits ARP-flood
+        # attempts. `arping -c 2 -A -w 3 -I <iface> <ip>` from
+        # iputils sends two unsolicited ARPs (option -A) with
+        # source == target IP.
+        try:
+            _run_command(
+                ["arping", "-c", "2", "-A", "-w", "3", "-I", interface, server_ip],
+                timeout=5, container=container,
+            )
+        except Exception as _arping_exc:
+            logger.debug(
+                "[DHCP] Gratuitous ARP for %s on %s skipped: %s "
+                "(iputils-arping may not be installed)",
+                server_ip, interface, _arping_exc,
+            )
+        return server_ip
     except Exception as exc:
         logger.warning(
             "[DHCP] Exception assigning IPv4 %s/%s to %s: %s",
             server_ip, mask_bits, interface, exc,
         )
     return None
+
+
+def _detect_iface_vrf(interface: str, container=None) -> Optional[str]:
+    """Return the VRF name the interface is enslaved to, or None if
+    it's in the default VRF / cannot be determined. Uses
+    `ip -o link show <iface>` which prints `... master vrf-XXX ...`
+    when the interface is VRF-slaved."""
+    try:
+        res = _run_command(
+            ["ip", "-o", "link", "show", interface],
+            timeout=3, container=container,
+        )
+        if res.returncode != 0:
+            return None
+        for tok in (res.stdout or "").split():
+            if tok.startswith("vrf-") or tok == "vrf-default":
+                return tok
+        # Alternate format: `master <name>` where <name> starts with vrf-.
+        parts = (res.stdout or "").split()
+        for i, tok in enumerate(parts):
+            if tok == "master" and i + 1 < len(parts):
+                master = parts[i + 1]
+                if master.startswith("vrf-"):
+                    return master
+    except Exception:
+        pass
+    return None
+
+
+def _vrf_has_connected_route(vrf_name: str, subnet: str,
+                             interface: str,
+                             container=None) -> bool:
+    """Return True iff the VRF's routing table has a connected
+    route to `subnet` via `interface`. v0.5.275 (DHCP-J2)."""
+    try:
+        res = _run_command(
+            ["ip", "route", "show", subnet, "vrf", vrf_name],
+            timeout=3, container=container,
+        )
+        if res.returncode != 0:
+            return False
+        # Kernel-emitted connected routes look like:
+        #   192.168.30.0/24 dev vlan10 proto kernel scope link src ...
+        # Match on both the subnet and the interface name.
+        for line in (res.stdout or "").splitlines():
+            if subnet in line and f"dev {interface}" in line:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=None) -> bool:
