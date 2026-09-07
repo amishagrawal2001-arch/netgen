@@ -1,7 +1,8 @@
+import json
 import logging
 import subprocess
 import threading
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 
 def container_exec_with_timeout(container, cmd, timeout_sec: float = 5.0):
@@ -1138,6 +1139,131 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
         logging.error(f"[OSPF STOP] Error stopping OSPF: {e}")
         return False
 
+def _parse_ospf_v4_neighbors_json(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """v0.5.274 (OSPF-J1): parse the neighbor list out of FRR's
+    ``show ip ospf <vrf> neighbor json`` payload.
+
+    OSPFv2 JSON shape (FRR ≥7.0)::
+
+        {
+          "neighbors": {
+            "1.2.3.4": [                             # keyed by router-id
+              {
+                "priority": 1,
+                "converged": "Full",                 # ← RFC 2328 §10.1
+                "role": "DROther",
+                "upTimeInMsec": 251206000,
+                "upTime": "2d21h47m",
+                "deadTimeMsec": 39912,
+                "address": "192.168.0.1",
+                "ifaceName": "vlan100",
+                "ifaceAddress": "192.168.0.2"
+              }
+            ]
+          }
+        }
+
+    Multiple adjacencies per router-id are legal on a multi-access
+    link (rare in our lab). The parser emits one entry per
+    adjacency, all typed ``IPv4`` and keyed with the original
+    router-id — same shape as the text parser produced, so
+    downstream callers need no changes.
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return out
+    _neighbors = payload.get("neighbors") or {}
+    if not isinstance(_neighbors, dict):
+        return out
+    for router_id, entries in _neighbors.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            out.append({
+                "neighbor_id": str(router_id),
+                "priority": str(entry.get("priority") or "0"),
+                # `converged` is the RFC 2328 §10.1 FSM state; when
+                # missing (very old FRR) fall back to `state`.
+                "state": str(
+                    entry.get("converged")
+                    or entry.get("state")
+                    or "Unknown"
+                ),
+                "up_time": str(
+                    entry.get("upTime")
+                    or entry.get("uptime")
+                    or ""
+                ),
+                "dead_time": str(entry.get("deadTimeMsec") or entry.get("deadTime") or ""),
+                "address": str(entry.get("address") or entry.get("ifaceAddress") or ""),
+                "interface": str(entry.get("ifaceName") or entry.get("interfaceName") or ""),
+                "type": "IPv4",
+            })
+    return out
+
+
+def _parse_ospf_v6_neighbors_json(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """v0.5.274 (OSPF-J1): parse the neighbor list out of FRR's
+    ``show ipv6 ospf6 <vrf> neighbor json`` payload.
+
+    OSPFv3 JSON shape (FRR ≥7.0) is a FLAT ARRAY — different from
+    OSPFv2's dict-of-lists::
+
+        {
+          "neighbors": [
+            {
+              "neighborId": "1.2.3.4",
+              "priority": 1,
+              "state": "Full",                       # ← RFC 5340 §4.6
+              "duration": "2d21h47m",
+              "deadTime": "00:00:39",
+              "interfaceName": "vlan100"
+            }
+          ]
+        }
+
+    Same-shape output as `_parse_ospf_v4_neighbors_json` so the
+    caller can flat-concatenate the two lists.
+    """
+    out: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return out
+    _neighbors = payload.get("neighbors") or []
+    if not isinstance(_neighbors, list):
+        return out
+    for entry in _neighbors:
+        if not isinstance(entry, dict):
+            continue
+        out.append({
+            "neighbor_id": str(
+                entry.get("neighborId")
+                or entry.get("routerId")
+                or ""
+            ),
+            "priority": str(entry.get("priority") or "0"),
+            "state": str(entry.get("state") or "Unknown"),
+            "up_time": str(
+                entry.get("duration")
+                or entry.get("upTime")
+                or ""
+            ),
+            "dead_time": str(entry.get("deadTime") or ""),
+            # OSPFv3 doesn't carry a link-local address in the
+            # neighbor list summary — keep the duration field the
+            # text-parser stashed here for back-compat.
+            "address": str(
+                entry.get("duration")
+                or entry.get("upTime")
+                or ""
+            ),
+            "interface": str(entry.get("interfaceName") or ""),
+            "type": "IPv6",
+        })
+    return out
+
+
 def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
     """Get OSPF status for a device."""
     try:
@@ -1161,97 +1287,166 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
         _scope = _ospf_show_scope(device_id)
         _scope_suffix = f" {_scope}" if _scope else ""
 
-        # Get IPv4 OSPF neighbors
-        # v0.5.264 (audit F5): wrap with a 5s timeout so a hung
-        # container doesn't wedge the Flask worker.
-        result_ipv4 = container_exec_with_timeout(
-            container, f"vtysh -c 'show ip ospf{_scope_suffix} neighbor'", timeout_sec=5,
+        # v0.5.274 (OSPF-J1): PRIMARY path uses FRR's JSON output.
+        # Same rationale as v0.5.273 for BGP — parsing the text
+        # neighbor table meant positional splits on lines like:
+        #   "Neighbor ID  Pri State    Up Time  Dead Time  Address  Interface"
+        # which broke every time FRR added a column or the state
+        # string grew ("Full/DR" vs "Full/-" vs "Full/DROther").
+        # JSON contract: `show ip ospf <vrf> neighbor json` emits
+        # {"neighbors": {"<rid>": [{"converged": "Full", "role":
+        # "DR", "upTime": "2d21h47m", ...}]}} where `converged` is
+        # the explicit adjacency-FSM state (RFC 2328 §10.1: Down,
+        # Attempt, Init, 2-Way, ExStart, Exchange, Loading, Full)
+        # and `role` is the DR/BDR/DROther election result — both
+        # were fused into `parts[2]` in the text format. `show ipv6
+        # ospf6 <vrf> neighbor json` returns a flat array
+        # `{"neighbors": [{"state": "Full", "neighborId": ...}]}`.
+        # Different shape from v2, so we handle each explicitly.
+        #
+        # Falls back to the historical text parser when the JSON
+        # command fails (exec / exit-code / parse), so pre-FRR-7.x
+        # deployments and container-transient errors keep the
+        # legacy behavior.
+        parse_source = "json"
+        _v4_json = None
+        result_ipv4_json = container_exec_with_timeout(
+            container, f"vtysh -c 'show ip ospf{_scope_suffix} neighbor json'",
+            timeout_sec=5,
         )
-        if result_ipv4 is None:
-            return None
-        if result_ipv4.exit_code == 0:
-            output_ipv4 = result_ipv4.output.decode()
-            
-            # Check if OSPF is not enabled
-            if 'OSPF is not enabled' in output_ipv4 or 'not configured' in output_ipv4.lower():
-                logging.info(f"[OSPF STATUS] OSPF not enabled for device {device_id}")
-                neighbors = []
-            else:
-                lines = output_ipv4.strip().split('\n')
-                
-                for line in lines:
-                    # Skip header lines and empty lines
-                    if ('Neighbor ID' in line or 'Pri' in line or 
-                        line.startswith('Total') or not line.strip() or
-                        line.startswith('%') or line.startswith('!')):
-                        continue
-                    
-                    parts = line.split()
-                    if len(parts) >= 7:
-                        # IPv4 OSPF format: Neighbor ID Pri State Up Time Dead Time Address Interface ...
-                        neighbor_id = parts[0]
-                        priority = parts[1]
-                        state = parts[2]
-                        up_time = parts[3]  # This is the neighbor uptime
-                        dead_time = parts[4]
-                        address = parts[5]
-                        interface = parts[6]
-                        
-                        neighbors.append({
-                            'neighbor_id': neighbor_id,
-                            'priority': priority,
-                            'state': state,
-                            'up_time': up_time,  # Add neighbor uptime
-                            'dead_time': dead_time,
-                            'address': address,
-                            'interface': interface,
-                            'type': 'IPv4'
-                        })
-        
-        # Get IPv6 OSPF neighbors
-        # OSPF6 syntax for VRF: `show ipv6 ospf6 vrf <name> neighbor`
-        result_ipv6 = container_exec_with_timeout(
-            container, f"vtysh -c 'show ipv6 ospf6{_scope_suffix} neighbor'", timeout_sec=5,
+        if result_ipv4_json is not None and result_ipv4_json.exit_code == 0:
+            try:
+                _v4_raw = result_ipv4_json.output.decode(errors="replace").strip()
+                _v4_json = json.loads(_v4_raw) if _v4_raw else {}
+            except (ValueError, TypeError) as _exc:
+                logging.info(
+                    f"[OSPF STATUS] v4 JSON parse failed for {device_id}: "
+                    f"{_exc}; falling back to text"
+                )
+                _v4_json = None
+        _v6_json = None
+        result_ipv6_json = container_exec_with_timeout(
+            container, f"vtysh -c 'show ipv6 ospf6{_scope_suffix} neighbor json'",
+            timeout_sec=5,
         )
-        if result_ipv6 is None:
-            return None
-        if result_ipv6.exit_code == 0:
-            output_ipv6 = result_ipv6.output.decode()
-            
-            # Check if OSPF6 is not enabled
-            if 'OSPF6 is not enabled' in output_ipv6 or 'not configured' in output_ipv6.lower():
-                logging.info(f"[OSPF STATUS] OSPF6 not enabled for device {device_id}")
-                # Don't clear neighbors here, keep IPv4 neighbors if any
-            else:
-                lines = output_ipv6.strip().split('\n')
-                
-                for line in lines:
-                    # Skip header lines and empty lines
-                    if ('Neighbor ID' in line or 'Pri' in line or 
-                        line.startswith('Total') or not line.strip() or
-                        line.startswith('%') or line.startswith('!')):
-                        continue
-                    
-                    parts = line.split()
-                    if len(parts) >= 6:
-                        # IPv6 OSPF format: Neighbor ID Pri DeadTime State/IfState Duration I/F[State]
-                        neighbor_id = parts[0]
-                        priority = parts[1]
-                        dead_time = parts[2]
-                        state = parts[3]
-                        duration = parts[4]  # This is the neighbor uptime
-                        interface = parts[5]
-                        
-                        neighbors.append({
-                            'neighbor_id': neighbor_id,
-                            'priority': priority,
-                            'state': state,
-                            'up_time': duration,  # Add neighbor uptime
-                            'dead_time': dead_time,
-                            'address': duration,  # Keep duration as address for backward compatibility
-                            'interface': interface,
-                            'type': 'IPv6'
-                        })
+        if result_ipv6_json is not None and result_ipv6_json.exit_code == 0:
+            try:
+                _v6_raw = result_ipv6_json.output.decode(errors="replace").strip()
+                _v6_json = json.loads(_v6_raw) if _v6_raw else {}
+            except (ValueError, TypeError) as _exc:
+                logging.info(
+                    f"[OSPF STATUS] v6 JSON parse failed for {device_id}: "
+                    f"{_exc}; falling back to text"
+                )
+                _v6_json = None
+
+        if _v4_json is not None or _v6_json is not None:
+            # At least one AF answered in JSON — build the neighbors
+            # list from whichever ones succeeded. Empty JSON dicts
+            # ({} / {"neighbors": {}}) mean "OSPF is running but has
+            # no neighbors", which is a valid, non-error state.
+            neighbors.extend(_parse_ospf_v4_neighbors_json(_v4_json or {}))
+            neighbors.extend(_parse_ospf_v6_neighbors_json(_v6_json or {}))
+        else:
+            # Both JSON queries failed — fall back to the legacy
+            # text parser so pre-FRR-7.x deployments keep working.
+            parse_source = "text"
+            logging.info(
+                f"[OSPF STATUS] {device_id}: both JSON queries failed, "
+                f"falling back to text parser"
+            )
+
+            # Get IPv4 OSPF neighbors
+            # v0.5.264 (audit F5): wrap with a 5s timeout so a hung
+            # container doesn't wedge the Flask worker.
+            result_ipv4 = container_exec_with_timeout(
+                container, f"vtysh -c 'show ip ospf{_scope_suffix} neighbor'", timeout_sec=5,
+            )
+            if result_ipv4 is None:
+                return None
+            if result_ipv4.exit_code == 0:
+                output_ipv4 = result_ipv4.output.decode()
+
+                # Check if OSPF is not enabled
+                if 'OSPF is not enabled' in output_ipv4 or 'not configured' in output_ipv4.lower():
+                    logging.info(f"[OSPF STATUS] OSPF not enabled for device {device_id}")
+                    neighbors = []
+                else:
+                    lines = output_ipv4.strip().split('\n')
+
+                    for line in lines:
+                        # Skip header lines and empty lines
+                        if ('Neighbor ID' in line or 'Pri' in line or
+                            line.startswith('Total') or not line.strip() or
+                            line.startswith('%') or line.startswith('!')):
+                            continue
+
+                        parts = line.split()
+                        if len(parts) >= 7:
+                            # IPv4 OSPF format: Neighbor ID Pri State Up Time Dead Time Address Interface ...
+                            neighbor_id = parts[0]
+                            priority = parts[1]
+                            state = parts[2]
+                            up_time = parts[3]  # This is the neighbor uptime
+                            dead_time = parts[4]
+                            address = parts[5]
+                            interface = parts[6]
+
+                            neighbors.append({
+                                'neighbor_id': neighbor_id,
+                                'priority': priority,
+                                'state': state,
+                                'up_time': up_time,  # Add neighbor uptime
+                                'dead_time': dead_time,
+                                'address': address,
+                                'interface': interface,
+                                'type': 'IPv4'
+                            })
+
+            # Get IPv6 OSPF neighbors
+            # OSPF6 syntax for VRF: `show ipv6 ospf6 vrf <name> neighbor`
+            result_ipv6 = container_exec_with_timeout(
+                container, f"vtysh -c 'show ipv6 ospf6{_scope_suffix} neighbor'", timeout_sec=5,
+            )
+            if result_ipv6 is None:
+                return None
+            if result_ipv6.exit_code == 0:
+                output_ipv6 = result_ipv6.output.decode()
+
+                # Check if OSPF6 is not enabled
+                if 'OSPF6 is not enabled' in output_ipv6 or 'not configured' in output_ipv6.lower():
+                    logging.info(f"[OSPF STATUS] OSPF6 not enabled for device {device_id}")
+                    # Don't clear neighbors here, keep IPv4 neighbors if any
+                else:
+                    lines = output_ipv6.strip().split('\n')
+
+                    for line in lines:
+                        # Skip header lines and empty lines
+                        if ('Neighbor ID' in line or 'Pri' in line or
+                            line.startswith('Total') or not line.strip() or
+                            line.startswith('%') or line.startswith('!')):
+                            continue
+
+                        parts = line.split()
+                        if len(parts) >= 6:
+                            # IPv6 OSPF format: Neighbor ID Pri DeadTime State/IfState Duration I/F[State]
+                            neighbor_id = parts[0]
+                            priority = parts[1]
+                            dead_time = parts[2]
+                            state = parts[3]
+                            duration = parts[4]  # This is the neighbor uptime
+                            interface = parts[5]
+
+                            neighbors.append({
+                                'neighbor_id': neighbor_id,
+                                'priority': priority,
+                                'state': state,
+                                'up_time': duration,  # Add neighbor uptime
+                                'dead_time': dead_time,
+                                'address': duration,  # Keep duration as address for backward compatibility
+                                'interface': interface,
+                                'type': 'IPv6'
+                            })
         
         # Get OSPF summary for IPv4
         result_ipv4_summary = container_exec_with_timeout(
@@ -1387,7 +1582,12 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
             'ospf_ipv4_established': ospf_ipv4_established,
             'ospf_ipv6_established': ospf_ipv6_established,
             'ospf_ipv4_uptime': ospf_ipv4_uptime,
-            'ospf_ipv6_uptime': ospf_ipv6_uptime
+            'ospf_ipv6_uptime': ospf_ipv6_uptime,
+            # v0.5.274 (OSPF-J1): observability — which parser
+            # produced the neighbors list ("json" for the primary
+            # path, "text" for the legacy fallback used by pre-
+            # FRR-7.x deployments or after JSON exec/parse errors).
+            'parse_source': parse_source,
         }
         
     except Exception as e:

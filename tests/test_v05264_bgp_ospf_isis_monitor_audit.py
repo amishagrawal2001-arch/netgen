@@ -123,15 +123,31 @@ def test_ospf_module_scope_exec_wrapper_defined():
 
 
 def test_get_ospf_status_uses_timeout_wrapper():
-    """All 4 primary vtysh calls in get_ospf_status must use the
-    timeout wrapper."""
+    """All primary vtysh calls in get_ospf_status must use the
+    timeout wrapper. v0.5.274 added 2 more JSON calls (v4 + v6
+    neighbor JSON) that also route through the wrapper — so the
+    minimum count went from 4 to 6."""
     idx = OSPF_UT.find("def get_ospf_status(device_id: str)")
     end = OSPF_UT.find("\ndef ", idx + 1)
-    body = OSPF_UT[idx:end if end > 0 else idx + 8000]
-    # Wrapper is called 4 times (v4 neigh, v6 neigh, v4 summary, v6 summary).
+    body = OSPF_UT[idx:end if end > 0 else idx + 12000]
+    # Wrapper call sites: v4 JSON, v6 JSON (v0.5.274), v4 text,
+    # v6 text, v4 summary, v6 summary. Bare-minimum 4 kept as
+    # the historical guarantee.
     assert body.count("container_exec_with_timeout(") >= 4
-    # And each wrapped call has an `if ... is None: return None` guard.
-    assert body.count("is None:\n            return None") >= 4
+    # Every wrapped call still has a None-check guard. The v0.5.274
+    # JSON pair uses `result_*_json is not None and ... exit_code`
+    # (nested inside an `if` block); the text pair keeps the
+    # historical `is None: return None`; the summary pair too. Assert
+    # there are at least four `is None` guards (regardless of the
+    # exact wrapping indentation) — that shows the caller is
+    # defensively checking every wrapped result.
+    _guards = [
+        ln for ln in body.splitlines()
+        if "is None" in ln and "result_" in ln
+    ]
+    assert len(_guards) >= 4, (
+        f"expected at least 4 result-is-None guards, found {_guards!r}"
+    )
 
 
 # --- F6: OSPF + ISIS Running filter ----------------------------

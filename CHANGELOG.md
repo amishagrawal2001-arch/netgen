@@ -2,6 +2,58 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.274] - 2026-09-07
+
+**OSPF state parser: FRR structured JSON as primary path (parity
+with v0.5.273's BGP treatment).**
+
+Follow-up to v0.5.273. `get_ospf_status` at
+[utils/ospf.py:1141](utils/ospf.py:1141) parsed
+`show ip ospf <vrf> neighbor` and
+`show ipv6 ospf6 <vrf> neighbor` via positional field splits — the
+exact class of parser that plagued BGP for six rewrites. Same fix:
+prefer FRR's structured JSON, keep the text parser as fallback.
+
+- **New `_parse_ospf_v4_neighbors_json` / `_parse_ospf_v6_neighbors_json`.**
+  Two helpers because OSPFv2 and OSPFv3 emit *different* JSON
+  shapes — v2's `neighbors` is a dict of `{router_id: [entries]}`
+  (multiple adjacencies per router-id allowed on multi-access),
+  while v3's `neighbors` is a flat array of entries with
+  `neighborId` inside. Each helper reads FRR's explicit state
+  field (`converged` for v2 = RFC 2328 §10.1 FSM state; `state`
+  for v3 = RFC 5340 §4.6) and emits the same neighbor-dict shape
+  the historical text parser produced, so downstream callers
+  (device DB, `bgp_monitor` sibling, UI table) need zero changes.
+
+- **`get_ospf_status` prefers JSON.** Runs
+  `show ip ospf <vrf> neighbor json` and
+  `show ipv6 ospf6 <vrf> neighbor json` first; falls back to the
+  historical text parser only when BOTH JSON queries fail (exec
+  error / exit-code / parse error). Adds `parse_source` field
+  to the return dict — `"json"` on the primary path, `"text"`
+  on fallback — matching v0.5.273's BGP observability.
+
+- **Retires the positional field-splits** for the neighbor table:
+  * v2: `parts[2]` was `state` (e.g. `Full/DR` fused state+role) — replaced by explicit `converged` + `role` JSON fields.
+  * v3: `parts[3]` was `state` with the same fusion problem — replaced by explicit `state` JSON field.
+  * Both: `parts[3]` / `parts[4]` uptime column was raw text like `2d21h47m` (would have broken the same way BGP did if the colon-check pattern had spread here).
+
+**ISIS not touched — already uses JSON.** `get_isis_status` at
+[utils/isis.py:53](utils/isis.py:53) has been on
+`sh isis <vrf> nei det json` since it was first written; v0.5.264
+audit refined the adjacency-state detection but the parser has
+been JSON-first the whole time. No text-parser fallback there,
+because the whole path was born JSON.
+
+Regression tests in `tests/test_v05274_ospf_json_parser.py` —
+recorded FRR JSON fixtures for OSPFv2 (dict-of-lists shape),
+OSPFv3 (flat-array shape), empty-neighbors, mixed-family
+Established, and malformed-JSON fallback cases. Full BGP/OSPF/
+FRR regression: 116/116 pass.
+
+Source-level verified only. The QFX5130 lab from the v0.5.272
+report is the natural verification target for the OSPF path too.
+
 ## [0.5.273] - 2026-09-07
 
 **BGP state parser: FRR JSON output as primary path (retires the
