@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.280] - 2026-09-07
+
+**DHCP anchor reachability: fix the "switch can't ping netgen's
+anchor IP" root cause (secondary-IP ARP replies + steady-state
+MAC-table warmth).**
+
+Operator asked why device3 (DHCP server, 172.16.30.2 on vlan10)
+showed green in netgen but the switch got 100% loss pinging it.
+Answer: netgen's neigh cache had a STALE entry for the gateway
+(learned from the v0.5.275 one-shot gratuitous ARP), which the
+endpoint correctly treats as resolved from netgen's side — but
+the SWITCH's MAC table for 172.16.30.2 had aged out and its own
+ARP requests were being silently dropped by netgen's kernel.
+
+Two root-cause fixes:
+
+- **DHCP-K1: set `arp_ignore=0` + `arp_announce=0` on the anchor
+  interface.** Many hosts default to `arp_ignore=1` which is
+  fine for primary IPs but can drop ARP replies for SECONDARY
+  IPs (172.16.30.2 is a secondary on vlan10 whose primary is
+  192.168.30.5/24). Set both explicitly so ARP replies for the
+  anchor work regardless of host defaults. Runs on both fresh-
+  add and already-assigned paths of `_ensure_ipv4_address`.
+
+- **DHCP-K2: periodic gratuitous-ARP refresh on the anchor.**
+  Switches age MAC-table entries after 300s (Cisco/Junos
+  default) of inactivity. DHCP servers are quiet between
+  clients — the switch drops the netgen MAC for the anchor,
+  subsequent switch→anchor packets have nowhere to go, ping
+  fails. Singleton daemon thread runs `arping -c 1 -A -w 2
+  -I <iface> <anchor_ip>` every 60s for every registered
+  anchor. Registry keyed by `<iface>#<ip>`, populated on
+  `_ensure_ipv4_address` success, unregistered on
+  `stop_dhcp_server`. Thread starts lazily on first
+  registration.
+
+Both fixes apply to DHCP-server anchors only (that's the DHCP
+path). BGP/OSPF/ISIS peers don't need this because the routing
+protocol handshake keeps their MAC entries fresh via its own
+keepalive traffic; the ARP endpoint's v0.5.278 ARP-H5 short-
+circuit covers those.
+
+Regression tests in `tests/test_v05280_anchor_arp_refresh.py`
+(9 tests, unit-covering registry mechanics + start/stop
+lifecycle + sysctl wiring). Full DHCP/ARP regression: 422
+passed.
+
+Ship recommendation: **immediate upgrade** for anyone whose
+DHCP-server anchor IP is unreachable from upstream switches
+after some period of quiescence.
+
 ## [0.5.279] - 2026-09-07
 
 **Gateway-orange class, take 7: my own v0.5.278 introduced an

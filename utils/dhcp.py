@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from types import SimpleNamespace
 
 import docker
@@ -1122,6 +1122,31 @@ def _ensure_ipv4_address(
                 pool_network, interface, _route_exc,
             )
 
+        # v0.5.280 (DHCP-K1): set arp_ignore=0 + arp_announce=0 on
+        # the anchor interface so ARP replies work for the pool
+        # anchor IP even when it's a SECONDARY address on the
+        # subif. Many hosts default to arp_ignore=1 (respond only
+        # if target IP is on the receiving interface — fine for
+        # secondaries) but srv06's setup showed arp_ignore taking
+        # values that silently dropped replies for the pool's
+        # secondary IP (172.16.30.2 on vlan10 whose PRIMARY is
+        # 192.168.30.5/24). The switch's ARP request then went
+        # unanswered, its MAC table stayed empty for the anchor,
+        # and pings + reachability checks failed. Set both
+        # explicitly on this iface so behaviour is deterministic
+        # regardless of host defaults.
+        for _k, _v in (("arp_ignore", "0"), ("arp_announce", "0")):
+            try:
+                _run_command(
+                    ["sysctl", "-w", f"net.ipv4.conf.{interface}.{_k}={_v}"],
+                    timeout=3, container=container,
+                )
+            except Exception as _sysctl_exc:
+                logger.debug(
+                    "[DHCP] sysctl net.ipv4.conf.%s.%s=%s failed: %s",
+                    interface, _k, _v, _sysctl_exc,
+                )
+
         # v0.5.275 (DHCP-J3): send a gratuitous ARP so upstream
         # switches learn our MAC on this port immediately. Without
         # this the switch's MAC table only populates when netgen
@@ -1144,6 +1169,17 @@ def _ensure_ipv4_address(
                 "(iputils-arping may not be installed)",
                 server_ip, interface, _arping_exc,
             )
+
+        # v0.5.280 (DHCP-K2): register the anchor for periodic
+        # re-arp so the switch's MAC table doesn't age out. Switch
+        # MAC-aging defaults are typically 300s; if netgen doesn't
+        # emit anything from this src IP inside that window (DHCP
+        # servers are quiet between clients), the switch drops the
+        # entry, subsequent switch→netgen packets for the anchor
+        # have nowhere to go, and pings fail. The periodic thread
+        # runs `arping -A` every 60s so the switch keeps refreshing
+        # its MAC learning.
+        _register_anchor_arp_refresh(interface, server_ip)
         return server_ip
     except Exception as exc:
         logger.warning(
@@ -1178,6 +1214,108 @@ def _detect_iface_vrf(interface: str, container=None) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+# v0.5.280 (DHCP-K2): periodic gratuitous-ARP registry.
+#
+# Switch MAC-tables age entries after 300s (Cisco/Junos default) of
+# inactivity. When a DHCP server is quiet between clients, the switch
+# drops the netgen host's MAC learned for the pool anchor IP →
+# subsequent switch-side pings + reachability checks for the anchor
+# fail because the switch has nowhere to forward them.
+#
+# _ensure_ipv4_address's v0.5.275 one-shot gratuitous ARP handles
+# session-start; this registry handles the STEADY STATE. Every
+# ANCHOR_ARP_REFRESH_INTERVAL seconds a single background thread
+# walks the registry and re-emits `arping -A` for each entry. That
+# refreshes the switch's MAC table and keeps the operator's
+# reachability probes green.
+#
+# The thread is a singleton, started lazily on first
+# `_register_anchor_arp_refresh` call, daemon so process exit kills
+# it. On DHCP-server stop the anchor is unregistered so the thread
+# stops re-arping addresses that no longer belong to us.
+
+_ANCHOR_ARP_REFRESH: Dict[str, Tuple[str, str]] = {}
+_ANCHOR_ARP_REFRESH_LOCK = threading.Lock()
+_ANCHOR_ARP_THREAD: Optional[threading.Thread] = None
+_ANCHOR_ARP_THREAD_LOCK = threading.Lock()
+ANCHOR_ARP_REFRESH_INTERVAL = 60.0
+
+
+def _register_anchor_arp_refresh(interface: str, server_ip: str) -> None:
+    """Add (interface, server_ip) to the periodic re-arp registry,
+    keyed by ``<interface>#<ip>``. Idempotent — re-registering the
+    same pair replaces the entry rather than duplicating. Starts
+    the singleton refresher thread on first use."""
+    if not interface or not server_ip:
+        return
+    key = f"{interface}#{server_ip}"
+    with _ANCHOR_ARP_REFRESH_LOCK:
+        _ANCHOR_ARP_REFRESH[key] = (interface, server_ip)
+    _ensure_anchor_arp_thread()
+
+
+def _unregister_anchor_arp_refresh(interface: str, server_ip: str = "") -> int:
+    """Remove entries for `interface` (and optionally the specific
+    server_ip). Called from stop_dhcp_server so we don't keep
+    re-arping addresses that no longer belong to any active
+    session. Returns the count of entries removed."""
+    if not interface:
+        return 0
+    removed = 0
+    with _ANCHOR_ARP_REFRESH_LOCK:
+        for key in list(_ANCHOR_ARP_REFRESH.keys()):
+            _iface, _ip = _ANCHOR_ARP_REFRESH[key]
+            if _iface != interface:
+                continue
+            if server_ip and _ip != server_ip:
+                continue
+            _ANCHOR_ARP_REFRESH.pop(key, None)
+            removed += 1
+    return removed
+
+
+def _ensure_anchor_arp_thread() -> None:
+    """Start the periodic re-arp thread if it isn't already
+    running. Daemon so process exit kills it."""
+    global _ANCHOR_ARP_THREAD
+    with _ANCHOR_ARP_THREAD_LOCK:
+        if _ANCHOR_ARP_THREAD is not None and _ANCHOR_ARP_THREAD.is_alive():
+            return
+        _ANCHOR_ARP_THREAD = threading.Thread(
+            target=_anchor_arp_refresh_loop,
+            name="dhcp-anchor-arp-refresh",
+            daemon=True,
+        )
+        _ANCHOR_ARP_THREAD.start()
+
+
+def _anchor_arp_refresh_loop() -> None:
+    """Background loop: every ANCHOR_ARP_REFRESH_INTERVAL seconds,
+    emit `arping -A` for each registered (interface, server_ip)
+    pair. Failures are logged at DEBUG (may fire on transient link
+    flaps) and don't stop the loop."""
+    import time as _time
+    while True:
+        try:
+            _time.sleep(ANCHOR_ARP_REFRESH_INTERVAL)
+        except Exception:
+            return
+        with _ANCHOR_ARP_REFRESH_LOCK:
+            entries = list(_ANCHOR_ARP_REFRESH.values())
+        for interface, server_ip in entries:
+            try:
+                _run_command(
+                    ["arping", "-c", "1", "-A", "-w", "2",
+                     "-I", interface, server_ip],
+                    timeout=4,
+                )
+            except Exception as _exc:
+                logger.debug(
+                    "[DHCP anchor-arp] refresh for %s on %s failed: %s",
+                    server_ip, interface, _exc,
+                )
 
 
 def _vrf_has_connected_route(vrf_name: str, subnet: str,
@@ -3063,6 +3201,10 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
 
     # v0.5.221: normalize display form vlan200@ens2f0np0 → vlan200.
     interface = _normalize_iface_name(interface)
+    # v0.5.280 (DHCP-K2): drop this interface from the periodic
+    # gratuitous-ARP registry so the background refresher stops
+    # re-arping the anchor IP once the DHCP server is stopped.
+    _unregister_anchor_arp_refresh(interface)
     pidfile = os.path.join(DNSMASQ_PID_DIR, f"dnsmasq-{interface}.pid")
     conffile = os.path.join(DNSMASQ_CONF_DIR, f"ostg-{interface}.conf")
     gateway = ""
