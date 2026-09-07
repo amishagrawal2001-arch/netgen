@@ -12761,17 +12761,105 @@ def get_bgp_statistics():
 @app.route("/api/bgp/status/<device_id>", methods=["GET"])
 @require_role("viewer")
 def get_device_bgp_status(device_id):
-    """Get BGP status for a specific device"""
+    """Get BGP status for a specific device.
+
+    v0.5.273: PRIMARY path is FRR's structured JSON output
+    (`vtysh -c "show bgp <vrf> summary json"`). Every peer object
+    carries an explicit ``state`` string matching the RFC 4271
+    §8.2.2 FSM verbatim — Idle / Connect / Active / OpenSent /
+    OpenConfirm / Established. This retires the field-position
+    text parser that rewrote six times (v0.5.264 ranking, v0.5.272
+    uptime shapes, etc.) and kept eating on FRR output changes:
+
+      * FRR uptime `2d21h47m` had no colons → v0.5.272
+      * PfxRcd number vs state name in same column → v0.5.264
+      * `(Policy)` synthetic marker → historical fix
+      * Multi-AFI header lines vs neighbor lines → historical fix
+
+    None of those classes can recur with the JSON contract.
+    Fallback to the text parser is kept guarded so pre-FRR-7.x
+    deployments (which we haven't seen in a while) keep working.
+    """
     try:
-        from utils.frr_docker import get_bgp_status, get_bgp_neighbors
-        
+        from utils.frr_docker import (
+            get_bgp_status, get_bgp_neighbors, get_bgp_status_json,
+        )
+
         # Use the device_id directly as the device name for container lookup
         device_name = device_id
-        
-        # Get BGP status from container
+
+        # v0.5.273: try the structured JSON path first.
+        json_payload = get_bgp_status_json(device_id, device_name)
+        if json_payload.get("status") == "success":
+            _peers_obj = json_payload.get("peers") or {}
+            neighbors_data = []
+            for peer_ip, peer in _peers_obj.items():
+                # peerUptimeMsec is the authoritative "how long
+                # has this session been up" — 0 / absent means
+                # never Established. Prefer the display string
+                # `peerUptime` for UI parity with the prior text
+                # parser (which stashed the raw uptime column).
+                neighbors_data.append({
+                    "neighbor_ip": peer_ip,
+                    "neighbor_as": (
+                        peer.get("remoteAs")
+                        or peer.get("remote-as")
+                    ),
+                    "state": peer.get("state") or "Unknown",
+                    "uptime": (
+                        peer.get("peerUptime")
+                        or peer.get("uptime")
+                        or "never"
+                    ),
+                })
+
+            bgp_established = any(
+                n.get("state") == "Established" for n in neighbors_data
+            )
+            bgp_ipv4_established = any(
+                n.get("state") == "Established" and "." in n.get("neighbor_ip", "")
+                for n in neighbors_data
+            )
+            bgp_ipv6_established = any(
+                n.get("state") == "Established" and ":" in n.get("neighbor_ip", "")
+                for n in neighbors_data
+            )
+            bgp_state = "Established" if bgp_established else (
+                "Not Established" if neighbors_data else "Unknown"
+            )
+            return jsonify({
+                "status": "success",
+                "device_id": device_id,
+                # Keep the shape identical to the text-parser path so
+                # bgp_monitor.py + the client dialog need zero changes.
+                "bgp_status": {
+                    "status": "success",
+                    "container_name": json_payload.get("container_name"),
+                    # Do NOT include the raw JSON here — it's kept in
+                    # json_payload.raw_v4 / .raw_v6 for debug callers
+                    # who go straight to get_bgp_status_json themselves.
+                },
+                "neighbors": neighbors_data,
+                "bgp_established": bgp_established,
+                "bgp_ipv4_established": bgp_ipv4_established,
+                "bgp_ipv6_established": bgp_ipv6_established,
+                "bgp_state": bgp_state,
+                "parse_source": "json",
+            }), 200
+
+        # v0.5.273: JSON path unavailable (very old FRR, container
+        # gone, exec error). Fall through to the historical text
+        # parser below — same behavior as pre-v0.5.273 clients.
+        logging.info(
+            f"[BGP STATUS] device {device_id}: JSON path unavailable "
+            f"({json_payload.get('reason', 'unknown')}); "
+            f"falling back to text parser"
+        )
+
+        # Get BGP status from container (text-parser fallback)
         bgp_status = get_bgp_status(device_id, device_name)
         bgp_neighbors = get_bgp_neighbors(device_id, device_name)
-        
+
         # Parse BGP summary to extract neighbor states
         neighbors_data = []
         if bgp_status.get('status') == 'success':
@@ -12902,7 +12990,8 @@ def get_device_bgp_status(device_id):
             'bgp_established': bgp_established,
             'bgp_ipv4_established': bgp_ipv4_established,
             'bgp_ipv6_established': bgp_ipv6_established,
-            'bgp_state': bgp_state
+            'bgp_state': bgp_state,
+            'parse_source': 'text',   # v0.5.273: JSON path failed → text fallback
         }), 200
         
     except Exception as e:

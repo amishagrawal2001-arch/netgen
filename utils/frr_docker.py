@@ -9,7 +9,7 @@ import json
 import time
 import subprocess
 import os
-from typing import Dict, Optional, List
+from typing import Any, Dict, List, Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1627,6 +1627,137 @@ def get_bgp_status(device_id: str, device_name: str = None) -> Dict:
             "output": str(e),
             "container_name": "unknown"
         }
+
+def get_bgp_status_json(device_id: str, device_name: str = None) -> Dict:
+    """Get BGP status as structured JSON from FRR.
+
+    v0.5.273: this replaces the text-parsing chain that has been
+    rewritten six times (v0.5.264 ranking, v0.5.272 uptime shapes,
+    plus everything in between). FRR's `show bgp summary json` emits
+    an explicit `state` field per peer for every FSM state defined
+    in RFC 4271 §8.2.2 (Idle / Connect / Active / OpenSent /
+    OpenConfirm / Established) — no need to guess from field
+    positions, prefix-count int() heuristics, or uptime-shape
+    checks. Supported by every FRR version since ~7.0 (2019).
+
+    Runs the query TWICE — once for `show bgp <vrf> summary json`
+    (IPv4 unicast) and once for `show bgp <vrf> ipv6 summary json`
+    (IPv6 unicast) — and merges the two `peers` dicts into a
+    single flat structure keyed by peer IP:
+
+        {
+            "status": "success",              # or "error"
+            "peers": {
+                "192.168.0.1":  {"state": "Established",
+                                 "remoteAs": 65000,
+                                 "pfxRcd": 0,
+                                 "peerUptimeMsec": 251206000,
+                                 "family": "ipv4"},
+                "2001:db8::1":  {"state": "Established", ...,
+                                 "family": "ipv6"},
+                ...
+            },
+            "container_name": "frr-<device>",
+            "raw_v4":  {...},                  # original FRR JSON
+            "raw_v6":  {...},
+        }
+
+    On any exec failure or malformed JSON, returns
+    `{"status": "error", "reason": "<why>"}` — the endpoint layer
+    will then fall back to text parsing for the container/version
+    combo that doesn't support JSON. That fallback is what keeps
+    the pre-FRR-7.x compatibility contract intact while giving
+    modern deployments a robust primary path.
+    """
+    try:
+        container_name = frr_manager._get_container_name(device_id, device_name)
+        container = frr_manager.client.containers.get(container_name)
+        scope = _bgp_vtysh_scope(device_id)
+
+        def _run(cmd: str) -> Optional[Dict]:
+            """Exec a vtysh command and parse its stdout as JSON.
+            Returns None on non-zero exit or unparseable output."""
+            res = container.exec_run(f"vtysh -c '{cmd}'")
+            if res.exit_code != 0:
+                return None
+            raw = (
+                res.output.decode("utf-8", errors="replace")
+                if isinstance(res.output, bytes) else str(res.output)
+            )
+            if not raw or not raw.strip():
+                return None
+            import json as _json
+            try:
+                return _json.loads(raw)
+            except (ValueError, TypeError):
+                return None
+
+        v4 = _run(f"show bgp {scope} summary json") or {}
+        v6 = _run(f"show bgp {scope} ipv6 summary json") or {}
+
+        # A per-VRF query wraps its answer inside `{<vrf-name>: {...}}`
+        # when scope=="vrf all". Unwrap that so callers don't need to
+        # know the VRF name. Single-scope queries return the vrf
+        # object at top-level already; leave those alone.
+        def _unwrap_vrf(payload: Dict) -> Dict:
+            if not isinstance(payload, dict):
+                return {}
+            # Structured payload from `vrf all` — a dict keyed by
+            # VRF name, each value having `ipv4Unicast` / `ipv6Unicast`
+            # sub-objects. Merge every non-default VRF's peers up.
+            if any(
+                isinstance(v, dict) and ("ipv4Unicast" in v or "ipv6Unicast" in v)
+                for v in payload.values()
+            ):
+                merged: Dict[str, Any] = {}
+                for _vrf, obj in payload.items():
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            # Later VRFs' peers override earlier ones
+                            # on IP collision — with per-device VRFs
+                            # that should never happen anyway.
+                            if k in merged and isinstance(merged[k], dict) \
+                                    and isinstance(v, dict):
+                                merged[k].update(v)
+                            else:
+                                merged[k] = v
+                return merged
+            return payload
+
+        v4 = _unwrap_vrf(v4)
+        v6 = _unwrap_vrf(v6)
+
+        peers: Dict[str, Dict[str, Any]] = {}
+
+        def _collect(payload: Dict, key: str, family: str) -> None:
+            afi = payload.get(key) or {}
+            _peers = afi.get("peers") or {}
+            for peer_ip, peer_obj in _peers.items():
+                if not isinstance(peer_obj, dict):
+                    continue
+                entry = dict(peer_obj)
+                entry["family"] = family
+                peers[peer_ip] = entry
+
+        _collect(v4, "ipv4Unicast", "ipv4")
+        _collect(v6, "ipv6Unicast", "ipv6")
+
+        return {
+            "status": "success",
+            "peers": peers,
+            "container_name": container_name,
+            "raw_v4": v4,
+            "raw_v6": v6,
+        }
+    except Exception as exc:
+        logger.warning(
+            f"[FRR] JSON BGP status for {device_id} failed: {exc}"
+        )
+        return {
+            "status": "error",
+            "reason": str(exc),
+        }
+
 
 def get_bgp_neighbors(device_id: str, device_name: str = None) -> Dict:
     """Get BGP neighbors from FRR container.

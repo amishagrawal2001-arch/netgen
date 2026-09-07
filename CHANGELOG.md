@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.273] - 2026-09-07
+
+**BGP state parser: FRR JSON output as primary path (retires the
+positional text-parser that rewrote six times).**
+
+The v0.5.272 postmortem asked "why does this keep breaking?" The
+answer was architectural: parsing `vtysh -c "show bgp summary"`
+means guessing field positions from a human-oriented CLI output
+whose shape drifts across FRR versions, VRF setups, and
+policy-applied peers. Every fix chased a new shape:
+
+  * v0.5.264 — arbitrary neighbor order → ranking table
+  * v0.5.264 — container-missing → empty neighbors forever
+  * v0.5.272 — FRR uptime `2d21h47m` had no colons
+  * historical — `(Policy)` synthetic marker
+  * historical — PfxRcd number vs state name in same column
+
+None of those can recur with the JSON contract. This ship switches
+the primary path to `vtysh -c "show bgp <vrf> summary json"`.
+
+- **New `utils.frr_docker.get_bgp_status_json(device_id)`** — runs
+  the JSON variant for IPv4 unicast and IPv6 unicast, unwraps the
+  `vrf all` per-VRF envelope, merges both address families into a
+  flat `peers: {ip → peer_object}` dict. Every peer object carries
+  an explicit `state` field with one of the seven RFC 4271 §8.2.2
+  FSM strings (Idle / Connect / Active / OpenSent / OpenConfirm /
+  Established) — parseable with `.get("state")` in one line, no
+  field-position heuristics. Returns `{"status":"error",...}` on
+  any exec / JSON-parse failure so the endpoint layer can decide
+  whether to fall back.
+
+- **`GET /api/bgp/status/<device_id>` prefers JSON.** Same response
+  shape the client + bgp_monitor already consume (`neighbors: [...]`,
+  `bgp_established`, `bgp_ipv4_established`, `bgp_state`, etc.) so
+  zero changes needed downstream. Adds `parse_source: "json"` (or
+  `"text"` on fallback) for observability. The historical text
+  parser stays behind the fallback for pre-FRR-7.x (2019)
+  deployments we haven't seen in a while.
+
+Regression tests in `tests/test_v05273_bgp_json_parser.py` —
+recorded FRR JSON fixtures for Established / Idle / Connect /
+mixed-family / container-missing / malformed-json cases; the
+parser tests don't touch any live FRR container.
+
+Follow-ups (not in this ship): same JSON migration for OSPF
+(`show ip ospf neighbor json`) and ISIS (`show isis neighbor
+json`). Both have the same class of positional-parser bug; both
+kept working through v0.5.264 because they see less FRR-shape
+drift than BGP, but the same refactor should land there next.
+
 ## [0.5.272] - 2026-09-07
 
 **BGP state "Idle" false-positive + IPv4 gateway ARP diagnostic.**
