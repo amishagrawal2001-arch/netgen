@@ -81,7 +81,7 @@ def test_ipv4_gateway_dumps_neigh_when_both_ping_and_neigh_fail():
     the diagnostic behavior it guaranteed is preserved."""
     idx = SRV.find("v0.5.277 (ARP-H1)")
     assert idx > 0, "ARP-H1 (successor to ARP-G2) marker missing"
-    body = SRV[idx:idx + 4000]
+    body = SRV[idx:idx + 12000]
     # The subprocess call runs `ip neigh show to <gateway>` under
     # the same VRF prefix used by everything else in the endpoint.
     assert 'list(ping_prefix)' in body

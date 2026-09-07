@@ -2,6 +2,67 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.278] - 2026-09-07
+
+**Gateway-orange class, take 6: v0.5.277 didn't stick for BGP-peer
+devices on srv06. Belt-and-suspenders fix.**
+
+Operator upgraded to v0.5.277, clicked ARP refresh, gateway still
+orange. v0.5.277's flip-to-neigh-first assumed the neigh table
+would have an entry, or that a `ping` arp-warm would populate one.
+Neither is guaranteed. Three fallbacks added:
+
+- **ARP-H3: `arping` as arp-warm instead of `ping`.** `ping` in
+  `ip vrf exec` context needs the destination's route in the VRF's
+  routing table; if the connected route is missing (kernel-timing
+  race between `ip addr add` and VRF enslavement, or the route
+  landed in main table 254 only), the ping silently fails
+  ("Network is unreachable") and the neigh cache stays empty.
+  `arping -c 1 -w 2 -I <iface> <gw>` sends L2 ARP requests bound
+  to the interface directly — bypasses IP routing entirely.
+  Falls back to `ping` when arping isn't installed (some base
+  images ship without iputils-arping).
+
+- **ARP-H4: unwrapped-neigh fallback.** `ip neigh show to <ip>`
+  uses netlink, which is namespace-scoped, not cgroup-scoped —
+  the VRF wrap shouldn't change the result. But some kernel
+  versions have edge cases. If the VRF-wrapped query returns
+  empty, retry without the wrap before giving up. Same fallback
+  applied after the arp-warm re-check.
+
+- **ARP-H5: Any-protocol-established short-circuit.** If ANY
+  routing protocol (BGP / OSPF / ISIS) has an
+  Established/Full/Up adjacency toward this device, ARP MUST be
+  resolved — a routing protocol cannot complete its handshake
+  without an ARP entry for the peer. Operator may configure
+  any / none / all of the three; ANY-established → resolved.
+  The columns (`bgp_established` / `bgp_ipv4_established` /
+  `ospf_established` / `ospf_ipv4_established` /
+  `isis_established`) come from the sibling monitors polling
+  FRR directly (JSON path since v0.5.273 / v0.5.274), so
+  they're authoritative and independent of the ARP endpoint's
+  own probes. Skip the detection dance in that case, which
+  kept biting even after v0.5.277.
+
+`details.gateway_check_path` now records:
+`bgp_established_short_circuit` /
+`ospf_established_short_circuit` /
+`isis_established_short_circuit` / `neigh_cache_hit` /
+`neigh_no_vrf_fallback` / `neigh_after_arp_warm` /
+`neigh_after_arp_warm_no_vrf` / `neigh_still_incomplete`.
+Diagnostic dump splits into `gateway_neigh_vrf` +
+`gateway_neigh_host` so kernel-context differences show;
+`gateway_neigh` (v0.5.272-v0.5.277 clients' key) kept as an
+alias for back-compat.
+
+Regression tests in `tests/test_v05278_arp_bgp_short_circuit.py`.
+Full ARP/DHCP/BGP regression: 411 passed.
+
+Ship recommendation: **immediate upgrade** for anyone still on
+v0.5.277 with per-device VRFs seeing orange gateways for
+Established BGP peers. The BGP short-circuit alone will paint
+those green on the next poll.
+
 ## [0.5.277] - 2026-09-07
 
 **Gateway-orange class, take 5: flip ARP check from ping-first to

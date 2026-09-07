@@ -37,7 +37,7 @@ def test_gateway_check_records_which_path_won():
     `neigh_after_arp_warm` / `neigh_still_incomplete` so operators
     can see WHY the gateway resolved (or didn't)."""
     idx = SRV.find("v0.5.277 (ARP-H1)")
-    body = SRV[idx:idx + 4000]
+    body = SRV[idx:idx + 12000]
     assert '"gateway_check_path"' in body
     # The three possible win states.
     for state in ("neigh_cache_hit", "neigh_after_arp_warm",
@@ -52,7 +52,7 @@ def test_gateway_ping_arp_warm_ignores_exit_code():
     drop the echo but still answer ARP. The check must be
     re-neigh, not re-ping-exit-code."""
     idx = SRV.find("v0.5.277 (ARP-H1)")
-    body = SRV[idx:idx + 4000]
+    body = SRV[idx:idx + 12000]
     # After the arp-warm ping, we must re-call _neigh_state_ok,
     # NOT check the ping's returncode again.
     warm_idx = body.find('"gateway_arp_warm"')
@@ -68,7 +68,7 @@ def test_gateway_check_still_dumps_neigh_output_on_failure():
     """The v0.5.272 diagnostic (dump `ip neigh show` output when
     the gateway remains unresolved) survives the refactor."""
     idx = SRV.find("v0.5.277 (ARP-H1)")
-    body = SRV[idx:idx + 4000]
+    body = SRV[idx:idx + 12000]
     assert '"gateway_neigh"' in body
     assert '"ip", "neigh", "show", "to", ipv4_gateway' in body
 

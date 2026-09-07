@@ -15069,71 +15069,171 @@ def get_device_arp_status(device_id):
                 arp_results["details"]["ipv6_ping_target"] = ipv6_gateway or ipv6_address
 
         # Check gateway connectivity (subprocess already at module scope — see IPv4 note)
-        # v0.5.277 (ARP-H1): NEIGH-FIRST ordering. This class of bug
-        # has been re-opened four times (v0.5.254, v0.5.258, v0.5.262,
-        # v0.5.272) because ping was primary. Every time the primary
-        # fails silently — ping_prefix mis-detected, Junos ICMP
-        # filter, kernel timing race, VRF cgroup transition — the UI
-        # painted orange even though `ip neigh show` had a REACHABLE
-        # entry. The neighbor table IS the L2 forwarding state; if
-        # the MAC is there we can forward frames, which is what
-        # "resolved" means. Ping's role is arp-warm (poke the peer
-        # so the kernel populates the neighbor cache) — it stopped
-        # being a good proxy for reachability years ago. New order:
-        #   1) Consult neigh table. Resolved state → True. Done.
-        #   2) Missing / INCOMPLETE / FAILED → send one ping as
-        #      arp-warm (kernel sends ARP request as a side effect,
-        #      updates the neigh table).
-        #   3) Re-check neigh. Resolved → True. Done.
-        #   4) Still not resolved → False, dump the raw `ip neigh
-        #      show` output into details for the operator.
+        # v0.5.277 (ARP-H1) + v0.5.278 (ARP-H3/H4/H5):
+        # NEIGH-FIRST ordering with belt-and-suspenders fallbacks.
+        # v0.5.278 additions after v0.5.277 didn't fix a BGP-peer
+        # gateway-orange case on srv06:
+        #   ARP-H3: use `arping` (L2) as arp-warm instead of `ping`
+        #           (L3+ICMP). `arping` bypasses IP routing entirely
+        #           — a missing connected route in the VRF table
+        #           doesn't stop it. `ping` in `ip vrf exec` context
+        #           needs the route in the VRF's table; if it isn't
+        #           there (kernel-timing race, or route landed in
+        #           main table only), the ping silently fails and
+        #           the neigh cache stays empty.
+        #   ARP-H4: if VRF-wrapped `ip neigh show` returns empty,
+        #           retry WITHOUT the wrap. Netlink is
+        #           namespace-scoped, not cgroup-scoped, so both
+        #           queries return the same entries in principle —
+        #           but some kernel versions have edge cases.
+        #           Belt-and-suspenders.
+        #   ARP-H5: Any-protocol-established short-circuit. If ANY
+        #           routing protocol (BGP / OSPF / ISIS) has an
+        #           Established/Full/Up adjacency toward this
+        #           gateway subnet, ARP MUST be resolved — a
+        #           routing protocol cannot complete its handshake
+        #           without an ARP entry for the peer. Skip the
+        #           whole detection dance in that case. The
+        #           operator may configure any / none / all of the
+        #           three; ANY-established → resolved. Columns come
+        #           from the sibling monitors polling FRR
+        #           directly (JSON path since v0.5.273 / v0.5.274),
+        #           so they're authoritative and independent of
+        #           the ARP endpoint's own probes.
         # `details.gateway_check_path` records which step won so the
-        # operator can see whether the neigh cache hit or arp-warm
-        # was needed.
+        # operator can see whether the neigh cache hit, arp-warm
+        # was needed, or the BGP-short-circuit fired.
         if ipv4_gateway:
             try:
                 _resolved_via = None
-                if _neigh_state_ok(ipv4_gateway, family="ipv4"):
+                # ARP-H5: if ANY routing protocol adjacency is up
+                # toward this device, the peer's ARP MUST be
+                # resolved — no routing protocol completes its
+                # handshake without an ARP entry for the neighbor.
+                # Operator may configure any / none / all of BGP /
+                # OSPF / ISIS on a given device; ANY-established
+                # is sufficient. The columns come from the sibling
+                # monitors polling FRR directly, so they're
+                # authoritative and independent of ARP probing.
+                # `short_circuit_proto` names which one won so the
+                # operator can trace it back in the diagnostic.
+                _short_circuit_proto = None
+                if device.get("bgp_established") or device.get(
+                    "bgp_ipv4_established"
+                ):
+                    _short_circuit_proto = "bgp"
+                elif device.get("ospf_established") or device.get(
+                    "ospf_ipv4_established"
+                ):
+                    _short_circuit_proto = "ospf"
+                elif device.get("isis_established"):
+                    _short_circuit_proto = "isis"
+                if _short_circuit_proto:
+                    _resolved_via = f"{_short_circuit_proto}_established_short_circuit"
+                elif _neigh_state_ok(ipv4_gateway, family="ipv4"):
                     _resolved_via = "neigh_cache_hit"
                 else:
-                    # arp-warm: send a ping to trigger ARP resolution
-                    # via the kernel, then re-check the neighbor table.
-                    # The ping's exit code is IRRELEVANT — Junos may
-                    # drop the echo but still answer ARP, and we only
-                    # need the ARP handshake to populate the table.
-                    _warm = subprocess.run(
-                        ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_gateway],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    arp_results["details"]["gateway_arp_warm"] = (
-                        "ping-ok" if _warm.returncode == 0 else "ping-fail"
-                    )
+                    # ARP-H4: VRF-wrapped neigh check missed. Retry
+                    # without the wrap — netlink queries are
+                    # namespace-scoped, this should return the same
+                    # entries but covers kernel-version edge cases.
+                    _saved_prefix = ping_prefix
+                    ping_prefix = []
+                    try:
+                        if _neigh_state_ok(ipv4_gateway, family="ipv4"):
+                            _resolved_via = "neigh_no_vrf_fallback"
+                    finally:
+                        ping_prefix = _saved_prefix
+                if _resolved_via is None:
+                    # ARP-H3: arp-warm via `arping` (L2, interface-
+                    # bound, no IP routing needed). Falls back to
+                    # `ping` when arping isn't installed (some
+                    # container/host base images ship without
+                    # iputils-arping).
+                    _iface_for_arp = (
+                        device.get("server_interface")
+                        or f"vlan{device.get('vlan')}"
+                        if device.get("vlan") and device.get("vlan") != "0"
+                        else device.get("server_interface")
+                    ) or ""
+                    _warm_kind = "skip"
+                    if _iface_for_arp:
+                        try:
+                            _warm = subprocess.run(
+                                ["arping", "-c", "1", "-w", "2",
+                                 "-I", _iface_for_arp, ipv4_gateway],
+                                capture_output=True, text=True, timeout=4,
+                            )
+                            _warm_kind = (
+                                "arping-ok" if _warm.returncode == 0
+                                else "arping-fail"
+                            )
+                        except FileNotFoundError:
+                            _warm_kind = "arping-not-installed"
+                    if _warm_kind in ("skip", "arping-not-installed",
+                                      "arping-fail"):
+                        # Fallback: ping-warm inside the VRF. Best
+                        # available if arping was unavailable.
+                        try:
+                            _warm2 = subprocess.run(
+                                ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_gateway],
+                                capture_output=True, text=True, timeout=5,
+                            )
+                            _warm_kind = (
+                                f"{_warm_kind}+ping-"
+                                f"{'ok' if _warm2.returncode == 0 else 'fail'}"
+                            )
+                        except Exception as _ping_exc:
+                            _warm_kind = f"{_warm_kind}+ping-error({_ping_exc})"
+                    arp_results["details"]["gateway_arp_warm"] = _warm_kind
+                    # Re-check neigh after warm — try both wrapped
+                    # and un-wrapped so kernel edge cases don't hide
+                    # a fresh entry.
                     if _neigh_state_ok(ipv4_gateway, family="ipv4"):
                         _resolved_via = "neigh_after_arp_warm"
+                    else:
+                        _saved_prefix = ping_prefix
+                        ping_prefix = []
+                        try:
+                            if _neigh_state_ok(ipv4_gateway, family="ipv4"):
+                                _resolved_via = "neigh_after_arp_warm_no_vrf"
+                        finally:
+                            ping_prefix = _saved_prefix
                 arp_results["arp_gateway_resolved"] = (_resolved_via is not None)
                 arp_results["details"]["gateway_check_path"] = (
                     _resolved_via or "neigh_still_incomplete"
                 )
                 if not arp_results["arp_gateway_resolved"]:
-                    # Dump the raw neigh output so operators can
-                    # distinguish INCOMPLETE (peer not answering ARP)
-                    # from no-entry (ARP not attempted — usually wrong
-                    # VRF / interface / subnet).
-                    try:
-                        neigh_cmd = list(ping_prefix) + [
-                            "ip", "neigh", "show", "to", ipv4_gateway,
-                        ]
-                        neigh_result = subprocess.run(
-                            neigh_cmd, capture_output=True,
-                            text=True, timeout=5,
-                        )
-                        arp_results["details"]["gateway_neigh"] = (
-                            (neigh_result.stdout or "").strip() or "no entry"
-                        )
-                    except Exception as neigh_exc:
-                        arp_results["details"]["gateway_neigh"] = (
-                            f"error: {neigh_exc}"
-                        )
+                    # Dump the raw neigh output from BOTH contexts
+                    # so operators can distinguish INCOMPLETE (peer
+                    # not answering ARP) from no-entry (wrong VRF /
+                    # interface / subnet). Include both wrapped and
+                    # unwrapped views since they can differ on some
+                    # kernels.
+                    for _label, _prefix in (
+                        ("gateway_neigh_vrf", list(ping_prefix)),
+                        ("gateway_neigh_host", []),
+                    ):
+                        try:
+                            neigh_cmd = _prefix + [
+                                "ip", "neigh", "show", "to", ipv4_gateway,
+                            ]
+                            neigh_result = subprocess.run(
+                                neigh_cmd, capture_output=True,
+                                text=True, timeout=5,
+                            )
+                            arp_results["details"][_label] = (
+                                (neigh_result.stdout or "").strip() or "no entry"
+                            )
+                        except Exception as neigh_exc:
+                            arp_results["details"][_label] = (
+                                f"error: {neigh_exc}"
+                            )
+                    # v0.5.278 back-compat: keep the `gateway_neigh`
+                    # key that clients on v0.5.272-v0.5.277 read.
+                    arp_results["details"]["gateway_neigh"] = (
+                        arp_results["details"].get("gateway_neigh_vrf", "")
+                    )
             except Exception as e:
                 arp_results["details"]["gateway_check_error"] = f"{e}"
         
