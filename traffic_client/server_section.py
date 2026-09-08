@@ -1913,7 +1913,20 @@ class TrafficGenClientServerSection():
         on a dead server.
         """
         try:
-            servers = [s for s in getattr(self, "server_interfaces", []) if s.get("online")]
+            # v0.5.285 (SERVER-A1): poll OFFLINE servers too so they
+            # can auto-recover to green when reachable again. Pre-fix
+            # only polled `online=True` servers — the "N consecutive
+            # health failures → flip offline" transition then became
+            # a one-way trip: once offline, no future poll would ever
+            # re-check that server, so it stayed red forever even
+            # after netgen-server came back up. Operator's split-
+            # brain (server RED, devices under it GREEN) after
+            # netgen-server restart during upgrade came from exactly
+            # this — the health probe caught the mid-restart gap,
+            # flipped offline, then never re-polled to see the
+            # server recover. Meanwhile device pollers used their own
+            # retry logic and correctly kept reporting devices up.
+            servers = list(getattr(self, "server_interfaces", []) or [])
             if not servers:
                 return
             conn_mgr = getattr(self, "connection_manager", None)
@@ -1991,6 +2004,21 @@ class TrafficGenClientServerSection():
                 return
             # Success path — reset the fail counter + apply health.
             server["health_fail_count"] = 0
+            # v0.5.285 (SERVER-A1): auto-recovery — an OFFLINE server
+            # whose /api/admin/health now responds 200 is by definition
+            # BACK online. Flip online=True so the LED goes red→green
+            # (via _update_server_led). Pre-fix this branch never
+            # updated `online`, so even after the poll succeeded the
+            # LED stayed red because _update_server_led read
+            # online=False. Log the recovery so operators see it.
+            _was_offline = not server.get("online")
+            if _was_offline:
+                logger.info(
+                    f"[SERVER HEALTH] {server.get('address')} "
+                    f"responded healthy — flipping back online"
+                )
+                server["online"] = True
+                server["is_online"] = True
             health = health or {}
             degraded = bool(health.get("degraded"))
             server["health"] = "degraded" if degraded else "healthy"

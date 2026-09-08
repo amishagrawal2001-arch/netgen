@@ -2,6 +2,55 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.285] - 2026-09-07
+
+**Client-side fix: server LED stuck RED forever after a
+netgen-server restart-during-upgrade caught it in a health-
+probe gap. Devices under it still show GREEN — split-brain.**
+
+Operator screenshot: TG 0 red, its interfaces (ens10f0 etc.) red
+squares, but device1/2/3 GREEN. Devices polled successfully =
+server was reachable. Server LED said unreachable. Split-brain.
+
+Root cause: `poll_server_health` at
+`traffic_client/server_section.py:1916` filtered its list of
+servers to poll to `[s for s in ... if s.get("online")]` —
+only ONLINE servers. Once a server hit the N-consecutive-
+failure threshold and got flipped to `online=False` (during
+the netgen-server restart gap, which is exactly when health
+probes fail momentarily), it got **excluded from all future
+polls**. One-way trip: red → never re-checked → red forever.
+
+Meanwhile the device-level pollers use their own per-device
+retry logic that keeps checking regardless of server "online"
+flag, so devices came back GREEN as soon as the server was
+back. Split-brain: green devices, red server.
+
+Two-part fix:
+
+- **SERVER-A1a**: poll offline servers too. Change the
+  server list from `if s.get("online")` to all servers.
+  Offline servers eventually respond healthy → get polled
+  → recover.
+
+- **SERVER-A1b**: on successful health response, flip
+  `server["online"] = True`. Pre-fix, success branch only
+  wrote `server["health"]` — the "online" flag stayed
+  False so `_update_server_led` still painted red even
+  after the poll succeeded. Log the transition so
+  operators see the recovery.
+
+Log to look for after upgrade:
+```
+[SERVER HEALTH] http://<server>:5050 responded healthy — flipping back online
+```
+
+Client-side change. Ship the wheel to whichever machine runs
+the client (usually the operator's laptop), not the netgen
+server.
+
+Full ARP/DHCP/BGP/client regression: 445 passed.
+
 ## [0.5.284] - 2026-09-07
 
 **Fix the actual delivery gap: anchor-side fixes never fire on
