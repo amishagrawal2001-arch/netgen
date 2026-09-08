@@ -2,6 +2,101 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.288] - 2026-09-08
+
+**Silence the schema-dump tsunami that was drowning out every
+DHCP/BGP/OSPF/ARP diagnostic in netgen-server logs.**
+
+Operator on srv06 2026-09-08 grepped 5 minutes of logs for
+`dnsmasq|dhcp|relay` while chasing why the DHCP server wasn't
+answering a relayed request. Got ~200 identical lines back and
+zero actual DHCP diagnostics. Every line was one of:
+
+```
+INFO:utils.device_database:[DEVICE DB] Current devices table columns: [...100 columns...]
+INFO:utils.device_database:[DEVICE DB] Checking for OSPF columns in devices table. Current columns: [...100 columns...]
+```
+
+repeating every ~3 seconds. Real dnsmasq / DHCP / relay-mode
+lines were completely buried.
+
+### Root cause
+
+`DeviceDatabase()` is constructed inline from ~30 call sites
+(`run_tgen_server.py`, `utils/bgp.py`, `utils/frr_docker.py`,
+several places in `utils/dhcp.py`, ...). Every construction:
+
+1. Calls `init_database()` → 4 INFO wrapper log lines
+2. Calls `_run_migrations()` → PRAGMA + full column dump at INFO
+   twice (devices, device_stats), plus per-check "already exist"
+   lines
+
+Every API request, every ARP-monitor tick, every FRR docker
+lookup constructed a fresh instance. That's ~200 log lines every
+few seconds on a busy server, all with the full schema inline.
+
+### Fix — two parts
+
+**1. Singleton gate on `_run_migrations`** (`utils/device_database.py`):
+
+```python
+_MIGRATIONS_LOCK = threading.Lock()
+_MIGRATIONS_APPLIED_FOR_PATHS: set = set()
+
+def _run_migrations(self, conn):
+    with _MIGRATIONS_LOCK:
+        if self.db_path in _MIGRATIONS_APPLIED_FOR_PATHS:
+            return
+        _MIGRATIONS_APPLIED_FOR_PATHS.add(self.db_path)
+    # ...actual migrations...
+```
+
+Keyed by path so tests with unique DB files still migrate. First
+construction per process runs the full migration flow once;
+every subsequent construction fast-returns before touching
+PRAGMA or logs. Cross-process safety unchanged (each process
+migrates its own copy; sqlite's file lock serializes any
+concurrent `ALTER TABLE`).
+
+**2. Downgrade always-fires wrappers to DEBUG**:
+
+- `[DEVICE DB] Initialized database at <path>` (in `__init__`)
+- `[DEVICE DB] Database tables and indexes created successfully`
+- `[DEVICE DB] Starting database migrations`
+- `[DEVICE DB] Database migrations completed`
+- `[DEVICE DB] Running database migrations` (inside _run_migrations)
+- `[DEVICE DB] Current devices table columns: [...]`
+- `[DEVICE DB] Checking for OSPF columns in devices table. ...`
+- `[DEVICE DB] OSPF status columns already exist in devices table`
+
+Real schema-change events (`Adding X column`, `Successfully
+added X`) stay at INFO — operators need to see actual schema
+evolution during upgrades.
+
+### After this ship
+
+`journalctl -u netgen-server | grep -iE "dnsmasq|dhcp|relay"`
+returns actual DHCP diagnostics on a busy server. Startup logs
+show ~4 lines about the DB (init + migrations completed) at
+DEBUG instead of ~200 at INFO. Steady-state logs contain zero
+`[DEVICE DB]` noise unless a real migration fires.
+
+### Verification
+
+10 new behavioral tests in
+`tests/test_v05288_devicedb_log_spam.py`:
+- Second construction produces zero migration log records
+- Second construction never re-dumps column lists at any level
+- Two different DB paths each migrate independently (singleton
+  keyed by path, not global)
+- Wrapper lines emit at DEBUG, not INFO
+- Real "Adding X" events stay at INFO
+- Source-level lock-ins on the singleton definition + fast-return
+
+Full DB+DHCP regression: **272/272 pass**. Wider suite unchanged
+(32 pre-existing test-drift failures across unrelated modules,
+none touch device_database).
+
 ## [0.5.287] - 2026-09-07
 
 **Root cause finally identified for the switch-can't-ping-anchor

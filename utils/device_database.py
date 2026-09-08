@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
@@ -15,6 +16,24 @@ import ipaddress
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# v0.5.288 (log-spam fix): DeviceDatabase() is constructed inline
+# from ~30 call sites (run_tgen_server.py, utils/bgp.py, utils/
+# frr_docker.py, ...). Every construction called _run_migrations
+# which dumped the full ~100-column schema TWICE at INFO. Operator
+# on srv06 2026-09-08 grepped 5 minutes of netgen-server logs for
+# `dhcp` and got ZERO matches — the log was 100% schema dumps,
+# every ~3s, drowning out every diagnostic. Fix: run the schema-
+# migration probe/apply exactly ONCE per process. The lock guards
+# the check-and-set; subsequent instances just call _run_migrations
+# which fast-returns. Schema-migrations are already idempotent, so
+# the singleton is a pure "do nothing when we already did" gate,
+# safe across threads. Cross-process safety unchanged (each process
+# still runs its own migration once — sqlite serializes concurrent
+# ALTER TABLE via its own file lock).
+_MIGRATIONS_LOCK = threading.Lock()
+_MIGRATIONS_APPLIED_FOR_PATHS: set = set()
+
 
 def _resolve_db_path():
     """Pick the SQLite DB path with sensible defaults + legacy fallback.
@@ -66,7 +85,9 @@ class DeviceDatabase:
         self.backup_path = f"{self.db_path}.backup"
         self.ensure_db_directory()
         self.init_database()
-        logger.info(f"[DEVICE DB] Initialized database at {self.db_path}")
+        # v0.5.288 (log-spam fix): DEBUG (was INFO) — DeviceDatabase()
+        # is constructed inline from ~30 sites, this fired on each.
+        logger.debug(f"[DEVICE DB] Initialized database at {self.db_path}")
     
     @staticmethod
     def _prepare_dhcp_config(raw_config: Any) -> Dict[str, Any]:
@@ -514,29 +535,52 @@ class DeviceDatabase:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_device_dhcp_pools_primary ON device_dhcp_pools(device_id, is_primary)")
             
             conn.commit()
-            logger.info("[DEVICE DB] Database tables and indexes created successfully")
-            
+            # v0.5.288 (log-spam fix): DEBUG (was INFO) — fires on
+            # every DeviceDatabase() construction.
+            logger.debug("[DEVICE DB] Database tables and indexes created successfully")
+
             # Run database migrations
-            logger.info("[DEVICE DB] Starting database migrations")
+            logger.debug("[DEVICE DB] Starting database migrations")
             self._run_migrations(conn)
-            logger.info("[DEVICE DB] Database migrations completed")
+            logger.debug("[DEVICE DB] Database migrations completed")
     
     def _run_migrations(self, conn):
         """Run database migrations to add new columns or modify schema."""
+        # v0.5.288 (log-spam fix): fast-return when this process has
+        # already migrated this exact DB path. Prevents both wasted
+        # PRAGMA/ALTER work and the massive schema-dump INFO logs
+        # from firing on every one of the ~30 inline DeviceDatabase()
+        # constructions across the codebase (~500 log lines/min on
+        # srv06 pre-fix, drowning out dhcp/bgp/arp diagnostics).
+        with _MIGRATIONS_LOCK:
+            if self.db_path in _MIGRATIONS_APPLIED_FOR_PATHS:
+                return
+            # Mark BEFORE running so a concurrent second caller
+            # short-circuits; sqlite's file lock still serializes
+            # any ALTER TABLE, and migrations are idempotent so a
+            # second entry mid-run at worst re-checks the schema
+            # (via the same connection semantics as before).
+            _MIGRATIONS_APPLIED_FOR_PATHS.add(self.db_path)
         try:
-            logger.info("[DEVICE DB] Running database migrations")
-            
+            # v0.5.288: DEBUG (was INFO) — fires every migration
+            # attempt, useful only when actively debugging schema
+            # drift; not for steady-state operator logs.
+            logger.debug("[DEVICE DB] Running database migrations")
+
             # Check if server_interface column exists
             cursor = conn.execute("PRAGMA table_info(devices)")
             columns = [column[1] for column in cursor.fetchall()]
-            logger.info(f"[DEVICE DB] Current devices table columns: {columns}")
-            
+            # v0.5.288: DEBUG (was INFO) — this dumped ~100-column
+            # list on every construction, the single largest
+            # contributor to log spam.
+            logger.debug(f"[DEVICE DB] Current devices table columns: {columns}")
+
             if 'server_interface' not in columns:
                 logger.info("[DEVICE DB] Adding server_interface column to devices table")
                 conn.execute("ALTER TABLE devices ADD COLUMN server_interface TEXT")
                 conn.commit()
                 logger.info("[DEVICE DB] Successfully added server_interface column")
-            
+
             # Check if BGP IPv4/IPv6 columns exist in devices table
             if 'bgp_ipv4_established' not in columns:
                 logger.info("[DEVICE DB] Adding BGP IPv4/IPv6 columns to devices table")
@@ -546,9 +590,11 @@ class DeviceDatabase:
                 conn.execute("ALTER TABLE devices ADD COLUMN bgp_ipv6_state TEXT DEFAULT 'Unknown'")
                 conn.commit()
                 logger.info("[DEVICE DB] Successfully added BGP IPv4/IPv6 columns to devices table")
-            
+
             # Check if OSPF status columns exist in devices table
-            logger.info(f"[DEVICE DB] Checking for OSPF columns in devices table. Current columns: {columns}")
+            # v0.5.288: DEBUG (was INFO) — the second largest log
+            # spammer; duplicated the full column list again.
+            logger.debug(f"[DEVICE DB] Checking for OSPF columns in devices table. Current columns: {columns}")
             if 'ospf_established' not in columns:
                 logger.info("[DEVICE DB] Adding OSPF status columns to devices table")
                 conn.execute("ALTER TABLE devices ADD COLUMN ospf_established BOOLEAN DEFAULT FALSE")
@@ -558,7 +604,8 @@ class DeviceDatabase:
                 conn.commit()
                 logger.info("[DEVICE DB] Successfully added OSPF status columns to devices table")
             else:
-                logger.info("[DEVICE DB] OSPF status columns already exist in devices table")
+                # v0.5.288: DEBUG (was INFO) — steady-state noise.
+                logger.debug("[DEVICE DB] OSPF status columns already exist in devices table")
             
             vxlan_columns = {
                 "vxlan_config": "TEXT",
