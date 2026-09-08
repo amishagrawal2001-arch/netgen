@@ -2,6 +2,72 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.282] - 2026-09-07
+
+**Anchor unreachable-from-switch: three real root causes found by
+the "trace the VRF local-table + `_add_route_and_vrf_copy`" agent
+after the operator confirmed v0.5.280/281 alone didn't fix it.**
+
+Operator: switch still `100% packet loss` pinging 172.16.30.2
+post-v0.5.281. The agent trace found:
+
+- **No code path anywhere in netgen installs the VRF local-table
+  entry for the anchor IP.** v0.5.275 (DHCP-J2) fixed the
+  main-table connected-route path but the LOCAL table
+  (`local <ip> ... scope host`) was never checked. On kernel
+  versions / timing races where `ip addr add X/N dev Y` (with
+  Y in vrf-Z) doesn't auto-install the local-table entry into
+  vrf-Z's local table, the kernel's dst-is-local check fails
+  for inbound frames to X → silently dropped at rx. Switch's
+  ARP handshake completes but the ICMP echo gets no reply
+  because the kernel doesn't think X belongs to it in the VRF.
+
+- **`_add_route_and_vrf_copy` unconditionally writes to the
+  DEFAULT namespace's main table AND then to the VRF.** For a
+  VRF-slaved interface, the default-table copy is dead weight —
+  no packet in the default netns will ever match `dev vlan10`
+  because vlan10 is enslaved. Worse, the operator sees noise in
+  `ip route` that obscures the actual routing state (they saw
+  the whole pool-subnet fan-out sitting in the default table).
+
+- **v0.5.280's sysctl fix (DHCP-K1) only runs on DHCP-server
+  (re)start.** Existing operators who upgraded to v0.5.280 but
+  didn't restart the DHCP-server device never got the sysctl
+  applied — `arp_ignore` stays at whatever host default (often
+  1) → secondary-IP ARP replies dropped → the exact symptom
+  the operator sees today.
+
+Three fixes:
+
+- **ARP-J1: local-table entry check + explicit install.** After
+  `ip addr add` succeeds in `_ensure_ipv4_address`, probe
+  `ip route show table local vrf <vrf>` for `local <ip>`. If
+  missing, install explicitly with `ip route add table local
+  local <ip>/32 dev <iface> proto kernel scope host src <ip>
+  vrf <vrf>`. Runs on both fresh-add and already-assigned paths.
+
+- **ARP-J2: `_add_route_and_vrf_copy` skips the default-table
+  write when the interface is VRF-slaved.** Guards the main-
+  table branch behind `if not vrf_name:`. Legacy untagged /
+  no-VRF deployments still get the main-table write because
+  that IS their routing table.
+
+- **ARP-J3: startup sysctl sweep in `arp_monitor.start()`.**
+  Sets `net.ipv4.conf.all.arp_ignore=0`, `.arp_announce=0`,
+  and the `default` scope equivalents so existing operators
+  benefit immediately without needing to restart any DHCP
+  device. Best-effort; failures logged at debug (rootless
+  containers, sysctl locked).
+
+Full ARP/DHCP/BGP regression: 437 passed (same as v0.5.281 —
+this ship is behaviour-changing but no regression tests broke).
+
+Ship recommendation: **immediate upgrade** for anyone whose
+DHCP-server anchor is unreachable from the upstream switch,
+regardless of what earlier version they're on. ARP-J3 alone
+should make the switch ping succeed on next ARP-monitor poll
+after upgrade (~30s), without any restart of the DHCP device.
+
 ## [0.5.281] - 2026-09-07
 
 **ARP-plane guards: postmortem-derived invariants + startup

@@ -759,38 +759,38 @@ def _make_dhcp_server_call(vrf_name):
     return recorder
 
 
-def test_T3_start_dhcp_server_mirrors_ipv4_route_into_vrf():
+def test_T3_start_dhcp_server_installs_ipv4_route_in_vrf_only():
+    """v0.5.282 (ARP-J2): when the device sits in a VRF,
+    start_dhcp_server writes IPv4 routes ONLY to the VRF's table.
+    Pre-fix (v0.5.218) mirrored into BOTH the default main table
+    AND the VRF's table — but the default-table copy is dead
+    weight for a VRF-slaved interface (no packet in the default
+    netns matches `dev vlanN` because vlanN is enslaved). Worse,
+    it cluttered `ip route` output and obscured routing state.
+    New behaviour: VRF-scoped write only when VRF is set;
+    main-table write only in the legacy no-VRF branch (covered
+    by test_T3_legacy_no_vrf_deployment_does_not_add_vrf_args)."""
     recorder = _make_dhcp_server_call(vrf_name="vrf-devT3")
 
     ipv4_calls = recorder.route_replace_calls("-4")
-    # Two categories exist post-fix L:
-    #   - main-table `ip -4 route replace <net> via 10.0.0.1 dev eth1`
-    #   - mirror     `ip -4 route replace <net> via 10.0.0.1 dev eth1 vrf vrf-devT3`
     assert ipv4_calls, "no ip -4 route replace calls at all"
     with_vrf = [c for c in ipv4_calls if "vrf" in c and "vrf-devT3" in c]
     without_vrf = [c for c in ipv4_calls if "vrf" not in c]
     assert with_vrf, (
         "no ip -4 route replace call included `vrf vrf-devT3` — "
-        "start_dhcp_server didn't mirror IPv4 route into VRF"
+        "start_dhcp_server didn't install IPv4 route into VRF"
     )
-    assert without_vrf, (
-        "no plain (main-table) ip -4 route replace call — the mirror "
-        "must NOT replace the main-table install"
-    )
-    # For every unique <net> that got a with_vrf install, the plain
-    # install must also be present (mirror = both tables).
-    def _net_of(cmd):
-        # cmd shape: ["ip", "-4", "route", "replace", "<net>", ...]
-        return cmd[4]
-    with_vrf_nets = {_net_of(c) for c in with_vrf}
-    without_vrf_nets = {_net_of(c) for c in without_vrf}
-    missing = with_vrf_nets - without_vrf_nets
-    assert not missing, (
-        f"IPv4 nets mirrored into VRF but missing from main table: {missing!r}"
+    # v0.5.282 (ARP-J2): main-table write must be gone when VRF is set.
+    assert not without_vrf, (
+        f"main-table `ip -4 route replace` calls found for a VRF-"
+        f"slaved device — v0.5.282 (ARP-J2) says these should be "
+        f"suppressed. Calls: {without_vrf!r}"
     )
 
 
-def test_T3_start_dhcp_server_mirrors_ipv6_route_into_vrf():
+def test_T3_start_dhcp_server_installs_ipv6_route_in_vrf_only():
+    """v0.5.282 (ARP-J2) parity for IPv6 — VRF write only, no
+    default-table copy."""
     recorder = _make_dhcp_server_call(vrf_name="vrf-devT3")
 
     ipv6_calls = recorder.route_replace_calls("-6")
@@ -799,11 +799,12 @@ def test_T3_start_dhcp_server_mirrors_ipv6_route_into_vrf():
     without_vrf = [c for c in ipv6_calls if "vrf" not in c]
     assert with_vrf, (
         "no ip -6 route replace call included `vrf vrf-devT3` — "
-        "start_dhcp_server didn't mirror IPv6 route into VRF"
+        "start_dhcp_server didn't install IPv6 route into VRF"
     )
-    assert without_vrf, (
-        "no plain (main-table) ip -6 route replace call — mirror must "
-        "not replace main-table install"
+    assert not without_vrf, (
+        f"main-table `ip -6 route replace` calls found for a VRF-"
+        f"slaved device — v0.5.282 (ARP-J2) says these should be "
+        f"suppressed. Calls: {without_vrf!r}"
     )
 
 

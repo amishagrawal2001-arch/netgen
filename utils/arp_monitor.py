@@ -111,6 +111,23 @@ class ARPStatusMonitor:
         except Exception as _exc:
             logger.warning(f"[ARP MONITOR] self-check raised: {_exc}")
 
+        # v0.5.282 (ARP-J3): sweep sysctls that block secondary-IP
+        # ARP replies. v0.5.280 (DHCP-K1) sets these per-anchor
+        # inside `_ensure_ipv4_address` — but that path only runs on
+        # DHCP-server (re)start. If an operator upgrades to v0.5.280
+        # or v0.5.282 without restarting the DHCP-server device, the
+        # sysctl fix never fires and switches still can't ping the
+        # anchor. Sweep at monitor start so EXISTING deployments
+        # benefit immediately: set `net.ipv4.conf.all.arp_ignore=0`
+        # and `net.ipv4.conf.all.arp_announce=0` — those propagate
+        # to per-interface via the kernel's OR-with-`all` semantics.
+        # Best-effort; log at debug when sysctl isn't available
+        # (rootless container, sysctl locked). Non-fatal.
+        try:
+            self._sweep_arp_sysctls()
+        except Exception as _exc:
+            logger.warning(f"[ARP MONITOR] sysctl sweep raised: {_exc}")
+
         self.is_running = True
         self.stop_event.clear()
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -198,7 +215,48 @@ class ARPStatusMonitor:
                 logger.warning("[ARP MONITOR] Monitor thread did not stop gracefully")
         
         logger.info("[ARP MONITOR] Stopped ARP status monitoring")
-    
+
+    def _sweep_arp_sysctls(self) -> None:
+        """v0.5.282 (ARP-J3): set the sysctls that block secondary-
+        IP ARP replies. Applied at ARP-monitor start so existing
+        deployments benefit without needing to restart any DHCP
+        device (the DHCP anchor add path already sets these per-
+        interface via v0.5.280 DHCP-K1, but that only runs on
+        (re)start).
+
+        The Linux kernel semantics for `net.ipv4.conf.<iface>.<key>`
+        is `max(all, <iface>)` for arp_ignore and `max(all, <iface>)`
+        for arp_announce — so setting `all=0` doesn't force per-
+        interface to 0 if the per-interface value is >0. Set BOTH
+        `all` and `default` (default = template for new interfaces)
+        to establish a safe baseline. The v0.5.280 per-anchor
+        override still runs and force-sets specific interfaces to 0.
+        """
+        import subprocess as _subprocess
+        _pairs = [
+            ("net.ipv4.conf.all.arp_ignore", "0"),
+            ("net.ipv4.conf.all.arp_announce", "0"),
+            ("net.ipv4.conf.default.arp_ignore", "0"),
+            ("net.ipv4.conf.default.arp_announce", "0"),
+        ]
+        for _key, _val in _pairs:
+            try:
+                _res = _subprocess.run(
+                    ["sysctl", "-w", f"{_key}={_val}"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if _res.returncode == 0:
+                    logger.info(f"[ARP MONITOR] sysctl {_key}={_val}")
+                else:
+                    logger.debug(
+                        f"[ARP MONITOR] sysctl {_key}={_val} "
+                        f"returned {_res.returncode}: {_res.stderr.strip()}"
+                    )
+            except Exception as _exc:
+                logger.debug(
+                    f"[ARP MONITOR] sysctl {_key}={_val} skipped: {_exc}"
+                )
+
     def _monitor_loop(self):
         """Main monitoring loop."""
         logger.info("[ARP MONITOR] Monitoring loop started")

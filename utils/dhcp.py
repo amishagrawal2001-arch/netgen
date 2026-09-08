@@ -658,25 +658,36 @@ def _add_route_and_vrf_copy(
                 log_prefix, gateway, interface, _probe_exc,
             )
 
-    # Main table (unchanged pre-fix behaviour).
-    try:
-        cmd = ["ip", ip_flag, "route", "replace", str(net)]
-        if _effective_gateway:
-            cmd.extend(["via", _effective_gateway])
-        if interface:
-            cmd.extend(["dev", interface])
-        _run_command(cmd, timeout=5, container=container)
-        logger.info(
-            "%s Added %s %s%s%s",
-            log_prefix, label, str(net),
-            f" via {_effective_gateway}" if _effective_gateway else "",
-            f" dev {interface}" if interface else "",
-        )
-    except Exception as route_exc:
-        logger.warning(
-            "%s Failed to add %s %s: %s",
-            log_prefix, label, str(net), route_exc,
-        )
+    # Main table (unchanged pre-fix behaviour) — BUT skip when the
+    # interface is VRF-slaved.
+    # v0.5.282 (ARP-J2): pre-fix wrote to BOTH the default main
+    # table AND the VRF's table unconditionally. For a VRF-slaved
+    # interface (`vlan10 master vrf-XXX`), the main-table copy is
+    # dead weight: no packet in the default netns will ever match
+    # `dev vlan10` route because vlan10 is enslaved. Worse, the
+    # operator sees these useless routes in `ip route` and it
+    # obscures the actual routing state. Only write the main-table
+    # copy when there's NO vrf_name — that's the untagged /
+    # legacy path where main-table IS the routing table used.
+    if not vrf_name:
+        try:
+            cmd = ["ip", ip_flag, "route", "replace", str(net)]
+            if _effective_gateway:
+                cmd.extend(["via", _effective_gateway])
+            if interface:
+                cmd.extend(["dev", interface])
+            _run_command(cmd, timeout=5, container=container)
+            logger.info(
+                "%s Added %s %s%s%s",
+                log_prefix, label, str(net),
+                f" via {_effective_gateway}" if _effective_gateway else "",
+                f" dev {interface}" if interface else "",
+            )
+        except Exception as route_exc:
+            logger.warning(
+                "%s Failed to add %s %s: %s",
+                log_prefix, label, str(net), route_exc,
+            )
 
     # VRF-scoped mirror (v0.5.218) — only when the device sits in a VRF.
     if not vrf_name:
@@ -1120,6 +1131,71 @@ def _ensure_ipv4_address(
                 "[DHCP] VRF connected-route post-check failed for "
                 "%s on %s: %s",
                 pool_network, interface, _route_exc,
+            )
+
+        # v0.5.282 (ARP-J1): verify the LOCAL-table entry landed in
+        # the VRF's local table. `ip addr add X/N dev Y` on a
+        # VRF-slaved Y SHOULD auto-install BOTH a main-table
+        # connected route AND a `local X` entry in the VRF's
+        # local table (255-in-VRF). The v0.5.275 (DHCP-J2) fix
+        # covered the main-table path. But some kernel versions
+        # (or timing races between interface enslavement and
+        # `ip addr add`) skip the local-table entry — dst-is-
+        # local check then fails for inbound frames to X and
+        # the packet is silently dropped at rx. The operator's
+        # exact symptom: switch pings anchor IP, ARP handshake
+        # completes, but ICMP echo never gets a reply because the
+        # kernel doesn't think X is one of its own addresses in
+        # the VRF's context.
+        try:
+            _vrf_name2 = _detect_iface_vrf(interface, container=container)
+            if _vrf_name2:
+                _has_local = False
+                try:
+                    _probe = _run_command(
+                        ["ip", "route", "show", "table", "local",
+                         f"local/{server_ip}", "vrf", _vrf_name2],
+                        timeout=3, container=container,
+                    )
+                    # `ip route show table local local/<ip> vrf <v>`
+                    # returns the entry line if present, empty
+                    # otherwise. Also try the equivalent selector.
+                    if not (_probe.stdout or "").strip():
+                        _probe = _run_command(
+                            ["ip", "route", "show", "table", "local",
+                             "vrf", _vrf_name2],
+                            timeout=3, container=container,
+                        )
+                    _out = (_probe.stdout or "")
+                    _has_local = (
+                        f"local {server_ip} " in _out
+                        or f"local {server_ip}\n" in _out
+                        or _out.strip().startswith(f"local {server_ip}")
+                    )
+                except Exception:
+                    _has_local = False
+                if not _has_local:
+                    logger.info(
+                        "[DHCP] VRF %s missing local %s dev %s "
+                        "(kernel auto-install didn't fire) — "
+                        "installing explicitly",
+                        _vrf_name2, server_ip, interface,
+                    )
+                    _run_command(
+                        [
+                            "ip", "route", "add", "table", "local",
+                            "local", f"{server_ip}/32",
+                            "dev", interface,
+                            "proto", "kernel", "scope", "host",
+                            "src", server_ip, "vrf", _vrf_name2,
+                        ],
+                        timeout=5, container=container,
+                    )
+        except Exception as _local_exc:
+            logger.debug(
+                "[DHCP] VRF local-table post-check failed for "
+                "%s on %s: %s",
+                server_ip, interface, _local_exc,
             )
 
         # v0.5.280 (DHCP-K1): set arp_ignore=0 + arp_announce=0 on
