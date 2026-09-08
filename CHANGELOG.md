@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.283] - 2026-09-07
+
+**Fix a self-inflicted bug in v0.5.282: sysctl sweep only set
+`all` and `default`, never touched existing interfaces.**
+
+Operator: still can't ping anchor post-v0.5.282. Ran a
+self-check on my own code and found the bug I introduced.
+
+v0.5.282 (ARP-J3) set `net.ipv4.conf.all.arp_ignore=0` and
+`net.ipv4.conf.default.arp_ignore=0`. My own comment
+acknowledged: "the Linux kernel semantics for
+`net.ipv4.conf.<iface>.<key>` is `max(all, <iface>)` — so
+setting `all=0` doesn't force per-interface to 0 if the
+per-interface value is >0."
+
+Then the code proceeded to set ONLY `all` + `default`. `default`
+is the template scope for NEWLY-CREATED interfaces — it doesn't
+touch existing ones. So for `vlan10` (which already existed with
+`arp_ignore=1` from whatever host default), the sweep did
+nothing. Effective arp_ignore for vlan10 = max(0, 1) = 1 → still
+blocks secondary-IP ARP replies → operator's exact symptom
+unchanged.
+
+**ARP-J4**: iterate every existing interface via `ip -o link
+show`, probe its current `arp_ignore` / `arp_announce` values,
+and force-set to 0 if non-zero. Logs BEFORE→AFTER value transition
+for each interface changed so ops-log grep can confirm the fix
+stuck. Loopback skipped.
+
+Runs after the existing `all`/`default` sweep so those still
+establish a baseline for new interfaces.
+
+Meta: this was a self-inflicted bug in code I shipped four
+turns ago. The comment literally described the exact bug the
+code then contained. Structural test only asserted the string
+`"net.ipv4.conf.all.arp_ignore"` was present — didn't evaluate
+whether the pattern would work against a per-interface non-zero
+starting value.
+
+Full ARP/DHCP/BGP regression: 442 passed (adds 4 tests for
+the per-interface sweep).
+
+Ship recommendation: **immediate upgrade** if you're on
+v0.5.280-282 and haven't seen the operator's specific fix.
+This one actually forces per-interface `arp_ignore=0`.
+
 ## [0.5.282] - 2026-09-07
 
 **Anchor unreachable-from-switch: three real root causes found by

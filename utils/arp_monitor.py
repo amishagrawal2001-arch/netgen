@@ -233,6 +233,7 @@ class ARPStatusMonitor:
         override still runs and force-sets specific interfaces to 0.
         """
         import subprocess as _subprocess
+        # First: baseline the `all` and `default` scopes.
         _pairs = [
             ("net.ipv4.conf.all.arp_ignore", "0"),
             ("net.ipv4.conf.all.arp_announce", "0"),
@@ -256,6 +257,76 @@ class ARPStatusMonitor:
                 logger.debug(
                     f"[ARP MONITOR] sysctl {_key}={_val} skipped: {_exc}"
                 )
+
+        # v0.5.283 (ARP-J4): the `all` baseline above is INSUFFICIENT
+        # for existing interfaces. The kernel computes the effective
+        # arp_ignore for an interface as `max(all, <iface>)` — so
+        # setting `all=0` while a per-interface value is >0 leaves
+        # the effective value at >0 (still blocking secondary-IP
+        # replies). My v0.5.282 comment even called this out but I
+        # only set `all` + `default`, and `default` doesn't touch
+        # existing interfaces (it's the template for new ones).
+        # This ship iterates every existing interface and force-
+        # sets per-interface arp_ignore/arp_announce to 0. That's
+        # what actually makes the effective value 0.
+        try:
+            _link = _subprocess.run(
+                ["ip", "-o", "link", "show"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if _link.returncode != 0:
+                logger.debug(
+                    f"[ARP MONITOR] `ip link show` returned "
+                    f"{_link.returncode}; per-interface sysctl "
+                    f"sweep skipped"
+                )
+                return
+            _ifaces: list = []
+            for _line in (_link.stdout or "").splitlines():
+                # Line shape: "<idx>: <name>: <BROADCAST,...>"
+                if ":" not in _line:
+                    continue
+                _parts = _line.split(":", 2)
+                if len(_parts) < 2:
+                    continue
+                _name = _parts[1].strip().split("@", 1)[0]
+                if not _name or _name == "lo":
+                    continue
+                _ifaces.append(_name)
+            _changed = 0
+            for _iface in _ifaces:
+                for _key in ("arp_ignore", "arp_announce"):
+                    _sysctl_key = f"net.ipv4.conf.{_iface}.{_key}"
+                    try:
+                        _cur = _subprocess.run(
+                            ["sysctl", "-n", _sysctl_key],
+                            capture_output=True, text=True, timeout=2,
+                        )
+                        _cur_val = (_cur.stdout or "").strip()
+                        if _cur_val == "0":
+                            continue
+                        _set = _subprocess.run(
+                            ["sysctl", "-w", f"{_sysctl_key}=0"],
+                            capture_output=True, text=True, timeout=2,
+                        )
+                        if _set.returncode == 0:
+                            logger.info(
+                                f"[ARP MONITOR] sysctl {_sysctl_key} "
+                                f"{_cur_val}→0"
+                            )
+                            _changed += 1
+                    except Exception:
+                        pass
+            logger.info(
+                f"[ARP MONITOR] per-interface sysctl sweep: "
+                f"{len(_ifaces)} iface(s), {_changed} value(s) "
+                f"changed"
+            )
+        except Exception as _exc:
+            logger.debug(
+                f"[ARP MONITOR] per-interface sysctl sweep failed: "
+                f"{_exc}"
+            )
 
     def _monitor_loop(self):
         """Main monitoring loop."""
