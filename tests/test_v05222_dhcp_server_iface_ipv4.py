@@ -55,9 +55,16 @@ os.environ.setdefault(
 # Helper: pick an IPv4 for the interface (runtime)
 # ─────────────────────────────────────────────────────────────────────
 
-def test_ensure_ipv4_prefers_gateway_when_in_pool():
-    """If operator provided gateway and it fits in the pool
-    subnet, use it — that's the dnsmasq default GW anyway."""
+def test_ensure_ipv4_skips_gateway_when_in_pool():
+    """v0.5.287 (audit anchor-gateway-collision) supersedes the
+    v0.5.222 semantics. If the operator's gateway falls inside the
+    pool subnet, do NOT anchor server_ip=gateway — the gateway is
+    by definition external (a router/switch's IP) and claiming it
+    made netgen own the switch's IP on its own NIC, which routed
+    ARP replies for sibling anchors out the wrong interface
+    UNTAGGED (srv06 2026-09-07 lab break, took 16+ ships to
+    diagnose). New behavior: skip the gateway and pick the next
+    usable host (.2 when gateway=.1)."""
     from utils import dhcp as m
     mock_run = MagicMock()
     mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
@@ -67,9 +74,9 @@ def test_ensure_ipv4_prefers_gateway_when_in_pool():
                 "vlan200", "192.168.30.10", "192.168.30.200",
                 gateway="192.168.30.1", container=None,
             )
-    assert picked == "192.168.30.1", (
-        "did not pick the operator-provided gateway even though it "
-        "falls in the pool subnet"
+    assert picked == "192.168.30.2", (
+        f"expected server_ip=.2 (gateway=.1 skipped as external), "
+        f"got {picked!r} — v0.5.287 regression"
     )
 
 

@@ -2,6 +2,118 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.287] - 2026-09-07
+
+**Root cause finally identified for the switch-can't-ping-anchor
+saga. It was never sysctl, never the VRF local table, never the
+gratuitous-ARP thread. It was `server_ip == gateway`: netgen was
+claiming the switch's own IP on its parent NIC.**
+
+### The 17-ship saga, resolved
+
+The operator ran `sudo ip addr del 172.16.30.1/24 dev ens2f0np0`
+on srv06 — removed the switch's own IP (172.16.30.1) from netgen's
+untagged parent NIC. Switch's ping to 172.16.30.2 (the DHCP anchor
+on vlan10, a VRF-slaved subif) immediately started replying. All
+16 prior hypotheses (v0.5.275/277/278/280/282/283/284/286) were
+looking at the wrong part of the ARP path.
+
+### What was actually happening
+
+Pre-fix `_ensure_ipv4_address` (line 1006–1011) explicitly set
+`server_ip = gateway` when the operator's declared gateway landed
+inside the pool subnet. For srv06's lab layout — pool
+`172.16.30.10-.200`, gateway `172.16.30.1` (the switch's irb.10) —
+this made netgen anchor `172.16.30.1/24` directly on its NIC.
+
+That anchor's connected route `172.16.30.0/24 dev ens2f0np0` sat
+in netgen's default VRF. When the switch later ARP-requested
+`172.16.30.2` on vlan10 (a sibling anchor in vrf-b7a16713f24),
+netgen's kernel:
+1. Received the tagged ARP correctly on vlan10 (tcpdump confirmed).
+2. Generated the correct ARP reply.
+3. Consulted the routing table to pick the outbound interface —
+   hit the default-VRF connected route via ens2f0np0.
+4. Sent the reply **UNTAGGED** out ens2f0np0.
+5. Switch's trunk access-mode dropped the untagged frame as garbage.
+
+Netgen saw itself replying. The switch saw silence. Every ARP-plane
+sysctl was set correctly. The local-table entry (which v0.5.282/286
+tried to install) was completely irrelevant — the kernel WAS
+happy to reply, it just sent the reply out the wrong door.
+
+### Retraction of v0.5.286 (ARP-J6)
+
+v0.5.286 fixed a real bug (the `table local` + `vrf` iproute2
+syntax collision was genuinely broken), but the CHANGELOG for that
+ship claimed it would fix the operator's ping-anchor issue. It
+did not. The ARP-J6 code stays in — it's still a valid safety net
+for future kernels where the auto-install truly misses — but the
+theory behind it was wrong.
+
+### Fix A — `_ensure_ipv4_address` never picks `server_ip == gateway`
+
+Refactored the picker at `utils/dhcp.py:1004–1103`. Iterate
+`pool_network.hosts()` and skip the gateway; new behavior:
+
+- gateway `.1` inside pool → server_ip `.2` (was `.1`)
+- gateway `.2` inside pool → server_ip `.1`
+- gateway outside pool → server_ip `.1` (unchanged)
+- no gateway → server_ip `.1` (unchanged)
+- /31 pool with gateway = one endpoint → the other endpoint
+- /32 pool whose sole host IS the gateway → `None` + log
+
+Mirrors the v0.5.245 relay-mode guard for the non-relay path. The
+gateway is by definition external (the DHCP-offered next-hop for
+clients); netgen must never claim it.
+
+### Fix B — cleanup on device stop sweeps the parent NIC
+
+`stop_dhcp_server` at `utils/dhcp.py:3617–3654` now also runs
+`_remove_matching_ipv4_anchors` against the subif's parent
+(via new `_iface_parent` helper). Anchors that drifted onto the
+parent — from pre-v0.5.287 devices with `server_ip == gateway`, or
+from an older no-VLAN device on the same NIC — get cleaned up on
+the first Stop after upgrade. The intersection gate in the
+existing sweeper keeps it safe: only IPs that match a device's own
+anchor candidates get deleted; unrelated management IPs on the
+parent stay put.
+
+### Fix C — startup drift-detect (WARN only, never delete)
+
+`arp_monitor._scan_parent_nic_drift` runs at monitor start after
+the v0.5.284 anchor replay. For each Running DHCP-server device,
+it enumerates the parent NIC's IPv4 addresses and warns if any
+match the device's anchor candidate set. The remediation the log
+line names: stop→start the device (triggers Fix B), or manual
+`sudo ip addr del`. It never deletes on its own — deleting IPs is
+destructive and the operator may have configured one intentionally.
+
+### Fix D — tests
+
+`tests/test_v05287_anchor_gateway_collision.py` — 20 tests
+covering: Fix A across 7 pool shapes (including /31, /32, gateway
+inside/outside/absent), Fix B `_iface_parent` behavioral +
+`stop_dhcp_server` wiring, Fix C source-level lock-ins including
+a delete-safety invariant, and a v0.5.245 relay-mode regression
+guard. Updated `test_v05222_dhcp_server_iface_ipv4.py`'s
+`test_ensure_ipv4_prefers_gateway_when_in_pool` to reflect the
+new v0.5.287 semantics.
+
+Full regression: previously-failing tests (8 in the DHCP/ARP suite,
+all pre-dating this ship, unrelated: v0.5.254 short-circuit test
+drift, v0.5.282 tests validating patterns v0.5.286 removed) unchanged.
+New test count: +20.
+
+### Verification pending
+
+The operator's `ip addr del` manually removed the stale anchor
+and proved the theory on srv06. This ship makes the fix permanent
+via Fix A (prevents creation) + Fix B (removes on next Stop) +
+Fix C (warns loudly on startup if drift exists). Not yet re-verified
+on srv06 with the shipped code — operator to confirm on next
+netgen-server upgrade + DHCP-device stop→start cycle.
+
 ## [0.5.286] - 2026-09-07
 
 **Fix broken syntax in v0.5.282 (ARP-J1) local-table install:

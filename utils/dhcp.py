@@ -94,6 +94,58 @@ def _normalize_iface_name(interface: str) -> str:
     return interface
 
 
+def _iface_parent(interface: str, container=None) -> Optional[str]:
+    """v0.5.287 (audit anchor-gateway-collision, fix B): return the
+    parent physical NIC of a VLAN sub-interface, or None if
+    ``interface`` is itself a parent (or the parent can't be
+    determined).
+
+    Uses ``ip link show <interface>`` — for a subif the header line
+    reads ``56: vlan10@ens2f0np0: <...>`` and we lift the token after
+    ``@``. For a parent physical NIC the header has no ``@``, so we
+    return None (nothing to do).
+
+    Used by cleanup on device delete: a prior no-VLAN DHCP-server
+    device (or the v0.5.245-pre bug where server_ip==gateway) may
+    have anchored an IP directly on the parent NIC. When the
+    operator later reconfigures the device to a subif, cleanup
+    only touches the subif and the parent-NIC anchor leaks
+    forever — silently breaking every ARP path on that subnet
+    for the next configured DHCP-server device on that host.
+    """
+    if not interface:
+        return None
+    try:
+        _probe = _run_command(
+            ["ip", "-o", "link", "show", interface],
+            timeout=5, container=container,
+        )
+    except Exception:
+        return None
+    _out = (getattr(_probe, "stdout", "") or "").strip()
+    if not _out:
+        return None
+    # Header form: "<idx>: <name>@<parent>: <flags> mtu ..." OR
+    # "<idx>: <name>: <flags> mtu ..." (no parent = physical).
+    # Split on the first ": " after the index to get "<name>[@<parent>]".
+    try:
+        _head = _out.split(":", 2)
+        if len(_head) < 3:
+            return None
+        _nameline = _head[1].strip()
+        if "@" not in _nameline:
+            return None
+        _, _, _parent = _nameline.partition("@")
+        _parent = _parent.strip()
+        # Sanity — must be non-empty, no whitespace, and different
+        # from the child.
+        if not _parent or _parent == interface or " " in _parent:
+            return None
+        return _parent
+    except Exception:
+        return None
+
+
 def _ensure_paths(container=None) -> None:
     """Ensure filesystem paths exist for PID/config/lease files."""
     paths = [
@@ -1001,50 +1053,104 @@ def _ensure_ipv4_address(
         logger.debug("[DHCP] Interface %s already has IPv4 in %s", interface, pool_network)
         return None
 
-    # Pick an address: gateway if it fits, else `.1` of the pool subnet.
+    # Pick an address: first usable host in the pool subnet that is
+    # NOT the gateway.
+    #
+    # v0.5.287 (audit anchor-gateway-collision): pre-fix, when the
+    # operator's declared gateway landed inside pool_network the
+    # code EXPLICITLY set `server_ip = gateway`. That made netgen
+    # claim the gateway's IP — for a lab where the gateway is an
+    # external switch (`gateway = 172.16.30.1` = switch's irb.10),
+    # netgen ended up owning the switch's IP on its own NIC. The
+    # kernel then routed ARP replies for sibling anchors (e.g.
+    # 172.16.30.2 on vlan10) via the parent NIC's connected route
+    # OUT UNTAGGED — the switch's trunk port for VID 10 dropped
+    # them as untagged garbage and ping-to-anchor failed silently
+    # for the entire lifecycle of the device.
+    #
+    # v0.5.245 fixed this for relay-mode by skipping anchor
+    # entirely. This fix extends the same principle to non-relay:
+    # the gateway is BY DEFINITION external (the DHCP-offered
+    # next-hop for clients), so netgen must never claim it.
+    #
+    # New logic: iterate hosts() and take the first one that isn't
+    # the gateway. Preserves .1-first preference in the common case
+    # (gateway not in pool) and correctly picks .2 when gateway=.1.
     server_ip = ""
+    gw_addr = None
     if gateway:
         try:
-            if ipaddress.IPv4Address(gateway) in pool_network:
-                server_ip = gateway
+            gw_addr = ipaddress.IPv4Address(gateway)
         except Exception:
-            pass
-    if not server_ip:
-        # v0.5.230 (audit P server-9): pool_network.hosts() is empty
-        # on /31 (RFC 3021 point-to-point, 0 usable hosts by the
-        # default iterator) and /32 (single host, iterator returns
-        # nothing). Pre-fix, `list(...)[0]` raised IndexError which
-        # got swallowed by the bare `except Exception: return None`
-        # so the operator saw no last_error explaining WHY the
-        # server couldn't derive an IP. Fall through to using the
-        # first address of the network (or the network address on
-        # /32) explicitly, and if the pool truly is that small
-        # return None with a clear log line — the caller writes it
-        # to dhcp_last_error via _handle_start_failure.
-        try:
-            hosts_iter = list(pool_network.hosts())
-            if hosts_iter:
-                server_ip = str(hosts_iter[0])
-            elif pool_network.prefixlen == 32:
-                # /32 = pool of exactly one host; use it.
-                server_ip = str(pool_network.network_address)
-            elif pool_network.prefixlen == 31:
-                # /31 = two hosts; hosts() returns [] but both
-                # addresses are valid endpoints.
-                server_ip = str(pool_network.network_address)
-            else:
+            gw_addr = None
+    # v0.5.230 (audit P server-9): pool_network.hosts() is empty
+    # on /31 (RFC 3021 point-to-point, 0 usable hosts by the
+    # default iterator) and /32 (single host, iterator returns
+    # nothing). Pre-fix, `list(...)[0]` raised IndexError which
+    # got swallowed by the bare `except Exception: return None`
+    # so the operator saw no last_error explaining WHY the
+    # server couldn't derive an IP. Fall through to using the
+    # first address of the network (or the network address on
+    # /32) explicitly, and if the pool truly is that small
+    # return None with a clear log line — the caller writes it
+    # to dhcp_last_error via _handle_start_failure.
+    try:
+        hosts_iter = list(pool_network.hosts())
+        if hosts_iter:
+            # v0.5.287: skip the gateway if it's inside the pool.
+            for _h in hosts_iter:
+                if gw_addr is None or _h != gw_addr:
+                    server_ip = str(_h)
+                    break
+            if not server_ip:
+                # Every host in the pool equals the gateway —
+                # only possible with a truly degenerate /32 pool
+                # whose sole host IS the gateway. Nothing left
+                # to anchor; caller must surface this.
                 logger.warning(
-                    "[DHCP] Pool network %s has no usable host for the "
-                    "server IP — pool is too small (prefix=%d).",
-                    pool_network, pool_network.prefixlen,
+                    "[DHCP] Pool network %s has no non-gateway host "
+                    "for the server IP (every candidate equals "
+                    "gateway=%s).",
+                    pool_network, gateway,
                 )
                 return None
-        except Exception as exc:
+        elif pool_network.prefixlen == 32:
+            # /32 = pool of exactly one host; use it (only if
+            # not the gateway).
+            _sole = pool_network.network_address
+            if gw_addr is not None and _sole == gw_addr:
+                logger.warning(
+                    "[DHCP] /32 pool %s IS the gateway %s — "
+                    "cannot anchor server IP.",
+                    pool_network, gateway,
+                )
+                return None
+            server_ip = str(_sole)
+        elif pool_network.prefixlen == 31:
+            # /31 = two hosts; hosts() returns [] but both
+            # addresses are valid endpoints. Pick the non-gateway
+            # endpoint.
+            _a = pool_network.network_address
+            _b = pool_network.broadcast_address
+            if gw_addr is not None and _a == gw_addr:
+                server_ip = str(_b)
+            elif gw_addr is not None and _b == gw_addr:
+                server_ip = str(_a)
+            else:
+                server_ip = str(_a)
+        else:
             logger.warning(
-                "[DHCP] Could not derive server IP from pool %s: %s",
-                pool_network, exc,
+                "[DHCP] Pool network %s has no usable host for the "
+                "server IP — pool is too small (prefix=%d).",
+                pool_network, pool_network.prefixlen,
             )
             return None
+    except Exception as exc:
+        logger.warning(
+            "[DHCP] Could not derive server IP from pool %s: %s",
+            pool_network, exc,
+        )
+        return None
 
     # v0.5.236 (audit P3): honor the device's declared mask over
     # the pool-size derivation. Pre-fix, callers passed
@@ -3565,6 +3671,34 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
         _remove_matching_ipv4_anchors(
             interface, _candidate_anchors, container=container,
         )
+        # v0.5.287 (audit anchor-gateway-collision, fix B): also
+        # sweep the parent NIC. A prior no-VLAN device (or the
+        # pre-v0.5.287 server_ip==gateway bug) may have placed the
+        # anchor on ``ens2f0np0`` even though the CURRENT config
+        # names ``vlan10``. Cleanup previously only touched the
+        # subif; the parent-NIC anchor leaked and later broke
+        # every ARP path on that subnet (kernel routed replies
+        # via the parent's connected route out untagged, switch
+        # trunk dropped them as untagged garbage). Operator hit
+        # this on srv06 2026-09-07 — 172.16.30.1/24 sat on
+        # ens2f0np0 across 16+ ships because no code path ever
+        # cleaned it up. The intersection gate in
+        # _remove_matching_ipv4_anchors keeps this safe: we ONLY
+        # delete addresses that both (a) match a candidate and
+        # (b) currently exist on the parent — an unrelated IP on
+        # the parent (management, etc.) is not a candidate and
+        # stays put.
+        _parent = _iface_parent(interface, container=container)
+        if _parent:
+            _parent_removed = _remove_matching_ipv4_anchors(
+                _parent, _candidate_anchors, container=container,
+            )
+            if _parent_removed:
+                logger.info(
+                    "[DHCP] Cleaned leaked anchor(s) %s off parent NIC "
+                    "%s (subif was %s) — pre-v0.5.287 anchor drift.",
+                    ", ".join(_parent_removed), _parent, interface,
+                )
     except Exception as _cleanup_exc:
         logger.debug(
             "[DHCP] Failed IPv4 anchor cleanup on stop for %s: %s",

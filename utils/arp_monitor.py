@@ -146,6 +146,25 @@ class ARPStatusMonitor:
         except Exception as _exc:
             logger.warning(f"[ARP MONITOR] DHCP anchor replay raised: {_exc}")
 
+        # v0.5.287 (audit anchor-gateway-collision, fix C): scan
+        # parent NICs of active DHCP-server subifs for orphaned
+        # anchor IPs. If an anchor drifted onto the parent (from a
+        # prior no-VLAN device or the pre-v0.5.287 server_ip==
+        # gateway bug), the kernel installs a connected route for
+        # its /24 in the default VRF via the parent — and ARP
+        # replies for sibling anchors on the vlan subif get routed
+        # out UNTAGGED into the switch's trunk (which drops them
+        # as untagged garbage). WARN only, never auto-delete:
+        # deleting IPs is destructive and an operator may have
+        # placed one intentionally. Stop→start on the DHCP device
+        # will trigger fix B cleanup and remove the orphan.
+        try:
+            self._scan_parent_nic_drift()
+        except Exception as _exc:
+            logger.warning(
+                f"[ARP MONITOR] parent-NIC drift scan raised: {_exc}"
+            )
+
         self.is_running = True
         self.stop_event.clear()
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -481,6 +500,128 @@ class ARPStatusMonitor:
             f"{_failed} failed (of {len(_dhcp_servers)} DHCP-server "
             f"devices)"
         )
+
+    def _scan_parent_nic_drift(self) -> None:
+        """v0.5.287 (audit anchor-gateway-collision, fix C): scan
+        parent physical NICs of active DHCP-server subifs for
+        orphaned anchor IPs.
+
+        The failure mode this catches: a pre-v0.5.287 device (or
+        the deleted-but-never-cleaned parent-NIC anchor from Fix B
+        pre-history) left an IP on the parent NIC. The kernel then
+        installs a connected route for its /24 in the default VRF
+        via that parent. When the switch pings a sibling anchor
+        (say 172.16.30.2 on vlan10), netgen's kernel generates a
+        correct ARP reply but consults the routing table for the
+        outbound interface, hits the default-VRF connected route
+        via the parent, and sends the reply UNTAGGED. Switch trunk
+        drops it. Operator sees 100% packet loss with no netgen-
+        side error. Took 16+ ships to diagnose on srv06 2026-09-07.
+
+        This method WARNS ONLY. It does not delete — deleting IPs
+        is destructive and the operator may have configured one
+        intentionally (management, out-of-band, etc.). The
+        operator's fix is stop→start on the affected DHCP device,
+        which triggers Fix B's parent-NIC cleanup.
+
+        For each active DHCP-server device: derive its expected
+        anchor candidates via `_collect_ipv4_anchor_candidates`,
+        derive the parent of its subif, list the parent's IPv4
+        addresses, and warn on any IP that matches a candidate.
+        Unrelated IPs on the parent (management, etc.) are not
+        candidates and don't trigger the warning.
+        """
+        try:
+            devices = self.device_db.get_all_devices()
+        except Exception as _exc:
+            logger.warning(
+                f"[ARP MONITOR] drift scan: get_all_devices failed: "
+                f"{_exc}"
+            )
+            return
+        _dhcp_servers = [
+            d for d in (devices or [])
+            if (d.get("status") == "Running"
+                and str(d.get("dhcp_mode") or "").lower() == "server")
+        ]
+        if not _dhcp_servers:
+            logger.debug(
+                "[ARP MONITOR] drift scan: no Running DHCP-server "
+                "devices; nothing to scan"
+            )
+            return
+        try:
+            from utils.dhcp import (
+                _collect_ipv4_anchor_candidates,
+                _iface_ipv4_addresses,
+                _iface_parent,
+            )
+        except Exception as _imp_exc:
+            logger.warning(
+                f"[ARP MONITOR] drift scan: cannot import DHCP helpers: "
+                f"{_imp_exc}"
+            )
+            return
+        _warned_ifaces: set = set()
+        for _dev in _dhcp_servers:
+            _dev_id = _dev.get("device_id") or "?"
+            _iface = (
+                _dev.get("interface")
+                or _dev.get("server_interface")
+                or ""
+            )
+            _vlan = str(_dev.get("vlan") or "0").strip()
+            if _vlan and _vlan != "0":
+                _iface = f"vlan{_vlan}"
+            _iface = (_iface or "").split("@", 1)[0]
+            if not _iface:
+                continue
+            _parent = _iface_parent(_iface, container=None)
+            if not _parent:
+                # Device is configured directly on a parent NIC —
+                # nothing to compare against a sibling subif. Skip.
+                continue
+            if _parent in _warned_ifaces:
+                # Already warned about this parent for another
+                # device on the same NIC — don't double-warn.
+                continue
+            _dhcp_cfg = _dev.get("dhcp_config")
+            if isinstance(_dhcp_cfg, str):
+                try:
+                    import json as _json
+                    _dhcp_cfg = _json.loads(_dhcp_cfg)
+                except Exception:
+                    _dhcp_cfg = {}
+            if not isinstance(_dhcp_cfg, dict):
+                _dhcp_cfg = {}
+            try:
+                _candidates = _collect_ipv4_anchor_candidates(_dhcp_cfg)
+            except Exception:
+                _candidates = set()
+            if not _candidates:
+                continue
+            try:
+                _parent_ips = _iface_ipv4_addresses(_parent, container=None)
+            except Exception:
+                _parent_ips = []
+            _candidate_ips = {ip for ip, _pfx in _candidates}
+            _orphans = [
+                (ip, pfx) for ip, pfx in _parent_ips
+                if ip in _candidate_ips
+            ]
+            if _orphans:
+                _orphan_str = ", ".join(f"{ip}/{pfx}" for ip, pfx in _orphans)
+                logger.warning(
+                    f"[ARP MONITOR] DRIFT: parent NIC {_parent} carries "
+                    f"anchor IP(s) that belong on subif {_iface} "
+                    f"(device {_dev_id}): {_orphan_str}. This routes "
+                    f"ARP replies for sibling anchors UNTAGGED through "
+                    f"the parent, and the switch trunk drops them. "
+                    f"Fix: stop→start the DHCP-server device (triggers "
+                    f"v0.5.287 fix B cleanup). Manual: "
+                    f"'sudo ip addr del <ip>/<pfx> dev {_parent}'."
+                )
+                _warned_ifaces.add(_parent)
 
     def _monitor_loop(self):
         """Main monitoring loop."""
