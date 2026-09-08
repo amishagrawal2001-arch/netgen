@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.286] - 2026-09-07
+
+**Fix broken syntax in v0.5.282 (ARP-J1) local-table install:
+combined `table local` AND `vrf <name>` — iproute2 rejects
+these as mutually exclusive selectors, silently. Also logs the
+outcome so we can see if this ever runs.**
+
+Operator: even after creating a fresh DHCP-server device (which
+triggers the full `_ensure_ipv4_address` chain), ping to
+anchor IP still fails. That means ALL my per-anchor fixes ran
+on the NEW device — including v0.5.282 ARP-J1 which should have
+verified/installed the VRF local-table entry. Yet ping fails.
+
+Re-read my v0.5.282 code. Found broken syntax:
+
+```python
+_run_command([
+    "ip", "route", "add", "table", "local",   # ← selector 1
+    "local", f"{server_ip}/32",
+    "dev", interface,
+    "proto", "kernel", "scope", "host",
+    "src", server_ip, "vrf", _vrf_name2,      # ← selector 2 (CONFLICTS)
+])
+```
+
+iproute2 rejects `table` + `vrf` together with:
+`Error: either "table" or "vrf" can be specified, not both`.
+
+Since I didn't check the return code, the local-table install
+has been a **no-op the entire time**. My ARP-J1 "check + install"
+was silently doing nothing. If the kernel auto-install skipped
+the local-table entry (which is my whole hypothesis for the
+"switch can't ping anchor" symptom), my fallback never fired.
+
+**Sixteen ships on this path. All of them broken because of a
+one-line syntax error in v0.5.282.**
+
+**ARP-J6**: Corrected syntax.
+- Probe: `ip route show table local` (global local table 255 —
+  VRF-slaved interface local entries land there on modern
+  kernels), grep for `local <ip> dev <iface> `.
+- Install: `ip route add local <ip>/32 dev <iface> proto kernel
+  scope host src <ip>` — kernel routes to the correct table via
+  the `dev` parameter, no explicit `table` or `vrf` selector
+  needed.
+- Log the outcome: success / "File exists" (kernel already
+  installed it) / failure with stderr, so ops-log grep confirms
+  the operation actually did something this time.
+
+If the operator's actual failure mode was the missing local
+entry, this ship will fix it on next DHCP-device restart. If
+NOT — i.e., ping still fails after v0.5.286 anchor replay — then
+the local-table entry was never the problem, and I need actual
+tcpdump data from the operator to distinguish "netgen kernel
+dropped the frame" from "frame never arrived at netgen."
+
+Full ARP/DHCP/BGP regression: 448 passed.
+
 ## [0.5.285] - 2026-09-07
 
 **Client-side fix: server LED stuck RED forever after a

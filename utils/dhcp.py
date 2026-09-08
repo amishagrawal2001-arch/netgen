@@ -1147,53 +1147,83 @@ def _ensure_ipv4_address(
         # completes, but ICMP echo never gets a reply because the
         # kernel doesn't think X is one of its own addresses in
         # the VRF's context.
+        # v0.5.286 (ARP-J6): fix broken v0.5.282 (ARP-J1) syntax.
+        # The previous probe used `local/<ip>` as a route selector
+        # which iproute2 doesn't understand → empty result → fell
+        # through to the "install" branch. The install then used
+        # BOTH `table local` AND `vrf <name>` which iproute2 rejects
+        # as mutually exclusive selectors → silent error → local
+        # entry never installed. So my whole ARP-J1 has been a no-op
+        # since v0.5.282. Sixteen ships on the wrong path.
+        #
+        # Corrected: probe via `ip route show table local` (global
+        # local table 255 — VRF-slaved iface local entries actually
+        # land here on modern kernels), grep for `local <ip> dev
+        # <iface>`. Install via `ip route add local <ip>/32 dev
+        # <iface> proto kernel scope host src <ip>` (no `table` or
+        # `vrf` — kernel routes to the correct table via the dev
+        # parameter). Uses check-then-add pattern; kernel's own
+        # EEXIST would show up in stderr but we swallow via the
+        # broader try/except so add-when-already-present is fine.
         try:
-            _vrf_name2 = _detect_iface_vrf(interface, container=container)
-            if _vrf_name2:
+            _has_local = False
+            try:
+                _probe = _run_command(
+                    ["ip", "route", "show", "table", "local"],
+                    timeout=3, container=container,
+                )
+                _out = _probe.stdout or ""
+                # Look for `local <ip> dev <iface> ` — the space
+                # after iface avoids matching `vlan100 ` prefix as
+                # `vlan10 `.
+                _needle = f"local {server_ip} dev {interface} "
+                _has_local = (_needle in _out
+                              or _out.rstrip().endswith(f"local {server_ip} dev {interface}"))
+            except Exception:
                 _has_local = False
-                try:
-                    _probe = _run_command(
-                        ["ip", "route", "show", "table", "local",
-                         f"local/{server_ip}", "vrf", _vrf_name2],
-                        timeout=3, container=container,
-                    )
-                    # `ip route show table local local/<ip> vrf <v>`
-                    # returns the entry line if present, empty
-                    # otherwise. Also try the equivalent selector.
-                    if not (_probe.stdout or "").strip():
-                        _probe = _run_command(
-                            ["ip", "route", "show", "table", "local",
-                             "vrf", _vrf_name2],
-                            timeout=3, container=container,
-                        )
-                    _out = (_probe.stdout or "")
-                    _has_local = (
-                        f"local {server_ip} " in _out
-                        or f"local {server_ip}\n" in _out
-                        or _out.strip().startswith(f"local {server_ip}")
-                    )
-                except Exception:
-                    _has_local = False
-                if not _has_local:
+            if not _has_local:
+                logger.info(
+                    "[DHCP] table-local missing local %s dev %s "
+                    "(kernel auto-install didn't fire) — "
+                    "installing explicitly",
+                    server_ip, interface,
+                )
+                _add = _run_command(
+                    [
+                        "ip", "route", "add",
+                        "local", f"{server_ip}/32",
+                        "dev", interface,
+                        "proto", "kernel", "scope", "host",
+                        "src", server_ip,
+                    ],
+                    timeout=5, container=container,
+                )
+                # Log the outcome so operators can grep for
+                # success/EEXIST/permission-denied.
+                if _add.returncode == 0:
                     logger.info(
-                        "[DHCP] VRF %s missing local %s dev %s "
-                        "(kernel auto-install didn't fire) — "
-                        "installing explicitly",
-                        _vrf_name2, server_ip, interface,
+                        "[DHCP] table-local: added local %s dev %s",
+                        server_ip, interface,
                     )
-                    _run_command(
-                        [
-                            "ip", "route", "add", "table", "local",
-                            "local", f"{server_ip}/32",
-                            "dev", interface,
-                            "proto", "kernel", "scope", "host",
-                            "src", server_ip, "vrf", _vrf_name2,
-                        ],
-                        timeout=5, container=container,
-                    )
+                else:
+                    _err = (_add.stderr or "").strip()
+                    if "File exists" in _err or "RTNETLINK answers: File exists" in _err:
+                        # Kernel auto-install DID fire; probe was
+                        # wrong. Not a real failure.
+                        logger.debug(
+                            "[DHCP] table-local: local %s dev %s "
+                            "already present (probe missed it)",
+                            server_ip, interface,
+                        )
+                    else:
+                        logger.warning(
+                            "[DHCP] table-local install failed for "
+                            "local %s dev %s: %s (rc=%s)",
+                            server_ip, interface, _err, _add.returncode,
+                        )
         except Exception as _local_exc:
             logger.debug(
-                "[DHCP] VRF local-table post-check failed for "
+                "[DHCP] table-local post-check failed for "
                 "%s on %s: %s",
                 server_ip, interface, _local_exc,
             )
