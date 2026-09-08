@@ -128,6 +128,24 @@ class ARPStatusMonitor:
         except Exception as _exc:
             logger.warning(f"[ARP MONITOR] sysctl sweep raised: {_exc}")
 
+        # v0.5.284 (ARP-J5): replay `_ensure_ipv4_address` for every
+        # existing Running DHCP-server device. The whole cluster of
+        # anchor-side fixes — v0.5.275 (DHCP-J2 VRF connected-route
+        # install), v0.5.280 (DHCP-K1 per-anchor sysctl + K2 anchor
+        # registration for periodic re-arp), v0.5.282 (ARP-J1 VRF
+        # local-table install) — lives inside `_ensure_ipv4_address`.
+        # That helper only runs when a DHCP-server device is
+        # (re)started. If the operator upgrades netgen-server but
+        # never touches the DHCP device from the UI, NONE of those
+        # fixes run on their existing anchors. Replay at monitor
+        # start so an operator gets every fix on next
+        # `systemctl restart netgen-server` without needing to also
+        # remove-and-re-add the DHCP device.
+        try:
+            self._replay_dhcp_anchor_setup()
+        except Exception as _exc:
+            logger.warning(f"[ARP MONITOR] DHCP anchor replay raised: {_exc}")
+
         self.is_running = True
         self.stop_event.clear()
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -327,6 +345,142 @@ class ARPStatusMonitor:
                 f"[ARP MONITOR] per-interface sysctl sweep failed: "
                 f"{_exc}"
             )
+
+    def _replay_dhcp_anchor_setup(self) -> None:
+        """v0.5.284 (ARP-J5): iterate every Running DHCP-server
+        device and re-invoke `_ensure_ipv4_address` for its anchor
+        so the whole cluster of v0.5.275/280/282 fixes fires on
+        existing deployments without needing to restart the DHCP
+        device.
+
+        Idempotent by design — `_ensure_ipv4_address` checks
+        whether the IP is already on the interface and short-
+        circuits the address-add ("File exists"), but the
+        post-add plumbing (VRF connected-route probe, VRF local-
+        table probe, per-anchor sysctl, gratuitous ARP, anchor
+        registration for periodic re-arp) all runs on both the
+        fresh-add AND already-assigned paths. So this replay
+        does the RIGHT thing for a pre-existing anchor: leaves
+        the address alone, but forces every guard to fire.
+
+        Best-effort. Failures logged at warning (rooted commands
+        may fail in rootless dev environments) but do NOT prevent
+        the monitor from starting.
+        """
+        try:
+            devices = self.device_db.get_all_devices()
+        except Exception as _exc:
+            logger.warning(
+                f"[ARP MONITOR] anchor replay: get_all_devices "
+                f"failed: {_exc}"
+            )
+            return
+        _dhcp_servers = [
+            d for d in (devices or [])
+            if (d.get("status") == "Running"
+                and str(d.get("dhcp_mode") or "").lower() == "server")
+        ]
+        if not _dhcp_servers:
+            logger.info(
+                "[ARP MONITOR] anchor replay: no Running DHCP-server "
+                "devices; nothing to replay"
+            )
+            return
+        try:
+            from utils.dhcp import _ensure_ipv4_address
+        except Exception as _imp_exc:
+            logger.warning(
+                f"[ARP MONITOR] anchor replay: cannot import "
+                f"_ensure_ipv4_address: {_imp_exc}"
+            )
+            return
+        # Normalize the display-form iface (`vlanN@ensXfY`) → `vlanN`
+        # the same way `_normalize_iface_name` does. Avoid importing
+        # utils.dhcp._normalize_iface_name here to keep the coupling
+        # narrow; the "@" split is stable and the only normalization
+        # we need.
+        def _norm(_iface: str) -> str:
+            return (_iface or "").split("@", 1)[0]
+        _replayed = 0
+        _failed = 0
+        for _dev in _dhcp_servers:
+            _dev_id = _dev.get("device_id") or "?"
+            _iface = (
+                _dev.get("interface")
+                or _dev.get("server_interface")
+                or ""
+            )
+            _vlan = str(_dev.get("vlan") or "0").strip()
+            # Prefer the vlan sub-interface when a VLAN is set
+            # (mirrors v0.5.279 ARP-H6 in the ARP endpoint).
+            if _vlan and _vlan != "0":
+                _iface = f"vlan{_vlan}"
+            _iface = _norm(_iface)
+            if not _iface:
+                logger.debug(
+                    f"[ARP MONITOR] anchor replay: device {_dev_id} "
+                    f"has no interface; skipping"
+                )
+                continue
+            _dhcp_cfg = _dev.get("dhcp_config")
+            if isinstance(_dhcp_cfg, str):
+                try:
+                    import json as _json
+                    _dhcp_cfg = _json.loads(_dhcp_cfg)
+                except Exception:
+                    _dhcp_cfg = {}
+            if not isinstance(_dhcp_cfg, dict):
+                _dhcp_cfg = {}
+            _pool_start = (
+                _dhcp_cfg.get("pool_start")
+                or _dev.get("dhcp_pool_start")
+                or ""
+            )
+            _pool_end = (
+                _dhcp_cfg.get("pool_end")
+                or _dev.get("dhcp_pool_end")
+                or ""
+            )
+            if not (_pool_start and _pool_end):
+                logger.debug(
+                    f"[ARP MONITOR] anchor replay: device {_dev_id} "
+                    f"has no pool range; skipping"
+                )
+                continue
+            _gateway = (
+                _dhcp_cfg.get("gateway")
+                or _dev.get("dhcp_gateway")
+                or ""
+            )
+            _mask = (
+                _dhcp_cfg.get("mask")
+                or _dev.get("ipv4_mask")
+                or ""
+            )
+            try:
+                _ensure_ipv4_address(
+                    _iface, str(_pool_start), str(_pool_end),
+                    gateway=str(_gateway or ""),
+                    ipv4_mask=str(_mask or ""),
+                    container=None,
+                )
+                _replayed += 1
+                logger.info(
+                    f"[ARP MONITOR] anchor replay: device {_dev_id} "
+                    f"iface={_iface} pool={_pool_start}-{_pool_end} "
+                    f"replayed"
+                )
+            except Exception as _rep_exc:
+                _failed += 1
+                logger.warning(
+                    f"[ARP MONITOR] anchor replay: device {_dev_id} "
+                    f"iface={_iface} failed: {_rep_exc}"
+                )
+        logger.info(
+            f"[ARP MONITOR] anchor replay: {_replayed} replayed, "
+            f"{_failed} failed (of {len(_dhcp_servers)} DHCP-server "
+            f"devices)"
+        )
 
     def _monitor_loop(self):
         """Main monitoring loop."""

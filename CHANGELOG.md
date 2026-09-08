@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.284] - 2026-09-07
+
+**Fix the actual delivery gap: anchor-side fixes never fire on
+existing deployments across netgen-server-only upgrades.**
+
+Traced this after v0.5.283 sysctl fix didn't stick either. The
+whole cluster of anchor-side plumbing fixes lives inside one
+function: `_ensure_ipv4_address`. That function is only called
+from `start_dhcp_server`. Which is only called when the operator
+(re)starts the DHCP-server device from the UI.
+
+So on a plain `pip install ostg-trafficgen==0.5.283 && systemctl
+restart netgen-server`, NONE of these run on the operator's
+existing anchor:
+
+  - v0.5.275 (DHCP-J2): VRF connected-route probe + install
+  - v0.5.280 (DHCP-K1): per-anchor `arp_ignore=0`, `arp_announce=0`
+  - v0.5.280 (DHCP-K2): register anchor for periodic re-arp
+  - v0.5.282 (ARP-J1): VRF local-table `local <ip> scope host` install
+
+Sixteen ships since v0.5.268. NONE of the ones with per-anchor
+fixes actually reached the operator's box because the trigger
+was DHCP-device restart, which they never did.
+
+**ARP-J5**: iterate every Running DHCP-server device at
+`arp_monitor.start()` and re-invoke `_ensure_ipv4_address` for
+each. Idempotent — `_ensure_ipv4_address` short-circuits the
+address-add ("File exists") but its post-add plumbing (VRF
+route probe, VRF local-table probe, per-anchor sysctl,
+gratuitous ARP, anchor registration) runs on BOTH the fresh-add
+AND already-assigned paths. So the replay does the right thing
+for a pre-existing anchor: leaves the address alone, forces
+every guard to fire.
+
+Now a plain `systemctl restart netgen-server` after upgrade
+triggers the entire anchor-side fix cluster for every existing
+DHCP-server device. No need for the operator to touch the DHCP
+device from the UI.
+
+Log to look for after upgrade:
+```
+[ARP MONITOR] anchor replay: 1 replayed, 0 failed (of 1 DHCP-server devices)
+```
+
+Full ARP/DHCP/BGP regression: 440 passed.
+
+Ship recommendation: **immediate upgrade** if you're on
+v0.5.280-283 and haven't seen the switch's ping to netgen's
+DHCP anchor succeed. This actually reaches the anchor.
+
 ## [0.5.283] - 2026-09-07
 
 **Fix a self-inflicted bug in v0.5.282: sysctl sweep only set
