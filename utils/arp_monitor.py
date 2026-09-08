@@ -100,12 +100,88 @@ class ARPStatusMonitor:
         if self.is_running:
             logger.warning("[ARP MONITOR] Monitor is already running")
             return
-        
+
+        # v0.5.281 (ARP-GUARD-1): startup self-check. Report the
+        # ARP-plane invariants that the gateway-orange saga (v0.5.254
+        # → v0.5.280) taught us to watch. Anything reported as WRONG
+        # here is a signal that the endpoint will produce a false-
+        # orange (or false-green) result on the next poll.
+        try:
+            self._log_arp_plane_self_check()
+        except Exception as _exc:
+            logger.warning(f"[ARP MONITOR] self-check raised: {_exc}")
+
         self.is_running = True
         self.stop_event.clear()
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
         logger.info("[ARP MONITOR] Started ARP status monitoring")
+
+    def _log_arp_plane_self_check(self) -> None:
+        """v0.5.281 (ARP-GUARD-1): dump the four invariants the
+        gateway-orange class taught us to enforce. On any
+        failure, log a WARNING that names the specific ship
+        the regression would look like — so a future operator
+        searching the log for `arp_ignore` or `anchor-arp`
+        finds this before opening yet another ticket."""
+        import subprocess as _subprocess
+        # Invariant 1: arp_ignore should be 0 on the "all" scope so
+        # secondary-IP replies work. v0.5.280 (DHCP-K1) set this on
+        # anchor interfaces explicitly; the "all" default backs it up.
+        try:
+            _res = _subprocess.run(
+                ["sysctl", "-n", "net.ipv4.conf.all.arp_ignore"],
+                capture_output=True, text=True, timeout=3,
+            )
+            _val = (_res.stdout or "").strip()
+            if _val and _val != "0":
+                logger.warning(
+                    f"[ARP MONITOR] SELF-CHECK: "
+                    f"net.ipv4.conf.all.arp_ignore={_val} "
+                    f"(expected 0). Secondary-IP ARP replies may be "
+                    f"dropped — the v0.5.280 class of 'switch can't "
+                    f"ping netgen anchor' regression."
+                )
+        except Exception:
+            pass
+        # Invariant 2: the anchor re-arp thread is alive when any
+        # anchors are registered. Without this the switch's MAC
+        # table ages out and the anchor becomes unreachable.
+        try:
+            from utils import dhcp as _dhcp
+            _anchors = list(_dhcp._ANCHOR_ARP_REFRESH.values())
+            _thread_alive = (
+                _dhcp._ANCHOR_ARP_THREAD is not None
+                and _dhcp._ANCHOR_ARP_THREAD.is_alive()
+            )
+            if _anchors and not _thread_alive:
+                logger.warning(
+                    f"[ARP MONITOR] SELF-CHECK: "
+                    f"{len(_anchors)} DHCP anchors registered but "
+                    f"the re-arp refresh thread is not alive — v0.5.280 "
+                    f"(DHCP-K2) regression. Switch MAC tables will age "
+                    f"out. Restart the DHCP-server device to re-register."
+                )
+            elif _anchors:
+                logger.info(
+                    f"[ARP MONITOR] SELF-CHECK: {len(_anchors)} "
+                    f"DHCP anchor(s) tracked by re-arp thread."
+                )
+        except Exception:
+            pass
+        # Invariant 3: the frr_manager lazy proxy is imported so
+        # VRF detection doesn't cold-init Docker on the hot path.
+        # v0.5.277 (ARP-H2) — the 2s-Docker-connect race that
+        # produced silent-orange.
+        try:
+            from utils.frr_docker import frr_manager as _fm  # noqa: F401
+        except Exception as _fm_exc:
+            logger.warning(
+                f"[ARP MONITOR] SELF-CHECK: cannot import "
+                f"frr_manager lazy proxy ({_fm_exc}); ARP-status "
+                f"endpoint will fall back to default netns for "
+                f"VRF-scoped devices — v0.5.277 (ARP-H2) regression."
+            )
     
     def stop(self):
         """Stop the ARP status monitoring thread."""

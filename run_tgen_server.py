@@ -14773,7 +14773,63 @@ def update_arp_monitor_config():
 
 @app.route("/api/device/arp/<device_id>", methods=["GET"])
 def get_device_arp_status(device_id):
-    """Get ARP status for a specific device."""
+    """Get ARP status for a specific device.
+
+    v0.5.281 (ARP-GUARD-2): INVARIANTS the gateway-orange class
+    (v0.5.254 → v0.5.280) taught us. Any code change to this
+    function that violates them re-opens a shipped-and-reopened
+    class of bug. Numbered so future authors can grep specific
+    regressions:
+
+      1. NEIGH-FIRST, not ping-first. `ping` is a noisy proxy
+         for reachability (Junos ICMP filters, VRF cgroup races,
+         Docker connect timeouts). The kernel neighbor table IS
+         the L2 forwarding state — if REACHABLE/STALE/DELAY/
+         PROBE/PERMANENT/NOARP, the peer's MAC is known and we
+         can forward frames. Ping's role is arp-warm (populate
+         the cache), NOT reachability decision.
+         Ships: v0.5.254, v0.5.258, v0.5.262, v0.5.272, v0.5.277.
+
+      2. ANY protocol adjacency (BGP/OSPF/ISIS) Established
+         means ARP MUST be resolved. Short-circuit before any
+         probe. The monitor DB flags are authoritative and
+         come from FRR JSON directly (v0.5.273/v0.5.274).
+         Ship: v0.5.278.
+
+      3. Use `arping -A -I <iface>` for arp-warm, not `ping`.
+         arping is L2 and interface-bound — bypasses IP routing,
+         so a missing connected route in the VRF's table
+         doesn't stop the arp-warm.
+         Ship: v0.5.278.
+
+      4. For VLAN devices, arp-warm targets `vlan<ID>` — NEVER
+         `server_interface` when server_interface holds the
+         parent NIC. Untagged frames on a trunk are dropped.
+         Ship: v0.5.279 (self-inflicted regression from
+         v0.5.278's broken ternary).
+
+      5. `arp_ignore=0` + `arp_announce=0` on anchor interfaces
+         so ARP replies for SECONDARY IPs work. DHCP-server
+         anchors are secondaries on interfaces whose primary
+         IP is the device's own.
+         Ship: v0.5.280 (DHCP-K1).
+
+      6. DHCP-server anchors need periodic gratuitous ARP so
+         upstream switch MAC tables don't age out. Registered
+         in utils.dhcp._ANCHOR_ARP_REFRESH; refreshed every
+         60s by a singleton daemon thread.
+         Ship: v0.5.280 (DHCP-K2).
+
+      7. `frr_manager` lazy proxy — NEVER `FRRDockerManager()`
+         at request time. Per-call docker.from_env() connect
+         raced with the 2s VRF-probe timeout, silent-orange
+         for BGP peers.
+         Ship: v0.5.277 (ARP-H2).
+
+    The v0.5.281 (ARP-GUARD-1) startup self-check in
+    arp_monitor.py logs a WARNING on invariant-1/5/6/7
+    violations so operators find them before opening tickets.
+    """
     try:
         # Get device information from database
         device = device_db.get_device(device_id)

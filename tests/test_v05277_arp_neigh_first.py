@@ -80,7 +80,10 @@ def test_vrf_detect_uses_lazy_frr_manager_singleton():
     """Pre-fix imported `FRRDockerManager` and instantiated it on
     every call. New code uses the module-level `frr_manager` lazy
     proxy — no per-call Docker connect."""
-    idx = SRV.find("v0.5.277 (ARP-H2)")
+    # v0.5.281 added an invariant docstring that also cites
+    # ARP-H2 by name — skip past it to the ACTUAL code block by
+    # anchoring on the longer, unique marker text.
+    idx = SRV.find("v0.5.277 (ARP-H2): VRF detection")
     assert idx > 0, "ARP-H2 marker missing"
     body = SRV[idx:idx + 2000]
     # Import the proxy, not the class.
@@ -100,7 +103,10 @@ def test_vrf_detect_uses_lazy_frr_manager_singleton():
 def test_vrf_detect_timeout_raised_to_5s():
     """2s was too tight — under load `docker.from_env()` alone
     exceeded that. Raised to 5s to give the netlink probe headroom."""
-    idx = SRV.find("v0.5.277 (ARP-H2)")
+    # v0.5.281 added an invariant docstring that also cites
+    # ARP-H2 by name — skip past it to the ACTUAL code block by
+    # anchoring on the longer, unique marker text.
+    idx = SRV.find("v0.5.277 (ARP-H2): VRF detection")
     body = SRV[idx:idx + 2000]
     # `ip -o link show <vrf>` with timeout=5.
     assert "timeout=5" in body
@@ -119,7 +125,10 @@ def test_vrf_detect_logs_warning_when_probe_returns_nonzero():
     resolve to an interface, log a warning telling the operator
     the ARP probe ran in default netns. Otherwise a green BGP
     session with orange gateway is unexplained."""
-    idx = SRV.find("v0.5.277 (ARP-H2)")
+    # v0.5.281 added an invariant docstring that also cites
+    # ARP-H2 by name — skip past it to the ACTUAL code block by
+    # anchoring on the longer, unique marker text.
+    idx = SRV.find("v0.5.277 (ARP-H2): VRF detection")
     body = SRV[idx:idx + 2500]
     assert "derived" in body and "vrf name" in body
     assert "default netns" in body

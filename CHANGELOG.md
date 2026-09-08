@@ -2,6 +2,54 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.281] - 2026-09-07
+
+**ARP-plane guards: postmortem-derived invariants + startup
+self-check + endpoint invariant docstring.**
+
+Postmortem of the gateway-orange class (v0.5.254 → v0.5.280,
+seven reopens): every fix chased a symptom without questioning
+whether `ping` was the wrong primary primitive. Each layer
+added a new failure mode. This ship encodes the lessons so a
+future author can't easily re-open the class.
+
+- **ARP-GUARD-1: startup self-check in `arp_monitor.start()`.**
+  Logs the ARP-plane invariants and WARNs on violations —
+  named after the specific ship the regression would look
+  like so future ops-log grepping hits the right rationale:
+  * `net.ipv4.conf.all.arp_ignore != 0` → warns "v0.5.280
+    class of 'switch can't ping netgen anchor' regression"
+  * Anchors registered but re-arp thread not alive → warns
+    "v0.5.280 (DHCP-K2) regression"
+  * `frr_manager` proxy import failure → warns "v0.5.277
+    (ARP-H2) regression"
+  Non-fatal — the monitor still starts, just logs the
+  invariant failure so the operator has a breadcrumb.
+
+- **ARP-GUARD-2: invariant docstring on `get_device_arp_status`.**
+  Enumerates the seven load-bearing invariants with the ship
+  each protects against. A future author reading the function
+  sees WHY the check is structured this way before they
+  "simplify" it (which is how v0.5.279's operator-precedence
+  bug happened). Guards:
+  1. Neigh-first, not ping-first (v0.5.254/258/262/272/277)
+  2. Any-protocol-Established short-circuit (v0.5.278)
+  3. arping (L2, iface-bound) for arp-warm, not ping (v0.5.278)
+  4. VLAN devices arping targets vlan<ID>, never
+     server_interface (v0.5.279)
+  5. arp_ignore=0 + arp_announce=0 on anchors (v0.5.280 K1)
+  6. Periodic anchor re-arp (v0.5.280 K2)
+  7. frr_manager lazy proxy, never FRRDockerManager() at
+     request time (v0.5.277 ARP-H2)
+
+Both are non-functional changes — no behaviour change. Guards
+are documentation + logging only. The pass/fail signal is
+the operator seeing warnings in the server log instead of
+opening a new "gateway orange" ticket.
+
+Full ARP/DHCP/BGP regression: 430 passed. Source-level test
+verified only.
+
 ## [0.5.280] - 2026-09-07
 
 **DHCP anchor reachability: fix the "switch can't ping netgen's
