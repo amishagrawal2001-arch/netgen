@@ -10811,6 +10811,24 @@ class DevicesTab(QWidget):
                     continue
 
                 status = device_info.get("Status", "")
+                # v0.5.298 (audit poll-scope-dhcp): ALSO refresh rows
+                # for DHCP-mode devices (client or server) regardless
+                # of Status. Without this, a DHCP-client device whose
+                # local-cached Status is empty / Stopped / Unknown
+                # never gets its IPv4 cell refreshed with the lease
+                # from the server — v0.5.297's lease-display code
+                # lives in _apply_device_status_row, which is called
+                # only for rows that make it into rows_to_refresh.
+                # Operator on srv06 2026-09-11: device4 had server-
+                # side status=Running + dhcp_lease_ip=192.16.30.105,
+                # but the client'''s cached Status was stale, poll
+                # skipped the row, IPv4 stayed empty forever.
+                _dhcp_mode = str(
+                    device_info.get("dhcp_mode")
+                    or device_info.get("DHCP Mode")
+                    or ""
+                ).lower()
+                _needs_dhcp_refresh = _dhcp_mode in ("client", "server")
                 if status == "Running":
                     running_count += 1
                     rows_to_refresh.append(row)
@@ -10822,6 +10840,12 @@ class DevicesTab(QWidget):
                     # but the DB says Running/Stopped) stayed on
                     # the transient dot forever until the operator
                     # clicked a manual refresh.
+                    rows_to_refresh.append(row)
+                elif _needs_dhcp_refresh:
+                    # v0.5.298: DHCP-mode device whose Status is not
+                    # in the "running/transient" bucket — still needs
+                    # per-tick poll to surface lease state changes
+                    # (client got a lease, server started serving).
                     rows_to_refresh.append(row)
 
             # Adjust polling cadence depending on activity

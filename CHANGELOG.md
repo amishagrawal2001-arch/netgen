@@ -2,6 +2,81 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.298] - 2026-09-11
+
+**poll_device_status skipped DHCP-client rows with stale local
+Status cache — so v0.5.297's lease-display code never ran.**
+
+### Symptom on srv06 2026-09-11 (v0.5.297 running)
+
+Operator screenshot: device4 (DHCP-client, vlan30) status green
+in the icon, but IPv4 column STILL empty. Server-side verified:
+`dhcp_mode=client`, `dhcp_lease_ip=192.16.30.105`, `status=Running`.
+v0.5.297's `_apply_device_status_row` code path was in the wheel.
+
+The poll's refresh code was correct — it just never ran for this
+row.
+
+### Root cause
+
+`widgets/devices_tab.py:poll_device_status` (line 10802 area):
+
+```python
+for row in range(self.devices_table.rowCount()):
+    ...
+    status = device_info.get("Status", "")
+    if status == "Running":
+        rows_to_refresh.append(row)
+    elif status in ("Starting", "Stopping"):
+        rows_to_refresh.append(row)
+```
+
+Only rows whose LOCAL-CACHED Status is Running/Starting/Stopping
+get added to `rows_to_refresh` — the input to
+`_refresh_device_table_from_database` → the async worker →
+`_apply_device_status_row`. Rows with any other cached status
+(empty, Stopped, Unknown) are dropped, and NOTHING refreshes them.
+
+Catch-22 for a fresh session load: client cache says
+Status="Stopped" from `add_device`'s default, poll skips, server
+says "Running" but nobody asks. For a DHCP-client that always
+needs lease-state polling, this is fatal — no matter how many
+downstream fixes ship (v0.5.294/297), the code path never
+reaches them.
+
+### Fix
+
+Extend the poll filter to include DHCP-mode rows regardless of
+Status:
+
+```python
+_dhcp_mode = str(
+    device_info.get("dhcp_mode")
+    or device_info.get("DHCP Mode")
+    or ""
+).lower()
+_needs_dhcp_refresh = _dhcp_mode in ("client", "server")
+if status == "Running": ...
+elif status in ("Starting", "Stopping"): ...
+elif _needs_dhcp_refresh:
+    rows_to_refresh.append(row)
+```
+
+Cheap — per-device HTTP fetch is already async, gated at 30s.
+
+### Verification
+
+8 behavioral tests in `tests/test_v05298_poll_scope_dhcp.py`:
+marker, dhcp_mode read from device_info under both key shapes,
+new elif branch appends DHCP-mode rows, gates on client/server
+only, regression on running_count / v0.5.215 transient inclusion
+/ v0.5.297 refresh code.
+
+### Operator action
+
+Upgrade client to v0.5.298, relaunch. On the next 30s tick,
+device4's IPv4 cell should populate with `192.16.30.105 (leased)`.
+
 ## [0.5.297] - 2026-09-11
 
 **Fix v0.5.294's lease-display guard — misfired because server
