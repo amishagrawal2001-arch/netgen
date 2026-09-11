@@ -3577,7 +3577,7 @@ class DevicesTab(QWidget):
                 # whether the code path fires + what values it sees.
                 # Grep client stderr for "[DHCP LEASE DISPLAY]" to
                 # trace. Set logger to INFO or lower to see them.
-                logger.info(
+                logger.debug(
                     "[DHCP LEASE DISPLAY] row=%s name=%r dhcp_mode=%r "
                     "dhcp_lease_ip=%r ipv4_address=%r",
                     row, device_name, _dhcp_mode_now,
@@ -3589,7 +3589,7 @@ class DevicesTab(QWidget):
                     _ipv4_item = self.devices_table.item(row, self.COL["IPv4"])
                     if _ipv4_item is not None:
                         _existing = _ipv4_item.text() or ""
-                        logger.info(
+                        logger.debug(
                             "[DHCP LEASE DISPLAY] client-branch: "
                             "_lease_now=%r _existing=%r COL[IPv4]=%s",
                             _lease_now, _existing, self.COL.get("IPv4"),
@@ -3606,26 +3606,35 @@ class DevicesTab(QWidget):
                         # "operator-declared static" (that field only
                         # has meaning for static-config devices).
                         # Always prefer dhcp_lease_ip when present.
+                        # v0.5.301 (audit inline-edit-loop): my setText
+                        # fires cellChanged → on_cell_changed treats it as
+                        # a user inline edit → immediately clears the cell
+                        # + writes empty to the server DB. Wrap in
+                        # QSignalBlocker so the poll-driven refresh doesn't
+                        # look like a keyboard edit. Same technique
+                        # on_cell_changed uses (~line 2535) for its
+                        # revert-on-invalid path.
+                        from PyQt5.QtCore import Qt as _Qt, QSignalBlocker
                         if _lease_now:
                             _desired = f"{_lease_now} (leased)"
                             if _existing != _desired:
-                                logger.info(
-                                    f"[DHCP LEASE DISPLAY] setText -> {_desired!r} "
-                                    f"on row {row}"
+                                logger.debug(
+                                    "[DHCP LEASE DISPLAY] setText -> %r on row %s",
+                                    _desired, row,
                                 )
-                                _ipv4_item.setText(_desired)
-                                from PyQt5.QtCore import Qt as _Qt
-                                _ipv4_item.setData(_Qt.UserRole + 2, _desired)
+                                with QSignalBlocker(self.devices_table):
+                                    _ipv4_item.setText(_desired)
+                                    _ipv4_item.setData(_Qt.UserRole + 2, _desired)
                             else:
-                                logger.info(
-                                    f"[DHCP LEASE DISPLAY] cell already matches "
-                                    f"{_desired!r} on row {row}"
+                                logger.debug(
+                                    "[DHCP LEASE DISPLAY] cell already matches %r on row %s",
+                                    _desired, row,
                                 )
                         elif not _lease_now and _existing.endswith(" (leased)"):
                             # Lease released — clear the cell.
-                            _ipv4_item.setText("")
-                            from PyQt5.QtCore import Qt as _Qt
-                            _ipv4_item.setData(_Qt.UserRole + 2, "")
+                            with QSignalBlocker(self.devices_table):
+                                _ipv4_item.setText("")
+                                _ipv4_item.setData(_Qt.UserRole + 2, "")
             except Exception as _lease_display_exc:
                 logger.debug(
                     f"[DEVICE POLL] v0.5.294 lease-IPv4 refresh for "

@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.301] - 2026-09-11
+
+**The v0.5.299 diagnostic caught the actual bug. My v0.5.297 setText
+fired cellChanged → on_cell_changed handler treated it as a user
+inline-edit → cleared the cell + wrote empty to server.**
+
+### The smoking-gun log from srv06 2026-09-11
+
+```
+08:51:32,786 [DHCP LEASE DISPLAY] setText -> '192.16.30.105 (leased)' on row 0
+08:51:32,786 [INLINE EDIT] device 9c1706b2-... 'IPv4' → ''
+```
+
+Same millisecond. My setText fires cellChanged synchronously,
+on_cell_changed reads the cell text (somehow saw empty — probably a
+Qt internal race or the "(leased)" text was already stomped by the
+handler's flow), classified it as a user edit, called
+update_device_data_in_memory with empty value, and marked the device
+for re-apply. My display fix and the inline-edit handler were
+fighting each other every 30s.
+
+### Fix
+
+Wrap the setText + setData calls in `QSignalBlocker(self.devices_table)`
+so cellChanged doesn't fire for automated poll-driven refreshes.
+Same technique on_cell_changed itself uses at line ~2535 for its
+revert-on-invalid path (which also needs to suppress the signal to
+avoid recursion).
+
+```python
+from PyQt5.QtCore import Qt as _Qt, QSignalBlocker
+with QSignalBlocker(self.devices_table):
+    _ipv4_item.setText(_desired)
+    _ipv4_item.setData(_Qt.UserRole + 2, _desired)
+```
+
+Also demoted the v0.5.299 diagnostic INFO logs to DEBUG now that we
+know the code path fires — shipping-forever INFO noise isn't needed.
+
+### Why this took 5 ships to find
+
+v0.5.294 shipped the display code. Correct code, but never actually
+delivered its intended update to the UI because:
+- v0.5.297 had to fix a false-positive guard
+- v0.5.298 had to fix the poll not scheduling the row
+- v0.5.299 added diagnostics
+- v0.5.300 hotfixed my own diagnostic syntax error
+- **v0.5.301 fixes the actual cellChanged-loop bug the diagnostics uncovered**
+
+Every previous ship was "correct code, wrong assumption" about the
+surrounding layer. Only the diagnostic ship (v0.5.299) surfaced what
+was really happening at runtime.
+
+### Verification
+
+Import check clean, ast.parse passes. Behavioral tests deferred until
+srv06 confirms — the code change is tiny (add QSignalBlocker
+context manager wrapping two lines) and has the same shape as the
+existing on_cell_changed revert path at line 2535.
+
+### Operator action
+
+Upgrade client to v0.5.301, relaunch. Wait 30s for a poll tick.
+IPv4 column should show `192.16.30.105 (leased)` AND stay that way
+(no more clearing on the next poll from the inline-edit handler
+overwriting).
+
 ## [0.5.300] - 2026-09-11
 
 **HOTFIX for v0.5.299 SyntaxError. The v0.5.299 wheel WILL NOT
