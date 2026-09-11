@@ -3578,10 +3578,11 @@ class DevicesTab(QWidget):
                 # Grep client stderr for "[DHCP LEASE DISPLAY]" to
                 # trace. Set logger to INFO or lower to see them.
                 logger.info(
-                    f"[DHCP LEASE DISPLAY] row={row} name={device_name!r} "
-                    f"dhcp_mode={_dhcp_mode_now!r} "
-                    f"dhcp_lease_ip={device_data.get(\"dhcp_lease_ip\")!r} "
-                    f"ipv4_address={device_data.get(\"ipv4_address\")!r}"
+                    "[DHCP LEASE DISPLAY] row=%s name=%r dhcp_mode=%r "
+                    "dhcp_lease_ip=%r ipv4_address=%r",
+                    row, device_name, _dhcp_mode_now,
+                    device_data.get("dhcp_lease_ip"),
+                    device_data.get("ipv4_address"),
                 )
                 if _dhcp_mode_now == "client":
                     _lease_now = str(device_data.get("dhcp_lease_ip") or "").strip()
@@ -3589,9 +3590,9 @@ class DevicesTab(QWidget):
                     if _ipv4_item is not None:
                         _existing = _ipv4_item.text() or ""
                         logger.info(
-                            f"[DHCP LEASE DISPLAY] client-branch: "
-                            f"_lease_now={_lease_now!r} _existing={_existing!r} "
-                            f"COL[IPv4]={self.COL.get(\"IPv4\")}"
+                            "[DHCP LEASE DISPLAY] client-branch: "
+                            "_lease_now=%r _existing=%r COL[IPv4]=%s",
+                            _lease_now, _existing, self.COL.get("IPv4"),
                         )
                         # v0.5.297 (audit dhcp-lease-display-guard):
                         # v0.5.294 gated the update on `not _static_

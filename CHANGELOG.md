@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.300] - 2026-09-11
+
+**HOTFIX for v0.5.299 SyntaxError. The v0.5.299 wheel WILL NOT
+IMPORT — install v0.5.300 to unbrick your client.**
+
+### The bug
+
+v0.5.299's diagnostic patch wrote:
+
+```python
+f"dhcp_lease_ip={device_data.get(\"dhcp_lease_ip\")!r} "
+```
+
+Backslash-escaped double-quotes inside an f-string expression are
+a SyntaxError in Python < 3.12. The `run_tgen_client.py` import
+chain fails immediately:
+
+```
+File "widgets/devices_tab.py", line 3583
+    f"dhcp_lease_ip={device_data.get(\"dhcp_lease_ip\")!r} "
+                                      ^
+SyntaxError: unexpected character after line continuation character
+```
+
+Client wouldn't even start.
+
+### The fix
+
+Rewrite the two v0.5.299 log statements using %r-style
+formatting (which takes args separately, no in-expression
+quoting needed):
+
+```python
+logger.info(
+    "[DHCP LEASE DISPLAY] row=%s name=%r dhcp_mode=%r "
+    "dhcp_lease_ip=%r ipv4_address=%r",
+    row, device_name, _dhcp_mode_now,
+    device_data.get("dhcp_lease_ip"),
+    device_data.get("ipv4_address"),
+)
+```
+
+Verified via `ast.parse` before committing this time.
+
+### Root cause of my own mistake
+
+My inline-python patch generator used `\"` in the source string
+it wrote to disk. That became `"` in the destination Python file
+— invalid f-string syntax. I should have used single quotes for
+the inner `.get()` args from the start, OR used %r-style logging
+from the start (which is what I did in the fix, for the same
+reason). Ship discipline lesson: run the patched file through
+`python3 -c "import <module>"` before committing.
+
+### Verification
+
+`ast.parse` on the patched file returns clean. `python3 -c
+"from widgets.devices_tab import DevicesTab"` (import chain that
+was crashing) now succeeds.
+
 ## [0.5.299] - 2026-09-11
 
 **Diagnostic-only ship. No behavior change. Adds INFO-level logs
