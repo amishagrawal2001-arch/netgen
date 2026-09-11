@@ -3573,11 +3573,26 @@ class DevicesTab(QWidget):
             # lease.
             try:
                 _dhcp_mode_now = str(device_data.get("dhcp_mode") or "").lower()
+                # v0.5.299 (diagnostic): log every poll so we can see
+                # whether the code path fires + what values it sees.
+                # Grep client stderr for "[DHCP LEASE DISPLAY]" to
+                # trace. Set logger to INFO or lower to see them.
+                logger.info(
+                    f"[DHCP LEASE DISPLAY] row={row} name={device_name!r} "
+                    f"dhcp_mode={_dhcp_mode_now!r} "
+                    f"dhcp_lease_ip={device_data.get(\"dhcp_lease_ip\")!r} "
+                    f"ipv4_address={device_data.get(\"ipv4_address\")!r}"
+                )
                 if _dhcp_mode_now == "client":
                     _lease_now = str(device_data.get("dhcp_lease_ip") or "").strip()
                     _ipv4_item = self.devices_table.item(row, self.COL["IPv4"])
                     if _ipv4_item is not None:
                         _existing = _ipv4_item.text() or ""
+                        logger.info(
+                            f"[DHCP LEASE DISPLAY] client-branch: "
+                            f"_lease_now={_lease_now!r} _existing={_existing!r} "
+                            f"COL[IPv4]={self.COL.get(\"IPv4\")}"
+                        )
                         # v0.5.297 (audit dhcp-lease-display-guard):
                         # v0.5.294 gated the update on `not _static_
                         # configured` (where _static_configured checked
@@ -3593,9 +3608,18 @@ class DevicesTab(QWidget):
                         if _lease_now:
                             _desired = f"{_lease_now} (leased)"
                             if _existing != _desired:
+                                logger.info(
+                                    f"[DHCP LEASE DISPLAY] setText -> {_desired!r} "
+                                    f"on row {row}"
+                                )
                                 _ipv4_item.setText(_desired)
                                 from PyQt5.QtCore import Qt as _Qt
                                 _ipv4_item.setData(_Qt.UserRole + 2, _desired)
+                            else:
+                                logger.info(
+                                    f"[DHCP LEASE DISPLAY] cell already matches "
+                                    f"{_desired!r} on row {row}"
+                                )
                         elif not _lease_now and _existing.endswith(" (leased)"):
                             # Lease released — clear the cell.
                             _ipv4_item.setText("")

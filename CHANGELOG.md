@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.299] - 2026-09-11
+
+**Diagnostic-only ship. No behavior change. Adds INFO-level logs
+around the DHCP-client lease-display code path so we can see
+whether it fires, what values it sees, and which branch it takes.**
+
+### Context
+
+srv06 2026-09-11 (v0.5.298 client + server both running): device4
+IPv4 column STILL empty. Server-side data verified correct
+(dhcp_mode=client, dhcp_lease_ip=192.16.30.105). Server API logs
+confirm the client IS polling device4 every 30s (v0.5.298
+poll-scope fix working). But UI cell doesn't update.
+
+Without visibility into what the client-side code path sees, I
+can't distinguish "code doesn't run" from "code runs but sees
+wrong values" from "code sets text but display doesn't repaint".
+
+### What v0.5.299 logs
+
+At INFO level (visible in default netgen client stderr), every
+poll of every device row emits:
+
+```
+[DHCP LEASE DISPLAY] row=0 name='device4' dhcp_mode='client'
+    dhcp_lease_ip='192.16.30.105' ipv4_address='192.16.30.105/24'
+```
+
+If `dhcp_mode == "client"`, additional:
+```
+[DHCP LEASE DISPLAY] client-branch: _lease_now='192.16.30.105'
+    _existing='' COL[IPv4]=3
+```
+
+If the cell actually gets rewritten:
+```
+[DHCP LEASE DISPLAY] setText -> '192.16.30.105 (leased)' on row 0
+```
+
+Or if the cell already matches:
+```
+[DHCP LEASE DISPLAY] cell already matches '192.16.30.105 (leased)' on row 0
+```
+
+### Operator instructions
+
+1. Upgrade client to v0.5.299 (client-only change; server upgrade
+   not needed)
+2. Relaunch client from a terminal so stderr is visible:
+   `netgen-client 2>&1 | grep -i "DHCP LEASE DISPLAY"`
+3. Wait 30s for the periodic poll tick
+4. Paste back the log lines
+
+### What each outcome will tell us
+
+- **No `[DHCP LEASE DISPLAY]` lines**: `_apply_device_status_row`
+  isn't being called for device4's row → poll job build path is
+  broken → different debug direction (device_id lookup mismatch).
+- **Lines present with `dhcp_mode='client'` but `_lease_now=''`**:
+  API response reaching the client differs from what curl shows →
+  transport/parsing issue.
+- **`client-branch` line present but no `setText` line**:
+  `_existing == _desired` (cell already matches) → the UI paint
+  isn't happening for some reason.
+- **`setText` line fires but UI stays empty**: PyQt5 render issue
+  → different fix (force viewport update).
+
+### After the diagnosis
+
+Once we see the actual behavior, v0.5.300 will contain the
+correct final fix. The v0.5.299 logs will be downgraded to DEBUG
+in v0.5.300 so they don't spam INFO forever.
+
 ## [0.5.298] - 2026-09-11
 
 **poll_device_status skipped DHCP-client rows with stale local
