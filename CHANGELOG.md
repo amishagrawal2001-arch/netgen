@@ -2,6 +2,88 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.292] - 2026-09-11
+
+**Reconcile the interface-mismatch that defeated v0.5.290/291's
+DAD guard. Anchor + DAD now match dnsmasq's bind interface.**
+
+### Symptom on srv06 2026-09-11 (v0.5.291 running with SSH access)
+
+`_ensure_ipv4_address` was called with `interface=ens2f0np0`
+(parent NIC) but dnsmasq bound to `interface=vlan10` (subif):
+
+```
+Sep 11 05:34:44 [DHCP] Assigned IPv4 192.16.30.1/24 to ens2f0np0
+Sep 11 05:34:47 [DHCP] Server-mode IPv4 anchor on ens2f0np0: 192.16.30.1
+```
+
+v0.5.290's DAD probe ran on `ens2f0np0` (untagged) — the switch's
+relay agent `192.16.30.1` lives on VLAN 10 tagged and doesn't
+reply to untagged ARP → DAD returned False → anchor proceeded
+on the wrong iface → the whole cluster of v0.5.287-291 fixes was
+functionally defeated by this one caller mismatch.
+
+### Root cause
+
+DB row for device3 (traced via sqlite direct-read):
+```json
+{
+  "interface": "ens2f0np0",      ← top-level column (parent NIC)
+  "vlan": 10,
+  "dhcp_config": {
+    "interface": "vlan10"        ← nested (subif) — MISMATCH
+  }
+}
+```
+
+Caller at `run_tgen_server.py:7332`:
+```python
+interface = device.get("interface") or dhcp_cfg.get("interface")
+```
+
+Parent wins over subif. dnsmasq's config template reads
+`dhcp_config.interface` (vlan10) directly, so dnsmasq bound to
+vlan10 while the anchor path ran on ens2f0np0. Everything below
+that mismatch (DAD, local-table entries, gratuitous ARP, VRF
+membership) inherited the wrong iface.
+
+### Fix
+
+At the top of `start_dhcp_server` (utils/dhcp.py:2914 area),
+after `_normalize_iface_name(interface)`:
+
+```python
+_cfg_iface = _normalize_iface_name((dhcp_config or {}).get("interface") or "")
+if _cfg_iface and _cfg_iface != interface:
+    _parent = _iface_parent(_cfg_iface, container=container)
+    if _parent == interface:
+        # dhcp_config's iface is a SUBIF of the caller's iface.
+        # Prefer it so anchor + DAD + local-table all match dnsmasq.
+        interface = _cfg_iface
+```
+
+Contained, one-place change. Guarded by `_iface_parent()` so we
+only reassign when the config's iface is actually a subif of the
+caller-passed iface. Backward compatible: devices without
+`dhcp_config.interface` (older configs) leave `interface`
+unchanged.
+
+### Verification
+
+9 behavioral tests in `tests/test_v05292_iface_reconcile.py`
+(source lock-ins for the marker, dhcp_config.interface read,
+parent-match guard, normalize call, INFO log line, plus
+regression checks for v0.5.287 Fix A + v0.5.289 bind-dynamic +
+v0.5.290 DAD helpers). All pass.
+
+### Bundled release with v0.5.290 + v0.5.291
+
+v0.5.290/291 were committed but never tag+released because their
+effectiveness depended on this fix. Shipping all three now as
+one coherent bundle so operators upgrading to v0.5.292 get the
+full end-to-end anchor-DAD story working on any device-config
+shape.
+
 ## [0.5.291] - 2026-09-11
 
 **v0.5.290 DAD probe silently no-op'd on hosts without

@@ -2910,6 +2910,42 @@ def start_dhcp_server(
     # vlan200@ens2f0np0 exceeds IFNAMSIZ, if_nametoindex fails,
     # dnsmasq silently exits, monitor writes Server Down).
     interface = _normalize_iface_name(interface)
+
+    # v0.5.292 (audit anchor-interface-reconcile): callers pass
+    # the top-level device.interface (typically the parent NIC,
+    # e.g. `ens2f0np0`), but the dnsmasq template + operator
+    # intent lives in dhcp_config.interface (typically the subif,
+    # e.g. `vlan10`). Pre-fix, `_ensure_ipv4_address` was called
+    # with the PARENT — anchor landed on ens2f0np0 while dnsmasq
+    # bound to vlan10. Result on srv06 2026-09-11 (v0.5.291
+    # running): the whole v0.5.290 DAD guard was defeated
+    # because DAD probed the parent (untagged) — the switch's
+    # relay-agent IP `192.16.30.1` lives on VLAN 10 tagged and
+    # doesn't reply to untagged ARP → DAD returned False →
+    # anchor proceeded on the wrong interface → DHCP kept
+    # breaking despite v0.5.287-291 all landing correctly.
+    #
+    # Reconcile: if dhcp_config.interface is a distinct
+    # subinterface of the passed `interface`, prefer it. That
+    # keeps _ensure_ipv4_address, DAD probes, local-table
+    # entries, and dnsmasq'''s bind ALL on the same iface. Falls
+    # back to the passed parent when dhcp_config.interface is
+    # absent or equal (backward compatible for existing devices
+    # that don'''t declare a subif in their dhcp_config).
+    _cfg_iface = _normalize_iface_name(
+        (dhcp_config or {}).get("interface") or ""
+    )
+    if _cfg_iface and _cfg_iface != interface:
+        _parent = _iface_parent(_cfg_iface, container=container)
+        if _parent == interface:
+            logger.info(
+                "[DHCP] v0.5.292 anchor-iface reconcile: caller "
+                "passed parent %s but dhcp_config.interface=%s "
+                "(subif of %s). Using %s for anchor + DAD to "
+                "match dnsmasq'''s bind interface.",
+                interface, _cfg_iface, interface, _cfg_iface,
+            )
+            interface = _cfg_iface
     # v0.5.219 (audit fix C3): mirror the client-path clear — see
     # start_dhcp_client's block for the full rationale. Any explicit
     # server Start supersedes the manual_override guard that
