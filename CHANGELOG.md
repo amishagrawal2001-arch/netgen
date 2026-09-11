@@ -2,6 +2,58 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.294] - 2026-09-11
+
+**Devices tab IPv4 column now shows DHCP-client leased IPs.**
+
+### Symptom on srv06 2026-09-11 (v0.5.293 running)
+
+Operator screenshot: `device4` (DHCP-client on vlan30) has status
+green, VLAN 30, but IPv4 column is EMPTY. Meanwhile SSH-verified
+state: `ip addr show vlan30` → `inet 192.16.30.105/24` (successful
+lease from the just-fixed dnsmasq), and `dhcp_lease_ip` column in
+the DB has the lease. The client UI just wasn't reading it.
+
+### Root cause
+
+`widgets/devices_tab.py`:
+- `add_device` / `populate_device_table` extract IPv4 from
+  `device_info["IPv4"]` (the operator-declared static field). For
+  DHCP-client devices this is empty — the client picks up an IP via
+  DHCP. Nothing falls back to `dhcp_lease_ip`.
+- `_apply_device_status_row` (the per-poll refresh path) only updates
+  Status + ARP colors. It never touches the IPv4 cell. So even
+  after the lease lands and the periodic poll sees it, the IPv4
+  column stays empty.
+
+### Fix — two-place
+
+**1. Initial load (`populate_device_table`)**: after reading `IPv4`
+from `device_info`, if it's empty AND `dhcp_mode == "client"`, use
+`device_info["dhcp_lease_ip"]` with a `" (leased)"` suffix so
+operators can tell static vs dynamic at a glance.
+
+**2. Poll refresh (`_apply_device_status_row`)**: on every polled
+update, if `dhcp_mode == "client"` and no static IPv4 was declared,
+set the IPv4 cell text to `<lease> (leased)`. If the lease was
+released (dhcp_lease_ip cleared), clear the cell (only when the
+current text ends with `" (leased)"` — never touch operator-
+declared static text). Best-effort try/except so a per-row hiccup
+doesn't break the rest of the poll.
+
+### Verification
+
+8 behavioral tests in `tests/test_v05294_dhcp_lease_visibility.py`:
+marker present, populate falls back correctly, only fires when
+IPv4 is empty, refresh updates cell on poll, only for
+dhcp_mode=client, skips when static IPv4 is configured, clears
+cell on lease release, wrapped in try/except.
+
+### srv06 verification path
+
+Install wheel, restart netgen-server, relaunch the client, look at
+device4's IPv4 column — should now show `192.16.30.105 (leased)`.
+
 ## [0.5.293] - 2026-09-11
 
 **Two operator-hit ghost-state bugs that survived the entire

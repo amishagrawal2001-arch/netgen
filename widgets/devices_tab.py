@@ -3564,6 +3564,39 @@ class DevicesTab(QWidget):
             except Exception:
                 pass
 
+            # v0.5.294 (audit dhcp-lease-visibility): refresh the
+            # IPv4 cell for DHCP-client devices whose lease landed
+            # AFTER the row was first added. add_device/populate_
+            # device_table only see the initial state; without a
+            # per-poll refresh, the operator sees IPv4="" forever
+            # for DHCP clients even though the backend has the
+            # lease.
+            try:
+                _dhcp_mode_now = str(device_data.get("dhcp_mode") or "").lower()
+                if _dhcp_mode_now == "client":
+                    _lease_now = str(device_data.get("dhcp_lease_ip") or "").strip()
+                    _ipv4_item = self.devices_table.item(row, self.COL["IPv4"])
+                    if _ipv4_item is not None:
+                        _existing = _ipv4_item.text() or ""
+                        _static_configured = bool(
+                            (device_data.get("ipv4_address") or "").strip()
+                        )
+                        if _lease_now and not _static_configured:
+                            _desired = f"{_lease_now} (leased)"
+                            if _existing != _desired:
+                                _ipv4_item.setText(_desired)
+                                from PyQt5.QtCore import Qt as _Qt
+                                _ipv4_item.setData(_Qt.UserRole + 2, _desired)
+                        elif not _lease_now and _existing.endswith(" (leased)"):
+                            _ipv4_item.setText("")
+                            from PyQt5.QtCore import Qt as _Qt
+                            _ipv4_item.setData(_Qt.UserRole + 2, "")
+            except Exception as _lease_display_exc:
+                logger.debug(
+                    f"[DEVICE POLL] v0.5.294 lease-IPv4 refresh for "
+                    f"row {row} raised: {_lease_display_exc}"
+                )
+
             # ARP status → individual IP/gateway cell colors
             arp_ipv4_raw = device_data.get('arp_ipv4_resolved', 0)
             arp_ipv6_raw = device_data.get('arp_ipv6_resolved', 0)
@@ -4334,6 +4367,29 @@ class DevicesTab(QWidget):
                     device_name = device_info.get("Device Name", "")
                     mac = device_info.get("MAC Address", "")
                     ipv4 = device_info.get("IPv4", "")
+                    # v0.5.294 (audit dhcp-lease-visibility): for
+                    # DHCP-client devices, the operator-declared
+                    # IPv4 field is empty (client picks up an IP
+                    # via DHCP). Fall back to the leased IP the
+                    # server stashed in dhcp_lease_ip so the
+                    # Devices tab IPv4 column shows the actual
+                    # bound address. Suffix " (leased)" to
+                    # distinguish from static config. Operator
+                    # screenshot 2026-09-11: device4 (DHCP client
+                    # on vlan30) got 192.16.30.105 but IPv4
+                    # column was empty — this fix.
+                    if not ipv4:
+                        _dhcp_mode = str(
+                            device_info.get("dhcp_mode")
+                            or device_info.get("DHCP Mode")
+                            or ""
+                        ).lower()
+                        if _dhcp_mode == "client":
+                            _lease = str(
+                                device_info.get("dhcp_lease_ip") or ""
+                            ).strip()
+                            if _lease:
+                                ipv4 = f"{_lease} (leased)"
                     ipv6 = device_info.get("IPv6", "")
                     vlan = device_info.get("VLAN", "0")
                     ipv4_mask = device_info.get("ipv4_mask", "24")
