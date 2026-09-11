@@ -496,12 +496,26 @@ class ARPStatusMonitor:
                 or _dev.get("ipv4_mask")
                 or ""
             )
+            # v0.5.295 (audit anchor-replay-relay-mode): the v0.5.245
+            # relay-mode guard in _ensure_ipv4_address short-circuits
+            # when relay_return_hop is set. But this replay path
+            # never read the field from dhcp_config, so on every
+            # netgen-server restart the anchor got re-installed on
+            # relay-mode DHCP-server devices. Symptom on srv06
+            # 2026-09-11: operator hit the anchor-collision +
+            # self-loop drop again after every restart, despite
+            # v0.5.245 having been in place since three sessions ago.
+            # Propagate the field.
+            _relay_return_hop = str(
+                _dhcp_cfg.get("relay_return_hop") or ""
+            )
             try:
                 _ensure_ipv4_address(
                     _iface, str(_pool_start), str(_pool_end),
                     gateway=str(_gateway or ""),
                     ipv4_mask=str(_mask or ""),
                     container=None,
+                    relay_return_hop=_relay_return_hop,
                 )
                 _replayed += 1
                 logger.info(

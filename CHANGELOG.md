@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.295] - 2026-09-11
+
+**Anchor-replay silently re-installed the relay-mode anchor on every
+netgen-server restart, defeating v0.5.245's relay-mode skip.**
+
+### Symptom on srv06 2026-09-11 14:01:55 (v0.5.294 running)
+
+Operator removed + re-added the DHCP-client device. Client's
+DHCPDISCOVER frames arrived at netgen tagged VLAN 10 (tcpdump
+confirmed via `d0:48:a1:d0:27:06 > 5c:25:73:3f:30:56, 192.16.30.1.67 >
+172.16.30.2.67`), but dnsmasq's log showed ZERO transactions since
+06:33 — hours before. dnsmasq was correctly bound to `vlan10:67`
+with `bind-dynamic` in the right VRF; the config was right; the
+server device's `dhcp_config.relay_return_hop` was still set to
+`172.16.30.1` (from v0.5.293 verify). Yet vlan10 had `192.16.30.1/24`
+back on it, silently making the kernel drop the relayed frames as
+martian sources.
+
+### Root cause
+
+`utils/arp_monitor.py:_replay_dhcp_anchor_setup` (v0.5.284) iterates
+Running DHCP-server devices at netgen-server startup and re-invokes
+`_ensure_ipv4_address` for each so the whole v0.5.275/280/282/286
+anchor-plumbing cluster fires on existing deployments. But the
+replay call site NEVER read `relay_return_hop` from `dhcp_config`:
+
+```python
+_ensure_ipv4_address(
+    _iface, str(_pool_start), str(_pool_end),
+    gateway=str(_gateway or ""),
+    ipv4_mask=str(_mask or ""),
+    container=None,
+    # relay_return_hop=???  ← missing
+)
+```
+
+`_ensure_ipv4_address`'s v0.5.245 first-line guard (`if
+relay_return_hop: return None`) only triggers when the kwarg is
+non-empty. Default was `""` — guard never fired on the replay path —
+anchor got re-installed on every netgen-server restart.
+
+Every operator upgrade+restart cycle silently re-created the
+anchor-collision self-loop that v0.5.293/292/289 chased through
+downstream symptoms.
+
+### Fix
+
+`utils/arp_monitor.py:499` area — read `relay_return_hop` from
+`_dhcp_cfg` and pass it to the call:
+
+```python
+_relay_return_hop = str(_dhcp_cfg.get("relay_return_hop") or "")
+_ensure_ipv4_address(
+    ...
+    relay_return_hop=_relay_return_hop,
+)
+```
+
+### Verification
+
+6 behavioral tests in `tests/test_v05295_replay_relay_return_hop.py`:
+marker present, replay reads the field from dhcp_config, passes to
+`_ensure_ipv4_address` as `relay_return_hop=` kwarg, still calls
+`_ensure_ipv4_address` (regression), str-wrap for type safety.
+
+### srv06 verification path
+
+Install wheel, `systemctl restart netgen-server`, watch for
+`Skipping IPv4 anchor on vlan10 for pool 192.16.30.10-192.16.30.200
+because relay_return_hop=172.16.30.1` in the anchor-replay logs
+(instead of `Assigned IPv4 192.16.30.1/24 to vlan10`). Then trigger
+`dhclient vlan30` inside the client container — expect DHCPACK.
+
 ## [0.5.294] - 2026-09-11
 
 **Devices tab IPv4 column now shows DHCP-client leased IPs.**
