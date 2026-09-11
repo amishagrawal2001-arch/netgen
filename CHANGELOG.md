@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.297] - 2026-09-11
+
+**Fix v0.5.294's lease-display guard — misfired because server
+persists lease into ipv4_address DB column too.**
+
+### Symptom on srv06 2026-09-11 (v0.5.296 running)
+
+Operator screenshot: device4 (DHCP client, vlan30) status green,
+VLAN 30, but IPv4 column STILL empty. `pip show ostg-trafficgen`
+confirmed v0.5.296 running. dhclient successfully bound
+`192.16.30.105/24` on vlan30 (verified via SSH). API response
+inspection revealed:
+
+```json
+{
+  "device_id": "2bf81cfb-...",
+  "dhcp_mode": "client",
+  "dhcp_lease_ip": "192.16.30.105",
+  "ipv4_address": "192.16.30.105/24",   ← lease persisted here too
+  "IPv4": null
+}
+```
+
+### Root cause
+
+v0.5.294's refresh path in `_apply_device_status_row`:
+
+```python
+_static_configured = bool((device_data.get("ipv4_address") or "").strip())
+if _lease_now and not _static_configured:
+    _ipv4_item.setText(f"{_lease_now} (leased)")
+```
+
+The `_static_configured` guard was defensive — meant to prevent
+stomping on any operator-declared static IPv4 on a DHCP device
+(unusual but conceptually possible). But the server writes the
+leased IP into `ipv4_address` too (with CIDR notation like
+`192.16.30.105/24`). So the guard misfires as "operator has
+static config here" and refuses to update the cell.
+
+For `dhcp_mode=client`, `ipv4_address` is NEVER operator-declared
+static — the field carries meaning only for non-DHCP devices where
+the operator typed the IPv4 in Add Device. DHCP-client devices
+have their `ipv4_address` populated by the DHCP apply flow with
+whatever the lease was.
+
+### Fix
+
+`widgets/devices_tab.py:_apply_device_status_row`: drop the
+`_static_configured` guard for `dhcp_mode=client`. Always prefer
+`dhcp_lease_ip` when present. The outer `_dhcp_mode_now ==
+"client"` check already gates the block so non-DHCP devices
+aren't touched.
+
+Also extend `populate_device_table`'s initial-load fallback: if
+`dhcp_lease_ip` isn't in the cached `device_info` (session-shape
+data may not have it), fall back to reading `ipv4_address` and
+strip any `/CIDR` suffix. Same "(leased)" suffix.
+
+### Verification
+
+9 behavioral tests in `tests/test_v05297_lease_guard_fix.py`:
+marker present, `_static_configured` gone from refresh path,
+still gated on `dhcp_mode=client`, "(leased)" suffix preserved,
+lease-release path still clears cell, populate fallback reads
+ipv4_address as second-choice + strips CIDR, only fires for
+dhcp_mode=client, v0.5.294 marker regression, version bump.
+
+### Operator action
+
+Upgrade client to v0.5.297, relaunch. IPv4 column for device4
+should now show `192.16.30.105 (leased)`.
+
 ## [0.5.296] - 2026-09-11
 
 **Expose `relay_return_hop` in the DHCP-server device dialog.**

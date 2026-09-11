@@ -83,15 +83,21 @@ def test_refresh_only_fires_for_dhcp_client_devices():
     assert '"client"' in body
 
 
-def test_refresh_skips_when_static_ipv4_configured():
-    """If the operator DID declare a static IPv4 on a DHCP device
-    (unusual but possible), the poll-refresh must NOT overwrite the
-    static text with a "(leased)" one."""
+def test_refresh_v05297_dropped_static_configured_guard():
+    """v0.5.294 shipped a `not _static_configured` guard against
+    overwriting operator-declared static IPv4 on DHCP-client
+    devices. v0.5.297 REMOVED that guard because the server
+    persists the DHCP lease into ipv4_address too (with CIDR),
+    causing the guard to misfire and refuse to update the cell.
+    For dhcp_mode=client, ipv4_address is never operator-static.
+    Test the new invariant: the guard is gone."""
     src = _src()
     idx = src.find("v0.5.294 (audit dhcp-lease-visibility): refresh")
     body = src[idx:idx + 3000]
-    assert '_static_configured' in body
-    assert 'not _static_configured' in body
+    # v0.5.297: _static_configured no longer present in refresh block.
+    assert 'not _static_configured' not in body
+    # Instead, the guard is `if _lease_now:` alone (v0.5.297).
+    assert '_lease_now:' in body
 
 
 def test_refresh_clears_cell_when_lease_released():

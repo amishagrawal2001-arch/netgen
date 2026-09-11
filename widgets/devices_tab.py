@@ -3578,16 +3578,26 @@ class DevicesTab(QWidget):
                     _ipv4_item = self.devices_table.item(row, self.COL["IPv4"])
                     if _ipv4_item is not None:
                         _existing = _ipv4_item.text() or ""
-                        _static_configured = bool(
-                            (device_data.get("ipv4_address") or "").strip()
-                        )
-                        if _lease_now and not _static_configured:
+                        # v0.5.297 (audit dhcp-lease-display-guard):
+                        # v0.5.294 gated the update on `not _static_
+                        # configured` (where _static_configured checked
+                        # device_data["ipv4_address"]). But for DHCP-
+                        # client devices, the server WRITES the lease
+                        # into ipv4_address too (with CIDR notation
+                        # like "192.16.30.105/24") — so the guard
+                        # misfires and the cell never updates. Fix:
+                        # for dhcp_mode=client, ipv4_address is NEVER
+                        # "operator-declared static" (that field only
+                        # has meaning for static-config devices).
+                        # Always prefer dhcp_lease_ip when present.
+                        if _lease_now:
                             _desired = f"{_lease_now} (leased)"
                             if _existing != _desired:
                                 _ipv4_item.setText(_desired)
                                 from PyQt5.QtCore import Qt as _Qt
                                 _ipv4_item.setData(_Qt.UserRole + 2, _desired)
                         elif not _lease_now and _existing.endswith(" (leased)"):
+                            # Lease released — clear the cell.
                             _ipv4_item.setText("")
                             from PyQt5.QtCore import Qt as _Qt
                             _ipv4_item.setData(_Qt.UserRole + 2, "")
@@ -4385,9 +4395,22 @@ class DevicesTab(QWidget):
                             or ""
                         ).lower()
                         if _dhcp_mode == "client":
+                            # v0.5.297: also fall through to
+                            # ipv4_address for cache shapes where
+                            # dhcp_lease_ip is absent but the lease
+                            # was persisted into ipv4_address (server
+                            # writes both). Strip any /CIDR suffix
+                            # since we're showing an IP, not a
+                            # subnet.
                             _lease = str(
                                 device_info.get("dhcp_lease_ip") or ""
                             ).strip()
+                            if not _lease:
+                                _ipv4_raw = str(
+                                    device_info.get("ipv4_address") or ""
+                                ).strip()
+                                if _ipv4_raw:
+                                    _lease = _ipv4_raw.split("/", 1)[0]
                             if _lease:
                                 ipv4 = f"{_lease} (leased)"
                     ipv6 = device_info.get("IPv6", "")
