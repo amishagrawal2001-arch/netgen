@@ -1810,6 +1810,45 @@ def _iface_ipv4_addresses(interface: str, container=None) -> List[tuple]:
     return out
 
 
+def _probe_ip_conflict_scapy(interface: str, ip: str) -> bool:
+    """v0.5.291 (audit anchor-DAD, fallback): pure-Scapy DAD probe
+    for use when ``iputils-arping`` isn't installed on the host.
+    Scapy is a hard netgen dependency (requirements.txt) so this
+    is always available.
+
+    Sends an ARP request (who-has ``ip``) via layer-2 srp on
+    ``interface``. If any reply arrives, ``ip`` is claimed by
+    another device on the segment → return True (conflict).
+
+    Import scapy lazily (module-level would add startup cost
+    to every dhcp.py user).
+    """
+    try:
+        # Import here — scapy is heavy at import time.
+        from scapy.all import ARP, Ether, srp, conf
+    except Exception:
+        return False
+    try:
+        # Suppress scapy's stdout chatter during the probe.
+        _orig_verb = conf.verb
+        conf.verb = 0
+        try:
+            pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+            ans, _ = srp(
+                pkt, iface=interface, timeout=3, retry=1, verbose=False,
+            )
+        finally:
+            conf.verb = _orig_verb
+    except Exception as _exc:
+        logger.debug(
+            "[DHCP] Scapy DAD for %s on %s raised: %s "
+            "(inconclusive, not blocking anchor)",
+            ip, interface, _exc,
+        )
+        return False
+    return len(ans) > 0
+
+
 def _probe_ip_conflict(
     interface: str, ip: str, container=None,
 ) -> bool:
@@ -1844,6 +1883,7 @@ def _probe_ip_conflict(
     """
     if not interface or not ip:
         return False
+    # Try arping first (fastest, most authoritative).
     try:
         _probe = _run_command(
             [
@@ -1855,28 +1895,46 @@ def _probe_ip_conflict(
             ],
             timeout=6, container=container,
         )
+        _rc = getattr(_probe, "returncode", 0)
+        _stderr = (getattr(_probe, "stderr", "") or "").lower()
+        _arping_missing = (
+            "command not found" in _stderr
+            or "no such file" in _stderr
+            or "not found" in _stderr
+        )
+        if not _arping_missing:
+            if _rc == 1:
+                logger.info(
+                    "[DHCP] DAD: arping -D found %s in use on %s "
+                    "(rc=1)", ip, interface,
+                )
+                return True
+            if _rc == 0:
+                return False
+            # Other rc — inconclusive; fall through to scapy.
+            logger.debug(
+                "[DHCP] arping -D on %s for %s returned rc=%s; "
+                "trying scapy DAD fallback",
+                interface, ip, _rc,
+            )
+    except FileNotFoundError:
+        # arping binary not on PATH.
+        pass
     except Exception as _exc:
-        # arping missing (iputils-arping not installed) or other
-        # infrastructural issue. Log at debug — don't block the
-        # anchor on tooling absence.
         logger.debug(
-            "[DHCP] DAD probe for %s on %s skipped: %s (arping "
-            "missing or unusable)", ip, interface, _exc,
+            "[DHCP] arping DAD raised (%s); trying scapy fallback",
+            _exc,
         )
-        return False
-    _rc = getattr(_probe, "returncode", 0)
-    if _rc == 1:
-        return True
-    if _rc != 0:
-        # Some other error — log at debug, don't block.
-        logger.debug(
-            "[DHCP] DAD probe for %s on %s: arping rc=%s "
-            "stderr=%r — treating as inconclusive",
-            ip, interface, _rc,
-            (getattr(_probe, "stderr", "") or "")[:200],
+    # v0.5.291: fall back to scapy-based ARP probe. Works on
+    # any host with scapy installed (netgen hard dep).
+    _scapy_hit = _probe_ip_conflict_scapy(interface, ip)
+    if _scapy_hit:
+        logger.info(
+            "[DHCP] DAD (scapy fallback): %s replied to ARP on "
+            "%s — IP is claimed by another device",
+            ip, interface,
         )
-        return False
-    return False
+    return _scapy_hit
 
 
 

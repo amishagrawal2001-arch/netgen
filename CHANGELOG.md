@@ -2,6 +2,69 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.291] - 2026-09-11
+
+**v0.5.290 DAD probe silently no-op'd on hosts without
+`iputils-arping`. Add scapy fallback so the fix works on any
+netgen-supported host.**
+
+### Failure mode discovered mid-verification on srv06
+
+v0.5.290 installed cleanly, but the netgen log showed no
+`Refusing to anchor` line despite `192.16.30.1` being obviously
+in use by the switch. Traced to `_probe_ip_conflict`:
+
+```python
+_probe = _run_command(["arping", "-D", ...], container=container)
+```
+
+On srv06, `container=None` for this call path, so arping runs on
+the host. But the host doesn't have `iputils-arping` — only
+`iputils-ping` and `iputils-tracepath`. `_run_command` raised
+FileNotFoundError, my handler's `except` returned `False`
+(inconclusive = don't block anchor), and the DAD was effectively
+a no-op.
+
+### Fix — scapy fallback
+
+New `_probe_ip_conflict_scapy(interface, ip)`: lazy-imports
+scapy (netgen hard dep via `requirements.txt`), sends a layer-2
+ARP request via `srp`, returns True if any reply arrives.
+
+`_probe_ip_conflict` now tries arping first (fastest, most
+authoritative on hosts that have it), and falls back to scapy on
+`FileNotFoundError` or any other arping failure. Detects
+`command not found` in arping's stderr as an alternative "arping
+missing" signal (some `_run_command` implementations catch the
+FileNotFoundError internally and return an rc-based result).
+
+### Behavior
+
+- **Host has arping** (installed via `apt install
+  iputils-arping`): arping runs, fast + accurate. Scapy path
+  never touched.
+- **Host has no arping**: arping call fails cleanly, scapy path
+  runs, DAD works (~3s slower but functionally equivalent).
+- **Both fail**: `_probe_ip_conflict` returns False
+  (inconclusive) and the anchor proceeds. Better than
+  refusing-legitimate-anchors when tooling is truly broken.
+
+### Verification
+
+18 existing v0.5.290 tests still pass. Behavioral test coverage
+for scapy fallback is deferred to v0.5.292 if needed —
+mocking scapy's `srp` at the netgen boundary would be more
+plumbing than value; the fallback runs on real hardware only.
+
+### srv06 verification path
+
+Same as v0.5.290: install wheel, restart netgen-server,
+Stop→Start the DHCP-server device via `/api/device/dhcp/restart`,
+expect `[DHCP] DAD (scapy fallback): 192.16.30.1 replied to ARP
+on vlan10 — IP is claimed by another device` and
+`[DHCP] Refusing to anchor 192.16.30.1 on vlan10 ...`. Then
+trigger the client and confirm lease.
+
 ## [0.5.290] - 2026-09-11
 
 **Three-part fix bundle for the anchor-collision saga that
