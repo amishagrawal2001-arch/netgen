@@ -6,6 +6,7 @@ Multi-threaded ARP status monitoring with database updates
 import threading
 import time
 import logging
+import subprocess
 import requests
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -704,6 +705,25 @@ class ARPStatusMonitor:
                 continue
             _ip = _tokens[1]
             _iface = _tokens[_dev_idx + 1]
+            # v0.5.293 (audit auto-cleanup-ghost, safety guards):
+            # Only handle SINGLE-HOST anchor entries (the shape
+            # v0.5.286 installs). Skip:
+            #   - loopback (`lo`) — kernel manages its own local
+            #     routes, netgen never uses lo as an anchor iface;
+            #     and lo has multi-host CIDR entries like
+            #     `local 127.0.0.0/8 dev lo` that we would falsely
+            #     match as ghosts (127.0.0.0/8 is the whole /8
+            #     network, not a host address on lo).
+            #   - CIDR-notation entries (any `/` in the IP field) —
+            #     v0.5.286 always installs /32 host routes; a
+            #     subnet-shaped `local` entry is by definition
+            #     something else (kernel-installed loopback range,
+            #     rare admin-installed subnet ARP-proxy) and MUST
+            #     NOT be auto-deleted.
+            if _iface == "lo":
+                continue
+            if "/" in _ip:
+                continue
             # Check whether _ip is currently on _iface.
             try:
                 _addr = subprocess.run(
@@ -722,18 +742,52 @@ class ARPStatusMonitor:
             )
             return
         for _ip, _iface in _ghosts:
-            logger.warning(
-                f"[ARP MONITOR] LOCAL-TABLE GHOST: "
-                f"`local {_ip} dev {_iface}` is in table local "
-                f"but {_ip} is NOT currently on {_iface}. Kernel "
-                f"still treats {_ip} as a local address; incoming "
-                f"packets with src={_ip} will be dropped as "
-                f"martian, silently breaking any DHCP relay or "
-                f"protocol whose peer owns that IP. Fix: "
-                f"`sudo ip route del local {_ip} dev {_iface} "
-                f"table local` — or stop/start the DHCP-server "
-                f"device on {_iface} to trigger v0.5.290 cleanup."
-            )
+            # v0.5.293 (audit auto-cleanup-ghost): AUTO-DELETE
+            # (was WARN-only in v0.5.290). Operator on srv06
+            # 2026-09-11 hit the ghost twice in one session after
+            # manual `ip addr del` cycles left orphaned entries
+            # that broke DHCP-relay until the entry was manually
+            # removed. WARN-only was too cautious — an
+            # application-installed local route whose IP isn't
+            # on the interface is by definition broken kernel
+            # state with zero legitimate use case. Auto-delete
+            # + WARN so the operator sees what happened.
+            _rm_ok = False
+            _rm_err = ""
+            _rm_rc = -1
+            try:
+                _rm = subprocess.run(
+                    [
+                        "ip", "route", "del", "local", _ip,
+                        "dev", _iface, "table", "local",
+                    ],
+                    capture_output=True, text=True, timeout=5,
+                )
+                _rm_ok = (_rm.returncode == 0)
+                _rm_rc = _rm.returncode
+                _rm_err = (_rm.stderr or "").strip()
+            except Exception as _rm_exc:
+                _rm_err = str(_rm_exc)
+            if _rm_ok:
+                logger.warning(
+                    f"[ARP MONITOR] LOCAL-TABLE GHOST auto-cleaned: "
+                    f"`local {_ip} dev {_iface}` was in table local "
+                    f"but {_ip} is NOT on {_iface}. Kernel would "
+                    f"drop incoming packets with src={_ip} as "
+                    f"martian, silently breaking DHCP relay or any "
+                    f"protocol whose peer owns that IP. Removed. "
+                    f"v0.5.293 auto-cleanup — earlier ships (v0.5.290) "
+                    f"only warned."
+                )
+            else:
+                logger.warning(
+                    f"[ARP MONITOR] LOCAL-TABLE GHOST detected but "
+                    f"auto-cleanup FAILED: `local {_ip} dev {_iface}` "
+                    f"(rc={_rm_rc}, err={_rm_err[:200]!r}). Run "
+                    f"manually: `sudo ip route del local {_ip} dev "
+                    f"{_iface} table local`. Kernel drops packets "
+                    f"with src={_ip} as martian until cleaned."
+                )
     def _monitor_loop(self):
         """Main monitoring loop."""
         logger.info("[ARP MONITOR] Monitoring loop started")

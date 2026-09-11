@@ -208,20 +208,24 @@ def test_local_table_drift_scan_wired_into_start():
     assert "local-table drift scan raised" in body
 
 
-def test_local_table_drift_scan_is_warn_only():
-    """The scan must NOT call `ip route del` — WARN only."""
+def test_local_table_drift_scan_still_warns_on_detection():
+    """v0.5.293 supersession: v0.5.290 shipped this as WARN-only,
+    but the operator hit the ghost twice in one session (srv06
+    2026-09-11). v0.5.293 upgrades to AUTO-DELETE — the scan now
+    both WARNs AND calls `ip route del`. Test the invariant that
+    WARN still happens on detection (dropping WARN would make the
+    auto-delete silent, defeating debuggability)."""
     src = _mon_src()
     idx = src.find("def _scan_local_table_drift")
     end = src.find("\n    def ", idx + 1)
     body = src[idx:end]
-    for banned in (
-        '"ip", "route", "del"',
-        "'ip', 'route', 'del'",
-        '"route", "del"',
-    ):
-        assert banned not in body, (
-            f"drift scan must not delete routes (found: {banned!r})"
-        )
+    # WARN must still fire — either on successful auto-clean or on
+    # auto-clean failure.
+    assert "logger.warning" in body, (
+        "drift scan must still log at warning (v0.5.293 kept WARN, "
+        "added auto-delete on top)"
+    )
+    assert "LOCAL-TABLE GHOST" in body
 
 
 def test_local_table_drift_scan_uses_ip_route_show_table_local():

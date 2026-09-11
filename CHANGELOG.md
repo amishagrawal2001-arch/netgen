@@ -2,6 +2,108 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.293] - 2026-09-11
+
+**Two operator-hit ghost-state bugs that survived the entire
+v0.5.287-292 fix chain. Both discovered on srv06 2026-09-11
+after v0.5.292 verified working. This ship closes the anchor-
+DHCP saga for good — durable across container restarts AND
+across manual `ip addr del` recovery cycles.**
+
+### Fix A — stale-conf sweep in `start_dhcp_server`
+
+Pre-v0.5.292, `start_dhcp_server` was called with the top-level
+`device.interface` (parent NIC, e.g. `ens2f0np0`), so it wrote
+`/etc/dnsmasq.d/ostg-ens2f0np0.conf`. v0.5.292 reconciled to
+the subif and started writing `ostg-vlan10.conf` — but the OLD
+conf was never deleted.
+
+Symptom on srv06 2026-09-11: `ls /etc/dnsmasq.d/` shows both
+files. The DHCP container's baked entrypoint launched
+`dnsmasq --conf-file=/etc/dnsmasq.d/ostg-ens2f0np0.conf` on the
+next container restart. dnsmasq bound to the parent NIC, ignored
+the v0.5.289 `bind-dynamic` config in the correct file, and
+silently dropped every relayed DHCP frame.
+
+`ss --extended` at that moment: `0.0.0.0%ens2f0np0:67` (should
+have been `0.0.0.0%vlan10:67`).
+
+Fix (`utils/dhcp.py:2914` area, right after v0.5.292 reconcile):
+```python
+_keep_conf = f"ostg-{interface}.conf"
+_existing = _run_command(["/bin/sh", "-c",
+    "ls /etc/dnsmasq.d/ostg-*.conf 2>/dev/null || true"])
+for _f in _existing.stdout.splitlines():
+    if _f.rsplit("/", 1)[-1] == _keep_conf:
+        continue
+    _run_command(["rm", "-f", _f])
+    logger.info("[DHCP] v0.5.293 stale-conf sweep: removed %s ...", _f)
+```
+
+Sweep runs on every `start_dhcp_server`. Cheap. Makes v0.5.292
+reconcile durable across container restarts.
+
+### Fix B — `_scan_local_table_drift` AUTO-DELETES
+
+v0.5.290 Fix 3 shipped this scan as WARN-only. Operator hit the
+ghost TWICE in one session before we caught on — each time, DHCP
+was silently broken until I ran `sudo ip route del local ... table
+local` manually. WARN was too cautious.
+
+Root cause of ghost: v0.5.286 (ARP-J6) installs `local <ip> dev
+<iface> proto kernel scope host` explicitly. When someone runs
+`ip addr del <ip>/24 dev <iface>` manually (not through netgen's
+cleanup path), the kernel removes the ADDRESS but NOT the
+application-installed local route. The ghost then convinces the
+kernel that netgen still owns the IP → drops incoming packets
+with that as src as martian.
+
+An orphan `local` route whose IP isn't on the interface has
+**zero legitimate use case** — it's by definition broken kernel
+state. WARN-only was defensive to a fault.
+
+Fix (`utils/arp_monitor.py:_scan_local_table_drift`):
+- On detection, now issues `ip route del local <ip> dev <iface>
+  table local` FIRST
+- On success, WARN "auto-cleaned" so operator sees what happened
+- On failure (permissions, timing), WARN with the exact manual
+  `ip route del` command + rc + stderr for diagnosis
+
+The scan still runs at monitor startup (v0.5.290 wiring), so
+existing ghosts get cleaned on the next `systemctl restart
+netgen-server`.
+
+### Verification
+
+15 new behavioral tests in `tests/test_v05293_stale_conf_and_
+auto_cleanup.py`:
+- **Fix A**: marker present, sweep lives before `_verify_
+  interface_exists`, lists `ostg-*.conf` + rm's non-matching,
+  logs at INFO, best-effort try/except
+- **Fix B**: marker present, scan now calls `ip route del`,
+  logs "auto-cleaned" on success, logs manual remediation on
+  failure with rc + stderr
+- Regression: v0.5.287/289/290/291/292 markers all intact
+
+Updated `test_v05290_dad_and_localroute_cleanup.py`'s
+`test_local_table_drift_scan_is_warn_only` (renamed to
+`_still_warns_on_detection`) to reflect the new semantics —
+the invariant that WARN happens on detection is preserved, the
+old "must not call ip route del" invariant is superseded by
+v0.5.293's intentional design change.
+
+DHCP + DB regression: 33/33 in the anchor-DAD/stale-conf test
+suites; 443/447 in the wider `-k dhcp or anchor` filter (4
+pre-existing v0.5.282 test-drift failures, unrelated).
+
+### srv06 verification path
+
+Same pattern as v0.5.292: install wheel, `systemctl restart
+netgen-server`, watch for `LOCAL-TABLE GHOST auto-cleaned` on
+startup (if any ghosts exist), then Stop→Start any DHCP-server
+device to trigger the stale-conf sweep. Both fixes are startup
++ per-device-restart triggered.
+
 ## [0.5.292] - 2026-09-11
 
 **Reconcile the interface-mismatch that defeated v0.5.290/291's

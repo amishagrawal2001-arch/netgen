@@ -2961,6 +2961,61 @@ def start_dhcp_server(
             },
         )
 
+    # v0.5.293 (audit stale-conf-sweep): scavenge stale
+    # /etc/dnsmasq.d/ostg-<other-iface>.conf files for THIS device.
+    # Pre-v0.5.292 the iface parameter was whatever the caller
+    # passed (parent NIC vs subif) — start_dhcp_server wrote
+    # /etc/dnsmasq.d/ostg-<that-iface>.conf. After v0.5.292 the
+    # reconcile picks the subif, so we write a NEW conf file
+    # (ostg-vlan10.conf), but the OLD one (ostg-ens2f0np0.conf)
+    # persists in the container. Symptom on srv06 2026-09-11:
+    # container's baked entrypoint launched
+    # `dnsmasq --conf-file=/etc/dnsmasq.d/ostg-ens2f0np0.conf`
+    # on restart → dnsmasq bound to the parent NIC, ignored the
+    # v0.5.289 bind-dynamic config, silently dropped every relayed
+    # DHCP frame.
+    #
+    # Sweep: list ostg-*.conf, delete any whose iface doesn't
+    # match the current one. Cheap; runs on every start; makes
+    # v0.5.292 reconcile durable across container restarts.
+    try:
+        _keep_conf = f"ostg-{interface}.conf"
+        _existing = _run_command(
+            [
+                "/bin/sh", "-c",
+                "ls /etc/dnsmasq.d/ostg-*.conf 2>/dev/null || true",
+            ],
+            timeout=5, container=container,
+        )
+        _files = [
+            _f.strip() for _f in (getattr(_existing, "stdout", "") or "").splitlines()
+            if _f.strip()
+        ]
+        for _f in _files:
+            _basename = _f.rsplit("/", 1)[-1]
+            if _basename == _keep_conf:
+                continue
+            try:
+                _run_command(
+                    ["rm", "-f", _f],
+                    timeout=5, container=container,
+                )
+                logger.info(
+                    "[DHCP] v0.5.293 stale-conf sweep: removed %s "
+                    "(current iface=%s, keeps only %s)",
+                    _f, interface, _keep_conf,
+                )
+            except Exception as _rm_exc:
+                logger.debug(
+                    "[DHCP] Failed to remove stale conf %s: %s "
+                    "(non-fatal)", _f, _rm_exc,
+                )
+    except Exception as _sweep_exc:
+        logger.debug(
+            "[DHCP] stale-conf sweep raised: %s (non-fatal)",
+            _sweep_exc,
+        )
+
     if not _verify_interface_exists(interface, container=container):
         error_msg = f"Interface {interface} not found in container/host. Cannot start DHCP server."
         logger.error(f"[DHCP] {error_msg}")
