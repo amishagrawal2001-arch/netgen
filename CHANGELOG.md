@@ -2,6 +2,100 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.289] - 2026-09-10
+
+**dnsmasq's socket was bound in the wrong VRF for VRF-slaved
+subifs. Kernel silently dropped every relayed DHCP request.
+dnsmasq LOUD-WARNING'd us for 288 ships that we should switch
+to `bind-dynamic`. Ignored it every time. Fixed now.**
+
+### Operator symptom on srv06 2026-09-11 (v0.5.288 running)
+
+DHCP-server device on `vlan10` slaved to `vrf-2ab19c928e6`.
+Switch relayed DHCP-client requests from a `vlan30` device via
+`giaddr=192.16.30.1` destined for `172.16.30.2:67` (netgen's
+server anchor).
+
+`tcpdump -ni ens2f0np0 vlan 10 -e` showed BOOTP requests arriving
+tagged VLAN 10 with switch's MAC as source and netgen's vlan10
+MAC as destination — clean L2 delivery, no wire problem:
+
+```
+d0:48:a1:d0:27:06 > 5c:25:73:3f:30:56, vlan 10, ...,
+    192.16.30.1.67 > 172.16.30.2.67: BOOTP/DHCP, Request
+```
+
+`docker exec ... tail /var/log/dnsmasq-vlan10.log` showed
+ZERO transaction lines after the startup message across every
+attempt. Client `dhclient` timed out with `No DHCPOFFERS
+received.` after 7 DHCPDISCOVERs.
+
+### Root cause
+
+`utils/dhcp.py:2965` template emitted `"bind-interfaces"`.
+dnsmasq with `bind-interfaces` binds sockets to specific IP
+addresses via `bind()`. Those sockets live in the DEFAULT VRF's
+binding table.
+
+For DHCP-server devices whose subif is slaved to a per-device
+VRF (netgen's `vrf-<device-id>` pattern), packets arrive via
+the VRF's routing table and the kernel's socket lookup is
+restricted to sockets bound in that VRF (or bound to the
+specific interface via `SO_BINDTODEVICE`). dnsmasq's
+default-VRF-bound socket didn't match → kernel silently
+dropped the packet.
+
+dnsmasq itself flagged this on every startup:
+
+```
+LOUD WARNING: use --bind-dynamic rather than --bind-interfaces
+  to avoid DNS amplification attacks via these interface(s)
+```
+
+The warning framing (DNS amplification) is about a different
+concern, but the recommended remediation happens to be exactly
+what fixes the VRF-isolation issue too: `bind-dynamic` uses
+`SO_BINDTODEVICE` per interface, so the socket joins the VRF
+that owns the interface.
+
+### Fix
+
+`utils/dhcp.py:2965`: `"bind-interfaces"` → `"bind-dynamic"`.
+
+Also gains: dnsmasq now follows IP add/remove on the interface
+dynamically. The pre-fix "stale-binding-after-ip-addr-del"
+class of bug (dnsmasq keeps a socket alive for an IP that's no
+longer on the interface, until you docker-restart the
+container) is closed by the same one-word change.
+
+### What this does NOT fix
+
+- **`192.16.30.1` re-anchoring on vlan10 (v0.5.290 candidate)**:
+  the switch owns `192.16.30.1` as its DHCP relay-agent IP for
+  the client's subnet. v0.5.287 Fix A prevents `server_ip ==
+  gateway` but doesn't guard against `server_ip == some-other-
+  device-on-the-wire`. Symptom: operator's manual
+  `ip addr del 192.16.30.1/24 dev vlan10` gets undone by the
+  next `_ensure_ipv4_address` call. Proper fix: DAD
+  (`arping -D`) before anchoring — if someone else answers,
+  refuse to anchor and surface to `dhcp_last_error`.
+- The pre-existing stale `/tmp/netgen-server-extract-241/`
+  systemd `ExecStart` on srv06 — cosmetic, the running process
+  is actually resolved from the v0.5.288 wheel install at
+  `/usr/local/lib/python3.12/dist-packages/`.
+
+### Verification
+
+- `tests/test_v05289_dnsmasq_bind_dynamic.py` — 5 behavioral
+  tests. The template's config_lines literal must contain
+  `bind-dynamic` and NOT `bind-interfaces`; the v0.5.289 marker
+  comment must reference SO_BINDTODEVICE + VRF; `except-
+  interface=lo` (v0.5.233) is preserved as defense-in-depth.
+- Not yet re-verified end-to-end on srv06 with the shipped
+  code. Operator to upgrade netgen-server to v0.5.289 and
+  confirm `dhclient -v vlan30` inside the client container
+  yields a DHCPACK.
+
 ## [0.5.288] - 2026-09-08
 
 **Silence the schema-dump tsunami that was drowning out every

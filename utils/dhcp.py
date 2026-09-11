@@ -2951,18 +2951,48 @@ def start_dhcp_server(
 
     config_lines = [
         f"interface={interface}",
-        # v0.5.233: skip loopback binding. Even with
-        # bind-interfaces + interface=vlan10, dnsmasq's DNS resolver
-        # tries to bind to lo's addresses (127.0.0.1 + any other
-        # globally-scoped IPs on lo — netgen assigns per-device
-        # loopback IPs like 192.255.10.3 to lo). When the whole
-        # process is wrapped in `ip vrf exec vrf-<device>` (v0.5.232),
-        # those loopback addresses aren't reachable from the VRF's
-        # routing table, so bind() returns EADDRNOTAVAIL and dnsmasq
-        # exits. Explicitly excluding lo (which we don't want DHCP
-        # serving on anyway) sidesteps the whole problem.
+        # v0.5.233: skip loopback binding. With the pre-v0.5.289
+        # bind-interfaces + interface=vlan10 combo, dnsmasq's DNS
+        # resolver tried to bind to lo's addresses (127.0.0.1 +
+        # any other globally-scoped IPs on lo — netgen assigns
+        # per-device loopback IPs like 192.255.10.3 to lo).
+        # Excluding lo explicitly sidesteps it. Still emitted
+        # under bind-dynamic (v0.5.289) as defense-in-depth even
+        # though `port=0` already disables the DNS side.
         "except-interface=lo",
-        "bind-interfaces",
+        # v0.5.289 (VRF socket isolation): switched from
+        # bind-interfaces → bind-dynamic. `bind-interfaces` binds
+        # sockets to specific IP addresses via bind(). Those
+        # sockets live in the DEFAULT VRF's binding table. For
+        # DHCP-server devices whose subif (e.g. vlan10) is slaved
+        # to a per-device VRF (`vrf-<device-id>`), packets arrive
+        # via the VRF's routing table and the kernel's socket
+        # lookup is restricted to sockets bound in that VRF (or
+        # bound to the specific interface via SO_BINDTODEVICE).
+        # dnsmasq's default-VRF-bound socket didn't match →
+        # kernel silently dropped every relayed DHCP request.
+        #
+        # Operator symptom on srv06 2026-09-11 (v0.5.288 running,
+        # DHCP-server on vlan10 in vrf-2ab19c928e6, switch
+        # relaying DHCP client requests from vlan30 via
+        # giaddr=192.16.30.1): tcpdump on ens2f0np0 showed
+        # DHCPDISCOVERs arriving tagged VLAN 10, dnsmasq's log
+        # stayed silent across dozens of attempts, dhclient
+        # timed out with "No DHCPOFFERS received."
+        #
+        # `bind-dynamic` uses SO_BINDTODEVICE per interface. The
+        # socket then joins the VRF that owns the interface, and
+        # the kernel delivers packets from that VRF to it. Also
+        # dynamically follows IP add/remove on the interface,
+        # eliminating the "stale binding after ip addr del"
+        # class of bug that bind-interfaces suffered from
+        # (previously required a dnsmasq restart to shed old
+        # bindings).
+        #
+        # dnsmasq itself emitted a LOUD WARNING recommending
+        # bind-dynamic on every startup we did with bind-
+        # interfaces. Ignored for 288 ships; finally listening.
+        "bind-dynamic",
         # v0.5.233: disable the DNS resolver entirely. netgen uses
         # dnsmasq strictly for DHCP; there's no reason for a DNS
         # port to be open per device, and it removes a second source

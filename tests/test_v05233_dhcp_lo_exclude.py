@@ -38,21 +38,31 @@ def test_dnsmasq_config_disables_dns_port():
     assert '"port=0",' in src
 
 
-def test_dnsmasq_config_still_has_bind_interfaces_and_authoritative():
+def test_dnsmasq_config_still_has_bind_directive_and_authoritative():
     """The v0.5.233 additions must not accidentally displace the
-    pre-existing bind-interfaces / dhcp-authoritative lines."""
+    bind directive or dhcp-authoritative.
+
+    v0.5.289 supersession: the bind directive changed from
+    `bind-interfaces` to `bind-dynamic` for VRF socket isolation
+    (see tests/test_v05289_dnsmasq_bind_dynamic.py). The v0.5.233
+    invariant now checks that ONE of the two forms is present."""
     src = _read("utils/dhcp.py")
-    assert '"bind-interfaces",' in src
+    assert '"bind-dynamic",' in src or '"bind-interfaces",' in src
     assert '"dhcp-authoritative",' in src
 
 
-def test_config_line_ordering_lo_before_bind_interfaces():
-    """`except-interface` must come BEFORE `bind-interfaces` in the
-    config file — dnsmasq processes interface directives in order,
-    and bind-interfaces snapshots the current list."""
+def test_config_line_ordering_lo_before_bind_directive():
+    """`except-interface` must come BEFORE the bind directive in
+    the config file — dnsmasq processes interface directives in
+    order, and both `bind-interfaces` (pre-v0.5.289) and
+    `bind-dynamic` (v0.5.289+) snapshot / dynamically-track the
+    current list, so exclusions must be established first."""
     src = _read("utils/dhcp.py")
     _idx_except = src.find('"except-interface=lo",')
-    _idx_bind = src.find('"bind-interfaces",')
+    # Find whichever bind directive is present.
+    _idx_bind = src.find('"bind-dynamic",')
+    if _idx_bind == -1:
+        _idx_bind = src.find('"bind-interfaces",')
     assert _idx_except != -1 and _idx_bind != -1
     assert _idx_except < _idx_bind
 
