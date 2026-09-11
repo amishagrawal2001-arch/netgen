@@ -901,6 +901,32 @@ class AddDeviceDialog(QDialog):
         self.dhcp_gateway_route_input.setEnabled(False)
         dhcp_left_layout.addRow("Gateway Route:", self.dhcp_gateway_route_input)
 
+        # v0.5.296 (audit relay-ui): expose relay_return_hop so DHCP-
+        # relay setups don'''t need direct sqlite edits. Value = the
+        # relay agent'''s IP on the SERVER'''s L2 segment (e.g. the
+        # switch'''s irb.10 IP when clients live on a different VLAN
+        # and the switch relays their DISCOVERs to netgen'''s server
+        # interface). When set, v0.5.245 skips the pool-anchor step
+        # entirely and installs a return route via this hop instead —
+        # prevents the anchor-collision + self-loop pattern the entire
+        # v0.5.287-295 saga was chasing. Empty = direct-attached mode
+        # (default, unchanged behavior).
+        self.dhcp_relay_return_hop_input = QLineEdit()
+        self.dhcp_relay_return_hop_input.setPlaceholderText(
+            "e.g. 172.16.30.1 (switch'''s IP on server'''s L2 — leave empty for direct-attached)"
+        )
+        self.dhcp_relay_return_hop_input.setToolTip(
+            "DHCP relay agent'''s IP on the DHCP-SERVER'''s L2 segment.\n\n"
+            "Set this when the client subnet is remote and a switch/router\n"
+            "relays client DISCOVERs to netgen. Netgen then routes OFFER\n"
+            "replies back through this hop instead of anchoring the pool'''s\n"
+            "\".1\" locally (which collides with the relay agent'''s giaddr\n"
+            "and silently drops every relayed frame — the v0.5.287-295 saga).\n\n"
+            "Leave EMPTY for direct-attached DHCP (client on same L2 as server)."
+        )
+        self.dhcp_relay_return_hop_input.setEnabled(False)
+        dhcp_left_layout.addRow("Relay Return Hop:", self.dhcp_relay_return_hop_input)
+
         dhcp_right_layout = QFormLayout()
         dhcp_right_layout.setSpacing(8)
 
@@ -1304,6 +1330,7 @@ class AddDeviceDialog(QDialog):
         self.dhcp_pool_end_input.setEnabled(False)
         self.dhcp_lease_time_input.setEnabled(False)
         self.dhcp_gateway_route_input.setEnabled(False)
+        self.dhcp_relay_return_hop_input.setEnabled(False)
         self.dhcp_mode_combo.setEnabled(False)
         
         # ROCEv2 fields
@@ -1450,6 +1477,7 @@ class AddDeviceDialog(QDialog):
             self.dhcp_pool_end_input,
             self.dhcp_lease_time_input,
             self.dhcp_gateway_route_input,
+            self.dhcp_relay_return_hop_input,
         ):
             widget.setEnabled(ipv4_active)
 
@@ -1914,6 +1942,12 @@ class AddDeviceDialog(QDialog):
                     dhcp_config["lease_time"] = lease_time
                     dhcp_config["gateway"] = gateway_value
                     dhcp_config["gateway_route"] = gateway_route_value
+                    # v0.5.296 (audit relay-ui): persist the relay_return_hop
+                    # so v0.5.245 relay-mode skip + v0.5.295 anchor-replay
+                    # propagation both see the operator'''s intent.
+                    dhcp_config["relay_return_hop"] = (
+                        self.dhcp_relay_return_hop_input.text().strip()
+                    )
 
                 if ipv6_enabled:
                     pool6_start = self.dhcp6_pool_start_input.text().strip()

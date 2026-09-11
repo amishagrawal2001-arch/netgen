@@ -7591,6 +7591,12 @@ class DevicesTab(QWidget):
                         gw_route = ",".join(str(x) for x in gw_route if x)
                     if gw_route:
                         dialog.dhcp_gateway_route_input.setText(str(gw_route))
+                    # v0.5.296 (audit relay-ui): preload the relay_return_hop
+                    # field from dhcp_config so an Edit dialog shows the
+                    # current value instead of blank.
+                    _rrh = dhcp_config.get("relay_return_hop") if isinstance(dhcp_config, dict) else ""
+                    if _rrh is not None and hasattr(dialog, "dhcp_relay_return_hop_input"):
+                        dialog.dhcp_relay_return_hop_input.setText(str(_rrh))
 
                 # IPv6 pool + prefix + server IP + gateway + routes + lease
                 if hasattr(dialog, "dhcp6_pool_start_input"):

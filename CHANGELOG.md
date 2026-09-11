@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.296] - 2026-09-11
+
+**Expose `relay_return_hop` in the DHCP-server device dialog.**
+
+The knob that unblocked the entire v0.5.287-295 debug saga wasn'''t
+in any dialog — I set it via direct sqlite write on srv06. v0.5.245
+shipped the server-side skip (three sessions ago), v0.5.295 shipped
+the anchor-replay propagation (last ship), but the field itself
+lived only in the DB. Any operator running a DHCP-relay setup would
+have hit the same 9-ship debug wall.
+
+### Fix — client UI addition, four wires
+
+`widgets/add_device_dialog.py`:
+1. New `QLineEdit` `dhcp_relay_return_hop_input` next to Gateway Route
+   in the DHCP-server IPv4 layout
+2. Placeholder + verbose tooltip: names the concept (relay agent'''s
+   IP on the server'''s L2), the failure mode without it (anchor
+   collision + self-loop drop), and the exact meaning of empty
+   (direct-attached, unchanged default)
+3. Initial `setEnabled(False)`; added to the enable/disable toggle
+   that fires on server-mode + IPv4 toggle
+4. Save path: `dhcp_config["relay_return_hop"] = input.text().strip()`
+
+`widgets/devices_tab.py`:
+5. Edit-load path: when re-opening the dialog for an existing device,
+   preload the field via `dialog.dhcp_relay_return_hop_input.setText(
+   dhcp_config.get("relay_return_hop", ""))` — guarded by
+   `hasattr()` for cross-version safety.
+
+Server side already reads the field (v0.5.245 in `start_dhcp_server`,
+v0.5.295 in `_replay_dhcp_anchor_setup`) — no server changes needed.
+
+### Verification
+
+13 behavioral tests in `tests/test_v05296_relay_return_hop_ui.py`:
+widget declared, tooltip references relay-agent + direct-attached,
+added to the right layout, initially disabled, in enable/disable
+group, save writes into dhcp_config, edit-load preloads from
+dhcp_config with `hasattr()` guard, regression on v0.5.245 read
+path + v0.5.295 replay propagation.
+
+### Operator impact
+
+Adding or editing a DHCP-server device now shows a "Relay Return Hop"
+field under IPv4 config. Leave empty for direct-attached (default,
+unchanged). Fill with switch/router IP for relay setups — netgen
+skips the anchor and installs a return route. **Closes the
+"invisible config" gap that made the v0.5.287-295 saga possible.**
+
 ## [0.5.295] - 2026-09-11
 
 **Anchor-replay silently re-installed the relay-mode anchor on every
