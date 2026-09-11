@@ -165,6 +165,25 @@ class ARPStatusMonitor:
                 f"[ARP MONITOR] parent-NIC drift scan raised: {_exc}"
             )
 
+        # v0.5.290 (audit anchor-DAD, part 3): scan the local
+        # routing table for stale `local <ip> dev <iface>` entries
+        # whose <ip> is no longer on <iface>. v0.5.286 (ARP-J6)
+        # installs these explicitly; a subsequent `ip addr del`
+        # (manual op, or the pre-v0.5.290 _remove_ipv4_address)
+        # removed the address but the kernel didn'''t GC the
+        # explicit local route. Kernel then treats the ghost IP
+        # as netgen'''s own → drops incoming packets claiming
+        # that source as martian → DHCP replies never see the
+        # relayed request. WARN only, never auto-delete: an
+        # operator may have installed a local route intentionally
+        # (rare, but possible).
+        try:
+            self._scan_local_table_drift()
+        except Exception as _exc:
+            logger.warning(
+                f"[ARP MONITOR] local-table drift scan raised: {_exc}"
+            )
+
         self.is_running = True
         self.stop_event.clear()
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -623,6 +642,98 @@ class ARPStatusMonitor:
                 )
                 _warned_ifaces.add(_parent)
 
+
+    def _scan_local_table_drift(self) -> None:
+        """v0.5.290 (audit anchor-DAD, part 3): find stale
+        ``local <ip> dev <iface>`` entries in the local routing
+        table whose ``<ip>`` is no longer present on ``<iface>``.
+
+        The failure this catches: v0.5.286 (ARP-J6) installs
+        ``ip route add local <ip>/32 dev <iface> ...`` explicitly
+        to guarantee the kernel treats the anchor IP as ours,
+        even under some VRF-race scenarios where the auto-install
+        missed. But when the address is later removed from the
+        interface (via ``ip addr del``, whether operator manual
+        or pre-v0.5.290 ``_remove_ipv4_address``), the kernel
+        does NOT auto-remove application-installed local routes.
+        The route persists as a ghost. Kernel still treats the
+        ghost IP as netgen'''s own → drops incoming packets
+        whose src IP matches the ghost as suspected spoofing
+        (martian source) → dnsmasq never sees relayed DHCP
+        requests from switches whose IP happens to match a
+        previous netgen anchor.
+
+        Operator on srv06 2026-09-11 hit this exact tail after
+        v0.5.289 (bind-dynamic) landed: config was correct,
+        socket was in the right VRF, packets reached vlan10 —
+        but dnsmasq still saw ZERO transactions because
+        ``local 192.16.30.1 dev vlan10`` remained after
+        ``ip addr del 192.16.30.1/24 dev vlan10``.
+
+        WARN-only (never auto-delete). The remediation the log
+        line names: ``sudo ip route del local <ip> dev <iface>
+        table local``. Restarting the DHCP-server device also
+        triggers v0.5.290 fix in ``_remove_ipv4_address`` which
+        cleans the route on the stop path.
+        """
+        try:
+            _res = subprocess.run(
+                ["ip", "route", "show", "table", "local"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception as _exc:
+            logger.debug(
+                f"[ARP MONITOR] local-table drift scan: "
+                f"ip route show failed: {_exc}"
+            )
+            return
+        _out = (_res.stdout or "")
+        # Parse lines of the form:
+        #   local <ip> dev <iface> proto kernel scope host src <ip>
+        # We care about `local <ip> dev <iface>`.
+        _ghosts = []
+        for _line in _out.splitlines():
+            _tokens = _line.strip().split()
+            if len(_tokens) < 4 or _tokens[0] != "local":
+                continue
+            try:
+                _dev_idx = _tokens.index("dev")
+            except ValueError:
+                continue
+            if _dev_idx + 1 >= len(_tokens):
+                continue
+            _ip = _tokens[1]
+            _iface = _tokens[_dev_idx + 1]
+            # Check whether _ip is currently on _iface.
+            try:
+                _addr = subprocess.run(
+                    ["ip", "-4", "-o", "addr", "show", "dev", _iface],
+                    capture_output=True, text=True, timeout=3,
+                )
+                _addr_out = (_addr.stdout or "")
+            except Exception:
+                continue
+            # `inet <ip>/<pfx>` — grep for the ip followed by /
+            if f" {_ip}/" not in _addr_out:
+                _ghosts.append((_ip, _iface))
+        if not _ghosts:
+            logger.debug(
+                "[ARP MONITOR] local-table drift scan: no ghosts"
+            )
+            return
+        for _ip, _iface in _ghosts:
+            logger.warning(
+                f"[ARP MONITOR] LOCAL-TABLE GHOST: "
+                f"`local {_ip} dev {_iface}` is in table local "
+                f"but {_ip} is NOT currently on {_iface}. Kernel "
+                f"still treats {_ip} as a local address; incoming "
+                f"packets with src={_ip} will be dropped as "
+                f"martian, silently breaking any DHCP relay or "
+                f"protocol whose peer owns that IP. Fix: "
+                f"`sudo ip route del local {_ip} dev {_iface} "
+                f"table local` — or stop/start the DHCP-server "
+                f"device on {_iface} to trigger v0.5.290 cleanup."
+            )
     def _monitor_loop(self):
         """Main monitoring loop."""
         logger.info("[ARP MONITOR] Monitoring loop started")

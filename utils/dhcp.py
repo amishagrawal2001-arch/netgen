@@ -1175,6 +1175,40 @@ def _ensure_ipv4_address(
         except Exception:
             _existing_mask = ""
     mask_bits = ipv4_mask or _existing_mask or str(pool_network.prefixlen)
+
+    # v0.5.290 (audit anchor-DAD): before we claim ``server_ip``,
+    # probe the wire with arping -D to check if some other device
+    # already owns it. v0.5.287 Fix A only skips the operator's
+    # declared gateway; it can't know about IPs owned by external
+    # devices whose addresses aren't in the DHCP-device config.
+    # Common case that motivated this: pool 192.16.30.10-.200 with
+    # gateway 172.16.30.1 (different subnet). Fix A derives
+    # server_ip=192.16.30.1 as the first host — but the switch's
+    # DHCP-relay agent already owns .1 on that subnet. Anchoring
+    # it puts the switch's IP on netgen's own NIC → self-loop for
+    # any relayed DHCP request → dnsmasq silently drops. Operator
+    # on srv06 2026-09-11 hit this repeatedly; manual `ip addr
+    # del` got undone by the next _ensure_ipv4_address call.
+    #
+    # DAD result → refuse-to-anchor path. If arping -D returns 1
+    # (address in use by someone else), refuse and surface a clear
+    # error message to dhcp_last_error via the caller so the
+    # operator sees WHY the anchor didn't land (versus "no reason
+    # given"). Idempotent behavior preserved for the case where
+    # the IP is already OURS: _iface_has_ipv4_in_subnet at ~line
+    # 1000 short-circuits before we get here.
+    if _probe_ip_conflict(interface, server_ip, container=container):
+        logger.warning(
+            "[DHCP] Refusing to anchor %s on %s — DAD (arping -D) "
+            "detected the address is already in use by another "
+            "device on the segment. Likely the switch's own IP or "
+            "another host in the same pool subnet. Set the DHCP "
+            "device's gateway field to that IP so v0.5.287 Fix A "
+            "skips it, or pick a different pool.",
+            server_ip, interface,
+        )
+        return None
+
     try:
         result = _run_command(
             ["ip", "-4", "addr", "add", f"{server_ip}/{mask_bits}", "dev", interface],
@@ -1614,6 +1648,59 @@ def _remove_ipv4_address(interface: str, address: str, prefix: str, container=No
             "[DHCP] Failed to remove IPv4 address %s/%s from %s: %s",
             address, _pfx, interface, exc,
         )
+    # v0.5.290 (audit anchor-DAD, part 2): also remove the local-
+    # table entry that v0.5.286 (ARP-J6) explicitly added. `ip -4
+    # addr del` auto-removes local routes the KERNEL installed,
+    # but NOT explicit routes an application installed via
+    # `ip route add local ...`. Operator on srv06 2026-09-11 hit
+    # this exact tail: manually removed 192.16.30.1/24 from vlan10
+    # to break a self-loop, but the ARP-J6 explicit local route
+    # persisted. Kernel then continued to treat 192.16.30.1 as
+    # netgen'''s own IP → dropped every incoming packet claiming
+    # src=192.16.30.1 as martian/spoofed, and dnsmasq never saw
+    # relayed DHCP requests from the switch.
+    #
+    # Explicit-remove mirrors ARP-J6'''s explicit-install. Same
+    # syntax modulo the verb; ignore "No such process" (kernel
+    # already GC'''d it in most cases) and any other transient
+    # errors — best-effort cleanup.
+    try:
+        _lr = _run_command(
+            [
+                "ip", "route", "del",
+                "local", f"{address}/32",
+                "dev", interface,
+                "table", "local",
+            ],
+            timeout=5, container=container,
+        )
+        _rc = getattr(_lr, "returncode", 0)
+        if _rc == 0:
+            logger.info(
+                "[DHCP] Removed local-table entry for %s dev %s "
+                "(v0.5.286 ARP-J6 install)",
+                address, interface,
+            )
+        else:
+            _err = (getattr(_lr, "stderr", "") or "").strip()
+            if "No such process" in _err or "No such file" in _err:
+                logger.debug(
+                    "[DHCP] Local-table entry for %s dev %s already "
+                    "absent (kernel GC'''d it) — nothing to do",
+                    address, interface,
+                )
+            else:
+                logger.debug(
+                    "[DHCP] Local-table entry cleanup for %s dev %s "
+                    "returned rc=%s stderr=%r",
+                    address, interface, _rc, _err[:200],
+                )
+    except Exception as _lr_exc:
+        logger.debug(
+            "[DHCP] Local-table entry cleanup for %s dev %s "
+            "raised: %s (non-fatal)",
+            address, interface, _lr_exc,
+        )
 
 
 def _collect_ipv4_anchor_candidates(dhcp_cfg: Optional[Dict]) -> set:
@@ -1721,6 +1808,76 @@ def _iface_ipv4_addresses(interface: str, container=None) -> List[tuple]:
         if ip and pfx:
             out.append((ip, pfx))
     return out
+
+
+def _probe_ip_conflict(
+    interface: str, ip: str, container=None,
+) -> bool:
+    """v0.5.290 (audit anchor-DAD): probe whether ``ip`` is already
+    claimed by ANOTHER device on the wire reachable through
+    ``interface``, before netgen anchors it.
+
+    Uses ``arping -D`` (Duplicate Address Detection): sends 2 ARP
+    probes with sender=0.0.0.0 target=<ip>, exits 0 if no reply,
+    1 if someone replies (i.e. the address is in use), other on
+    error (arping missing, iface down, permissions).
+
+    Returns True iff a conflict was detected. Errors from the probe
+    (arping missing, transient issues) return False so we don't
+    block legitimate anchor operations on tooling gaps — the
+    caller still proceeds and the existing "ip addr add" path will
+    surface any real failure.
+
+    Motivation — operator's srv06 setup 2026-09-11: switch owns
+    ``192.16.30.1`` as its DHCP relay-agent IP for a vlan30
+    client subnet. Netgen's DHCP-server device on vlan10 has
+    pool=192.16.30.10-.200 and gateway=172.16.30.1 (on a
+    different subnet, so v0.5.287 Fix A can't skip it as the
+    pool's gateway). Fix A derives server_ip = 192.16.30.1 as
+    the first host — colliding with the switch. Netgen anchors
+    .1, kernel routes DHCP replies via netgen's own copy of .1
+    → self-loop → dnsmasq sees packets from its own IP and
+    silently drops them. Manual ``ip addr del`` on the host
+    gets undone by every subsequent ``_ensure_ipv4_address``
+    call. DAD is the general-case guard: don't claim IPs owned
+    by other devices we can see on the L2 segment.
+    """
+    if not interface or not ip:
+        return False
+    try:
+        _probe = _run_command(
+            [
+                "arping", "-D",
+                "-c", "2",
+                "-w", "3",
+                "-I", interface,
+                ip,
+            ],
+            timeout=6, container=container,
+        )
+    except Exception as _exc:
+        # arping missing (iputils-arping not installed) or other
+        # infrastructural issue. Log at debug — don't block the
+        # anchor on tooling absence.
+        logger.debug(
+            "[DHCP] DAD probe for %s on %s skipped: %s (arping "
+            "missing or unusable)", ip, interface, _exc,
+        )
+        return False
+    _rc = getattr(_probe, "returncode", 0)
+    if _rc == 1:
+        return True
+    if _rc != 0:
+        # Some other error — log at debug, don't block.
+        logger.debug(
+            "[DHCP] DAD probe for %s on %s: arping rc=%s "
+            "stderr=%r — treating as inconclusive",
+            ip, interface, _rc,
+            (getattr(_probe, "stderr", "") or "")[:200],
+        )
+        return False
+    return False
+
 
 
 def _remove_matching_ipv4_anchors(

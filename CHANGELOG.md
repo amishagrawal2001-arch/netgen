@@ -2,6 +2,121 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.290] - 2026-09-11
+
+**Three-part fix bundle for the anchor-collision saga that
+survived v0.5.287/288/289. Root cause finally isolated on srv06
+2026-09-11 with SSH access + live tcpdump/ss inspection.**
+
+### The situation coming into v0.5.290
+
+After v0.5.289 (bind-dynamic) landed on srv06:
+- `ss --extended` confirmed dnsmasq's socket was properly in
+  `vrf-2ab19c928e6` via cgroup binding
+- tcpdump on vlan10 confirmed the switch's relayed DHCP requests
+  were arriving (`d0:48:a1:d0:27:06 > 5c:25:73:3f:30:56, vlan 10
+  ..., 192.16.30.1.67 > 172.16.30.2.67`)
+- dnsmasq's log still showed ZERO transactions across 8+ DHCPDISCOVER
+  attempts
+- Operator manually `ip addr del`'d the offending `192.16.30.1/24`
+  from vlan10 — didn't help
+
+### Root cause — stale explicit local-table entry
+
+Reading `sudo ip route show table local` uncovered:
+
+```
+local 192.16.30.1 dev vlan10 proto kernel scope host src 192.16.30.1
+```
+
+v0.5.286 (ARP-J6) had installed this entry explicitly when netgen
+anchored `192.16.30.1` earlier. `ip addr del` removed the address
+but the kernel does NOT auto-remove application-installed local
+routes (only kernel-installed ones). The route persisted as a
+ghost. Kernel then treated `192.16.30.1` as netgen's own IP →
+packets arriving with `src=192.16.30.1` (the switch's relay
+agent) got dropped as martian sources (spoofed local IP) →
+dnsmasq's socket never saw them, despite being correctly bound
+in the VRF.
+
+### Fix 1 — DAD before anchor (`utils/dhcp.py`)
+
+New `_probe_ip_conflict(interface, ip, container=None)` helper.
+Runs `arping -D -c 2 -w 3 -I <iface> <ip>`. Returns True iff
+arping's DAD returns exit 1 (address in use by someone else on
+the wire). Missing arping / other errors return False (don't
+block legitimate anchor operations on tooling gaps).
+
+`_ensure_ipv4_address` now calls this BEFORE `ip addr add`. If
+conflict detected, logs warning + returns None + suggests
+operator remedy (set the DHCP device's gateway field to that IP
+so v0.5.287 Fix A skips it, or pick a different pool).
+
+Prevents `server_ip == some-other-device's-IP-on-the-wire` at
+the source. v0.5.287 Fix A only guards `server_ip == gateway`;
+this is the general case.
+
+### Fix 2 — cleanup local-table on address removal (`utils/dhcp.py`)
+
+`_remove_ipv4_address` now issues both `ip addr del` AND
+`ip route del local <ip>/32 dev <iface> table local` — mirroring
+v0.5.286's explicit install with an explicit remove. Best-effort;
+"No such process" (kernel already GC'd it) treated as debug.
+
+Fixes the "ghost local route survives address deletion" pattern
+that broke srv06 for hours after v0.5.289 landed.
+
+### Fix 3 — startup local-table drift-detect (`utils/arp_monitor.py`)
+
+New `_scan_local_table_drift`. On monitor start (after
+`_scan_parent_nic_drift`), enumerates `ip route show table local`
+and grep-matches `local <ip> dev <iface>`. For each match,
+checks whether `<ip>` is currently on `<iface>` via `ip -4 -o
+addr show dev <iface>`. If not, logs a WARNING with:
+
+- The ghost IP + interface
+- Explanation of the martian-source drop symptom
+- Exact remediation: `sudo ip route del local <ip> dev <iface>
+  table local`
+- Alternative: stop→start the DHCP-server device to trigger
+  Fix 2's cleanup
+
+WARN-only, never auto-delete (same design principle as v0.5.287
+Fix C — operators may have installed a local route intentionally).
+
+### Verification
+
+17 new behavioral tests in `tests/test_v05290_dad_and_
+localroute_cleanup.py`:
+- DAD helper: True on rc=1, False on rc=0, False on missing
+  arping, False on other errors
+- Wiring: DAD probe called BEFORE `ip addr add`; refusal
+  short-circuits before the add
+- Cleanup: `_remove_ipv4_address` issues both addr del + route
+  del, uses /32 to match v0.5.286 install, best-effort with
+  "No such process" as debug
+- Drift-scan: defined, wired into `start()`, WARN-only (banned
+  every `ip route del` string), uses `ip route show table
+  local`, warning names the exact remediation command
+- Regression: v0.5.287 Fix A + v0.5.289 bind-dynamic still
+  present
+
+DHCP + DB regression: 349/352 pass (3 failures are pre-existing
+v0.5.282 test drift, unrelated).
+
+### srv06 verification path
+
+Operator paste-back needed:
+1. Install v0.5.290 wheel into `/opt/netgen-server/netgen-venv`
+2. `systemctl restart netgen-server` (systemd already points at
+   the /opt venv per v0.5.289 verification)
+3. On startup, `[ARP MONITOR] LOCAL-TABLE GHOST: ...` warning
+   should fire for the current `local 192.16.30.1 dev vlan10`
+   entry (or nothing if already cleaned)
+4. Stop → Start the DHCP-server device to trigger Fix 2 cleanup
+5. Trigger dhclient inside the client container: expect
+   DHCPOFFER/DHCPACK, vlan30 gets an IP in `192.16.30.10-.200`
+
 ## [0.5.289] - 2026-09-10
 
 **dnsmasq's socket was bound in the wrong VRF for VRF-slaved
