@@ -250,6 +250,60 @@ _TEMPLATES: List[_Template] = [
     ),
 
     _Template(
+        key="dhcp_server_ipv6",
+        title="DHCPv6 server (pool 2001:db8:30::100-1ff)",
+        summary="dnsmasq DHCPv6 inside the device VRF. Interface + pool "
+                "land on 2001:db8:30::/64 (device at ::1, pool "
+                "::100–::1ff), 1-hour lease, prefix /64. Uses a distinct "
+                "/64 within the RFC 3849 documentation range "
+                "(2001:db8::/32) so this DHCPv6 server stays isolated "
+                "from regular IPv6 devices (default 2001:db8::/64) — "
+                "mirror of the IPv4 template's 172.16.30.0/24 isolation "
+                "from the 192.168.0.0/24 default. dnsmasq also enables "
+                "Router Advertisement on the interface so downstream "
+                "clients can pick up the prefix even before a DHCPv6 "
+                "exchange completes. Useful for stressing DHCPv6 lease "
+                "churn, prefix-delegation, or IPv6-only client racks.",
+        protocols=["DHCP"],
+        fields={
+            # IPv6-only: v4 off, v6 on. Mirror of the IPv4 template's
+            # v4-only shape — this template is the direct analog.
+            "ipv4_checkbox": False,
+            "ipv6_checkbox": True,
+            "vlan_input": "10",
+            "dhcp_mode_combo": "Server",
+            # Flip the DHCP-family sub-toggles too, otherwise
+            # _update_dhcp_field_states leaves the IPv6 pool
+            # widgets disabled + hidden (the defaults are
+            # dhcp_ipv4=on, dhcp_ipv6=off — inverse of what a
+            # DHCPv6-server template wants). Names match
+            # add_device_dialog.py:451,454.
+            "dhcp_ipv4_enabled_checkbox": False,
+            "dhcp_ipv6_enabled_checkbox": True,
+            # Device sits at ::1 of the DHCPv6 subnet so dnsmasq
+            # listens on the same broadcast domain as the pool.
+            # Mirror of the 172.16.30.1 anchor in the IPv4 dhcp_server
+            # template — without this the interface would inherit the
+            # 2001:db8::2/64 widget default (a different /64 from
+            # the pool) and dnsmasq would refuse to serve pool
+            # addresses (v0.5.222 shape: "no address in subnet on
+            # interface").
+            "ipv6_input": "2001:db8:30::1",
+            "ipv6_mask_input": "64",
+            "ipv6_gateway_input": "2001:db8:30::1",
+            # DHCPv6 server widgets live in dhcp_ipv6_container
+            # (add_device_dialog.py:947-996).
+            "dhcp6_pool_start_input": "2001:db8:30::100",
+            "dhcp6_pool_end_input": "2001:db8:30::1ff",
+            "dhcp6_prefix_input": "64",
+            "dhcp6_server_ip_input": "2001:db8:30::1",
+            "dhcp6_gateway_input": "2001:db8:30::1",
+            "dhcp6_gateway_route_input": "2001:db8:30::/64",
+            "dhcp6_lease_time_input": "3600",
+        },
+    ),
+
+    _Template(
         key="bgp_ospf_pe",
         title="PE router (eBGP external + OSPFv2 internal)",
         summary="Classic provider-edge: eBGP to the upstream (AS 65000 "
