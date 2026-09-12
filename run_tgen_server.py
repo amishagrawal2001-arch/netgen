@@ -5731,6 +5731,13 @@ def apply_device():
                         update_data["dhcp_lease_server"] = ""
                         update_data["dhcp_lease_expires"] = None
                         update_data["dhcp_lease_subnet"] = ""
+                        # v0.5.302 (IPv6 DHCP client): also wipe v6
+                        # lease surface — pre-fix an operator who
+                        # unchecked DHCP after a v6 lease landed would
+                        # see the stale IPv6 lease persist in the UI.
+                        update_data["dhcp_lease_ip6"] = ""
+                        update_data["dhcp_lease_prefix6"] = ""
+                        update_data["dhcp_lease_gateway6"] = ""
                         update_data["last_dhcp_check"] = datetime.now(timezone.utc).isoformat()
                         # v0.5.229 (audit U server-8): actually STOP
                         # the daemons. Pre-fix, this branch scrubbed
@@ -6646,6 +6653,10 @@ def stop_device():
                         'dhcp_lease_ip': None,
                         'dhcp_lease_mask': None,
                         'dhcp_lease_gateway': None,
+                        # v0.5.302 (IPv6 DHCP client): v6 lease surface
+                        'dhcp_lease_ip6': None,
+                        'dhcp_lease_prefix6': None,
+                        'dhcp_lease_gateway6': None,
                         'last_dhcp_check': datetime.now(timezone.utc).isoformat(),
                     }
                     device_db.update_device(device_id, update_data)
@@ -6700,6 +6711,10 @@ def stop_device():
                 'dhcp_lease_ip': None,
                 'dhcp_lease_mask': None,
                 'dhcp_lease_gateway': None,
+                # v0.5.302 (IPv6 DHCP client): v6 lease surface
+                'dhcp_lease_ip6': None,
+                'dhcp_lease_prefix6': None,
+                'dhcp_lease_gateway6': None,
                 'last_dhcp_check': datetime.now(timezone.utc).isoformat(),
             }
             device_db.update_device(device_id, update_data)
@@ -7268,6 +7283,14 @@ def get_dhcp_status():
                 "lease_gateway": device.get("dhcp_lease_gateway"),
                 "lease_server": device.get("dhcp_lease_server"),
                 "lease_expires": device.get("dhcp_lease_expires"),
+                # v0.5.302 (IPv6 DHCP client): expose the v6 lease
+                # surface start_dhcp_client / get_dhcp_client_snapshot
+                # now populate. Without this the DB has the v6 lease
+                # but the client's DHCP status polling never sees it,
+                # and the Devices tab IPv6 column stays empty.
+                "lease_ip6": device.get("dhcp_lease_ip6"),
+                "lease_prefix6": device.get("dhcp_lease_prefix6"),
+                "lease_gateway6": device.get("dhcp_lease_gateway6"),
                 "last_check": device.get("last_dhcp_check"),
                 # v0.5.222: surface last DHCP start-failure reason
                 # so operators don't have to grep server logs to see
@@ -14053,6 +14076,10 @@ def export_devices():
             "dhcp_state", "dhcp_running", "dhcp_lease_ip",
             "dhcp_lease_mask", "dhcp_lease_gateway", "dhcp_lease_server",
             "dhcp_lease_expires", "dhcp_lease_subnet", "last_dhcp_check",
+            # v0.5.302 (IPv6 DHCP client): runtime lease surface —
+            # exports must strip these too or a topology round-trip
+            # replays stale IPv6 leases into a fresh env.
+            "dhcp_lease_ip6", "dhcp_lease_prefix6", "dhcp_lease_gateway6",
             "vxlan_state", "vxlan_last_error", "vxlan_updated_at",
             "container_id", "created_at", "updated_at",
             "isis_manual_override", "isis_manual_override_time",

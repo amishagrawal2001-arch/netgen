@@ -3641,6 +3641,59 @@ class DevicesTab(QWidget):
                     f"row {row} raised: {_lease_display_exc}"
                 )
 
+            # v0.5.302 (IPv6 DHCP client): mirror the v0.5.294→v0.5.301
+            # IPv4 lease-display path for the IPv6 column. When the
+            # backend surfaces dhcp_lease_ip6 (populated by
+            # start_dhcp_client / get_dhcp_client_snapshot in
+            # utils/dhcp.py from v0.5.302 forward), show
+            # "<addr>/<prefix> (leased)" in COL[IPv6] and the v6 gw
+            # in COL[IPv6 Gateway]. Same QSignalBlocker discipline as
+            # the IPv4 branch — automated setText MUST NOT re-trigger
+            # on_cell_changed as an inline-edit (which would then
+            # clear the cell and write the empty value back to the
+            # server every 30s poll, the same loop v0.5.301 fixed).
+            try:
+                if _dhcp_mode_now == "client":
+                    _lease6_now = str(device_data.get("dhcp_lease_ip6") or "").strip()
+                    _prefix6_now = str(device_data.get("dhcp_lease_prefix6") or "").strip()
+                    _gw6_now = str(device_data.get("dhcp_lease_gateway6") or "").strip()
+                    _ipv6_item = self.devices_table.item(row, self.COL.get("IPv6"))
+                    _gw6_item = self.devices_table.item(row, self.COL.get("IPv6 Gateway"))
+                    from PyQt5.QtCore import Qt as _Qt6, QSignalBlocker as _QSB6
+                    if _ipv6_item is not None:
+                        _existing6 = _ipv6_item.text() or ""
+                        if _lease6_now:
+                            _desired6 = (
+                                f"{_lease6_now}/{_prefix6_now} (leased)"
+                                if _prefix6_now
+                                else f"{_lease6_now} (leased)"
+                            )
+                            if _existing6 != _desired6:
+                                with _QSB6(self.devices_table):
+                                    _ipv6_item.setText(_desired6)
+                                    _ipv6_item.setData(_Qt6.UserRole + 2, _desired6)
+                        elif _existing6.endswith(" (leased)"):
+                            with _QSB6(self.devices_table):
+                                _ipv6_item.setText("")
+                                _ipv6_item.setData(_Qt6.UserRole + 2, "")
+                    if _gw6_item is not None:
+                        _existing_gw6 = _gw6_item.text() or ""
+                        if _gw6_now:
+                            _desired_gw6 = f"{_gw6_now} (leased)"
+                            if _existing_gw6 != _desired_gw6:
+                                with _QSB6(self.devices_table):
+                                    _gw6_item.setText(_desired_gw6)
+                                    _gw6_item.setData(_Qt6.UserRole + 2, _desired_gw6)
+                        elif _existing_gw6.endswith(" (leased)"):
+                            with _QSB6(self.devices_table):
+                                _gw6_item.setText("")
+                                _gw6_item.setData(_Qt6.UserRole + 2, "")
+            except Exception as _lease6_display_exc:
+                logger.debug(
+                    f"[DEVICE POLL] v0.5.302 lease-IPv6 refresh for "
+                    f"row {row} raised: {_lease6_display_exc}"
+                )
+
             # ARP status → individual IP/gateway cell colors
             arp_ipv4_raw = device_data.get('arp_ipv4_resolved', 0)
             arp_ipv6_raw = device_data.get('arp_ipv6_resolved', 0)
@@ -4448,11 +4501,61 @@ class DevicesTab(QWidget):
                             if _lease:
                                 ipv4 = f"{_lease} (leased)"
                     ipv6 = device_info.get("IPv6", "")
+                    # v0.5.302 (IPv6 DHCP client): mirror of the v0.5.294
+                    # IPv4 fallback above — a DHCP-client row with an
+                    # empty operator-declared IPv6 field should show
+                    # the DHCPv6-leased address the server stashed in
+                    # dhcp_lease_ip6 (or, on legacy shapes, the CIDR
+                    # in ipv6_address). Suffix " (leased)" so it's
+                    # visually distinct from static config.
+                    if not ipv6:
+                        _dhcp_mode6 = str(
+                            device_info.get("dhcp_mode")
+                            or device_info.get("DHCP Mode")
+                            or ""
+                        ).lower()
+                        if _dhcp_mode6 == "client":
+                            _lease6 = str(
+                                device_info.get("dhcp_lease_ip6") or ""
+                            ).strip()
+                            _prefix6_val = str(
+                                device_info.get("dhcp_lease_prefix6") or ""
+                            ).strip()
+                            if not _lease6:
+                                _ipv6_raw = str(
+                                    device_info.get("ipv6_address") or ""
+                                ).strip()
+                                if _ipv6_raw:
+                                    if "/" in _ipv6_raw:
+                                        _lease6, _prefix6_val = _ipv6_raw.split("/", 1)
+                                    else:
+                                        _lease6 = _ipv6_raw
+                            if _lease6:
+                                ipv6 = (
+                                    f"{_lease6}/{_prefix6_val} (leased)"
+                                    if _prefix6_val
+                                    else f"{_lease6} (leased)"
+                                )
                     vlan = device_info.get("VLAN", "0")
                     ipv4_mask = device_info.get("ipv4_mask", "24")
                     ipv6_mask = device_info.get("ipv6_mask", "64")
                     ipv4_gateway = device_info.get("IPv4 Gateway", device_info.get("Gateway", ""))
                     ipv6_gateway = device_info.get("IPv6 Gateway", "")
+                    # v0.5.302: same fallback for IPv6 gateway column.
+                    if not ipv6_gateway:
+                        _dhcp_mode6 = str(
+                            device_info.get("dhcp_mode")
+                            or device_info.get("DHCP Mode")
+                            or ""
+                        ).lower()
+                        if _dhcp_mode6 == "client":
+                            _gw6 = str(
+                                device_info.get("dhcp_lease_gateway6")
+                                or device_info.get("ipv6_gateway")
+                                or ""
+                            ).strip()
+                            if _gw6:
+                                ipv6_gateway = f"{_gw6} (leased)"
                     loopback_ipv4 = device_info.get("Loopback IPv4", "")
                     loopback_ipv6 = device_info.get("Loopback IPv6", "")
                     

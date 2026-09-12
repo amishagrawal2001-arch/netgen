@@ -530,6 +530,75 @@ def _parse_gateway(interface: str, container=None, device_id: Optional[str] = No
     return None
 
 
+def _parse_gateway6(interface: str, container=None, device_id: Optional[str] = None) -> Optional[str]:
+    """Return IPv6 default gateway for interface if present.
+
+    Mirrors _parse_gateway shape (main table → device-VRF fallback)
+    but reads `ip -6 route`. DHCPv6 leases don't always install a
+    default route (SLAAC + RA handle that separately); when they
+    don't, this returns None and callers should treat "no gateway"
+    as informational, not an error.
+    """
+    def _scan(extra_args):
+        try:
+            result = _run_command(
+                ["ip", "-6", "route", "show"] + extra_args + ["dev", interface],
+                timeout=5, container=container,
+            )
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("default via"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        return parts[2]
+        except Exception as exc:
+            logger.debug("[DHCP] v6 route-show failed (%s): %s", " ".join(extra_args) or "main", exc)
+        return None
+
+    gw = _scan([])
+    if gw:
+        return gw
+
+    if device_id:
+        try:
+            from utils.frr_docker import FRRDockerManager
+            vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+            if vrf_name:
+                check = subprocess.run(
+                    ["ip", "-o", "link", "show", vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if check.returncode == 0 and (check.stdout or "").strip():
+                    return _scan(["vrf", vrf_name])
+        except Exception as exc:
+            logger.debug("[DHCP] v6 VRF gateway lookup failed for %s: %s", device_id, exc)
+    return None
+
+
+def _pick_global_ipv6(addrs: Optional[list]) -> Optional[Dict[str, str]]:
+    """From a _parse_ipv6 list, return the first non-link-local entry.
+
+    _parse_ipv6 returns *every* inet6 on the interface — fe80::/10
+    link-local, ULA, and any DHCPv6/SLAAC global address.
+    The lease-display path wants the ONE global address that the
+    server or SLAAC just handed out; link-local always exists and
+    is meaningless to the operator.
+    """
+    if not addrs:
+        return None
+    for entry in addrs:
+        ip = str(entry.get("ip") or "")
+        if not ip:
+            continue
+        try:
+            if ipaddress.IPv6Address(ip).is_link_local:
+                continue
+        except (ipaddress.AddressValueError, ValueError):
+            continue
+        return entry
+    return None
+
+
 def _migrate_dhcp_route_to_vrf(
     device_id: str,
     interface: str,
@@ -2167,6 +2236,17 @@ def get_dhcp_client_snapshot(
         "ipv4_address": "",
         "ipv4_mask": "",
         "ipv4_gateway": "",
+        # v0.5.302 (IPv6 DHCP client): mirror the IPv4 lease surface
+        # so the UI can show the DHCPv6-leased address in the IPv6
+        # column the same way v0.5.294-301 shows the v4 lease in
+        # the IPv4 column. Empty until a global (non-link-local)
+        # inet6 shows up on the interface.
+        "dhcp_lease_ip6": "",
+        "dhcp_lease_prefix6": "",
+        "dhcp_lease_gateway6": "",
+        "ipv6_address": "",
+        "ipv6_mask": "",
+        "ipv6_gateway": "",
         "last_dhcp_check": timestamp,
     }
 
@@ -2190,6 +2270,10 @@ def get_dhcp_client_snapshot(
     ip_info = _parse_ipv4(interface, container=container)
     gateway = _parse_gateway(interface, container=container, device_id=device_id) or ""
     dhclient_running = _is_dhclient_running(interface, container=container)
+
+    # v0.5.302: also probe IPv6 lease state.
+    ip6_info = _pick_global_ipv6(_parse_ipv6(interface, container=container))
+    gateway6 = _parse_gateway6(interface, container=container, device_id=device_id) or ""
 
     if ip_info:
         snapshot["dhcp_state"] = "Leased"
@@ -2215,6 +2299,28 @@ def get_dhcp_client_snapshot(
         snapshot["dhcp_state"] = "Requesting" if dhclient_running else "No Lease"
         snapshot["dhcp_running"] = dhclient_running
         snapshot["dhcp_lease_gateway"] = gateway
+
+    # v0.5.302 (IPv6 DHCP client): populate v6 lease surface
+    # independently of the v4 state. A dual-stack client can be
+    # v4-leased with v6 still requesting, or vice versa. If EITHER
+    # family is leased, flip dhcp_state to "Leased" so the row
+    # isn't shown as "No Lease" while v6 is up.
+    if ip6_info:
+        snapshot["dhcp_lease_ip6"] = ip6_info.get("ip", "")
+        snapshot["dhcp_lease_prefix6"] = ip6_info.get("prefix", "")
+        snapshot["dhcp_lease_gateway6"] = gateway6
+        snapshot["ipv6_address"] = (
+            f"{snapshot['dhcp_lease_ip6']}/{snapshot['dhcp_lease_prefix6']}"
+            if snapshot["dhcp_lease_ip6"] and snapshot["dhcp_lease_prefix6"]
+            else snapshot["dhcp_lease_ip6"]
+        )
+        snapshot["ipv6_mask"] = snapshot["dhcp_lease_prefix6"]
+        snapshot["ipv6_gateway"] = gateway6
+        if snapshot["dhcp_state"] != "Leased":
+            snapshot["dhcp_state"] = "Leased"
+            snapshot["dhcp_running"] = True
+    elif gateway6:
+        snapshot["dhcp_lease_gateway6"] = gateway6
 
     return snapshot
 
@@ -2775,7 +2881,52 @@ def start_dhcp_client(
         if not addr6:
             ipv6_result = {"success": False, "error": "IPv6 lease not observed"}
         else:
-            ipv6_result = {"success": True, "addresses": addr6}
+            # v0.5.302 (IPv6 DHCP client): persist the leased v6 into
+            # device_db in the same shape as the v4 branch above.
+            # Pre-fix start_dhcp_client parsed addr6 into a local
+            # variable and never wrote it to the DB, so the UI's
+            # IPv6 column stayed blank even when the DHCPv6 lease
+            # was live on the wire.
+            global6 = _pick_global_ipv6(addr6)
+            if global6:
+                gateway6 = _parse_gateway6(
+                    interface, container=container, device_id=device_id
+                ) or ""
+                # Best-effort VRF migration for v6 too — dhclient -6
+                # / dhcp6c install default routes into main table,
+                # which is invisible to sockets bound to the device's
+                # VRF (same shape as the v4 fix at line 2676).
+                if gateway6:
+                    _migrate_dhcp_route_to_vrf(
+                        device_id, interface, gateway6,
+                        family="ipv6", container=container,
+                    )
+                v6_lease_info = {
+                    "dhcp_lease_ip6": global6.get("ip", ""),
+                    "dhcp_lease_prefix6": global6.get("prefix", ""),
+                    "dhcp_lease_gateway6": gateway6,
+                    "ipv6_address": (
+                        f"{global6.get('ip')}/{global6.get('prefix')}"
+                        if global6.get("ip") and global6.get("prefix")
+                        else global6.get("ip", "")
+                    ),
+                    "ipv6_mask": global6.get("prefix", ""),
+                    "ipv6_gateway": gateway6,
+                }
+                _update_device_db(device_db, device_id, v6_lease_info)
+                ipv6_result = {
+                    "success": True,
+                    "addresses": addr6,
+                    "ip6": global6.get("ip", ""),
+                    "prefix6": global6.get("prefix", ""),
+                    "gateway6": gateway6,
+                }
+            else:
+                ipv6_result = {
+                    "success": False,
+                    "error": "no global IPv6 observed (only link-local)",
+                    "addresses": addr6,
+                }
 
     success = ipv4_result.get("success") or ipv6_result.get("success")
     _update_device_db(
@@ -2891,6 +3042,14 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
             "ipv6_address": "",
             "ipv6_mask": "",
             "ipv6_gateway": "",
+            # v0.5.302 (IPv6 DHCP client): also clear the mirror
+            # lease fields start_dhcp_client now populates, so a
+            # Stop leaves NO stale DHCPv6 lease anywhere in the
+            # DB row (same reason v4's dhcp_lease_ip/mask/gateway
+            # are cleared here).
+            "dhcp_lease_ip6": "",
+            "dhcp_lease_prefix6": "",
+            "dhcp_lease_gateway6": "",
             "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -3729,6 +3888,14 @@ def start_dhcp_server(
             "dhcp_lease_server": "",
             "dhcp_lease_expires": None,
             "dhcp_lease_subnet": lease_subnet,
+            # v0.5.302 (IPv6 DHCP): mirror v4 blanking. Server rows
+            # never carry a lease themselves — those fields are the
+            # CLIENT-side surface. Blank them here so an operator
+            # who flips a device from client → server doesn't see
+            # a stale IPv6 lease sticking around in the UI.
+            "dhcp_lease_ip6": "",
+            "dhcp_lease_prefix6": "",
+            "dhcp_lease_gateway6": ipv6_gateway if ipv6_enabled else "",
             "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
         },
     )

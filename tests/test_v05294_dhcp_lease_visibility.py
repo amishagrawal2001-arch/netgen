@@ -78,7 +78,13 @@ def test_refresh_only_fires_for_dhcp_client_devices():
     config)."""
     src = _src()
     idx = src.find("v0.5.294 (audit dhcp-lease-visibility): refresh")
-    body = src[idx:idx + 3000]
+    # v0.5.302: v0.5.301's QSignalBlocker comment block + v0.5.302's
+    # IPv6-mirror comments pushed the IPv4 lease-display code past
+    # the original 3000-char window. Widen to 8000 so the whole
+    # v0.5.294→v0.5.301 branch (comment + code) fits. If future
+    # extensions push past 8000, prefer bounding the window with a
+    # sentinel comment rather than growing the number.
+    body = src[idx:idx + 8000]
     assert '_dhcp_mode_now ==' in body
     assert '"client"' in body
 
@@ -93,7 +99,13 @@ def test_refresh_v05297_dropped_static_configured_guard():
     Test the new invariant: the guard is gone."""
     src = _src()
     idx = src.find("v0.5.294 (audit dhcp-lease-visibility): refresh")
-    body = src[idx:idx + 3000]
+    # v0.5.302: v0.5.301's QSignalBlocker comment block + v0.5.302's
+    # IPv6-mirror comments pushed the IPv4 lease-display code past
+    # the original 3000-char window. Widen to 8000 so the whole
+    # v0.5.294→v0.5.301 branch (comment + code) fits. If future
+    # extensions push past 8000, prefer bounding the window with a
+    # sentinel comment rather than growing the number.
+    body = src[idx:idx + 8000]
     # v0.5.297: _static_configured no longer present in refresh block.
     assert 'not _static_configured' not in body
     # Instead, the guard is `if _lease_now:` alone (v0.5.297).
@@ -106,7 +118,13 @@ def test_refresh_clears_cell_when_lease_released():
     would persist forever."""
     src = _src()
     idx = src.find("v0.5.294 (audit dhcp-lease-visibility): refresh")
-    body = src[idx:idx + 3000]
+    # v0.5.302: v0.5.301's QSignalBlocker comment block + v0.5.302's
+    # IPv6-mirror comments pushed the IPv4 lease-display code past
+    # the original 3000-char window. Widen to 8000 so the whole
+    # v0.5.294→v0.5.301 branch (comment + code) fits. If future
+    # extensions push past 8000, prefer bounding the window with a
+    # sentinel comment rather than growing the number.
+    body = src[idx:idx + 8000]
     assert '_existing.endswith(" (leased)")' in body
     assert '_ipv4_item.setText("")' in body
 
@@ -117,7 +135,13 @@ def test_refresh_is_best_effort():
     row-application work."""
     src = _src()
     idx = src.find("v0.5.294 (audit dhcp-lease-visibility): refresh")
-    body = src[idx:idx + 3000]
+    # v0.5.302: v0.5.301's QSignalBlocker comment block + v0.5.302's
+    # IPv6-mirror comments pushed the IPv4 lease-display code past
+    # the original 3000-char window. Widen to 8000 so the whole
+    # v0.5.294→v0.5.301 branch (comment + code) fits. If future
+    # extensions push past 8000, prefer bounding the window with a
+    # sentinel comment rather than growing the number.
+    body = src[idx:idx + 8000]
     assert "try:" in body
     assert "except Exception as _lease_display_exc:" in body
 

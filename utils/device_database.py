@@ -324,6 +324,17 @@ class DeviceDatabase:
                     dhcp_lease_server TEXT,
                     dhcp_lease_expires TIMESTAMP,
                     dhcp_lease_subnet TEXT,
+                    -- v0.5.302 (IPv6 DHCP client): DHCPv6 lease
+                    -- surface (address, prefix length, upstream
+                    -- gateway). Written by start_dhcp_client when
+                    -- a global IPv6 lease is observed; consumed
+                    -- by widgets/devices_tab.py to show the
+                    -- leased address in the IPv6 column with a
+                    -- "(leased)" marker (mirror of the v0.5.294
+                    -- v4 flow).
+                    dhcp_lease_ip6 TEXT,
+                    dhcp_lease_prefix6 TEXT,
+                    dhcp_lease_gateway6 TEXT,
                     dhcp_manual_override BOOLEAN DEFAULT FALSE,
                     dhcp_manual_override_time TIMESTAMP,
                     dhcp_last_error TEXT,
@@ -886,6 +897,18 @@ class DeviceDatabase:
                 conn.execute("ALTER TABLE devices ADD COLUMN dhcp_last_error TEXT")
                 conn.commit()
 
+            # v0.5.302 (IPv6 DHCP client): add v6 lease surface for
+            # existing DBs. New installs pick these up from the
+            # CREATE TABLE above; older DBs need per-column ADDs so
+            # start_dhcp_client's v6 lease write doesn't silently
+            # drop the fields on an "unknown column" error.
+            columns_now = [c[1] for c in conn.execute("PRAGMA table_info(devices)").fetchall()]
+            for _v6_col in ("dhcp_lease_ip6", "dhcp_lease_prefix6", "dhcp_lease_gateway6"):
+                if _v6_col not in columns_now:
+                    logger.info(f"[DEVICE DB] Adding {_v6_col} column to devices table")
+                    conn.execute(f"ALTER TABLE devices ADD COLUMN {_v6_col} TEXT")
+                    conn.commit()
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Migration failed: {e}")
             # Don't raise the exception to avoid breaking the database initialization
@@ -1048,6 +1071,15 @@ class DeviceDatabase:
                     'dhcp_lease_server': 'dhcp_lease_server',
                     'dhcp_lease_expires': 'dhcp_lease_expires',
                     'dhcp_lease_subnet': 'dhcp_lease_subnet',
+                    # v0.5.302 (IPv6 DHCP client): map v6 lease
+                    # fields — without these entries in the mapping,
+                    # start_dhcp_client's writes into the payload
+                    # dict get silently dropped by update_device,
+                    # and the UI keeps seeing an empty IPv6 column
+                    # for DHCP-client devices.
+                    'dhcp_lease_ip6': 'dhcp_lease_ip6',
+                    'dhcp_lease_prefix6': 'dhcp_lease_prefix6',
+                    'dhcp_lease_gateway6': 'dhcp_lease_gateway6',
                     'last_dhcp_check': 'last_dhcp_check',
                     'status': 'status',
                     # v0.5.193: `bgp_established` column exists in

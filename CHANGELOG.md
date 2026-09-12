@@ -2,6 +2,124 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.302] - 2026-09-12
+
+**Feature: IPv6 DHCP client — lease surface end-to-end.**
+
+Operator ask (post-v0.5.301 confirmation "dhcp client is working
+now"): also enable IPv6 DHCP client + server. Server-side dnsmasq
+IPv6 emission and dhcp6c client launch were already in place
+(v0.5.230, v0.5.218), and the client dialog already exposed the
+IPv4/IPv6 toggle + `dhcp6_*` server fields. What was missing was
+the **runtime lease surface** — the DHCPv6 lease landed on the
+wire but never propagated to the Devices tab's IPv6 column, and
+no DB column existed to persist it.
+
+### The end-to-end plumbing this ship adds
+
+1. **`utils/dhcp.py`**
+   - `_parse_gateway6()` — mirror of `_parse_gateway` using
+     `ip -6 route show`, with the same per-VRF fallback.
+   - `_pick_global_ipv6()` — filter link-local (`fe80::/10`)
+     from `_parse_ipv6`'s list; the operator wants the global
+     address, not the fe80 every interface carries.
+   - `get_dhcp_client_snapshot` — schema gains
+     `dhcp_lease_ip6` / `dhcp_lease_prefix6` /
+     `dhcp_lease_gateway6` + `ipv6_address/mask/gateway`.
+     Populates them via the new helpers.
+   - `start_dhcp_client` — after `_parse_ipv6` returns a global
+     address, persists the same six fields to `device_db` (the
+     symmetric v4 write was there since v0.5.229; v6 was
+     parsed and dropped on the floor).
+   - `stop_dhcp_client` — clears the v6 lease surface alongside
+     the existing v4 clear (parity with v0.5.218 fix K).
+   - `start_dhcp_server` — blanks the v6 lease fields on the
+     "Server Running" write (server rows don't carry client
+     lease values).
+
+2. **`utils/device_database.py`**
+   - CREATE TABLE gains the three v6 lease columns.
+   - Idempotent ALTER TABLE ADD COLUMN migration for existing
+     DBs — per-column check against `PRAGMA table_info` so
+     re-runs no-op (v0.5.220 fresh-DB safeguard preserved).
+   - `update_device`'s `field_mapping` gains the three keys —
+     otherwise `_update_device_db` writes from the DHCP layer
+     would silently drop them and the UI would stay blank.
+
+3. **`run_tgen_server.py`**
+   - `/api/device/dhcp/status` projects the three DB fields as
+     `lease_ip6` / `lease_prefix6` / `lease_gateway6`.
+   - Runtime-fields blacklist for topology export gains the
+     three keys (prevent stale-lease replay on import).
+   - The DHCP-disabled protocol scrub path (when operator
+     un-selects DHCP) wipes the v6 lease surface alongside v4.
+   - Both device-stop paths (light stop + status-cleanup)
+     wipe the v6 lease fields to None.
+
+4. **`widgets/devices_tab.py`**
+   - Poll-refresh (`_apply_device_status_row`) has a v6 branch
+     parallel to the v0.5.301 v4 branch: reads
+     `dhcp_lease_ip6` / `dhcp_lease_prefix6` /
+     `dhcp_lease_gateway6` and writes `"<addr>/<prefix> (leased)"`
+     into `COL[IPv6]` + `"<gw> (leased)"` into
+     `COL[IPv6 Gateway]`. **Wrapped in `QSignalBlocker`** —
+     the entire v0.5.301 lesson (cellChanged → on_cell_changed
+     inline-edit loop) applies verbatim to the v6 twin.
+   - `populate_device_table` has a v6 fallback parallel to
+     the v0.5.294 v4 fallback: when operator-declared IPv6 is
+     empty on a DHCP-client row, show the leased address
+     (from `dhcp_lease_ip6` or `ipv6_address` CIDR-strip)
+     with " (leased)" suffix.
+
+### Not in scope for this ship (deferred)
+
+- **DHCPv6 relay** (`dhcrelay -6`). IPv4 relay landed in
+  v0.5.245–296; the v6 relay is a separate service with its
+  own UI knob (`relay_return_hop_v6`). Only ~1 in 50 lab
+  setups use DHCPv6 relay — the dominant deployment is
+  direct-attached, which this ship covers end-to-end.
+- **Per-family success / failure surfacing**. Today
+  `start_dhcp_client` sets a single aggregate `success` flag
+  (`ipv4 OR ipv6`) — a dual-stack client with v4 leased and
+  v6 failed reports overall "Leased" and the operator sees
+  no signal that v6 fell down. A follow-up ship will split
+  `dhcp_state` into per-family or add a `dhcp_state_v6`.
+- **DHCPv6 IA_NA vs IA_PD selection**. The dhcp6c config
+  template is hard-coded to rapid-commit + `id-assoc pd 0`;
+  the client UI doesn't yet expose the choice.
+
+### Verification
+
+- 15 new source-level tests in
+  `tests/test_v05302_dhcp_ipv6_client_lease_surface.py` lock
+  in the schema, field mapping, snapshot shape, DB migration,
+  API projection, and QSignalBlocker discipline in the
+  devices_tab v6 branch.
+- v0.5.294 lease-visibility tests updated: the 3000-char
+  window they used to slice was already too tight after the
+  v0.5.301 comment expansion (pre-existing brittleness).
+  Widened to 8000 as part of this ship.
+- Full DHCP test suite: 311 passed, 0 failed.
+- Python `ast.parse` clean on all 4 edited files
+  (v0.5.300 discipline).
+
+### Operator action once shipped
+
+Upgrade client + server to v0.5.302, add a device with:
+  - DHCP mode = Client
+  - IPv4 + IPv6 enabled (checkboxes in the DHCP section)
+
+Or, for server:
+  - DHCP mode = Server
+  - IPv4 + IPv6 enabled
+  - Populate IPv6 Pool Start/End/Prefix/Server-IP/Lease-Time
+
+Client-mode: within 30s of Apply, the IPv6 column should show
+`<addr>/<prefix> (leased)` alongside the existing IPv4 lease.
+Server-mode: dnsmasq starts serving IPv6 via `dhcp-range` +
+`enable-ra` (already in place since v0.5.230); any client on
+the same L2 that requests v6 gets a lease from the pool.
+
 ## [0.5.301] - 2026-09-11
 
 **The v0.5.299 diagnostic caught the actual bug. My v0.5.297 setText
