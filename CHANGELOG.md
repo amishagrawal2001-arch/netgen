@@ -2,6 +2,67 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.303] - 2026-09-12
+
+**Ship: DHCPv6 server template.**
+
+Follow-up to v0.5.302's IPv6 DHCP lease surface. The template
+catalog previously offered `dhcp_server` (IPv4) but no IPv6
+mirror — operators wanting a DHCPv6 server had to build the
+config by hand every time. Template was committed on
+`dd84a546` between v0.5.302 and this ship; this release just
+bumps version + CHANGELOG so it lands in a shipped wheel.
+
+Add Device dialog's template dropdown now shows both entries:
+
+  - DHCP server (pool 172.16.30.10-200)     ← v4, unchanged
+  - DHCPv6 server (pool 2001:db8:30::100-1ff) ← new
+
+One-click behavior for the new template:
+
+  * v4 checkbox off, v6 checkbox on (matches the v4 sibling's
+    v4-only shape, flipped)
+  * DHCP-family sub-toggles set: `dhcp_ipv4_enabled=False`,
+    `dhcp_ipv6_enabled=True` (otherwise
+    `_update_dhcp_field_states` would leave the IPv6 pool
+    widgets disabled + hidden)
+  * Interface IPv6 = `2001:db8:30::1/64` — distinct /64 within
+    RFC 3849 documentation range so this device stays isolated
+    from regular IPv6 devices (default 2001:db8::/64), mirror
+    of how the v4 template's 172.16.30.0/24 isolates from the
+    default 192.168.0.0/24
+  * Pool `2001:db8:30::100 - 2001:db8:30::1ff`, prefix /64
+  * Server IPv6 = gateway = `2001:db8:30::1` (device is its
+    own gateway for pool clients — direct-attached shape)
+  * Lease 3600s, route CIDR `2001:db8:30::/64`
+
+dnsmasq's IPv6 emission (enable-ra + dhcp-range) landed in
+v0.5.230 and the runtime lease surface landed in v0.5.302, so
+this template plugs into an already-working backend. One click
+gives a functioning DHCPv6 server with no manual field entry.
+
+### Tests
+
+7 lock-in tests in
+`tests/test_dhcp_server_ipv6_template.py` — template
+registered under stable key, every widget name it targets
+exists on AddDeviceDialog (v0.4.7-shape silent-skip guard),
+interface + pool share the same /64 (v0.5.222-shape "no
+address in subnet on interface" guard applied to v6),
+documentation-range invariants, sane lease + route.
+Full template suite: 66 passed, 1 skipped, 0 failed.
+
+### Operator action
+
+Upgrade client to v0.5.303, relaunch, open Add Device →
+template dropdown. "DHCPv6 server (pool 2001:db8:30::100-1ff)"
+should appear right under "DHCP server (pool 172.16.30.10-200)".
+Select it, fill Device Name + Interface, Apply — dnsmasq starts
+serving DHCPv6 on 2001:db8:30::/64. A downstream v6 client on
+the same L2 requesting v6 gets a lease from the pool; the
+Devices tab's IPv6 column shows the leased address (per
+v0.5.302's lease-display path).
+
 ## [0.5.302] - 2026-09-12
 
 **Feature: IPv6 DHCP client — lease surface end-to-end.**
