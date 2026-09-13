@@ -2,6 +2,93 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.308] - 2026-09-13
+
+**v0.5.307's guard needed dhcp_config in device_config; caller
+strips it. Widen the FRR-side guard to trigger on `dhcp_mode`
+alone.**
+
+srv06 v0.5.307 log for a fresh DHCPv6 server device apply:
+  * `dhcp_config.ipv4_enabled=False` in /api/device/apply ✓
+  * `[DEVICE APPLY WARN v0.5.306]` didn't fire (input `ipv4`
+    already empty — v0.5.306 correctly cleared it upstream)
+  * BUT `[FRR] Using interface IPv4 192.168.0.2 as loopback
+    fallback` fired
+  * AND `[FRR] Final loopback values: loopback_ipv4=192.168.0.2`
+    fired
+  * AND `san-hp-srv06(config-if)#  ip address 192.168.0.2/24`
+    ran via vtysh inside the FRR container → interface got
+    192.168.0.2/24
+
+### Root cause of v0.5.307 miss
+
+Six of the `start_frr_container(device_id, device_config)` call
+sites in run_tgen_server.py build the container config dict
+inline. At line 5286 (the one that fires for device Apply),
+`container_device_config` includes `dhcp_mode` but does NOT
+include `dhcp_config`:
+
+    container_device_config = {
+        "device_name": ...,
+        "interface": ...,
+        "vlan": ...,
+        "ipv4": ...,
+        "ipv6": ...,
+        "loopback_ipv4": ...,
+        "loopback_ipv6": ...,
+        "dhcp_mode": dhcp_mode,     # ← included
+        "bgp_asn": ...,
+        "vxlan_config": ...,
+    }
+    # dhcp_config: not included!
+
+So `_configure_interfaces` (v0.5.307) saw `device_config.get(
+"dhcp_config") = None` → `_v4_off_by_config = False` → fell
+through to the hardcoded 192.168.0.2 default.
+
+### Fix
+
+Rather than patch all six call sites (fragile — the next new
+one will drift), widen the FRR-side guard in
+`_configure_interfaces` to skip the widget-default fallback
+for ANY DHCP-mode device:
+
+    if dhcp_mode in ("client", "server"):
+        ipv4_addr = ''
+        ipv4_mask = ''
+    else:
+        ipv4_addr = '192.168.0.2'    # legacy widget default
+        ipv4_mask = '24'
+
+Rationale: DHCP-server v4 pools get their interface anchor
+from `utils/dhcp._ensure_ipv4_address` (v0.5.222 fix); DHCP-
+server v6-only devices have no v4 to add; DHCP-client devices
+pick up v4 from the lease. In none of these cases does the
+FRR container need to add its own static v4 default. The
+widget-default fallback is preserved for non-DHCP static-IP
+devices (legacy behavior).
+
+### Verification
+
+5 lock-in tests in
+`tests/test_v05308_frr_dhcp_mode_widget_default_leak.py`
+covering: marker present in both `_configure_interfaces`
+blocks, widened `dhcp_mode in ("client", "server")` guard,
+v0.5.307's fragile probe removed, widget-default preserved
+for non-DHCP path, ast.parse clean.
+
+### Operator action
+
+Upgrade server to v0.5.308. Remove device5, re-add via the
+DHCPv6 template, Apply. Interface should now show ONLY
+`inet6 2001:db8:30::1/64` — no more `inet 192.168.0.2/24`.
+
+If it STILL leaks — the fourth injection site would be
+somewhere I haven't found yet; grep server log for
+`ip addr add` around the apply timestamp and share.
+
+Server-only change; client can stay on v0.5.303/v0.5.305.
+
 ## [0.5.307] - 2026-09-13
 
 **Actual root cause of the v0.5.306 "same problem" report:

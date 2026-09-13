@@ -625,17 +625,25 @@ class FRRDockerManager:
                 # ipv4_enabled=False (typically the DHCPv6-server
                 # template, but any operator-configured v6-only
                 # server too), matching the client branch's shape.
-                _dc = device_config.get("dhcp_config") if device_config else None
-                if isinstance(_dc, str):
-                    try:
-                        _dc = json.loads(_dc) if _dc else {}
-                    except Exception:
-                        _dc = {}
-                _dc = _dc if isinstance(_dc, dict) else {}
-                _v4_off_by_config = _dc.get("ipv4_enabled") is False
-                if dhcp_mode == "client" or (
-                    dhcp_mode == "server" and _v4_off_by_config
-                ):
+                # v0.5.308 (audit v6-only-dhcp-server-leak, actual
+                # actual root cause): v0.5.307 tried to gate the
+                # widget-default drop on dhcp_config.ipv4_enabled,
+                # but the caller at run_tgen_server.py:5286 builds
+                # container_device_config WITHOUT dhcp_config, so
+                # my guard saw no config and the drop never fired.
+                # Two of the six start_frr_container call sites in
+                # run_tgen_server.py have the same shape.
+                #
+                # Rather than patch every caller (fragile), widen
+                # the FRR-side guard to skip the widget-default
+                # fallback for ANY DHCP-mode device. Rationale:
+                # DHCP-server v4 pools get their interface anchor
+                # from utils/dhcp._ensure_ipv4_address (v0.5.222);
+                # DHCP-server v6-only should have no v4 at all;
+                # DHCP-client picks up v4 from the lease. In none
+                # of these cases does the FRR container need to
+                # add its own static v4 default.
+                if dhcp_mode in ("client", "server"):
                     ipv4_addr = ''
                     ipv4_mask = ''
                 else:
@@ -847,17 +855,25 @@ class FRRDockerManager:
                 # ipv4_enabled=False (typically the DHCPv6-server
                 # template, but any operator-configured v6-only
                 # server too), matching the client branch's shape.
-                _dc = device_config.get("dhcp_config") if device_config else None
-                if isinstance(_dc, str):
-                    try:
-                        _dc = json.loads(_dc) if _dc else {}
-                    except Exception:
-                        _dc = {}
-                _dc = _dc if isinstance(_dc, dict) else {}
-                _v4_off_by_config = _dc.get("ipv4_enabled") is False
-                if dhcp_mode == "client" or (
-                    dhcp_mode == "server" and _v4_off_by_config
-                ):
+                # v0.5.308 (audit v6-only-dhcp-server-leak, actual
+                # actual root cause): v0.5.307 tried to gate the
+                # widget-default drop on dhcp_config.ipv4_enabled,
+                # but the caller at run_tgen_server.py:5286 builds
+                # container_device_config WITHOUT dhcp_config, so
+                # my guard saw no config and the drop never fired.
+                # Two of the six start_frr_container call sites in
+                # run_tgen_server.py have the same shape.
+                #
+                # Rather than patch every caller (fragile), widen
+                # the FRR-side guard to skip the widget-default
+                # fallback for ANY DHCP-mode device. Rationale:
+                # DHCP-server v4 pools get their interface anchor
+                # from utils/dhcp._ensure_ipv4_address (v0.5.222);
+                # DHCP-server v6-only should have no v4 at all;
+                # DHCP-client picks up v4 from the lease. In none
+                # of these cases does the FRR container need to
+                # add its own static v4 default.
+                if dhcp_mode in ("client", "server"):
                     ipv4_addr = ''
                     ipv4_mask = ''
                 else:
