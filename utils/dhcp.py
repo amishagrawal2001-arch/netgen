@@ -2806,6 +2806,44 @@ def start_dhcp_client(
         # Flush existing IPv6 addresses (except link-local) to ensure DHCP client actively requests a lease
         _flush_ipv6(interface, container=container)
 
+        # v0.5.309 (audit dhcpv6-lease-e2e): disable SLAAC autoconf on
+        # the interface before spawning dhcp6c. Pre-fix, if the paired
+        # DHCPv6 server on the same L2 emits Router Advertisement with
+        # a Prefix Information Option (dnsmasq `enable-ra`), the
+        # client kernel auto-generates a SLAAC address from that
+        # prefix. That lands on the interface ALONGSIDE the
+        # dhcp6c-obtained lease. `_pick_global_ipv6` iterates in the
+        # order `ip -o -6 addr show` returns and may pick the SLAAC-
+        # derived address instead of the actual DHCPv6 lease —
+        # user-visible symptom: `dhcp_lease_ip6` in the DB and the
+        # Devices tab's IPv6 column show a non-pool address (e.g.
+        # 2001:db8:30::5e25:73ff:fe3f:3056 derived from MAC) instead
+        # of the lease (2001:db8:30::100).
+        #
+        # Setting accept_ra=0 blocks RA processing entirely; setting
+        # autoconf=0 blocks SLAAC only (keeps RA-derived default
+        # route). We disable BOTH here because a DHCPv6-client-mode
+        # device is explicitly asking dhcp6c to manage all v6
+        # addressing, so RA-derived state is noise. Restored in
+        # stop_dhcp_client so a subsequent v4-only apply doesn't
+        # inherit v6 lockdown. Best-effort: sysctl failure is logged
+        # but doesn't block the lease request.
+        for _sysctl_key in (
+            f"net.ipv6.conf.{interface}.accept_ra",
+            f"net.ipv6.conf.{interface}.autoconf",
+        ):
+            try:
+                _run_command(
+                    ["sysctl", "-w", f"{_sysctl_key}=0"],
+                    timeout=3, container=container,
+                )
+            except Exception as _sysctl_exc:
+                logger.debug(
+                    "[DHCP] v0.5.309: sysctl %s=0 failed on %s (SLAAC "
+                    "may race dhcp6c): %s",
+                    _sysctl_key, interface, _sysctl_exc,
+                )
+
         lease_deadline = time.time() + lease_timeout
         addr6 = None
 

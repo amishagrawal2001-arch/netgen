@@ -2,6 +2,128 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.309] - 2026-09-13
+
+**Make DHCPv6 lease end-to-end reliable + ship DHCPv6 client template.**
+
+Operator ask post-v0.5.308: "make sure when DHCPv6 client is
+active, DHCPv6 server is able to lease v6 IPs — in the past we had
+this class of problem for v4 (v0.5.287-301 saga) and want the same
+level of due diligence for v6."
+
+Audited utils/dhcp.py DHCPv6 paths against every v4 fix from
+v0.5.287-302. Found 3 gaps blocking end-to-end lease reliability;
+this ship closes the 2 highest-impact ones + adds the DHCPv6 client
+template committed on `afd8efa0`.
+
+### Fix A: RA/autoconf race on the DHCPv6 client interface
+
+**Symptom** (would surface as soon as operator paired dhcp_client_ipv6
+with dhcp_server_ipv6 on the same vlan): server dnsmasq emits Router
+Advertisement (`enable-ra` in dnsmasq.conf), client kernel does
+SLAAC from the PIO and generates a global v6 address ALONGSIDE the
+dhcp6c-obtained lease. `_pick_global_ipv6` iterates in
+`ip -o -6 addr show` order and may pick the SLAAC-derived address
+(EUI-64 from MAC) instead of the actual DHCPv6 lease. User-visible:
+DB `dhcp_lease_ip6` and Devices tab IPv6 column show something like
+`2001:db8:30::5e25:73ff:fe3f:3056` instead of the pool lease
+`2001:db8:30::100`.
+
+**Fix** (`utils/dhcp.py:start_dhcp_client`): right after
+`_flush_ipv6` and before spawning dhcp6c, sysctl
+`net.ipv6.conf.{iface}.accept_ra=0` and
+`net.ipv6.conf.{iface}.autoconf=0`. accept_ra=0 blocks RA
+processing entirely; autoconf=0 blocks SLAAC only. Belt-and-
+suspenders — dhcp6c-client devices are explicitly delegating v6
+addressing to dhcp6c; RA/SLAAC state is noise. Best-effort: sysctl
+failure logs at debug and doesn't block the lease request.
+
+### Fix B: v6 anchor-replay in arp_monitor
+
+**Symptom** (would surface after netgen-server restart or the
+periodic ARP monitor tick): server's IPv6 anchor (e.g.
+`2001:db8:30::1/64` for dnsmasq to bind) vanishes from the vlan
+sub-if. dnsmasq DHCPv6 socket fails or returns EADDRNOTAVAIL,
+clients stop getting v6 leases. Same shape as v4 anchor drift
+that v0.5.295 fixed for v4.
+
+**Root cause**: `utils/arp_monitor._sweep_anchor_replay` only
+imported and called `_ensure_ipv4_address`. Worse, the pool-empty
+guard at :483 (`if not (_pool_start and _pool_end): continue`)
+short-circuited the WHOLE device for v6-only DHCPv6-server
+devices — no v6 pool anchor replay code, no way to reach one.
+
+**Fix** (`utils/arp_monitor.py`):
+  1. Import `_ensure_ipv6_address` alongside `_ensure_ipv4_address`.
+  2. Widen the pool-empty guard to peek at v6 pool fields inline
+     and only skip when BOTH families are absent.
+  3. Gate v4 replay on `_pool_start AND _pool_end AND ipv4_enabled`
+     (so a v6-only device with stale v4 pool fields doesn't get
+     the v4 anchor unwanted re-installed).
+  4. Add a symmetric v6 replay block: read `ipv6_pool_start`,
+     `ipv6_pool_end`, `ipv6_prefix`, derive the anchor from
+     `ipv6_server_ip` when set, else first host of the pool
+     /prefix; call `_ensure_ipv6_address`.
+  5. Both v4 and v6 replay log independently — one can succeed
+     while the other fails without either being silenced.
+
+### Also shipping: DHCPv6 client template (committed `afd8efa0`)
+
+New `dhcp_client_ipv6` template in `utils/device_templates.py`:
+one-click DHCPv6 client — pairs with the v0.5.303
+`dhcp_server_ipv6` template for lab stress-testing. Same vlan
+default (10) so one-click both templates lands them on the same
+L2. Detail:
+  * protocols=["DHCP"], dhcp_mode_combo="Client"
+  * dhcp_ipv4_enabled_checkbox=False, dhcp_ipv6_enabled_checkbox=True
+  * No static address preset — client-mode branch of
+    _on_dhcp_mode_changed clears them anyway; lease provides it
+
+### Deferred (follow-up)
+
+**C. DAD-wait for v6 anchor** in `_ensure_ipv6_address` (parallel
+of v0.5.290 for v4). Kernel DAD usually settles fast enough that
+dnsmasq bind succeeds on retry; only bites on hard collision on
+the same L2. No evidence of hitting it on srv06 yet. Follow-up
+if operator sees dnsmasq-bind-failed / EADDRNOTAVAIL in the log.
+
+### Verification
+
+10 lock-in tests in
+`tests/test_v05309_dhcpv6_lease_e2e_fixes.py` covering:
+  * Fix A: marker placement (between _flush_ipv6 and dhcp6c
+    spawn), both accept_ra AND autoconf disabled, best-effort
+    sysctl (except+debug, no lease block).
+  * Fix B: both markers present in arp_monitor, import extended,
+    pool-empty guard widened, v4/v6 gated on their respective
+    ipv{4,6}_enabled flags, v6 anchor derivation correct.
+  * Both edited files ast.parse clean.
+
+Also the 8 lock-in tests for the DHCPv6 client template
+(`tests/test_dhcp_client_ipv6_template.py`) that shipped on
+`afd8efa0`. All pass.
+
+### Operator action
+
+Upgrade server + client to v0.5.309. On srv06, apply
+`dhcp_server_ipv6` on vlan-X, then apply `dhcp_client_ipv6` on
+the same vlan-X (paste-device or add-device with the same VLAN).
+Wait ~10 s for dhcp6c SOLICIT → dnsmasq REPLY.
+
+Expected on the client device's interface:
+  * Only ONE global v6 (from the pool: `2001:db8:30::100`-ish)
+  * Devices tab IPv6 column shows `<lease>/64 (leased)`
+  * DB `dhcp_lease_ip6` reflects the pool address, not the
+    SLAAC MAC-derived form
+
+If it still doesn't work, check:
+  * `journalctl -u netgen-server | grep 'v0.5.309'` for sysctl
+    failures
+  * `docker exec <dhcp-client-container> dhcp6c -f ...` for
+    SOLICIT/ADVERTISE traffic
+  * Server-side `docker exec <dhcp-server-container> dnsmasq
+    --test` and check for enable-ra + dhcp-range lines
+
 ## [0.5.308] - 2026-09-13
 
 **v0.5.307's guard needed dhcp_config in device_config; caller

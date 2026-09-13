@@ -426,11 +426,11 @@ class ARPStatusMonitor:
             )
             return
         try:
-            from utils.dhcp import _ensure_ipv4_address
+            from utils.dhcp import _ensure_ipv4_address, _ensure_ipv6_address
         except Exception as _imp_exc:
             logger.warning(
                 f"[ARP MONITOR] anchor replay: cannot import "
-                f"_ensure_ipv4_address: {_imp_exc}"
+                f"_ensure_ipv4_address / _ensure_ipv6_address: {_imp_exc}"
             )
             return
         # Normalize the display-form iface (`vlanN@ensXfY`) → `vlanN`
@@ -480,10 +480,22 @@ class ARPStatusMonitor:
                 or _dev.get("dhcp_pool_end")
                 or ""
             )
-            if not (_pool_start and _pool_end):
+            # v0.5.309 (audit dhcpv6-lease-e2e): only skip the WHOLE
+            # device when BOTH v4 AND v6 pools are absent. Pre-fix,
+            # a v6-only DHCPv6-server device (no v4 pool at all)
+            # was skipped here before the v6 anchor replay below
+            # could run — so on netgen-server restart the v6 anchor
+            # silently disappeared and dnsmasq stopped answering
+            # DHCPv6 SOLICITs. Peek at the v6 pool fields inline
+            # so this guard doesn't short-circuit v6-only devices.
+            _peek_v6_start = str(_dhcp_cfg.get("ipv6_pool_start") or "")
+            _peek_v6_end = str(_dhcp_cfg.get("ipv6_pool_end") or "")
+            _has_v4 = bool(_pool_start and _pool_end)
+            _has_v6 = bool(_peek_v6_start and _peek_v6_end)
+            if not (_has_v4 or _has_v6):
                 logger.debug(
                     f"[ARP MONITOR] anchor replay: device {_dev_id} "
-                    f"has no pool range; skipping"
+                    f"has no v4 or v6 pool range; skipping"
                 )
                 continue
             _gateway = (
@@ -509,26 +521,88 @@ class ARPStatusMonitor:
             _relay_return_hop = str(
                 _dhcp_cfg.get("relay_return_hop") or ""
             )
-            try:
-                _ensure_ipv4_address(
-                    _iface, str(_pool_start), str(_pool_end),
-                    gateway=str(_gateway or ""),
-                    ipv4_mask=str(_mask or ""),
-                    container=None,
-                    relay_return_hop=_relay_return_hop,
-                )
-                _replayed += 1
-                logger.info(
-                    f"[ARP MONITOR] anchor replay: device {_dev_id} "
-                    f"iface={_iface} pool={_pool_start}-{_pool_end} "
-                    f"replayed"
-                )
-            except Exception as _rep_exc:
-                _failed += 1
-                logger.warning(
-                    f"[ARP MONITOR] anchor replay: device {_dev_id} "
-                    f"iface={_iface} failed: {_rep_exc}"
-                )
+            # v0.5.309 (audit dhcpv6-lease-e2e): only replay v4 anchor
+            # when a v4 pool is defined AND v4 is enabled. Pre-fix,
+            # the check `if not (_pool_start and _pool_end)` at :483
+            # skipped devices with NO v4 pool — good — but for a
+            # v6-only DHCPv6-server device, `pool_start`/`pool_end`
+            # are also empty, so the whole device was skipped and
+            # the v6 anchor never got replayed. Split into two
+            # separate replays: v4 pool if present, v6 pool if
+            # present, and only skip the WHOLE device when neither
+            # is defined.
+            _v4_enabled_dc = bool(_dhcp_cfg.get("ipv4_enabled", True))
+            if _pool_start and _pool_end and _v4_enabled_dc:
+                try:
+                    _ensure_ipv4_address(
+                        _iface, str(_pool_start), str(_pool_end),
+                        gateway=str(_gateway or ""),
+                        ipv4_mask=str(_mask or ""),
+                        container=None,
+                        relay_return_hop=_relay_return_hop,
+                    )
+                    _replayed += 1
+                    logger.info(
+                        f"[ARP MONITOR] anchor replay: device {_dev_id} "
+                        f"iface={_iface} v4 pool={_pool_start}-{_pool_end} "
+                        f"replayed"
+                    )
+                except Exception as _rep_exc:
+                    _failed += 1
+                    logger.warning(
+                        f"[ARP MONITOR] anchor replay: device {_dev_id} "
+                        f"iface={_iface} v4 failed: {_rep_exc}"
+                    )
+
+            # v0.5.309: mirror v4 replay for the v6 pool anchor. The
+            # server's IPv6 (e.g. 2001:db8:30::1/64) sits on the vlan
+            # sub-if for dnsmasq to bind. If the interface got
+            # flushed (netgen-server restart, arp_monitor sweep,
+            # container recreate), the anchor disappears and dnsmasq
+            # stops answering DHCPv6 SOLICITs. Symptom: client sees
+            # SLAAC-derived address (from RA still emitted by
+            # dnsmasq) but never gets a DHCPv6 lease. Same shape as
+            # v4 anchor drift the v0.5.295 v4 replay fixed.
+            _v6_enabled_dc = bool(_dhcp_cfg.get("ipv6_enabled", False))
+            _v6_pool_start = str(_dhcp_cfg.get("ipv6_pool_start") or "")
+            _v6_pool_end = str(_dhcp_cfg.get("ipv6_pool_end") or "")
+            _v6_prefix = str(_dhcp_cfg.get("ipv6_prefix") or "64")
+            _v6_server_ip = str(
+                _dhcp_cfg.get("ipv6_server_ip")
+                or _dhcp_cfg.get("ipv6_server")
+                or ""
+            )
+            if _v6_enabled_dc and _v6_pool_start and _v6_pool_end:
+                # Derive the anchor address the same way start_dhcp_
+                # server does: prefer the operator-set ipv6_server_ip;
+                # else default to the first host of the /prefix
+                # containing the pool.
+                if not _v6_server_ip:
+                    try:
+                        import ipaddress as _ipa
+                        _net = _ipa.IPv6Network(
+                            f"{_v6_pool_start}/{_v6_prefix}", strict=False,
+                        )
+                        _v6_server_ip = str(_net.network_address + 1)
+                    except Exception:
+                        _v6_server_ip = _v6_pool_start
+                try:
+                    _ensure_ipv6_address(
+                        _iface, _v6_server_ip, _v6_prefix,
+                        container=None,
+                    )
+                    _replayed += 1
+                    logger.info(
+                        f"[ARP MONITOR] anchor replay: device {_dev_id} "
+                        f"iface={_iface} v6 anchor={_v6_server_ip}/{_v6_prefix} "
+                        f"pool={_v6_pool_start}-{_v6_pool_end} replayed"
+                    )
+                except Exception as _rep6_exc:
+                    _failed += 1
+                    logger.warning(
+                        f"[ARP MONITOR] anchor replay: device {_dev_id} "
+                        f"iface={_iface} v6 failed: {_rep6_exc}"
+                    )
         logger.info(
             f"[ARP MONITOR] anchor replay: {_replayed} replayed, "
             f"{_failed} failed (of {len(_dhcp_servers)} DHCP-server "
