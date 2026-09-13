@@ -168,6 +168,40 @@ _TEMPLATES: List[_Template] = [
             "dhcp_mode_combo": "Client",
         },
     ),
+
+    _Template(
+        key="dhcp_client_ipv6",
+        title="DHCPv6 client",
+        summary="dhcp6c (or dhclient -6 fallback) inside the device "
+                "VRF. IPv6 enabled, IPv4 off — pairs with the "
+                "DHCPv6 server template. Lease + gateway populate "
+                "at runtime; the Devices tab IPv6 column shows the "
+                "leased address with a '(leased)' marker (v0.5.302 "
+                "lease-display path). Useful for stressing DHCPv6 "
+                "lease churn or IPv6-only client racks against the "
+                "DHCPv6 server template.",
+        protocols=["DHCP"],
+        fields={
+            # ipv4/ipv6 checkboxes are FORCED to False by the client-
+            # mode branch of _on_dhcp_mode_changed (add_device_dialog.
+            # py:1561-1575) — client-mode devices don't get a static
+            # address. Values here are cosmetic; the DHCP sub-toggles
+            # below are what drives dhclient/dhcp6c inside the
+            # container.
+            "ipv4_checkbox": False,
+            "ipv6_checkbox": True,
+            "vlan_input": "10",
+            "dhcp_mode_combo": "Client",
+            # DHCP-family sub-toggles: dhclient -4 OFF, dhcp6c ON.
+            # start_dhcp_client (utils/dhcp.py) reads
+            # dhcp_config.ipv4_enabled / ipv6_enabled to decide which
+            # daemons to spawn. Default is v4=on/v6=off, so a v6-only
+            # client template needs both flipped from the widget
+            # defaults.
+            "dhcp_ipv4_enabled_checkbox": False,
+            "dhcp_ipv6_enabled_checkbox": True,
+        },
+    ),
     _Template(
         key="vxlan_vtep",
         title="VXLAN tunnel endpoint",
