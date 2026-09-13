@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.305] - 2026-09-13
+
+**Fix v0.5.304 miss: teardown didn't sweep the IFNAMSIZ-truncated
+alt-name.**
+
+Operator ran the v0.5.304 immediate-unblock command on srv06 and
+found the leaked interface was the truncated alt form:
+
+    $ ip link del vlan20 ; ip -o link show | grep vlan20-
+    Cannot find device "vlan20"
+    413: vlan20-ens2f0np@ens2f0np0: <BROADCAST,MULTICAST,UP,LOWER_UP>
+        mtu 1500 qdisc noqueue state UP mode DEFAULT ...
+
+`vlan20-ens2f0np` — 15 chars — is what the Apply-create path
+actually put on the wire for parent `ens2f0np0` (9 chars, so the
+raw `vlan20-ens2f0np0` at 16 chars overshoots IFNAMSIZ 15 and
+Apply truncates parent → `ens2f0np`).
+
+v0.5.304's teardown/self-heal loops used the untruncated raw
+f-string `f"vlan{vlan}-{parent}"` as their alt candidate, so
+they scanned for `vlan20-ens2f0np0` — which never existed on
+the wire — and silently skipped the actual truncated form.
+The interface leaked past v0.5.304's own cleanup.
+
+### Fix (`run_tgen_server.py`)
+
+New module-level `_vlan_alt_name(vlan_id, parent_iface)` helper
+returns the same truncated form the Apply-create path emits.
+Same math, same fallback (when the vlan id alone fills the
+15-char budget, fall back to the simple `vlan<N>` name).
+
+All three sites now derive the alt name from this one helper:
+  * Apply-create — the original inline truncation math replaced
+    with a call to the helper. Single source of truth.
+  * Apply-path self-heal — its candidate list gets `_vlan_alt_name`.
+  * `_teardown_stale_vlan_subif` — same. Duplicate guard for the
+    fallback case (when `_vlan_alt_name` returns the simple name)
+    so we don't try to delete `vlan<N>` twice.
+
+### Verification
+
+4 new lock-in tests in `tests/test_vlan_subif_leak_teardown.py`
+covering:
+  * `_vlan_alt_name` produces the correct truncated form for the
+    operator's actual srv06 case (`vlan20` + `ens2f0np0` →
+    `vlan20-ens2f0np`) + edge cases (short parent no-op, exactly
+    15-char boundary, extreme vlan ids).
+  * Teardown loop routes through `_vlan_alt_name` (not raw
+    f-string).
+  * Self-heal loop routes through `_vlan_alt_name`.
+  * Apply-create routes through `_vlan_alt_name` — the inline
+    truncation math is gone.
+
+Two v0.5.304 tests updated to assert on the helper usage instead
+of the removed raw f-string. Full suite: 14/14 pass. ast.parse
+clean.
+
+### Operator action
+
+Upgrade server to v0.5.305. If you still have the leaked
+`vlan20-ens2f0np` on srv06 from before, next Apply for vlan20
+will reclaim it automatically via the (now correctly-truncated)
+self-heal — no manual `ip link del` needed. Or delete it now:
+
+    sudo ip link del vlan20-ens2f0np
+
+Either way, the underlying bug is fixed forward: future removes
+will sweep the correct on-wire name and Apply-time self-heal
+catches any residue from older builds.
+
 ## [0.5.304] - 2026-09-13
 
 **Fix: VLAN sub-interface leak on `/api/device/remove` + Apply

@@ -65,14 +65,20 @@ def test_teardown_helper_reference_counts_before_deletion():
 def test_teardown_helper_deletes_both_naming_variants():
     """A device that hit the collision path uses the alt name
     `vlan<N>-<parent>` — so the teardown must consider BOTH the
-    simple `vlan<N>` name AND the alt name (line 4711 area
-    creates `vlan{vlan}-{interface_normalized}`)."""
+    simple `vlan<N>` name AND the alt name. v0.5.305 routes the
+    alt-name computation through `_vlan_alt_name` so it matches
+    the truncated on-wire form (Apply-create truncates to
+    IFNAMSIZ 15). Bare f-string in v0.5.304 missed the truncated
+    variant → operator saw the leak on srv06 as `vlan20-ens2f0np`
+    even after the v0.5.304 teardown ran."""
     src = _src()
     idx = src.index("def _teardown_stale_vlan_subif(")
     tail = src[idx:idx + 6000]
-    # Both candidates listed in the sweep loop.
+    # Simple name candidate.
     assert 'f"vlan{vlan_id}"' in tail
-    assert 'f"vlan{vlan_id}-{parent_iface}"' in tail
+    # Alt candidate derived from the shared helper — NOT a raw
+    # f-string (v0.5.305 fix).
+    assert "_vlan_alt_name(vlan_id, parent_iface)" in tail
     assert '"ip", "link", "del", candidate' in tail
 
 
@@ -130,10 +136,12 @@ def test_apply_path_self_heal_before_branching():
     assert idx != -1, "Apply-path self-heal marker missing"
     # The block must be in the Apply path (near line 4670 area),
     # not somewhere else — cheap sanity via a nearby anchor.
-    window = src[max(0, idx - 800):idx + 2000]
+    window = src[max(0, idx - 800):idx + 3000]
     assert "check_result = subprocess.run" in window
     assert "device_db.get_all_devices()" in window
-    assert 'f"vlan{vlan}-{interface_normalized}"' in window
+    # v0.5.305: alt-name derived from shared helper (was raw
+    # f-string; missed truncated on-wire form).
+    assert "_vlan_alt_name(vlan, interface_normalized)" in window
 
 
 def test_apply_self_heal_fails_closed_on_db_exception():
@@ -159,6 +167,83 @@ def test_apply_self_heal_only_fires_when_no_device_claims_vlan_id():
     window = src[idx:idx + 2500]
     # The `if not _any_claim:` guard gates the sweep + re-check.
     assert "if not _any_claim:" in window
+
+
+def test_vlan_alt_name_helper_matches_apply_truncation():
+    """v0.5.305: the alt-name helper MUST produce the same truncated
+    form the Apply-create path puts on the wire, otherwise the
+    teardown/self-heal sweep silently misses the leaked interface.
+    Operator hit this on srv06 with vlan20 leaked as
+    `vlan20-ens2f0np@ens2f0np0` — parent `ens2f0np0` (9 chars)
+    combined with `vlan20-` (7 chars) = 16 chars > IFNAMSIZ 15,
+    so Apply-create had truncated to `vlan20-ens2f0np` (15) but the
+    v0.5.304 teardown loop used the raw f-string `vlan20-ens2f0np0`
+    and never matched, leaking the interface indefinitely."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_srv_mod", str(_SERVER_PY),
+    )
+    # Just source-check the function's shape — importing the full
+    # module pulls in Flask + docker + everything else.
+    src = _src()
+    assert "def _vlan_alt_name(" in src
+    # Extract the function body and eval() it in a scratch namespace
+    # so we can hit the actual truncation math.
+    idx = src.index("def _vlan_alt_name(")
+    end = src.index("def _teardown_stale_vlan_subif(", idx)
+    fn_src = src[idx:end]
+    ns = {}
+    exec(fn_src, ns)
+    _vlan_alt_name = ns["_vlan_alt_name"]
+    # The operator's actual srv06 case.
+    assert _vlan_alt_name("20", "ens2f0np0") == "vlan20-ens2f0np"
+    # No-truncation case (short parent).
+    assert _vlan_alt_name("20", "eth0") == "vlan20-eth0"
+    # Boundary — exactly 15 chars, no truncation.
+    assert _vlan_alt_name("20", "ens2f0np") == "vlan20-ens2f0np"
+    # Long parent, long vlan — still fits ≤15 after truncation.
+    assert len(_vlan_alt_name("100", "veryLongParent")) <= 15
+    assert _vlan_alt_name("100", "veryLongParent") == "vlan100-veryLon"
+    # Vlan id alone > 15 - "vlan" - "-" budget → fall back to simple.
+    # "vlan99999-" = 10 chars, leaves 5 for parent → truncated.
+    assert _vlan_alt_name("99999", "somelongname") == "vlan99999-somel"
+
+
+def test_teardown_helper_uses_alt_name_helper():
+    """Belt-and-suspenders: the teardown loop's candidate list must
+    include the truncated alt-name (via _vlan_alt_name), not the raw
+    f-string that would miss the truncated on-wire form."""
+    src = _src()
+    idx = src.index("def _teardown_stale_vlan_subif(")
+    tail = src[idx:idx + 6000]
+    # The candidate list construction must go through _vlan_alt_name.
+    assert "_vlan_alt_name(vlan_id, parent_iface)" in tail
+    # And guard against duplicates when the alt equals the simple
+    # name (fallback case) — otherwise we'd try to delete `vlanN`
+    # twice.
+    assert "if _alt not in _candidates" in tail
+
+
+def test_apply_self_heal_uses_alt_name_helper():
+    """Same fix in the Apply-path self-heal loop — v0.5.304 used
+    a raw f-string here too and missed truncated leaks."""
+    src = _src()
+    idx = src.index("v0.5.304 self-heal")
+    window = src[idx:idx + 3000]
+    assert "_vlan_alt_name(vlan, interface_normalized)" in window
+
+
+def test_apply_create_uses_alt_name_helper():
+    """Consolidation: Apply-create originally inlined the truncation
+    math; v0.5.305 routes it through _vlan_alt_name so all three
+    sites (create, self-heal, teardown) derive the alt name from
+    one authoritative place."""
+    src = _src()
+    # The old inline truncation math is gone — no more
+    # `max_vlan_len = len(f"vlan{vlan}-")` at the Apply-create site.
+    assert 'max_vlan_len = len(f"vlan{vlan}-")' not in src
+    # And the create-branch call to _vlan_alt_name exists.
+    assert "vlan_name_with_parent = _vlan_alt_name(" in src
 
 
 def test_server_ast_parses():

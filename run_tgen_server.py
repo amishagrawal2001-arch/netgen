@@ -4679,10 +4679,16 @@ def apply_device():
                             f"reclaiming orphan sub-interface(s) "
                             f"before create"
                         )
-                        for _cand in (
-                            vlan_name_only,
-                            f"vlan{vlan}-{interface_normalized}",
-                        ):
+                        # v0.5.305: use _vlan_alt_name so the alt
+                        # candidate matches the actual truncated
+                        # on-wire name (see helper docstring). Pre-
+                        # v0.5.305 self-heal missed the truncated
+                        # form on parents > 8 chars.
+                        _alt_cand = _vlan_alt_name(vlan, interface_normalized)
+                        _self_heal_candidates = [vlan_name_only]
+                        if _alt_cand not in _self_heal_candidates:
+                            _self_heal_candidates.append(_alt_cand)
+                        for _cand in _self_heal_candidates:
                             try:
                                 subprocess.run(
                                     ["ip", "link", "set", _cand, "down"],
@@ -4756,18 +4762,15 @@ def apply_device():
                         # VLAN interface exists but linked to different parent
                         # Try to create a new VLAN interface with a unique name that includes the parent interface
                         # This allows the same VLAN ID to be used on multiple interfaces
-                        vlan_name_with_parent = f"vlan{vlan}-{interface_normalized}"
-                        # Linux interface name limit is 15 characters (IFNAMSIZ)
-                        if len(vlan_name_with_parent) > 15:
-                            # Truncate parent interface name if needed
-                            max_vlan_len = len(f"vlan{vlan}-")
-                            max_parent_len = 15 - max_vlan_len
-                            if max_parent_len > 0:
-                                truncated_parent = interface_normalized[:max_parent_len]
-                                vlan_name_with_parent = f"vlan{vlan}-{truncated_parent}"
-                            else:
-                                # Fallback to simple name (will fail if already exists)
-                                vlan_name_with_parent = vlan_name_only
+                        # v0.5.305: delegate to _vlan_alt_name so
+                        # Apply-create, Apply-self-heal, and remove-
+                        # teardown all agree on the same truncated
+                        # form (pre-v0.5.305 the teardown loops used
+                        # the raw f-string, missing the truncated
+                        # on-wire name and silently leaking).
+                        vlan_name_with_parent = _vlan_alt_name(
+                            vlan, interface_normalized,
+                        )
                         
                         logging.info(f"[DEVICE APPLY] VLAN {vlan_name_only} exists on different interface, creating {vlan_name_with_parent} on {interface_normalized}")
                         vlan_result = subprocess.run([
@@ -6781,6 +6784,36 @@ def stop_device():
         return jsonify({"error": str(e)}), 500
 
 
+def _vlan_alt_name(vlan_id, parent_iface):
+    """Compute the alt-name variant the Apply path would create for a
+    given (vlan, parent) pair, honoring Linux IFNAMSIZ (15 chars).
+
+    Extracted in v0.5.305 so Apply-create + Apply-self-heal + remove-
+    teardown all agree on the same truncated form. Pre-v0.5.305 the
+    teardown/self-heal loops in _teardown_stale_vlan_subif and the
+    Apply self-heal used the raw f"vlan{vlan}-{parent}" string, which
+    for parents longer than 8 chars (e.g. `ens2f0np0`) does NOT match
+    what the Apply create path actually put on the wire (`vlan20-
+    ens2f0np`, 15 chars) — so the sweep silently missed the truncated
+    alt-name interface. Operator hit this on srv06 with vlan20 leaked
+    as `vlan20-ens2f0np@ens2f0np0`.
+
+    Mirror of the truncation block at line ~4759-4770 in the Apply
+    create path — same math, same corner cases.
+    """
+    name = f"vlan{vlan_id}-{parent_iface}"
+    if len(name) <= 15:
+        return name
+    max_vlan_len = len(f"vlan{vlan_id}-")
+    max_parent_len = 15 - max_vlan_len
+    if max_parent_len <= 0:
+        # vlan id alone already fills the budget — no room for a
+        # meaningful alt-name suffix, so fall back to the simple
+        # name (matches Apply-create fallback at line ~4770).
+        return f"vlan{vlan_id}"
+    return f"vlan{vlan_id}-{parent_iface[:max_parent_len]}"
+
+
 def _teardown_stale_vlan_subif(vlan_id, parent_iface, exclude_device_ids=None):
     """Delete leaked vlan<id>[-<parent>] sub-interfaces when no device
     still claims them.
@@ -6851,7 +6884,15 @@ def _teardown_stale_vlan_subif(vlan_id, parent_iface, exclude_device_ids=None):
                 ),
             }
     deleted = []
-    for candidate in (f"vlan{vlan_id}", f"vlan{vlan_id}-{parent_iface}"):
+    # v0.5.305: use _vlan_alt_name so the alt candidate matches the
+    # truncated form Apply-create actually put on the wire (was
+    # naive f-string in v0.5.304 → missed leaks on parents > 8
+    # chars, e.g. `ens2f0np0` truncates the alt to `vlan20-ens2f0np`).
+    _candidates = [f"vlan{vlan_id}"]
+    _alt = _vlan_alt_name(vlan_id, parent_iface)
+    if _alt not in _candidates:
+        _candidates.append(_alt)
+    for candidate in _candidates:
         try:
             check = subprocess.run(
                 ["ip", "-o", "link", "show", candidate],
