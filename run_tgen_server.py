@@ -4650,9 +4650,57 @@ def apply_device():
                 # Linux shows VLAN interfaces as vlan{vlan}@{parent}, but we check using just vlan{vlan}
                 # Also check if a standalone vlan{vlan} exists and verify its parent
                 vlan_name_only = f"vlan{vlan}"
-                check_result = subprocess.run(["ip", "link", "show", vlan_name_only], 
+                check_result = subprocess.run(["ip", "link", "show", vlan_name_only],
                                             capture_output=True, text=True, timeout=5)
-                
+
+                # v0.5.304 self-heal: if the interface exists AND no
+                # device in the DB claims vlan<N> at all, treat this
+                # as an orphan leaked by a pre-v0.5.304 remove_device
+                # (which never called `ip link del`) and sweep it
+                # BEFORE the branching below. The subsequent
+                # branching then takes the "doesn't exist" path and
+                # creates a fresh vlan<N> linked to our parent,
+                # instead of falling into the "linked to a different
+                # parent" branch and erroring with "File exists".
+                # Fail-closed: any DB exception treats the vlan as
+                # claimed (don't delete on unknown DB state).
+                if check_result.returncode == 0:
+                    try:
+                        _any_claim = any(
+                            str(d.get("vlan") or "0") == str(vlan)
+                            for d in (device_db.get_all_devices() or [])
+                        )
+                    except Exception:
+                        _any_claim = True
+                    if not _any_claim:
+                        logging.info(
+                            f"[DEVICE APPLY] v0.5.304 self-heal: no "
+                            f"device in DB claims vlan{vlan}; "
+                            f"reclaiming orphan sub-interface(s) "
+                            f"before create"
+                        )
+                        for _cand in (
+                            vlan_name_only,
+                            f"vlan{vlan}-{interface_normalized}",
+                        ):
+                            try:
+                                subprocess.run(
+                                    ["ip", "link", "set", _cand, "down"],
+                                    capture_output=True, text=True, timeout=5,
+                                )
+                                subprocess.run(
+                                    ["ip", "link", "del", _cand],
+                                    capture_output=True, text=True, timeout=5,
+                                )
+                            except Exception:
+                                pass
+                        # Re-check so downstream branching sees the
+                        # "doesn't exist" state naturally.
+                        check_result = subprocess.run(
+                            ["ip", "link", "show", vlan_name_only],
+                            capture_output=True, text=True, timeout=5,
+                        )
+
                 if check_result.returncode != 0:
                     # VLAN interface doesn't exist - create new one
                     # CRITICAL: Use vlan{vlan} as the name, Linux will show it as vlan{vlan}@{parent}
@@ -6733,6 +6781,114 @@ def stop_device():
         return jsonify({"error": str(e)}), 500
 
 
+def _teardown_stale_vlan_subif(vlan_id, parent_iface, exclude_device_ids=None):
+    """Delete leaked vlan<id>[-<parent>] sub-interfaces when no device
+    still claims them.
+
+    Callers:
+      * /api/device/remove — after the row is dropped from the DB, if
+        no OTHER device row still claims the same (vlan, parent) pair
+        then the kernel sub-interface is dead weight and must be
+        torn down. Pre-v0.5.304 remove_device leaked these entirely
+        (no `ip link del` call anywhere in that endpoint), so the
+        NEXT Apply for the same vlan on a different parent hit
+        "File exists" and failed with a confusing
+        "linked to a different parent interface" error — the exact
+        symptom that surfaced this bug.
+      * /api/device/apply self-heal — when a fresh Apply sees a
+        stale vlan interface left by a pre-v0.5.304 remove, it can
+        call the sibling reclaim logic (inlined near line 4675) to
+        turn the confusing error into a self-heal.
+
+    Reference-counting: multiple devices legitimately share a
+    (vlan_id, parent_iface) pair — e.g. three devices all on
+    vlan10@ens2f0np0. Deleting the sub-interface while any device
+    still uses it would rip the ground out from under the others.
+    So we only sweep if the DB, after excluding the caller's own
+    device_id, has zero rows matching this pair.
+
+    Args:
+        vlan_id: VLAN ID as string (e.g. "20").
+        parent_iface: Normalized parent NIC name (e.g. "ens2f0np0").
+        exclude_device_ids: Iterable of device_ids to skip during the
+            reference count. Pass the device that just called
+            /api/device/remove — its row is gone by the time this
+            is called, but the exclusion is a belt-and-suspenders
+            guard against a caller who invokes this BEFORE the DB
+            delete (self-heal path).
+
+    Returns:
+        dict {"deleted": [...], "kept_reason": str | None}.
+        `kept_reason` is set when we refused to delete — DB still
+        shows a claim, or the kernel sub-interface's parent doesn't
+        match ours (defensive guard against zapping a same-named
+        vlan sitting on a different NIC).
+    """
+    excl = set(str(x) for x in (exclude_device_ids or []))
+    try:
+        remaining = device_db.get_all_devices() or []
+    except Exception as exc:
+        return {"deleted": [], "kept_reason": f"db-query-failed: {exc}"}
+    for d in remaining:
+        if str(d.get("device_id")) in excl:
+            continue
+        d_vlan = str(d.get("vlan") or "0")
+        d_iface_raw = str(d.get("interface") or "")
+        # Normalize parent shape to match interface_normalized in the
+        # Apply/Remove paths (mirrors the block near line 6767-6775).
+        s = d_iface_raw.strip().strip('"').rstrip(",")
+        if " - " in s:
+            s = s.split(" - ", 1)[-1].strip()
+        if ":" in s:
+            s = s.rsplit(":", 1)[-1].strip()
+        parts = s.split()
+        d_iface = parts[-1] if parts else s
+        if d_vlan == str(vlan_id) and d_iface == parent_iface:
+            return {
+                "deleted": [],
+                "kept_reason": (
+                    f"still-in-use-by device_id={d.get('device_id')}"
+                ),
+            }
+    deleted = []
+    for candidate in (f"vlan{vlan_id}", f"vlan{vlan_id}-{parent_iface}"):
+        try:
+            check = subprocess.run(
+                ["ip", "-o", "link", "show", candidate],
+                capture_output=True, text=True, timeout=5,
+            )
+            if check.returncode != 0:
+                continue
+            link_out = check.stdout
+            # Only delete when the kernel iface's parent actually IS
+            # our parent — belt-and-suspenders against zapping a
+            # same-named vlan sitting on some other NIC (shouldn't
+            # happen if the DB is authoritative, but the DB isn't
+            # authoritative for kernel state and we saw pre-fix
+            # divergence in prod).
+            _parent_ok = (
+                f"@{parent_iface}:" in link_out
+                or link_out.rstrip().endswith(f"@{parent_iface}")
+                or f"link/{parent_iface} " in link_out
+                or link_out.rstrip().endswith(f"link/{parent_iface}")
+            )
+            if not _parent_ok:
+                continue
+            subprocess.run(
+                ["ip", "link", "set", candidate, "down"],
+                capture_output=True, text=True, timeout=5,
+            )
+            rmv = subprocess.run(
+                ["ip", "link", "del", candidate],
+                capture_output=True, text=True, timeout=5,
+            )
+            if rmv.returncode == 0:
+                deleted.append(candidate)
+        except Exception:
+            continue
+    return {"deleted": deleted, "kept_reason": None}
+
+
 @app.route("/api/device/remove", methods=["POST"])
 @require_role("admin")
 def remove_device():
@@ -7053,6 +7209,45 @@ def remove_device():
             import traceback
             logging.error(f"[DEVICE DB] Traceback: {traceback.format_exc()}")
 
+        # v0.5.304 (audit vlan-leak): tear down the vlan sub-interface
+        # this device was using, IFF no remaining device claims the
+        # same (vlan, parent) pair. Pre-fix, remove_device cleaned FRR
+        # + VXLAN + DHCP + DB but never called `ip link del vlan<N>`
+        # anywhere — the sub-interface stuck around forever, and the
+        # next Apply for the same vlan on a different parent hit the
+        # "linked to a different parent interface" branch and errored
+        # out with "File exists" (RTNETLINK). Reference-counted so a
+        # vlan legitimately shared by multiple devices isn't torn
+        # down until the last user is removed.
+        vlan_teardown_report = None
+        if device_info:
+            _vlan_for_teardown = str(device_info.get("vlan") or "0")
+            _parent_for_teardown = iface_normalized  # normalized ~line 6767
+            if _vlan_for_teardown and _vlan_for_teardown != "0" and _parent_for_teardown:
+                try:
+                    vlan_teardown_report = _teardown_stale_vlan_subif(
+                        _vlan_for_teardown,
+                        _parent_for_teardown,
+                        exclude_device_ids=[device_id],
+                    )
+                    if vlan_teardown_report.get("deleted"):
+                        logging.info(
+                            f"[DEVICE REMOVE] Tore down vlan sub-interface(s) "
+                            f"{vlan_teardown_report['deleted']} on parent "
+                            f"{_parent_for_teardown} for {device_id}"
+                        )
+                    elif vlan_teardown_report.get("kept_reason"):
+                        logging.info(
+                            f"[DEVICE REMOVE] Kept vlan{_vlan_for_teardown} "
+                            f"on {_parent_for_teardown}: "
+                            f"{vlan_teardown_report['kept_reason']}"
+                        )
+                except Exception as _vt_exc:
+                    logging.warning(
+                        f"[DEVICE REMOVE] vlan teardown raised for "
+                        f"{device_id}: {_vt_exc}"
+                    )
+
         # Return status with details
         _emit_event(
             "device_removed",
@@ -7074,6 +7269,12 @@ def remove_device():
         }
         if dhcp_remove_failures:
             _payload["dhcp_stop_failures"] = dhcp_remove_failures
+        if vlan_teardown_report is not None:
+            # v0.5.304: surface teardown result so operator debugging
+            # a "still there" complaint can see whether we deleted
+            # the sub-iface, kept it (still-in-use), or found it
+            # already gone.
+            _payload["vlan_teardown"] = vlan_teardown_report
         return jsonify(_payload), 200
 
     except Exception as e:
