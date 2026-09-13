@@ -2,6 +2,104 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.304] - 2026-09-13
+
+**Fix: VLAN sub-interface leak on `/api/device/remove` + Apply
+self-heal.**
+
+Operator report on srv06 2026-09-12: device5 Apply failed with
+> "VLAN interface vlan20 exists but is linked to a different parent
+> interface. Failed to create alternative interface name.
+> Error: RTNETLINK answers: File exists."
+
+...even after they had already removed the prior device using
+vlan20. Error message told them to remove the vlan first — which
+was exactly what they'd done, but through the client's Remove
+action rather than an `ip link del`.
+
+### Root cause
+
+`/api/device/remove` cleaned up: FRR container, VXLAN tunnels,
+DHCP services, DB row. What it did NOT do anywhere: run
+`ip link del vlan<N>` on the sub-interface it created at Apply
+time. The kernel sub-interface leaked forever. The next Apply
+for the same vlan on a different parent hit the "linked to a
+different parent" branch, then the alt-name fallback, then
+errored out with File exists.
+
+### Fix (both in `run_tgen_server.py`)
+
+**1. Reference-counted teardown helper**
+`_teardown_stale_vlan_subif(vlan_id, parent_iface, exclude_device_ids)`
+queries `device_db.get_all_devices()` and deletes `vlan<N>` +
+`vlan<N>-<parent>` only when zero remaining devices claim the
+same `(vlan, parent)` pair. Reference counting is critical —
+three devices sharing `vlan10@ens2f0np0` legitimately share
+the sub-interface, and pre-fix behavior of "delete on first
+remove" would break the surviving two.
+
+Belt-and-suspenders parent-link guard: the delete only fires
+when the kernel sub-interface's actual parent link matches
+ours (same shape as the existing `_parent_link_matches` check
+in the Apply path). Prevents zapping a same-named vlan sitting
+on a different NIC — shouldn't happen if the DB is authoritative
+for kernel state, but the DB isn't, so this is a real safety
+net against divergence.
+
+Fail-closed on DB errors — a `get_all_devices` exception makes
+the helper return `{"deleted": [], "kept_reason": "db-query-failed"}`
+instead of proceeding blind.
+
+**2. `remove_device` hookup**
+Calls the helper right after `device_db.remove_device(device_id)`
+succeeds — the DB delete happens first so the ref-count query
+naturally sees zero remaining rows for the just-freed
+`(vlan, parent)` pair. Result surfaced in the
+`/api/device/remove` response as
+`vlan_teardown: {"deleted": [...], "kept_reason": str|None}` so
+an operator debugging a "still there" complaint gets a
+machine-readable answer instead of guessing.
+
+**3. Apply-path self-heal**
+Inserted at the top of the vlan-exists branch: if kernel
+`vlan<N>` exists AND no device in the DB claims that vlan id
+at all, treat it as an orphan leaked by a pre-fix remove and
+sweep BEFORE the parent-match branching. The downstream code
+then re-checks and takes the "doesn't exist" path — creates
+fresh on our parent, no error. Fail-closed on DB errors.
+
+This second path matters for operators upgrading to v0.5.304
+with leaked vlans already on the wire from pre-fix removes —
+without the self-heal they'd have to `ip link del vlan<N>`
+manually to unblock the first Apply after upgrade. With the
+self-heal the leaked vlans just get reclaimed silently.
+
+### Verification
+
+10 source-level lock-in tests in
+`tests/test_vlan_subif_leak_teardown.py` — helper reference
+counting, both naming variants swept, parent guard, call
+ordering (teardown after DB delete), response payload
+surfacing, Apply-path self-heal placement, guards, and
+fail-closed on DB exceptions. All pass. Python `ast.parse`
+clean on `run_tgen_server.py`.
+
+### Operator action
+
+Upgrade server to v0.5.304 (client can stay on v0.5.303 — the
+fix is entirely server-side). Then:
+
+  - New device removes automatically clean up their vlan
+    sub-interface (unless another device still shares it).
+  - Any vlan interface still leaked on the wire from a
+    pre-v0.5.304 remove gets reclaimed on the next Apply that
+    wants the same vlan id — no manual `ip link del` needed.
+  - To sanity-check on srv06 after upgrade:
+    `ip -o link show type vlan` — any surviving orphan
+    `vlan<N>` that no live device row references will be
+    reclaimed on the next Apply for that N; you don't need to
+    scrub them by hand.
+
 ## [0.5.303] - 2026-09-12
 
 **Ship: DHCPv6 server template.**
