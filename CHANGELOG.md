@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.307] - 2026-09-13
+
+**Actual root cause of the v0.5.306 "same problem" report:
+`utils/frr_docker._configure_interfaces` hardcoded 192.168.0.2/24
+as a widget-default fallback when ipv4 was empty for non-client
+devices.**
+
+v0.5.306 shipped a defensive drop in `/api/device/apply` that
+correctly zeroed the payload's `ipv4` when the DHCP config
+declared v6-only-server. Server logs on srv06 confirmed:
+
+  * `dhcp_config.ipv4_enabled=False` arrived correctly.
+  * The top-level Step-4 IPv4-add block did NOT run (no
+    `[DEVICE APPLY] Configured IPv4 address` log).
+  * BUT `[FRR] Final loopback values: loopback_ipv4=192.168.0.2`
+    fired — and the interface still got 192.168.0.2/24.
+
+Root cause found at `utils/frr_docker.py` lines 607 and 799
+(two near-duplicate `_configure_interfaces` blocks):
+
+    else:
+        if dhcp_mode == "client":
+            ipv4_addr = ''
+            ipv4_mask = ''
+        else:
+            ipv4_addr = '192.168.0.2'   # <-- widget-default leak
+            ipv4_mask = '24'
+
+When the container was spawned for the DHCPv6-server device, this
+else fell through to the hardcoded widget default. FRR then wrote
+`ip address 192.168.0.2/24` on the kernel interface via vtysh.
+That's the second injection site v0.5.306 missed — the top-level
+drop was correct but incomplete.
+
+### Fix
+
+Widen the "no IPv4 needed" branch (both occurrences) to also
+match `dhcp_mode == "server"` when `dhcp_config.ipv4_enabled is
+False`. Uses strict identity (`is False`) so a missing key
+(None) keeps the legacy fallback for non-DHCP paths. dhcp_config
+parsed defensively (accepts dict or JSON-string form).
+
+The widget-default-as-fallback anti-pattern stays for all
+non-DHCP paths (legacy behavior, some tests depend on it) —
+this ship only re-routes the DHCP-server-v6-only case to
+empty, matching the DHCP-client branch's shape.
+
+### Verification
+
+7 lock-in tests in
+`tests/test_v05307_frr_v4_widget_default_leak.py` covering:
+  * v0.5.307 marker present in BOTH duplicate blocks
+  * Widened guard: `client OR (server AND ipv4_enabled=False)`
+  * dhcp_config parsed defensively (dict or JSON string)
+  * `json` import available
+  * Widget-default fallback preserved for non-DHCP paths
+  * Strict `is False` identity check (not truthiness)
+All pass. ast.parse clean.
+
+### Operator action
+
+Upgrade server to v0.5.307. Remove device5, re-add with
+DHCPv6 template, Apply. Interface should now show ONLY
+`2001:db8:30::1/64` — no more `192.168.0.2/24` phantom.
+
+Client can stay on v0.5.303 (template) / v0.5.305 (vlan-teardown).
+Server-only change.
+
 ## [0.5.306] - 2026-09-13
 
 **Defensive drop: IPv6-only DHCP-server device must not carry an

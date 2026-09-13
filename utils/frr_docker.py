@@ -605,7 +605,37 @@ class FRRDockerManager:
                 ipv4_addr = ipv4
                 ipv4_mask = '24'
             else:
-                if dhcp_mode == "client":
+                # v0.5.307 (audit v6-only-dhcp-server-leak, actual
+                # root cause of the v0.5.306 "same problem" report):
+                # pre-v0.5.307 the else fell through to a hardcoded
+                # `ipv4_addr = '192.168.0.2', ipv4_mask = '24'` for
+                # ANY non-client device with empty ipv4 — the
+                # widget-default value from add_device_dialog. FRR
+                # vtysh then wrote `ip address 192.168.0.2/24` on
+                # the kernel interface via the container, so an
+                # IPv6-only DHCPv6-server device ended up with a
+                # bogus IPv4 anchor even after v0.5.306's
+                # /api/device/apply-level drop correctly cleared
+                # `ipv4`. Widget-default-as-fallback is an anti-
+                # pattern; the client's checkbox-gate already
+                # emits empty-string as "no IPv4 needed".
+                #
+                # Extend the "no IPv4 needed" branch to also cover
+                # DHCP-server devices whose dhcp_config declares
+                # ipv4_enabled=False (typically the DHCPv6-server
+                # template, but any operator-configured v6-only
+                # server too), matching the client branch's shape.
+                _dc = device_config.get("dhcp_config") if device_config else None
+                if isinstance(_dc, str):
+                    try:
+                        _dc = json.loads(_dc) if _dc else {}
+                    except Exception:
+                        _dc = {}
+                _dc = _dc if isinstance(_dc, dict) else {}
+                _v4_off_by_config = _dc.get("ipv4_enabled") is False
+                if dhcp_mode == "client" or (
+                    dhcp_mode == "server" and _v4_off_by_config
+                ):
                     ipv4_addr = ''
                     ipv4_mask = ''
                 else:
@@ -797,7 +827,37 @@ class FRRDockerManager:
                 ipv4_addr = ipv4
                 ipv4_mask = '24'
             else:
-                if dhcp_mode == "client":
+                # v0.5.307 (audit v6-only-dhcp-server-leak, actual
+                # root cause of the v0.5.306 "same problem" report):
+                # pre-v0.5.307 the else fell through to a hardcoded
+                # `ipv4_addr = '192.168.0.2', ipv4_mask = '24'` for
+                # ANY non-client device with empty ipv4 — the
+                # widget-default value from add_device_dialog. FRR
+                # vtysh then wrote `ip address 192.168.0.2/24` on
+                # the kernel interface via the container, so an
+                # IPv6-only DHCPv6-server device ended up with a
+                # bogus IPv4 anchor even after v0.5.306's
+                # /api/device/apply-level drop correctly cleared
+                # `ipv4`. Widget-default-as-fallback is an anti-
+                # pattern; the client's checkbox-gate already
+                # emits empty-string as "no IPv4 needed".
+                #
+                # Extend the "no IPv4 needed" branch to also cover
+                # DHCP-server devices whose dhcp_config declares
+                # ipv4_enabled=False (typically the DHCPv6-server
+                # template, but any operator-configured v6-only
+                # server too), matching the client branch's shape.
+                _dc = device_config.get("dhcp_config") if device_config else None
+                if isinstance(_dc, str):
+                    try:
+                        _dc = json.loads(_dc) if _dc else {}
+                    except Exception:
+                        _dc = {}
+                _dc = _dc if isinstance(_dc, dict) else {}
+                _v4_off_by_config = _dc.get("ipv4_enabled") is False
+                if dhcp_mode == "client" or (
+                    dhcp_mode == "server" and _v4_off_by_config
+                ):
                     ipv4_addr = ''
                     ipv4_mask = ''
                 else:
