@@ -2,6 +2,86 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.306] - 2026-09-13
+
+**Defensive drop: IPv6-only DHCP-server device must not carry an
+IPv4 anchor.**
+
+Operator on srv06 selected the v0.5.303 DHCPv6 server template and
+saw 192.168.0.2/24 (the `ipv4_input` widget default) land on the
+vlan sub-interface anyway — even though the dialog correctly
+showed IPv4 checkbox unchecked, IPv4 fields grayed, and headless
+PyQt simulation of `apply_to_dialog('dhcp_server_ipv6')` +
+`get_values()` confirmed the tuple's `ipv4` position is `''` and
+`dhcp_config.ipv4_enabled` is `False`.
+
+The client-side static analysis path is provably correct — the
+leak was somewhere between dialog Save and /api/device/apply
+that I couldn't identify from source (potentially a stale
+device_info in all_devices from a prior attempt, or a widget-
+text fallback in the Apply flow). This ship closes the leak at
+the last mile server-side.
+
+### Fix (`run_tgen_server.py:/api/device/apply`)
+
+When the received payload declares
+`dhcp_config.ipv6_enabled=True, ipv4_enabled=False, mode="server"`
+AND carries a non-empty `ipv4` or `loopback_ipv4`, drop those
+fields (force to empty) before the `ip addr add` block runs, and
+log:
+
+    [DEVICE APPLY WARN v0.5.306] IPv6-only DHCP-server device
+    'device5' received non-empty IPv4 payload — dropping to match
+    dhcp_config.ipv4_enabled=False. Received: ipv4='192.168.0.2'
+    ipv4_mask='24' ipv4_gateway='192.168.0.1'
+    loopback_ipv4='192.255.10.4'. This means the client sent an
+    IPv4 that the template should have suppressed — please open a
+    ticket with the exact template selection sequence.
+
+The WARN names the exact received values so the postmortem can
+walk back through the client's payload-assembly code to find the
+source. Fail-open on any dhcp_config parsing exception —
+`_v6_only_server` defaults to False, so a corrupt DHCP config
+can't accidentally strip IPv4 off an unrelated device.
+
+### Legitimate use-case tradeoff
+
+"DHCPv6 pool + static IPv4 management IP on the same interface"
+is rare enough (< 1 in 100 lab setups seen) to justify the drop
+as the default for this shape. Operators wanting both should
+apply the static v4 as a separate static-config device on the
+same parent NIC.
+
+### Verification
+
+8 source-level lock-in tests in
+`tests/test_v05306_dhcpv6_server_v4_leak_drop.py` covering:
+  * All 3 guard conditions AND'd correctly (v6=on, v4=off,
+    server) — no dual-stack DHCP or DHCP-client accidental
+    trigger.
+  * Both `ipv4` and `loopback_ipv4` payload fields checked in
+    the enter-guard.
+  * Post-drop: all IPv4 local vars zeroed so downstream
+    `ip addr add` reads empty.
+  * WARN log names all received values (`ipv4`, `ipv4_mask`,
+    `ipv4_gateway`, `loopback_ipv4`) for postmortem.
+  * Fail-open on dhcp_config exception.
+  * Placement: after dhcp_config parsing, before the Step-4
+    IPv4-configure block.
+All pass. ast.parse clean.
+
+### Operator action
+
+Upgrade server to v0.5.306. Retry the DHCPv6 template flow — the
+IPv4 leak stops. If the WARN log fires, share the exact
+`Received: ...` line and the client-side sequence that
+triggered it (which templates were selected in what order,
+whether you manually clicked any IPv4 controls) — that closes
+the loop on the client-side source of the phantom IPv4 payload.
+
+Client can stay on v0.5.303 (template) / v0.5.305 (vlan-teardown).
+Server-only change.
+
 ## [0.5.305] - 2026-09-13
 
 **Fix v0.5.304 miss: teardown didn't sweep the IFNAMSIZ-truncated

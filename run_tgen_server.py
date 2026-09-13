@@ -4270,6 +4270,53 @@ def apply_device():
             dhcp_config = dhcp_config_raw or {}
         if dhcp_config and "DHCP" not in protocols:
             protocols.append("DHCP")
+
+        # v0.5.306 (audit v6-only-dhcp-server-leak): defensive drop.
+        # Operator on srv06 2026-09-13 selected the DHCPv6 server
+        # template — dialog correctly showed IPv4 checkbox unchecked,
+        # dhcp_ipv4_enabled unchecked, IPv4 fields grayed. Client-side
+        # headless simulation confirmed get_values() returns ipv4=''
+        # and dhcp_config.ipv4_enabled=False for that template. Yet
+        # 192.168.0.2/24 (the ipv4_input widget's default text) still
+        # landed on the vlan sub-interface. The static-analysis trace
+        # couldn't identify which code path re-injected the default;
+        # this defensive drop closes the leak at the last mile:
+        # whenever a DHCPv6-server-mode device (ipv6_enabled=True,
+        # ipv4_enabled=False) arrives with a non-empty ipv4, force
+        # ipv4 (and ipv4_mask / gateway / loopback) to empty and log
+        # a WARN naming the received values so the postmortem can
+        # identify the client-side source.
+        #
+        # Legitimate "DHCPv6 pool + static IPv4 management IP on the
+        # same iface" is rare enough (and easy to work around: apply
+        # the static v4 as a SEPARATE static-config device on the
+        # same parent NIC) that dropping is the right default for
+        # this shape.
+        try:
+            _dc_v4_on = dhcp_config.get("ipv4_enabled") is True
+            _dc_v6_on = dhcp_config.get("ipv6_enabled") is True
+            _dc_mode = str(dhcp_config.get("mode") or "").lower()
+            _v6_only_server = (
+                _dc_v6_on and (not _dc_v4_on) and _dc_mode == "server"
+            )
+        except Exception:
+            _v6_only_server = False
+        if _v6_only_server and (ipv4 or loopback_ipv4):
+            logging.warning(
+                "[DEVICE APPLY WARN v0.5.306] IPv6-only DHCP-server "
+                "device %r received non-empty IPv4 payload — dropping "
+                "to match dhcp_config.ipv4_enabled=False. Received: "
+                "ipv4=%r ipv4_mask=%r ipv4_gateway=%r loopback_ipv4=%r. "
+                "This means the client sent an IPv4 that the template "
+                "should have suppressed — please open a ticket with "
+                "the exact template selection sequence.",
+                device_name, ipv4, ipv4_mask, ipv4_gateway, loopback_ipv4,
+            )
+            ipv4 = ""
+            ipv4_mask = "24"
+            ipv4_gateway = ""
+            loopback_ipv4 = ""
+
         vxlan_config_raw = data.get("vxlan_config", {})
         if isinstance(vxlan_config_raw, str):
             try:
