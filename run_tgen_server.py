@@ -20175,6 +20175,217 @@ def _save_bind_history(history):
             )
 
 
+# ─────────────────────────────────────────────────────────
+# v0.5.312 (audit admin-console-deps): host-side apt-package
+# manifest.
+#
+# Historically netgen-install auto-provisioned only lldpd + libpcap
+# (v0.5.82) and, after v0.5.310, iputils-arping. But the tarball
+# installer only runs on fresh installs from scratch — an operator
+# who upgraded from a pre-v0.5.310 build never got arping, and
+# there was no in-console way to see which host deps were missing
+# or install them on demand.
+#
+# This manifest is the single source of truth for
+#   * `/api/admin/deps` — enumerate deps + installed state
+#   * `/api/admin/deps/install` — install one whitelisted dep
+#     via apt-get (safe: only accepts names from the manifest)
+#   * `_ADMIN_HTML` — "System Dependencies" card with per-row
+#     Install buttons
+#
+# Adding a new dep here is one line — the endpoints + UI both
+# drive off this list.
+_NETGEN_HOST_DEPS = [
+    {
+        "name": "iputils-arping",
+        "binary": "arping",
+        "purpose": "ARP monitor arp-warm primitive. Without it the "
+                   "gateway ARP status can incorrectly show orange "
+                   "on hosts where the VRF routing table populates "
+                   "late (v0.5.278 ARP-H3 → v0.5.310 auto-install).",
+        "criticality": "recommended",
+        "since_version": "v0.5.278",
+    },
+    {
+        "name": "lldpd",
+        "binary": "lldpcli",
+        "purpose": "LLDP neighbor discovery — per-interface Neighbor "
+                   "column in the admin console (v0.5.82).",
+        "criticality": "recommended",
+        "since_version": "v0.5.82",
+    },
+    {
+        "name": "libpcap0.8",
+        "binary": None,  # library, not a binary
+        "check_cmd": ["ldconfig", "-p"],
+        "check_grep": "libpcap.so",
+        "purpose": "Scapy runtime dependency. Missing it means "
+                   "netgen-server can't import scapy → traffic-gen "
+                   "features fail at import time.",
+        "criticality": "critical",
+        "since_version": "v0.4.0",
+    },
+    {
+        "name": "ethtool",
+        "binary": "ethtool",
+        "purpose": "Interface stat + link parameter probes (line "
+                   "speed, ring size, driver) in the Network "
+                   "Interfaces table + Down/Up buttons.",
+        "criticality": "recommended",
+        "since_version": "v0.4.0",
+    },
+    {
+        "name": "iproute2",
+        "binary": "ip",
+        "purpose": "Core interface management (ip link/addr/route/"
+                   "neigh). Universally preinstalled but checked "
+                   "for completeness — a broken install without "
+                   "this breaks every device apply.",
+        "criticality": "critical",
+        "since_version": "v0.4.0",
+    },
+    {
+        "name": "iputils-ping",
+        "binary": "ping",
+        "purpose": "Health-check ping for self-check and gateway "
+                   "reachability probes.",
+        "criticality": "recommended",
+        "since_version": "v0.4.0",
+    },
+    {
+        "name": "dnsmasq",
+        "binary": "dnsmasq",
+        "purpose": "DHCP server backend. Optional on the host — "
+                   "the FRR-container flow (default) spins dnsmasq "
+                   "inside the container, not on the host.",
+        "criticality": "optional",
+        "since_version": "v0.5.222",
+    },
+]
+
+
+def _dep_installed(dep):
+    """Whether the dep's binary or library check passes on this
+    host. Returns bool. Never raises."""
+    import shutil as _sh
+    if dep.get("binary"):
+        try:
+            return bool(_sh.which(dep["binary"]))
+        except Exception:
+            return False
+    if dep.get("check_cmd"):
+        try:
+            res = subprocess.run(
+                dep["check_cmd"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if res.returncode != 0:
+                return False
+            needle = str(dep.get("check_grep") or "")
+            return needle in (res.stdout or "")
+        except Exception:
+            return False
+    return False
+
+
+@app.route("/api/admin/deps", methods=["GET"])
+@require_role("viewer")
+def api_admin_deps():
+    """v0.5.312: enumerate netgen host-side apt packages with
+    installed status. UI card drives off this."""
+    return jsonify({
+        "packages": [
+            {
+                "name": dep["name"],
+                "binary": dep.get("binary"),
+                "purpose": dep["purpose"],
+                "criticality": dep["criticality"],
+                "since_version": dep["since_version"],
+                "installed": _dep_installed(dep),
+            }
+            for dep in _NETGEN_HOST_DEPS
+        ],
+    })
+
+
+@app.route("/api/admin/deps/install", methods=["POST"])
+@require_role("admin")
+def api_admin_deps_install():
+    """v0.5.312: install one whitelisted host dep via apt-get.
+
+    Body: {"name": "iputils-arping"}. Refuses any name not in
+    the _NETGEN_HOST_DEPS manifest — no arbitrary apt installs
+    from an admin's HTTP session.
+
+    Synchronous with a 3-minute cap. All manifest packages are
+    tiny (< 200 KB) so apt completes quickly on any working
+    mirror; the timeout only bites when dpkg lock is contended
+    (surface hint to the operator so they retry once the other
+    process releases). Uses `DPkg::Lock::Timeout=30` so apt
+    itself waits up to 30 s for the lock before erroring.
+    """
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()
+    dep = next((d for d in _NETGEN_HOST_DEPS if d["name"] == name), None)
+    if not dep:
+        return jsonify({
+            "error": f"Package {name!r} not in netgen deps manifest",
+            "known_deps": [d["name"] for d in _NETGEN_HOST_DEPS],
+        }), 400
+    if _dep_installed(dep):
+        return jsonify({
+            "success": True,
+            "already_installed": True,
+            "installed": True,
+            "message": f"{name} already installed",
+        })
+    try:
+        res = subprocess.run(
+            [
+                "apt-get", "install", "-y",
+                "-o", "DPkg::Lock::Timeout=30",
+                "-o", "APT::Sandbox::User=root",
+                name,
+            ],
+            capture_output=True, text=True, timeout=180,
+        )
+        installed_now = _dep_installed(dep)
+        ok = res.returncode == 0 and installed_now
+        payload = {
+            "success": ok,
+            "installed": installed_now,
+            "returncode": res.returncode,
+            # Tail the output so a verbose apt log doesn't blow
+            # the response size, but keep the important bit
+            # (usually the last few lines with "Setting up X ...").
+            "stdout": (res.stdout or "").strip()[-2000:],
+            "stderr": (res.stderr or "").strip()[-2000:],
+        }
+        return jsonify(payload), (200 if ok else 500)
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "success": False,
+            "installed": False,
+            "error": (
+                "apt-get install timed out after 180 s — another "
+                "apt/dpkg process may hold the lock. Wait for it "
+                "to finish and retry."
+            ),
+        }), 504
+    except FileNotFoundError:
+        return jsonify({
+            "success": False,
+            "installed": False,
+            "error": "apt-get not found — this host isn't Debian/Ubuntu.",
+        }), 500
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "installed": False,
+            "error": str(exc),
+        }), 500
+
+
 @app.route("/api/admin/health", methods=["GET"])
 @require_role("viewer")  # v0.5.92 (audit H1): leaks hostname / kernel
 # cmdline / mounts / hugepage state. Anonymous reads gave passive
@@ -22859,6 +23070,26 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       </p>
     </div>
 
+    <!-- v0.5.312 (audit admin-console-deps): host-side apt-package
+         dependency dashboard. Historically only lldpd + libpcap +
+         (v0.5.310) iputils-arping were auto-installed by the
+         tarball installer, and only on FRESH installs. Operators
+         upgrading from older builds silently missed newer deps.
+         This card is the source of truth: enumerates every dep,
+         shows installed state, offers a one-click Install button
+         backed by /api/admin/deps/install (which only accepts
+         whitelisted names from the same manifest). -->
+    <div class="card" style="grid-column: 1 / -1;" id="card-deps">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">System Dependencies</h2>
+        <button class="secondary" id="btn-refresh-deps">Refresh</button>
+      </div>
+      <p style="color: var(--muted); font-size: 12px; margin: 4px 0 8px;">
+        Host-side apt packages netgen relies on. Auto-provisioned by the tarball installer on fresh installs — this table lets you catch and install anything missing after an upgrade.
+      </p>
+      <div id="deps-table-wrap"><div class="iface-empty">Loading…</div></div>
+    </div>
+
     <!-- v0.5.76: DPDK Accelerators card. Operator on srv06 asked
          what the 16 "Intel PCI not associated with interface"
          entries (state: DPDK accelerator kernel ioatdma) were.
@@ -24877,6 +25108,123 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     });
 
     $('btn-refresh-ifaces').addEventListener('click', refreshInterfaces);
+
+    // v0.5.312 (audit admin-console-deps): host-side apt-package
+    // dependency dashboard. Fetches /api/admin/deps → renders one
+    // row per manifest package with an Install button on missing
+    // ones. Install POSTs /api/admin/deps/install {name} which
+    // runs apt-get install synchronously (max 3 min) with a
+    // whitelist gate on the server so this endpoint can't be
+    // abused to install arbitrary packages.
+    async function refreshDeps() {
+      const wrap = $('deps-table-wrap');
+      if (!wrap) return;
+      try {
+        const r = await fetch('/api/admin/deps');
+        if (!r.ok) {
+          wrap.innerHTML = `<div class="iface-empty">Failed to load: HTTP ${r.status}</div>`;
+          return;
+        }
+        const d = await r.json();
+        const pkgs = (d && d.packages) || [];
+        if (!pkgs.length) {
+          wrap.innerHTML = '<div class="iface-empty">No packages declared.</div>';
+          return;
+        }
+        const missing = pkgs.filter(p => !p.installed).length;
+        const missingBanner = missing
+          ? `<div style="padding: 8px 10px; margin: 0 0 8px; background: #fef3c7; border: 1px solid #fbbf24; border-radius: 6px; color: #78350f; font-size: 12px;">
+               <strong>${missing}</strong> package(s) missing. Click Install to add them (idempotent — safe to re-click).
+             </div>`
+          : `<div style="padding: 8px 10px; margin: 0 0 8px; background: #d1fae5; border: 1px solid #6ee7b7; border-radius: 6px; color: #065f46; font-size: 12px;">
+               All ${pkgs.length} declared packages are installed.
+             </div>`;
+        const rows = pkgs.map(p => {
+          const statusPill = p.installed
+            ? '<span class="pill" style="background: #d1fae5; color: #065f46;">installed</span>'
+            : '<span class="pill" style="background: #fee2e2; color: #991b1b;">missing</span>';
+          const critPill = ({
+            critical:    '<span class="pill" style="background: #fee2e2; color: #991b1b;">critical</span>',
+            recommended: '<span class="pill" style="background: #fef3c7; color: #78350f;">recommended</span>',
+            optional:    '<span class="pill" style="background: #e5e7eb; color: #374151;">optional</span>',
+          })[p.criticality] || '';
+          const installCell = p.installed
+            ? '<span style="color: var(--muted); font-size: 11px;">—</span>'
+            : `<button class="secondary btn-dep-install" data-pkg="${p.name}" style="padding: 3px 10px; font-size: 11px;">Install</button>`;
+          return `<tr>
+            <td style="font-family: ui-monospace, monospace; font-size: 12px; padding: 6px 8px;">${p.name}</td>
+            <td style="font-family: ui-monospace, monospace; font-size: 12px; padding: 6px 8px; color: var(--muted);">${p.binary || '—'}</td>
+            <td style="padding: 6px 8px;">${critPill}</td>
+            <td style="padding: 6px 8px;">${statusPill}</td>
+            <td style="padding: 6px 8px; color: var(--muted); font-size: 12px;">${p.purpose}</td>
+            <td style="padding: 6px 8px; text-align: right;">${installCell}</td>
+          </tr>`;
+        }).join('');
+        wrap.innerHTML = missingBanner + `
+          <table style="width: 100%; border-collapse: collapse;">
+            <thead>
+              <tr style="text-align: left; border-bottom: 1px solid var(--border); background: #f9fafb;">
+                <th style="padding: 6px 8px; font-weight: 600; font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em;">Package</th>
+                <th style="padding: 6px 8px; font-weight: 600; font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em;">Binary</th>
+                <th style="padding: 6px 8px; font-weight: 600; font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em;">Criticality</th>
+                <th style="padding: 6px 8px; font-weight: 600; font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em;">Status</th>
+                <th style="padding: 6px 8px; font-weight: 600; font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em;">Purpose</th>
+                <th style="padding: 6px 8px; text-align: right;"></th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+          <div id="deps-install-log" style="margin-top: 8px;"></div>
+        `;
+      } catch (e) {
+        wrap.innerHTML = `<div class="iface-empty">Error loading deps: ${e}</div>`;
+      }
+    }
+    async function installDep(name, btn) {
+      const log = $('deps-install-log');
+      btn.disabled = true;
+      const origLabel = btn.textContent;
+      btn.textContent = 'Installing…';
+      log.innerHTML = `<div style="padding: 8px; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; color: #1e40af; font-size: 12px;">
+        Running <code>apt-get install ${name}</code>…
+      </div>`;
+      try {
+        const r = await fetch('/api/admin/deps/install', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name}),
+        });
+        const d = await r.json();
+        const ok = r.ok && d.success;
+        const bg = ok ? '#d1fae5' : '#fee2e2';
+        const brd = ok ? '#6ee7b7' : '#fca5a5';
+        const ink = ok ? '#065f46' : '#991b1b';
+        const detail = d.stderr || d.stdout || d.error || d.message || '';
+        log.innerHTML = `<div style="padding: 8px; background: ${bg}; border: 1px solid ${brd}; border-radius: 6px; color: ${ink}; font-size: 12px;">
+          <strong>${ok ? '✓ Installed' : '✗ Failed'}: ${name}</strong>
+          ${detail ? `<pre style="margin: 6px 0 0; padding: 6px; background: rgba(0,0,0,0.05); border-radius: 4px; overflow-x: auto; white-space: pre-wrap; font-size: 11px;">${detail.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre>` : ''}
+        </div>`;
+      } catch (e) {
+        log.innerHTML = `<div style="padding: 8px; background: #fee2e2; border: 1px solid #fca5a5; border-radius: 6px; color: #991b1b; font-size: 12px;">
+          Network error: ${e}
+        </div>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = origLabel;
+        // Re-fetch to reflect new state (row status pill flips
+        // installed / Install button disappears).
+        refreshDeps();
+      }
+    }
+    const _btnRefreshDeps = $('btn-refresh-deps');
+    if (_btnRefreshDeps) _btnRefreshDeps.addEventListener('click', refreshDeps);
+    document.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button.btn-dep-install');
+      if (!btn) return;
+      const pkg = btn.dataset.pkg;
+      if (pkg) installDep(pkg, btn);
+    });
+    refreshDeps();
 
     // Initial render + auto-refresh every 30s. Interface list refreshes on
     // demand only (bind/unbind triggers a refresh; otherwise the user can
