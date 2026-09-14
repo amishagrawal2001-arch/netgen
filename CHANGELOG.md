@@ -2,6 +2,82 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.311] - 2026-09-14
+
+**ARP IPv4 metric now targets the gateway, not the device's own
+IP — operator called out the semantic bug in the v0.5.310
+tooltip fix.**
+
+Operator: "why pinging local ip, ARP should be for Gateway ip".
+Correct. ARP is by definition for REMOTE peers. Pinging own IP
+doesn't involve ARP (kernel routes via lo through the local
+table). v0.5.310 renamed the tooltip to "IPv4 self-check
+failed" — honest about what the metric was doing, but the
+metric itself was misfeatured.
+
+### Fix (run_tgen_server.py:/api/device/arp/<id>)
+
+Pre-v0.5.311 IPv4 branch pinged `ipv4_address` (device's own).
+IPv6 branch already had the right shape:
+
+    if ipv6_address or ipv6_gateway:
+        ipv6_target = ipv6_gateway or ipv6_address   # ← gateway wins
+        ping6_cmd = ping_prefix + ["ping6", "-c", "1", "-W", "1", ipv6_target]
+
+v0.5.311 makes the IPv4 branch symmetric:
+
+    if ipv4_gateway or ipv4_address:
+        ipv4_target = ipv4_gateway or ipv4_address   # ← gateway wins
+        result = subprocess.run(ping_prefix + ["ping", ..., ipv4_target], ...)
+
+  * Guard widens from `if ipv4_address:` to
+    `if ipv4_gateway or ipv4_address:` (matches v6).
+  * Neigh-cache fallback (v0.5.254) now consults the neigh entry
+    for the same target the ping went to — no missed resolution.
+  * Endpoint surfaces `arp_results.details.ipv4_target` so the
+    client can show operators what was probed.
+
+### Tooltip (widgets/devices_tab.py)
+
+Wording reverts from v0.5.310's honest "IPv4 self-check failed"
+back to "IPv4 ARP failed — gateway not reachable via ARP from
+this device's VRF context. Check the gateway is on the same L2
+and answering ARP." Now accurate because the metric IS
+targeting the gateway.
+
+Success wording clarified from "IPv4 ARP resolved" to
+"IPv4 ARP resolved (gateway reachable)".
+
+### v0.5.310 Fix B (VRF local host-route install) STAYS
+
+The v0.5.310 `_create_vrf` change installs `local <ip>/32 dev
+<iface> table <vrf-table>` after enslavement. It's no longer in
+the metric's critical path — but the local-route drift is a
+real underlying kernel state issue that could bite other VRF-
+scoped code (traffic-gen socket source-address bind, monitor
+probes). Kept as defense-in-depth. No revert.
+
+### Verification
+
+10 lock-in tests in
+`tests/test_v05311_arp_ipv4_targets_gateway.py` covering:
+  * ipv4_target = ipv4_gateway or ipv4_address
+  * Guard widens to include gateway
+  * Neigh fallback consults the same target
+  * Endpoint surfaces ipv4_target in details
+  * Tooltip wording matches gateway semantic (both failure +
+    success branches)
+  * Tooltip surfaces target + ping result + VRF
+All pass. ast.parse clean on both edited files.
+
+### Operator action
+
+Upgrade server to v0.5.311. No re-apply needed — the ARP
+endpoint runs fresh on every check. device1's status icon
+should flip to green immediately (BGP-established short-
+circuit was already resolving the gateway; now the IPv4 metric
+targets the same gateway and inherits the resolution).
+
 ## [0.5.310] - 2026-09-14
 
 **Three-part fix for the "device1 gateway ARP failing" report.**

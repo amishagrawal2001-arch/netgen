@@ -15367,9 +15367,30 @@ def get_device_arp_status(device_id):
         # ping 192.168.200.2` succeeds in 0.024ms while the unwrapped
         # form returns 100% loss. The old behaviour left arp_status
         # yellow forever on any multi-device (VRF) deployment.
-        if ipv4_address:
+        # v0.5.311 (audit arp-ipv4-semantic-fix): operator called out
+        # that this check pre-fix pinged the device's OWN IP as its
+        # "IPv4 ARP resolved" metric. That's semantically wrong — ARP
+        # is by definition for REMOTE peers. Pinging your own IP
+        # doesn't involve ARP at all (kernel routes via lo through
+        # the local table). Mirror the IPv6 branch's shape below:
+        # prefer the GATEWAY as the target (that's the primary L3
+        # dependency), fall back to own IP only when no gateway is
+        # configured. This aligns the metric with what its name
+        # promises AND makes v4/v6 symmetric.
+        #
+        # NB: v0.5.310 Fix B (VRF local host-route install in
+        # utils/frr_docker._create_vrf) was addressing the symptom
+        # of the pre-fix self-ping-in-VRF failure. Now that the
+        # metric targets the gateway, self-ping in VRF is no longer
+        # in the metric's critical path — but the local-route
+        # install stays as defense-in-depth for other VRF-scoped
+        # code (traffic-gen socket source-address bind, monitor
+        # probes) that would break silently without it.
+        if ipv4_gateway or ipv4_address:
             try:
-                result = subprocess.run(ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_address],
+                ipv4_target = ipv4_gateway or ipv4_address
+                arp_results["details"]["ipv4_target"] = ipv4_target
+                result = subprocess.run(ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_target],
                                       capture_output=True, text=True, timeout=5)
                 ping_ok = result.returncode == 0
                 arp_results["details"]["ipv4_ping"] = "success" if ping_ok else "failed"
@@ -15378,7 +15399,7 @@ def get_device_arp_status(device_id):
                 else:
                     # v0.5.254: ping-fail is not proof of ARP failure.
                     # Consult the neighbor table before flagging orange.
-                    if _neigh_state_ok(ipv4_address, family="ipv4"):
+                    if _neigh_state_ok(ipv4_target, family="ipv4"):
                         arp_results["arp_ipv4_resolved"] = True
                         arp_results["details"]["ipv4_neigh_fallback"] = "resolved via ip neigh"
                     else:
