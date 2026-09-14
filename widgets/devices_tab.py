@@ -3910,17 +3910,49 @@ class DevicesTab(QWidget):
         orange_color = QColor(255, 165, 0)  # Orange color for failed IPs
         default_color = QColor(0, 0, 0)     # Default black color for resolved IPs
         
-        # IPv4 column - Show orange if IPv4 ARP failed
+        # IPv4 column - Show orange if IPv4 self-check failed.
+        # v0.5.310 (audit arp-tooltip-mislabel): pre-fix, this
+        # tooltip read "IPv4 ARP failed: Failed" — operators
+        # interpreted the label as "ARP for the gateway failed"
+        # because there's no separate cell for the self-check
+        # result. But this metric is actually the endpoint's
+        # ipv4_ping to the device's OWN IP inside its VRF context
+        # (a proxy for "L3 config is correctly wired up"). The
+        # gateway ARP status is a SEPARATE column (IPv4 Gateway)
+        # with its own tooltip. Rename the label and — when the
+        # server sent detail-augmented arp_results — surface the
+        # actual failure reason so operators can distinguish:
+        #   - self-ping fails (VRF-local-table drift, see v0.5.310
+        #     _create_vrf fix)
+        #   - interface down
+        #   - ping-in-VRF fails despite resolved neigh cache (rare)
+        # Keeps the color logic unchanged (orange when False).
         ipv4_item = self.devices_table.item(row, self.COL["IPv4"])
         if ipv4_item:
             ipv4_resolved = arp_results.get("ipv4_resolved", False)
+            _details = arp_results.get("details") or {}
+            _ping_res = _details.get("ipv4_ping") if isinstance(_details, dict) else None
             if not ipv4_resolved and ipv4_item.text().strip():
                 ipv4_item.setForeground(orange_color)
-                ipv4_item.setToolTip(f"IPv4 ARP failed: {arp_results.get('ipv4_status', 'Unknown')}")
+                _reason_bits = [
+                    f"self-check: {arp_results.get('ipv4_status', 'Unknown')}",
+                ]
+                if _ping_res:
+                    _reason_bits.append(f"vrf-ping={_ping_res}")
+                _vrf_name = _details.get("vrf") if isinstance(_details, dict) else None
+                if _vrf_name:
+                    _reason_bits.append(f"vrf={_vrf_name}")
+                ipv4_item.setToolTip(
+                    "IPv4 self-check failed (device's own IP not "
+                    "reachable inside its VRF context). "
+                    "Gateway ARP status is shown separately in the "
+                    "IPv4 Gateway column.\n\n"
+                    + "\n".join(_reason_bits)
+                )
             else:
                 ipv4_item.setForeground(default_color)
                 if ipv4_resolved:
-                    ipv4_item.setToolTip("IPv4 ARP resolved")
+                    ipv4_item.setToolTip("IPv4 self-check passed")
                 else:
                     ipv4_item.setToolTip("Device IPv4 address")
         

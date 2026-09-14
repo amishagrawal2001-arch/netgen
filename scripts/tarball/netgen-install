@@ -405,6 +405,64 @@ def _setup_lldpd() -> None:
         )
 
 
+def _setup_arping() -> None:
+    """v0.5.310: install iputils-arping.
+
+    The ARP monitor's gateway-resolve path (v0.5.278 ARP-H3 fix at
+    run_tgen_server.py:15544) uses `arping -I <iface> <gw>` as its
+    arp-warm primitive when the neigh cache is empty. arping is
+    L2 + interface-bound, so it bypasses IP routing entirely — a
+    missing VRF connected route doesn't stop it. `ping` is the
+    fallback but requires the route in the VRF's routing table
+    (kernel-timing race, or route landed in main table only), and
+    was silently missing in earlier srv06 saga bugs.
+
+    When arping is not installed the code hits FileNotFoundError
+    and falls back to ping-warm; on hosts whose L3 routing is
+    fully wired (e.g. srv06 with BGP up) this is invisible, but
+    on hosts where any of the ARP-H3/H4 fallbacks matters (which
+    is why v0.5.278 shipped the arping primitive in the first
+    place), the gateway shows orange with no obvious clue. Ship
+    the dep alongside lldpd so the fallback chain runs at full
+    strength on any fresh install.
+
+    Best-effort: failure logs + skips, doesn't abort install.
+    Package is tiny (~50 KB, dep on libc + iproute2 which are
+    always present) and universally available in apt for every
+    Debian / Ubuntu release netgen supports.
+    """
+    logger.info("[ARPING] Installing iputils-arping "
+                "(ARP monitor arp-warm primitive, v0.5.278 fix)")
+    apt_res = _run(
+        ["apt-get", "install", "-y", "-o", "APT::Sandbox::User=root",
+         "iputils-arping"],
+        check=False, capture=True,
+    )
+    if apt_res.returncode != 0:
+        logger.warning(
+            f"[ARPING] apt-get install iputils-arping failed "
+            f"(rc={apt_res.returncode}). ARP monitor will fall back "
+            f"to ping-warm; a gateway that BGP/OSPF/ISIS hasn't "
+            f"populated in the VRF's routing table may show orange "
+            f"on the Devices tab. Manual install: "
+            f"`apt install iputils-arping`."
+        )
+        if apt_res.stderr:
+            logger.warning(f"[ARPING] apt stderr: {apt_res.stderr.strip()[:500]}")
+        return
+    # No systemd service — arping is invoked on-demand by
+    # run_tgen_server.py's ARP endpoint. Verify presence.
+    which = _run(["which", "arping"], check=False, capture=True)
+    if which.returncode == 0 and (which.stdout or "").strip():
+        logger.info(f"[ARPING] arping installed at "
+                    f"{which.stdout.strip()} — arp-warm primitive ready")
+    else:
+        logger.warning(
+            "[ARPING] apt reported success but `which arping` empty. "
+            "The ARP monitor will hit FileNotFoundError; check PATH."
+        )
+
+
 def _build_frr_image(install_root: Path) -> bool:
     """Build the netgen-frr:latest Docker image from Dockerfile.frr.
     Returns True on success, False on failure (logged but non-fatal —
@@ -751,6 +809,7 @@ def main() -> int:
 
     _preflight(install_root, force=force)
     _setup_lldpd()  # v0.5.82: install + enable lldpd for neighbor discovery
+    _setup_arping()  # v0.5.310: iputils-arping for ARP monitor arp-warm (ARP-H3)
     _build_frr_image(install_root)
     _write_systemd_unit(install_root)
     _create_path_symlinks(install_root)

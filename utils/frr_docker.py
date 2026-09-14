@@ -501,6 +501,85 @@ class FRRDockerManager:
                         f"[VRF] attach {iface_name} to {vrf_name} failed: {attach.stderr.strip()}"
                     )
                     return None
+
+            # v0.5.310 (audit vrf-local-host-route-drift): when the
+            # device apply path adds IPv4/IPv6 addresses to `iface_
+            # name` BEFORE we enslave it to `vrf_name` here, the
+            # kernel installs the corresponding `local <ip>/32 dev
+            # lo` route in the DEFAULT local table (255), and
+            # enslavement doesn't automatically migrate it. Result:
+            # `ip vrf exec <vrf> ping <own-ip>` returns "no route to
+            # host" / 100% loss because the VRF's local table has
+            # the CONNECTED subnet route but no LOCAL host route —
+            # the kernel then treats the packet as remote, ARPs its
+            # own address, and drops it. Surface: netgen ARP monitor
+            # reports arp_ipv4_resolved=False → yellow icon +
+            # "IPv4 self-check failed" tooltip on a device whose
+            # switch-side ping and BGP session both work fine.
+            # (Operator hit this on srv06 2026-09-13 for device1
+            # 192.168.0.2 on vlan100 in vrf-fdde6b42126.)
+            #
+            # Fix: enumerate the interface's current host addresses
+            # and install `local <addr>/<host-prefix> dev <iface>
+            # table <vrf_table>` for each. Idempotent — kernel
+            # returns "File exists" if the route is already there,
+            # which we swallow.
+            try:
+                for _fam_flag in ("-4", "-6"):
+                    _addrs = subprocess.run(
+                        ["ip", _fam_flag, "-o", "addr", "show", "dev", iface_name],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if _addrs.returncode != 0:
+                        continue
+                    for _line in (_addrs.stdout or "").splitlines():
+                        _toks = _line.split()
+                        try:
+                            _idx = _toks.index("inet" if _fam_flag == "-4" else "inet6")
+                        except ValueError:
+                            continue
+                        if _idx + 1 >= len(_toks):
+                            continue
+                        _cidr = _toks[_idx + 1]
+                        if "/" not in _cidr:
+                            continue
+                        _addr, _pfx = _cidr.split("/", 1)
+                        # Skip link-local for v6 (no local route needed).
+                        if _fam_flag == "-6":
+                            try:
+                                import ipaddress as _ipa
+                                if _ipa.IPv6Address(_addr).is_link_local:
+                                    continue
+                            except Exception:
+                                continue
+                        _host_pfx = "32" if _fam_flag == "-4" else "128"
+                        _route_cmd = [
+                            "ip", _fam_flag, "route", "add",
+                            "local", f"{_addr}/{_host_pfx}",
+                            "dev", iface_name,
+                            "table", str(vrf_table),
+                        ]
+                        _r = subprocess.run(
+                            _route_cmd, capture_output=True, text=True, timeout=5,
+                        )
+                        if _r.returncode == 0:
+                            logger.info(
+                                f"[VRF] device {device_id}: installed local "
+                                f"{_addr}/{_host_pfx} dev {iface_name} "
+                                f"table {vrf_table} (v0.5.310)"
+                            )
+                        elif "File exists" not in (_r.stderr or ""):
+                            logger.warning(
+                                f"[VRF] device {device_id}: failed to install "
+                                f"local {_addr}/{_host_pfx} dev {iface_name} "
+                                f"table {vrf_table}: {_r.stderr.strip()}"
+                            )
+            except Exception as _local_route_exc:
+                logger.warning(
+                    f"[VRF] device {device_id}: local-route install "
+                    f"raised (self-ping in VRF may fail): {_local_route_exc}"
+                )
+
             logger.info(
                 f"[VRF] device {device_id}: {iface_name} → {vrf_name} (table {vrf_table})"
             )

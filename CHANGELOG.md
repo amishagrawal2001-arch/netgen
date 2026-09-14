@@ -2,6 +2,113 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.310] - 2026-09-14
+
+**Three-part fix for the "device1 gateway ARP failing" report.**
+
+Operator report on srv06: yellow status icon + tooltip "IPv4 ARP
+failed: Failed" on device1 (192.168.0.2 on vlan100), even though
+ping from switch → 192.168.0.2 works cleanly and OSPF is
+Established through that gateway. Investigation via SSH probes on
+srv06 revealed three independent issues:
+
+  * The tooltip label is misleading — the actual failed metric is
+    `arp_ipv4_resolved` (self-ping to own IP inside VRF), NOT the
+    gateway ARP (which was already resolved via BGP short-circuit
+    per v0.5.278 ARP-H5).
+  * The self-ping actually fails: from inside vrf-fdde6b42126,
+    `ping 192.168.0.2` returns 100% loss because the VRF's local
+    routing table has no `local 192.168.0.2` host route — only
+    the connected subnet route.
+  * `arping` (v0.5.278 ARP-H3 fallback primitive) isn't installed
+    on srv06 — apt-provisioned deps in the netgen-install tarball
+    cover lldpd but not iputils-arping.
+
+### Fix A (widgets/devices_tab.py:set_status_icon_with_individual_ips)
+
+Rename the IPv4 column failure tooltip from
+`"IPv4 ARP failed: Failed"` to
+`"IPv4 self-check failed (device's own IP not reachable inside its
+VRF context). Gateway ARP status is shown separately in the IPv4
+Gateway column."` plus a per-line breakdown of `ipv4_ping` result
++ VRF name from the `/api/device/arp/<id>` details dict, so
+operators can distinguish self-check failure from actual gateway
+ARP problems. The success-branch tooltip also gets its more
+accurate `"IPv4 self-check passed"` phrasing.
+
+### Fix B (utils/frr_docker._create_vrf)
+
+Root cause of the actual self-ping failure. The device-apply path
+runs `ip addr add 192.168.0.2/24 dev vlan100` in Step 4
+(run_tgen_server.py:4908) BEFORE FRR container start enslaves
+vlan100 to vrf-fdde6b42126 via `ip link set vlan100 master
+vrf-...`. The kernel installs the auto-generated
+`local 192.168.0.2 dev lo` route in the DEFAULT local table
+(255), and enslavement doesn't automatically migrate it into the
+VRF's local table. Inside the VRF, `ping 192.168.0.2` treats own
+IP as remote → ARPs its own address → drops (100% loss).
+
+`_create_vrf` now, after enslavement, enumerates the interface's
+v4 + v6 addresses (skipping link-local) and installs
+`ip <fam> route add local <addr>/<host_pfx> dev <iface> table
+<vrf_table>` for each. `File exists` on re-run is swallowed
+(idempotent). Best-effort — a failure logs a warning but does NOT
+abort VRF creation (VRF + enslavement already succeeded, only
+this belt-and-suspenders local-route step remains).
+
+Only affects new device applies (existing devices need re-apply
+via the client's Apply-selected or a full Remove + Add to trigger
+`_create_vrf` again).
+
+### Fix C (scripts/tarball/netgen-install)
+
+Add `_setup_arping()` — an idempotent `apt-get install
+iputils-arping` invocation wired next to the existing
+`_setup_lldpd()`. Best-effort: apt failure logs + skips, doesn't
+abort the install. arping is a tiny package (~50 KB, deps only on
+libc + iproute2) universally available in every Debian / Ubuntu
+release netgen supports.
+
+Answer to operator's "why did C not happen automatically" — only
+lldpd (v0.5.82) and libpcap0.8 (scapy dep) were previously
+auto-provisioned by the tarball installer. arping was assumed
+preinstalled; when v0.5.278 shipped ARP-H3 using arping as the
+gateway arp-warm primitive, the installer wasn't extended to
+match. This ship closes that gap.
+
+### Verification
+
+15 lock-in tests in
+`tests/test_v05310_arp_tooltip_vrf_local_arping.py` covering:
+  * Fix A: rename in setToolTip call (comments quoting the old
+    string are OK), success/failure branch semantics, details
+    surfacing.
+  * Fix B: marker present, runs AFTER enslavement, iterates v4+v6
+    with link-local skip, correct `ip route add local` shape and
+    table target, File-exists idempotency, best-effort try/except.
+  * Fix C: `_setup_arping` defined + wired into main flow next to
+    `_setup_lldpd`, installs `iputils-arping` package, apt failure
+    doesn't abort install.
+All pass. ast.parse clean on all three edited files.
+
+### Operator action
+
+Upgrade server to v0.5.310. Existing device1 needs a
+Remove + Add (or Apply-selected trigger a fresh `_create_vrf`
+run) for Fix B to take effect on it. For future devices, the
+local route lands correctly on first apply. Fix A + Fix C
+apply immediately on upgrade.
+
+Verify:
+  * Tooltip on the IPv4 column now says "IPv4 self-check failed
+    (device's own IP not reachable inside its VRF context)"
+    when appropriate — with the underlying `vrf-ping=failed`
+    and `vrf=vrf-<id>` breakdown.
+  * `which arping` on srv06 returns a path (was empty pre-v0.5.310).
+  * After Remove + Add of device1: `ip vrf exec vrf-<id> ping
+    <own-ip>` succeeds (0.02 ms range), self-check tooltip flips
+    to "IPv4 self-check passed", status icon goes green.
+
 ## [0.5.309] - 2026-09-13
 
 **Make DHCPv6 lease end-to-end reliable + ship DHCPv6 client template.**
