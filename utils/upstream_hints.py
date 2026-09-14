@@ -173,19 +173,98 @@ def render_all(device_data: Union[dict, List[dict]]) -> Dict[str, str]:
 
 
 def _render_all_scale(devices: List[dict]) -> Dict[str, str]:
+    """v0.5.320 (audit upstream-hint-scale-dedupe): shared blocks
+    that are IDENTICAL across all N devices (e.g. the DHCP-relay
+    stanza when every device sits on the same client VLAN; the
+    interface vlan-tagging + subunit lines when VLAN doesn't
+    increment) are emitted ONCE at the top under a "Shared
+    upstream config" banner. Only blocks that vary per-device
+    (BGP neighbor with per-device IP, interface description with
+    per-device name) get repeated per device.
+
+    Pre-fix, every device's stanza was concatenated verbatim, so
+    a 100-device scale on a shared VLAN emitted 100 identical
+    DHCP-relay stanzas. Operator's srv06 lab: 2-device scale had
+    the 5-line dhcp-relay block twice for no reason. This
+    slimmed-down form is what actually gets pasted into a switch.
+    """
     if not devices:
         return {"juniper": "", "cisco": "", "arista": ""}
-    dividers = {
-        "juniper": "\n\n# " + "=" * 68 + "\n",
-        "cisco":   "\n\n! " + "=" * 68 + "\n",
-        "arista":  "\n\n! " + "=" * 68 + "\n",
-    }
-    out: Dict[str, List[str]] = {"juniper": [], "cisco": [], "arista": []}
+    # v0.5.320: a 1-element list is degenerate scale — there is
+    # nothing to share ACROSS devices when there is only one.
+    # Emit the single device's plain rendering (no shared banner,
+    # no divider) to keep the paste-body clean.
+    if len(devices) == 1:
+        return {
+            "juniper": render_juniper(devices[0]) + "\n",
+            "cisco":   render_cisco(devices[0]) + "\n",
+            "arista":  render_arista(devices[0]) + "\n",
+        }
+    return {v: _dedupe_and_emit(devices, v) for v in ("juniper", "cisco", "arista")}
+
+
+def _dedupe_and_emit(devices: List[dict], vendor: str) -> str:
+    marker = {"juniper": "#", "cisco": "!", "arista": "!"}[vendor]
+
+    # Render every device, split each rendered blob into blocks
+    # separated by "\n\n" (each protocol stanza is one block, per
+    # `_render`'s "\n\n".join). Trim trailing/leading whitespace
+    # so identical-content blocks compare equal regardless of tail
+    # newlines.
+    per_device_blocks: List[List[str]] = []
     for dev in devices:
-        out["juniper"].append(render_juniper(dev))
-        out["cisco"].append(render_cisco(dev))
-        out["arista"].append(render_arista(dev))
-    return {v: dividers[v].join(out[v]) for v in out}
+        rendered = _render(dev, vendor).rstrip("\n")
+        blocks = [b.strip("\n") for b in rendered.split("\n\n") if b.strip()]
+        per_device_blocks.append(blocks)
+
+    # Block layout is stable per _render (header, iface, bgp?,
+    # ospf?, isis?, dhcp_relay?) so index i on device j maps to
+    # the "same kind" of block on device k. Classify each index as
+    # SHARED (byte-identical text on every device) or PER_DEVICE.
+    max_i = max((len(b) for b in per_device_blocks), default=0)
+    shared_idx: List[int] = []
+    per_device_idx: List[int] = []
+    for i in range(max_i):
+        texts = [b[i] if i < len(b) else "" for b in per_device_blocks]
+        # The first block is the header (device_name in comment) —
+        # always per-device, never share.
+        if i > 0 and all(t == texts[0] and t != "" for t in texts):
+            shared_idx.append(i)
+        else:
+            per_device_idx.append(i)
+
+    chunks: List[str] = []
+    banner_shared = (
+        f"{marker} === Shared upstream config "
+        f"(applies to all {len(devices)} netgen devices) ==="
+    )
+    banner_per_dev = f"{marker} " + "=" * 68
+
+    # 1) Emit shared blocks once at top (from device 0 — they're
+    #    all identical by definition).
+    shared_blocks = [per_device_blocks[0][i] for i in shared_idx
+                     if i < len(per_device_blocks[0])]
+    if shared_blocks:
+        chunks.append(banner_shared)
+        chunks.extend(shared_blocks)
+
+    # 2) Emit per-device sections. Each device contributes its
+    #    header block (index 0) plus any per-device unique blocks.
+    for j, blocks in enumerate(per_device_blocks):
+        dev_chunks: List[str] = []
+        for i in per_device_idx:
+            if i < len(blocks):
+                dev_chunks.append(blocks[i])
+        if not dev_chunks:
+            continue
+        # Divider before every per-device section except when this
+        # is the very first thing emitted (no shared banner AND
+        # this is device 0).
+        if chunks:
+            chunks.append(banner_per_dev)
+        chunks.extend(dev_chunks)
+
+    return "\n\n".join(chunks) + "\n"
 
 
 # --- Scale expansion --------------------------------------------------------

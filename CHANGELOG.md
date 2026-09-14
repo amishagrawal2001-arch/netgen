@@ -2,6 +2,93 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.320] - 2026-09-14
+
+**Upstream Config Hint scale mode: dedupe shared blocks so
+identical stanzas (DHCP-relay, interface-when-VLAN-doesn't-
+change) don't repeat once per device.**
+
+Operator report on v0.5.319: 2-device DHCP-client scale emitted
+the 5-line dhcp-relay stanza TWICE (byte-for-byte identical
+across both devices). At 100-device scale it'd be 100 copies —
+which is useless in a switch config paste-body.
+
+### Root cause
+
+`_render_all_scale` in v0.5.319 concatenated per-device rendered
+blobs verbatim with a `====` divider. That's correct for blocks
+that vary per-device (BGP neighbor with per-device IP, interface
+description with per-device name) but wrong for blocks that are
+identical across every device — the DHCP-relay stanza when all
+N devices sit on the same client VLAN, the interface vlan-
+tagging + subunit lines when VLAN doesn't increment.
+
+### Fix
+
+In `_render_all_scale` → new `_dedupe_and_emit(devices, vendor)`:
+
+  1. Render each device via `_render`, split into blocks by
+     `"\n\n"` (block layout is stable: header, iface, bgp?, ospf?,
+     isis?, dhcp_relay?).
+  2. For each block index i > 0 (index 0 = header, always per-
+     device because device_name is in it), check whether the
+     text at index i is byte-identical across every device. If
+     yes → SHARED. Otherwise → PER_DEVICE.
+  3. Emit SHARED blocks ONCE at the top under
+     `# === Shared upstream config (applies to all N netgen devices) ===`.
+  4. Emit PER_DEVICE blocks per device, separated by the
+     `# ====================================================================`
+     divider (unchanged).
+
+Degenerate case: a 1-element list is scale mode with N=1 —
+nothing is shared *across* devices when there's only one. That
+form now returns the plain per-device rendering (no banner, no
+divider). Single-dict input path is unchanged (backward compat
+with pre-v0.5.319 callers).
+
+### End-to-end
+
+**Before (v0.5.319, DHCP-client scale of 2):**
+
+```
+# Upstream config for netgen device 'netgen-device'
+... interface block ...
+... dhcp-relay 5 lines ...              ← emitted here
+
+# ============================
+# Upstream config for netgen device 'netgen-device-2'
+... interface block ...
+... dhcp-relay 5 lines again ...        ← duplicated verbatim
+```
+
+**After (v0.5.320):**
+
+```
+# === Shared upstream config (applies to all 2 netgen devices) ===
+... dhcp-relay 5 lines ...              ← once
+
+# ============================
+# Upstream config for netgen device 'netgen-device'
+... interface block ...
+
+# ============================
+# Upstream config for netgen device 'netgen-device-2'
+... interface block ...
+```
+
+### Verification
+
+15 lock-in tests in
+`tests/test_v05320_upstream_hint_scale_dedupe.py` covering: DHCP-
+relay dedupe (exactly-once across all three vendors); shared
+banner text + count-substitution; ordering (shared first);
+per-device unique blocks preserved; BGP-scale with no shared
+blocks (no banner emitted); N-1 dividers between per-device
+sections; single-device list-form + dict-form both suppress the
+banner; header block never treated as shared even when text is
+identical; trailing newline + no orphan divider. Plus all 26
+v0.5.226 + 18 v0.5.318 + 27 v0.5.319 tests still pass.
+
 ## [0.5.319] - 2026-09-14
 
 **Upstream Config Hint: (a) Cisco/Arista relay parity with
