@@ -23,9 +23,14 @@ The generator is intentionally conservative:
   actually forms — mismatched intervals are the classic OSPF trap).
 - IS-IS NET is derived from the device's system-id when set, or
   synthesized from the loopback when not.
-- DHCP hints are deliberately not emitted — a DHCP-server device
-  on netgen serves clients directly on the wire, so the upstream
-  doesn't need special config beyond what BGP/OSPF already set up.
+- DHCP-client devices emit a dhcp-relay stanza (v0.5.318): a
+  netgen DHCP-client sitting on VLAN N can't reach a netgen
+  DHCP-server on a different subnet without a dhcp-relay agent
+  on the L3 gateway. The server-IP field is a placeholder (the
+  client-side dialog doesn't know its own server's address) and
+  the client-VLAN SVI is inferred from the device's VLAN
+  (irb.<vlan> / Vlan<vlan>). Suppressed for DHCP-server + non-
+  DHCP devices.
 
 Callers get vendor-neutral empty strings for protocols the device
 doesn't have enabled — the section header just doesn't appear.
@@ -168,6 +173,7 @@ def _render(device_data: dict, vendor: str) -> str:
     bgp_config  = device_data.get("bgp_config") or {}
     ospf_config = device_data.get("ospf_config") or {}
     isis_config = device_data.get("isis_config") or {}
+    dhcp_config = device_data.get("dhcp_config") or {}
 
     sections = []
     sections.append(_iface_stanza(
@@ -189,6 +195,20 @@ def _render(device_data: dict, vendor: str) -> str:
         isis = _isis_stanza(vendor, vlan, loopback_v4, isis_config)
         if isis:
             sections.append(isis)
+
+    # v0.5.318 (audit dhcp-client-upstream-relay-hint): a netgen
+    # DHCP-client device needs the L3 gateway (this upstream) to
+    # forward its DHCP requests to the netgen DHCP-server device
+    # via dhcp-relay. Emit for CLIENT mode only. Server-mode +
+    # non-DHCP devices don't need this and get no stanza.
+    _dhcp_mode = (
+        str(dhcp_config.get("mode") or dhcp_config.get("dhcp_mode") or "").strip().lower()
+        or str(device_data.get("dhcp_mode") or "").strip().lower()
+    )
+    if _dhcp_mode == "client":
+        relay = _dhcp_relay_stanza(vendor, vlan, dhcp_config)
+        if relay:
+            sections.append(relay)
 
     header = _header(vendor, device_name, vlan, ipv4, ipv6)
     return header + "\n" + "\n\n".join(s for s in sections if s) + "\n"
@@ -420,6 +440,81 @@ def _ospf_stanza(vendor: str, vlan: str, ipv4: str, ipv4_mask: str,
             if p2p_v6:
                 lines.append(f"   ipv6 ospf network point-to-point")
             lines.append("!")
+        return "\n".join(lines)
+
+    return ""
+
+
+def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
+    """v0.5.318 (audit dhcp-client-upstream-relay-hint):
+    upstream L3-gateway config that forwards a netgen DHCP-client's
+    requests to a remote netgen DHCP-server device.
+
+    Two values the operator MUST substitute after paste:
+
+      * DHCP-server device IP — the client-side dialog doesn't
+        know its own server's address; render as a placeholder
+        (`<DHCP-SERVER-IP>`) with a comment. Some deployments
+        pin it in `dhcp_config.upstream_server_hint`; use that
+        when present.
+      * Client-VLAN SVI — inferred from the device's VLAN
+        (`irb.<vlan>` / `interface Vlan<vlan>`). No substitution
+        needed when the operator's naming matches netgen's guess.
+    """
+    server_ip = _first(
+        dhcp_config.get("upstream_server_hint"),
+        # Legacy shape: some dhcp_config dumps have relay_server_ip
+        # from an earlier design; honor it if present.
+        dhcp_config.get("relay_server_ip"),
+    ) or "<DHCP-SERVER-IP>"
+
+    svi_note = ""
+    if not vlan or vlan == "0":
+        # No VLAN means we can't name the SVI — leave it as an
+        # explicit placeholder so the operator picks it.
+        svi_juniper = "irb.<vlan>"
+        svi_cisco = "Vlan<vlan>"
+        svi_arista = "Vlan<vlan>"
+        svi_note = " (edit: netgen device has no VLAN set)"
+    else:
+        svi_juniper = f"irb.{vlan}"
+        svi_cisco = f"Vlan{vlan}"
+        svi_arista = f"Vlan{vlan}"
+
+    if vendor == "juniper":
+        lines = [
+            "# --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
+            f"# Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
+            f"# Client-VLAN SVI: {svi_juniper}{svi_note}",
+            "set forwarding-options dhcp-relay overrides allow-snooped-clients",
+            "set forwarding-options dhcp-relay forward-only",
+            f"set forwarding-options dhcp-relay server-group DHCP-SERVERS {server_ip}",
+            "set forwarding-options dhcp-relay active-server-group DHCP-SERVERS",
+            f"set forwarding-options dhcp-relay group CLIENTS interface {svi_juniper}",
+        ]
+        return "\n".join(lines)
+
+    if vendor == "cisco":
+        lines = [
+            "! --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
+            f"! Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
+            f"! Client-VLAN SVI: interface {svi_cisco}{svi_note}",
+            "! (IOS uses `ip helper-address` on the client-facing SVI — global service is on by default.)",
+            f"interface {svi_cisco}",
+            f" ip helper-address {server_ip}",
+            "!",
+        ]
+        return "\n".join(lines)
+
+    if vendor == "arista":
+        lines = [
+            "! --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
+            f"! Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
+            f"! Client-VLAN SVI: interface {svi_arista}{svi_note}",
+            f"interface {svi_arista}",
+            f"   ip helper-address {server_ip}",
+            "!",
+        ]
         return "\n".join(lines)
 
     return ""

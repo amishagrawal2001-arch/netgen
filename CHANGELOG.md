@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.318] - 2026-09-14
+
+**DHCP-relay stanza in the Upstream Config Hint dialog — for all
+three vendors. Reverts the v0.5.317 in-dialog QLabel (superseded).**
+
+Operator report on v0.5.317: the static QLabel hint under the
+DHCP fields was single-vendor (Juniper only) and duplicated a
+UI surface that already exists — the "Upstream Config Hint…"
+button on the Add Device dialog opens a proper multi-vendor
+tabbed dialog with copy-to-clipboard. Pre-fix, that dialog
+emitted NO dhcp-relay stanza (its module docstring even
+asserted this was intentional — wrong for RELAY-mode).
+
+### Fix
+
+1. `utils/upstream_hints.py` — new `_dhcp_relay_stanza(vendor,
+   vlan, dhcp_config)` renderer emitting:
+
+   - **Juniper**: `set forwarding-options dhcp-relay …` block
+     (matches operator's srv06 QFX5130 reference config).
+   - **Cisco IOS**: `interface Vlan<N>` + `ip helper-address …`.
+   - **Arista EOS**: same shape as IOS.
+
+   Wired into `_render` gated on `dhcp_mode == "client"` — a
+   DHCP-server device (or non-DHCP device) never emits a relay
+   stanza (a server doesn't need its own upstream to relay to
+   itself). Client-VLAN SVI inferred from `device_data.vlan`
+   (`irb.<vlan>` / `Vlan<vlan>`); `<vlan>` placeholder + note
+   when the device has no VLAN. Server-IP placeholder
+   `<DHCP-SERVER-IP>` (client-side dialog doesn't know its
+   server) unless `dhcp_config.upstream_server_hint` is set.
+
+2. `widgets/add_device_dialog.py._snapshot_for_upstream_hint`
+   — now emits `dhcp_mode` + `dhcp_config` when the DHCP
+   protocol is enabled on the dialog. Gated on
+   `dhcp_enable_checkbox` so a static-config device (with the
+   default "Client" combo value) doesn't spuriously trigger
+   the relay stanza.
+
+3. **Reverted v0.5.317**: the in-dialog `dhcp_client_relay_hint`
+   QLabel is gone. Its visibility toggle in
+   `_on_dhcp_mode_changed` is also gone. Operators now have
+   ONE place to look for switch-side config, and the Juniper
+   snippet the operator relied on is preserved verbatim inside
+   the Upstream Config Hint dialog's Juniper tab.
+
+### Verification
+
+18 lock-in tests in
+`tests/test_v05318_upstream_hint_dhcp_relay.py` covering: v0.5.317
+QLabel gone; module-level integration (dhcp_config read,
+client-mode gate, renderer defined + wired); runtime render for
+all 3 vendors (Juniper `set forwarding-options dhcp-relay`,
+Cisco/Arista `ip helper-address`); no-emit for server-mode +
+non-DHCP; placeholder + upstream_server_hint substitution;
+VLAN=0 SVI placeholder; dialog snapshot emits dhcp_config
+gated on DHCP-enable; AST-parse. Plus all 26 pre-existing
+v0.5.226 tests still pass — no regressions in the existing
+BGP/OSPF/ISIS stanza renderers.
+
 ## [0.5.317] - 2026-09-14
 
 **Upstream DHCP-relay agent config hint on the Add Device
