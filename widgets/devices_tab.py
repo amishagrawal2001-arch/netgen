@@ -8844,6 +8844,70 @@ class DevicesTab(QWidget):
             self.devices_table.setUpdatesEnabled(False)
             
             try:
+                # v0.5.316 (audit dhcp-lease-fallback-in-update-path):
+                # v0.5.294/302/313 planted the DHCP-client lease
+                # fallback in populate_device_table only. But the nav
+                # path (server-tree selection change) rebuilds via
+                # update_device_table (this method), NOT via
+                # populate_device_table — so on every nav the fallback
+                # never fired and the IPv4/IPv6/Gateway cells went
+                # blank for DHCP-client rows even though the lease
+                # was in all_devices (post-v0.5.314 sync). Mirror the
+                # populate-time fallback here so both entrypoints
+                # render DHCP-client rows the same way.
+                #
+                # Helper closure computes DHCP-client fallback for the
+                # 4 columns that need it. Static-config devices are
+                # untouched (falsy dhcp_mode check).
+                def _dhcp_client_fallback(device, header, base_value):
+                    if base_value:
+                        return base_value
+                    _mode = str(
+                        device.get("dhcp_mode")
+                        or device.get("DHCP Mode")
+                        or ""
+                    ).lower()
+                    if _mode != "client":
+                        return base_value
+                    if header == "IPv4":
+                        _lease = str(device.get("dhcp_lease_ip") or "").strip()
+                        if not _lease:
+                            _ipv4_raw = str(device.get("ipv4_address") or "").strip()
+                            if _ipv4_raw:
+                                _lease = _ipv4_raw.split("/", 1)[0]
+                        return f"{_lease} (leased)" if _lease else ""
+                    if header == "IPv6":
+                        _lease6 = str(device.get("dhcp_lease_ip6") or "").strip()
+                        _prefix6 = str(device.get("dhcp_lease_prefix6") or "").strip()
+                        if not _lease6:
+                            _ipv6_raw = str(device.get("ipv6_address") or "").strip()
+                            if _ipv6_raw:
+                                if "/" in _ipv6_raw:
+                                    _lease6, _prefix6 = _ipv6_raw.split("/", 1)
+                                else:
+                                    _lease6 = _ipv6_raw
+                        if not _lease6:
+                            return ""
+                        return (
+                            f"{_lease6}/{_prefix6} (leased)"
+                            if _prefix6 else f"{_lease6} (leased)"
+                        )
+                    if header == "IPv4 Gateway":
+                        _gw4 = str(
+                            device.get("dhcp_lease_gateway")
+                            or device.get("ipv4_gateway")
+                            or ""
+                        ).strip()
+                        return f"{_gw4} (leased)" if _gw4 else ""
+                    if header == "IPv6 Gateway":
+                        _gw6 = str(
+                            device.get("dhcp_lease_gateway6")
+                            or device.get("ipv6_gateway")
+                            or ""
+                        ).strip()
+                        return f"{_gw6} (leased)" if _gw6 else ""
+                    return base_value
+
                 # Now populate rows
                 for row, (iface, device) in enumerate(devices_to_add):
                     for header in self.device_headers:
@@ -8861,6 +8925,11 @@ class DevicesTab(QWidget):
                             )
                         else:
                             value = device.get(header, "")
+                            # v0.5.316: DHCP-client lease fallback for
+                            # the 4 columns that populate_device_table
+                            # already handles (v0.5.294/302/313).
+                            if header in ("IPv4", "IPv6", "IPv4 Gateway", "IPv6 Gateway"):
+                                value = _dhcp_client_fallback(device, header, value)
 
                         if header == "Status":
                             item = QTableWidgetItem("")

@@ -2,6 +2,82 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.316] - 2026-09-14
+
+**DHCP-client lease fallback in `update_device_table` —
+completes the "IPv4/IPv6 cell blank after interface navigation"
+fix that v0.5.294/302/313/314 all left half-done.**
+
+Operator report post-v0.5.315: still see the same blank IPv4/IPv6
+cells for DHCP-client rows after switching interfaces in the
+server tree and coming back — even though v0.5.314 was supposed
+to fix exactly that.
+
+### Root cause (misdiagnosed in v0.5.314)
+
+The v0.5.314 CHANGELOG blamed `populate_device_table` for the
+stale-rebuild on nav. Wrong. Two code paths build device rows:
+
+  * `populate_device_table` — initial paint, `add_device`
+    call site. HAS the v0.5.294/302/313 DHCP-client lease
+    fallback for IPv4 / IPv6 / IPv4 Gateway / IPv6 Gateway.
+
+  * `update_device_table` — server-tree selection change path
+    (this is what actually fires on nav). Bypasses `add_device`
+    and does `value = device.get(header, "")` for every column.
+    NO fallback. So on every nav a DHCP-client row's IPv4
+    (empty operator-declared field) rendered blank even
+    though `all_devices[iface][i]["dhcp_lease_ip"]` was set
+    (v0.5.314 sync).
+
+The lease-visibility fallback was planted in the wrong entry
+point. v0.5.314's `all_devices` sync was necessary but not
+sufficient — nothing at the nav path was reading it.
+
+### Fix
+
+Add a `_dhcp_client_fallback(device, header, base_value)`
+closure inside `update_device_table` that mirrors the populate-
+time logic for the 4 affected columns:
+
+```python
+if header in ("IPv4", "IPv6", "IPv4 Gateway", "IPv6 Gateway"):
+    value = _dhcp_client_fallback(device, header, value)
+```
+
+The helper short-circuits when `base_value` is non-empty (so a
+static-config device or an already-suffixed value is unchanged)
+AND when `dhcp_mode != "client"` (so a DHCP-server device with
+an empty operator IPv4 field doesn't get a spurious "(leased)"
+suffix). Read order matches populate:
+
+  * IPv4:         `dhcp_lease_ip` → `ipv4_address` (CIDR-strip)
+  * IPv6:         `dhcp_lease_ip6/prefix6` → `ipv6_address` (CIDR-split)
+  * IPv4 Gateway: `dhcp_lease_gateway` → `ipv4_gateway`
+  * IPv6 Gateway: `dhcp_lease_gateway6` → `ipv6_gateway`
+
+Suffix `(leased)` in all cases, matching populate.
+
+### What this doesn't fix
+
+The "IPv4 Gateway cell blank AND DB `dhcp_lease_gateway` empty"
+symptom on device4 is a SEPARATE issue — the DHCP server is
+sending an unreachable router-option, so dhclient can't install
+a default route and the lease has no gateway to display.
+v0.5.315 shipped the fix (new "Pool Router" field on the DHCP-
+server device dialog); operator needs to Edit device5, set
+Pool Router to the client-subnet gateway (e.g. `192.16.30.1`),
+Save, Apply.
+
+### Verification
+
+11 lock-in tests in
+`tests/test_v05316_dhcp_lease_fallback_update_path.py` covering:
+marker presence, helper defined inside `update_device_table`,
+short-circuit on static-config, all 4 columns handled, read
+order matches populate, empty-base-value guard, helper wired
+into column iteration, and full-file AST-parse.
+
 ## [0.5.315] - 2026-09-13
 
 **Add distinct "Pool Router" field on the DHCP-server device
