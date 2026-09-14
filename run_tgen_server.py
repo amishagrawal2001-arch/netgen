@@ -15552,51 +15552,145 @@ def get_device_arp_status(device_id):
 
         # Check IPv6 NDP. v0.5.193: same VRF fix as IPv4 — self-ping
         # runs inside the VRF because the local table is per-VRF.
+        # v0.5.328 (audit ipv6-ndp-parity): the IPv6 path used to
+        # be `ping6 → single neigh check → done` with none of the
+        # IPv4 gateway path's belt-and-suspenders. Result: operator
+        # got the switch's `ping 2001:db8:20::2` working after the
+        # v0.5.327 IRB-MAC fix, but the netgen UI still showed
+        # yellow because netgen's own VRF-scoped ping6 failed
+        # (kernel-timing race, or ping6 succeeded on switch side
+        # only, not the reverse direction). Add the same 4-tier
+        # fallback shape as IPv4:
+        #   (H5) any-protocol short-circuit (BGP/OSPF/ISIS established)
+        #   (H1) VRF-wrapped neigh cache hit
+        #   (H4) unwrapped neigh cache hit fallback
+        #   (H3) interface-bound ping6 warm-up + re-check
+        # Then declare orange only if all four fail.
         if ipv6_address or ipv6_gateway:
             try:
                 ipv6_target = ipv6_gateway or ipv6_address
+                arp_results["details"]["ipv6_ping_target"] = ipv6_target
+
+                # H5: any-protocol short-circuit — BGP/OSPF/ISIS
+                # v6 adjacencies can't complete without NDP being
+                # resolved, so any established v6 session is proof
+                # the neighbor cache is populated. Same logic as
+                # the IPv4 branch below.
+                _v6_short_circuit = None
+                if device.get("bgp_ipv6_established") or (
+                    device.get("bgp_established") and device.get("ipv6_address")
+                ):
+                    _v6_short_circuit = "bgp"
+                elif device.get("ospf_ipv6_established") or device.get(
+                    "ospf6_established"
+                ):
+                    _v6_short_circuit = "ospf"
+                elif device.get("isis_established"):
+                    _v6_short_circuit = "isis"
+
+                # First try: VRF-scoped ping6 (existing behavior).
                 ping6_cmd = ping_prefix + ["ping6", "-c", "1", "-W", "1", ipv6_target]
                 result = subprocess.run(ping6_cmd, capture_output=True, text=True, timeout=5)
                 ping_ok = result.returncode == 0
-                arp_results["details"]["ipv6_ping_target"] = ipv6_target
                 arp_results["details"]["ipv6_ping"] = "success" if ping_ok else "failed"
+
                 if ping_ok:
                     arp_results["arp_ipv6_resolved"] = True
+                    arp_results["details"]["ipv6_check_path"] = "ping6_vrf_ok"
+                elif _v6_short_circuit:
+                    # v6 routing session up → neighbor MUST be resolved.
+                    arp_results["arp_ipv6_resolved"] = True
+                    arp_results["details"]["ipv6_check_path"] = (
+                        f"{_v6_short_circuit}_v6_established_short_circuit"
+                    )
+                elif _neigh_state_ok(ipv6_target, family="ipv6"):
+                    # v0.5.254 fallback: check neigh table (VRF-wrapped).
+                    arp_results["arp_ipv6_resolved"] = True
+                    arp_results["details"]["ipv6_check_path"] = "neigh_cache_hit_vrf"
                 else:
-                    # v0.5.254: fall back to the ND table before
-                    # declaring failure. Same rationale as IPv4.
-                    if _neigh_state_ok(ipv6_target, family="ipv6"):
+                    # H4: unwrapped neigh check (kernel edge cases
+                    # where VRF-wrapped netlink returns a different
+                    # slice than unwrapped).
+                    _saved_prefix = ping_prefix
+                    ping_prefix = []
+                    _neigh_no_vrf_ok = _neigh_state_ok(ipv6_target, family="ipv6")
+                    ping_prefix = _saved_prefix
+                    if _neigh_no_vrf_ok:
                         arp_results["arp_ipv6_resolved"] = True
-                        arp_results["details"]["ipv6_neigh_fallback"] = "resolved via ip -6 neigh"
+                        arp_results["details"]["ipv6_check_path"] = "neigh_no_vrf_fallback"
                     else:
-                        arp_results["arp_ipv6_resolved"] = False
+                        # H3: interface-bound NDP warm-up. `ping6 -I
+                        # vlan<N>` bypasses the VRF's IPv6 routing
+                        # table and forces the kernel to send NS out
+                        # the specific iface — the switch replies
+                        # with NA, kernel populates neigh cache,
+                        # re-check succeeds.
+                        _vlan = str(device.get("vlan") or "0").strip()
+                        if _vlan and _vlan != "0":
+                            _iface_for_ndp = f"vlan{_vlan}"
+                        else:
+                            _iface_for_ndp = device.get("server_interface") or ""
+                        _v6_warm_kind = "skip"
+                        if _iface_for_ndp:
+                            try:
+                                _v6_warm = subprocess.run(
+                                    ["ping6", "-c", "1", "-W", "2",
+                                     "-I", _iface_for_ndp, ipv6_target],
+                                    capture_output=True, text=True, timeout=5,
+                                )
+                                _v6_warm_kind = (
+                                    "ping6-iface-ok" if _v6_warm.returncode == 0
+                                    else "ping6-iface-fail"
+                                )
+                            except Exception as _v6_warm_exc:
+                                _v6_warm_kind = f"ping6-iface-error({_v6_warm_exc})"
+                        arp_results["details"]["ipv6_ndp_warm"] = _v6_warm_kind
+                        # Re-check neigh after warm-up.
+                        if _neigh_state_ok(ipv6_target, family="ipv6"):
+                            arp_results["arp_ipv6_resolved"] = True
+                            arp_results["details"]["ipv6_check_path"] = (
+                                "neigh_after_ndp_warm_vrf"
+                            )
+                        else:
+                            _saved_prefix = ping_prefix
+                            ping_prefix = []
+                            _post_warm_ok = _neigh_state_ok(ipv6_target, family="ipv6")
+                            ping_prefix = _saved_prefix
+                            if _post_warm_ok:
+                                arp_results["arp_ipv6_resolved"] = True
+                                arp_results["details"]["ipv6_check_path"] = (
+                                    "neigh_after_ndp_warm_no_vrf"
+                                )
+                            else:
+                                arp_results["arp_ipv6_resolved"] = False
+                                arp_results["details"]["ipv6_check_path"] = "ndp_still_incomplete"
+                if not arp_results["arp_ipv6_resolved"]:
+                    # Diagnostic dump — surfaces the actual entry
+                    # state (INCOMPLETE vs FAILED vs no-entry) from
+                    # BOTH VRF-wrapped and unwrapped netlink views,
+                    # since v0.5.262 confirmed the two can return
+                    # different slices on some kernel versions.
+                    for _label, _prefix in (
+                        ("ipv6_neigh_vrf", list(ping_prefix)),
+                        ("ipv6_neigh_host", []),
+                    ):
                         try:
-                            # Diagnostic dump — surfaces the actual
-                            # entry state so the operator can tell
-                            # INCOMPLETE from FAILED from no-entry.
-                            # v0.5.262 (audit ARP-8): use `ip vrf exec`
-                            # instead of the `vrf <name>` netlink
-                            # filter. The two syntaxes select
-                            # DIFFERENT sets of neighbor entries
-                            # (`ip vrf exec` runs the command inside
-                            # the VRF's routing context; `vrf <name>`
-                            # filters netlink to interfaces enslaved
-                            # to that VRF via master). Under some
-                            # kernel versions they disagree, producing
-                            # a "resolved" boolean that says True
-                            # while `details.ipv6_neigh` says "no
-                            # entry" — hard for operators to
-                            # diagnose. `_neigh_state_ok` already
-                            # uses `ip vrf exec`; match it here.
-                            neigh_cmd = list(ping_prefix) + [
+                            neigh_cmd = _prefix + [
                                 "ip", "-6", "neigh", "show", "to", ipv6_target,
                             ]
                             neigh_result = subprocess.run(
                                 neigh_cmd, capture_output=True, text=True, timeout=5
                             )
-                            arp_results["details"]["ipv6_neigh"] = neigh_result.stdout.strip() or "no entry"
+                            arp_results["details"][_label] = (
+                                (neigh_result.stdout or "").strip() or "no entry"
+                            )
                         except Exception as neigh_exc:
-                            arp_results["details"]["ipv6_neigh"] = f"error: {neigh_exc}"
+                            arp_results["details"][_label] = f"error: {neigh_exc}"
+                    # v0.5.278 back-compat key for pre-v0.5.328 clients
+                    # that read `details.ipv6_neigh`.
+                    arp_results["details"]["ipv6_neigh"] = (
+                        arp_results["details"].get("ipv6_neigh_vrf", "")
+                    )
             except Exception as e:
                 arp_results["details"]["ipv6_ping"] = f"error: {e}"
                 arp_results["details"]["ipv6_ping_target"] = ipv6_gateway or ipv6_address

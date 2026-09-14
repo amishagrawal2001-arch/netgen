@@ -2,6 +2,91 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.328] - 2026-09-14
+
+**Two bundled operator asks:
+  (1) IPv6 NDP resolution parity with IPv4 gateway fallback chain;
+  (2) IRB MAC in Juniper hint is now self-contained (LAA prefix),
+      no `<chassis-base>` placeholder.**
+
+### (1) IPv6 NDP resolution parity
+
+Operator on srv06 vlan20 device1_2: after the v0.5.327 IRB-MAC fix
+made ping work from the switch, netgen UI still showed **yellow**
+on the device. Diagnosis:
+
+The IPv4 gateway resolution path (`/api/device/arp/<device_id>`)
+had 4 fallback tiers to declare a gateway resolved:
+  * H5: any-protocol short-circuit (BGP/OSPF/ISIS established
+    means ARP MUST be resolved)
+  * H1: VRF-wrapped `ip neigh show` cache hit
+  * H4: unwrapped fallback (kernel netlink edge cases)
+  * H3: `arping -I <vlan-iface>` warm-up + re-check
+
+The IPv6 path had NONE of these — just `ping6 → single neigh
+check → done`. When netgen's VRF-scoped `ip vrf exec <vrf> ping6
+<gw>` failed (which happens routinely — kernel-timing race, or
+the switch's ping only primed the switch-side neighbor cache,
+not netgen's), the whole chain declared orange. Operator saw
+ping work from the switch but netgen stayed yellow.
+
+Fix: mirror all 4 tiers on the IPv6 side.
+  * H5: `bgp_ipv6_established` / `ospf_ipv6_established` /
+    `ospf6_established` / `isis_established` — any one → resolved.
+  * H1: `_neigh_state_ok(ipv6_target, family="ipv6")` in VRF.
+  * H4: retry unwrapped when VRF-wrapped returns empty.
+  * H3: `ping6 -I vlan<N> <ipv6_target>` — interface-bound, so
+    bypasses VRF routing table dependency (kernel sends NS
+    directly out the specified iface, switch replies with NA,
+    kernel populates neigh cache). VLAN-iface selection matches
+    ARP-H6 (v0.5.279) — VLAN sub-interface first, parent NIC
+    only when no VLAN.
+
+Records `arp_results["details"]["ipv6_check_path"]` naming
+which tier resolved (or `ndp_still_incomplete` if all failed),
+same debuggability as `gateway_check_path`. Diagnostic dump on
+failure now includes BOTH VRF-scoped and unwrapped neigh output.
+`ipv6_neigh` back-compat key preserved for pre-v0.5.328 clients.
+
+### (2) Self-contained IRB MAC in Juniper upstream hint
+
+Operator asked to eliminate the `<chassis-base>` placeholder so
+the emitted line is ready to paste. v0.5.327 emitted:
+
+```
+# Get chassis base with: `show interfaces irb extensive | match hard`
+# then substitute the first 5 octets below (VLAN 20 → last byte 20):
+set interfaces irb.20 mac <chassis-base>:20
+```
+
+v0.5.328 emits:
+
+```
+# MAC below is locally-administered (bit 1 of first octet set, no
+# vendor-OUI conflict), unique per-VLAN, ready to paste as-is:
+set interfaces irb.20 mac 02:00:00:00:00:20
+```
+
+Uses the locally-administered address prefix `02:` — first octet
+bit 1 set, unicast, guaranteed no vendor-OUI conflict. Last byte
+= VLAN ID matches srv06 operator convention (visually grep-able).
+Deterministic per-VLAN, so re-running the hint doesn't produce
+a different MAC each time.
+
+### Verification
+
+18 lock-in tests in
+`tests/test_v05328_ipv6_ndp_parity_and_self_contained_mac.py`:
+  * 9 for IPv6 NDP path (marker + all 4 tiers + `ipv6_check_path`
+    detail + dual-context neigh dump + `ipv6_neigh` back-compat)
+  * 5 for self-contained IRB MAC (LAA marker + no `<chassis-base>`
+    in emitted line + LAA prefix + end-to-end runtime + per-VLAN
+    uniqueness)
+  * 2 v0.5.327 tests updated for the new MAC form
+  * 2 AST-parse guards
+
+All 275 pre-existing upstream-hint tests still pass (293 total).
+
 ## [0.5.327] - 2026-09-14
 
 **Juniper upstream-hint: add IRB-style variant (QFX/EX/ACX

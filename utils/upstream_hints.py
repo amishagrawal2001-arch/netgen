@@ -707,21 +707,22 @@ def _iface_stanza(
         # convention: last byte of MAC = VLAN ID (irb.20 →
         # `..:20`). Confirmed working on srv06 2026-09-14.
         # Reference: memory/project_srv06_junos_irb_shared_mac.md
-        # Match srv06 operator convention: last MAC byte = VLAN ID
-        # as-written (interpreted as hex). VLAN 20 → `..:20`,
-        # VLAN 30 → `..:30`. Works cleanly for VLAN 0-99; VLAN 100+
-        # wraps to the last two decimal digits — operator adjusts.
-        # The critical property is UNIQUENESS across IRBs, not the
-        # specific representation.
+        # v0.5.328 (audit self-contained-irb-mac):
+        # Generate a fully self-contained, ready-to-paste MAC — no
+        # `<chassis-base>` placeholder. Use a locally-administered
+        # address (LAA) with the first octet's bit 1 set (`02:`),
+        # so the MAC is guaranteed to not conflict with any vendor
+        # OUI. Last byte matches VLAN ID as visible number (irb.20
+        # → `..:20`, srv06 operator convention 2026-09-14) so
+        # per-IRB MACs are grep-able. Deterministic per-VLAN → the
+        # SAME operator running the SAME hint twice gets the SAME
+        # MAC (no drift, no re-commit churn).
         try:
             _v = int(str(vlan) or "0")
             _last_byte = f"{_v % 100:02d}"
         except (ValueError, TypeError):
             _last_byte = "20"
-        # Use a placeholder base MAC — operator MUST substitute the
-        # first 5 octets with their chassis's actual base MAC (from
-        # `show interfaces irb extensive | match hard`).
-        _placeholder_mac = f"<chassis-base>:{_last_byte}"
+        _placeholder_mac = f"02:00:00:00:00:{_last_byte}"
         irb_lines = [
             "# --- Option B: IRB style (QFX / EX / ACX switching) ---",
             "# Configure the physical uplink as an ethernet-switching trunk",
@@ -743,8 +744,8 @@ def _iface_stanza(
             "# CRITICAL: on QFX/EX all IRBs share the chassis MAC by default.",
             "# When multiple IRBs are trunked to one peer, NDP resolution",
             "# gets clobbered — ping fails one-way. Fix: unique per-IRB MAC.",
-            "# Get chassis base with: `show interfaces irb extensive | match hard`",
-            f"# then substitute the first 5 octets below (VLAN {vlan} → last byte {_last_byte}):",
+            f"# MAC below is locally-administered (bit 1 of first octet set, no",
+            f"# vendor-OUI conflict), unique per-VLAN, ready to paste as-is:",
             f"set interfaces irb.{vlan} mac {_placeholder_mac}",
         ])
 

@@ -104,20 +104,25 @@ def test_juniper_irb_variant_last_byte_matches_vlan_id():
     """srv06 operator convention (2026-09-14): last MAC byte =
     VLAN ID as-written for readability (irb.20 → `..:20`,
     irb.30 → `..:30`). Anything unique across IRBs works — this
-    convention is just visually memorable."""
+    convention is just visually memorable.
+
+    v0.5.328: MAC is now self-contained (LAA prefix `02:00:00:00:00:`
+    + VLAN ID as last byte), no `<chassis-base>` placeholder."""
     out_v20 = u.render_juniper(_device_v6("20"))
     out_v30 = u.render_juniper(_device_v6("30"))
-    assert "set interfaces irb.20 mac <chassis-base>:20" in out_v20
-    assert "set interfaces irb.30 mac <chassis-base>:30" in out_v30
+    assert "set interfaces irb.20 mac 02:00:00:00:00:20" in out_v20
+    assert "set interfaces irb.30 mac 02:00:00:00:00:30" in out_v30
 
 
-def test_juniper_irb_variant_notes_how_to_get_chassis_base():
-    """The placeholder `<chassis-base>` requires the operator to
-    read the actual value from `show interfaces irb extensive |
-    match hard`. Note the command in the hint so the operator
-    doesn't have to guess."""
+def test_juniper_irb_variant_mac_is_self_contained():
+    """v0.5.328 (audit self-contained-irb-mac): the emitted MAC is
+    ready to paste as-is — no `<chassis-base>` placeholder for the
+    operator to substitute. Uses locally-administered prefix
+    (`02:` — first octet bit 1 set) so no vendor-OUI conflict."""
     out = u.render_juniper(_device_v6("20"))
-    assert "show interfaces irb extensive | match hard" in out
+    assert "<chassis-base>" not in out
+    # LAA MAC ready to paste.
+    assert "02:00:00:00:00:20" in out
 
 
 def test_juniper_irb_variant_carries_ipv4_when_present():
