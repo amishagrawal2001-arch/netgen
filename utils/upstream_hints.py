@@ -570,10 +570,17 @@ def _render(device_data: dict, vendor: str) -> str:
     ipv6_gw     = _get(device_data, "ipv6_gateway", "IPv6 Gateway")
     loopback_v4 = _get(device_data, "loopback_ipv4", "Loopback IPv4")
 
-    bgp_config  = device_data.get("bgp_config") or {}
-    ospf_config = device_data.get("ospf_config") or {}
-    isis_config = device_data.get("isis_config") or {}
-    dhcp_config = device_data.get("dhcp_config") or {}
+    bgp_config    = device_data.get("bgp_config") or {}
+    ospf_config   = device_data.get("ospf_config") or {}
+    isis_config   = device_data.get("isis_config") or {}
+    dhcp_config   = device_data.get("dhcp_config") or {}
+    # v0.5.325: operator asked "no config suggestion for ROCEv2 and
+    # VXLAN". Both are switch-side data-plane features netgen just
+    # produces packets for; the upstream needs matching config
+    # (DSCP/PFC classifier for RoCE, VNI + VTEP peer for VXLAN)
+    # or the packets get dropped / delivered wrong.
+    rocev2_config = device_data.get("rocev2_config") or {}
+    vxlan_config  = device_data.get("vxlan_config") or {}
 
     sections = []
     sections.append(_iface_stanza(
@@ -609,6 +616,20 @@ def _render(device_data: dict, vendor: str) -> str:
         relay = _dhcp_relay_stanza(vendor, vlan, dhcp_config)
         if relay:
             sections.append(relay)
+
+    # v0.5.325: RoCEv2 + VXLAN stanzas. Both are switch-side
+    # dependencies of what netgen puts on the wire — the operator
+    # gets the packets to leave the box but the upstream must be
+    # configured to carry/classify them correctly.
+    if rocev2_config:
+        rocev2 = _rocev2_stanza(vendor, vlan, rocev2_config)
+        if rocev2:
+            sections.append(rocev2)
+
+    if vxlan_config:
+        vxlan = _vxlan_stanza(vendor, vlan, vxlan_config)
+        if vxlan:
+            sections.append(vxlan)
 
     header = _header(vendor, device_name, vlan, ipv4, ipv6)
     # v0.5.321: header + sections joined with blank-line separator
@@ -944,6 +965,204 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
             "! Client-facing SVI: forward this VLAN's DHCP requests to the server device:",
             f"interface {svi_arista}",
             f"   ip helper-address {server_ip}",
+            "!",
+        ]
+        return "\n".join(lines)
+
+    return ""
+
+
+def _rocev2_stanza(vendor: str, vlan: str, rocev2_config: dict) -> str:
+    """v0.5.325 (audit rocev2-vxlan-upstream-hint):
+
+    RoCEv2 packets are UDP/4791 tagged with a Priority Code Point
+    (PCP) at L2 and a DSCP at L3. Without a matching classifier
+    on the upstream switch, the fabric ignores the priority marks
+    and drops RoCE frames under any congestion — RDMA writes hang
+    with completion-queue timeouts. The switch also has to enable
+    PFC (Priority Flow Control) on the classifier'd priority so
+    the RoCE flow gets lossless treatment.
+
+    Netgen knows:
+      * rocev2_priority — the 802.1p PCP bit netgen sets on TX
+      * rocev2_dscp — the DSCP netgen sets on TX
+      * rocev2_udp_port — the RoCEv2 UDP port (usually 4791)
+
+    We emit a MINIMAL classifier + PFC-enable snippet the
+    operator adapts. Real production fabrics usually already
+    have RoCE-CoS templates the operator should reference
+    instead.
+    """
+    prio = _first(
+        rocev2_config.get("rocev2_priority"),
+        rocev2_config.get("priority"), "3",
+    )
+    dscp = _first(
+        rocev2_config.get("rocev2_dscp"),
+        rocev2_config.get("dscp"), "26",
+    )
+    udp = _first(
+        rocev2_config.get("rocev2_udp_port"),
+        rocev2_config.get("udp_port"), "4791",
+    )
+    upstream = _upstream_iface(vendor)
+
+    if vendor == "juniper":
+        return "\n".join([
+            "# --- RoCEv2: classify + enable PFC on this priority so",
+            "# --- RDMA writes get lossless treatment across the fabric.",
+            f"# Netgen sends RoCEv2 on UDP/{udp}, 802.1p priority={prio}, DSCP={dscp}.",
+            f"set class-of-service classifiers ieee-802.1 ROCE-CLASSIFIER forwarding-class no-loss loss-priority low code-points {prio:0>3}",
+            f"set class-of-service interfaces {upstream} unit {vlan} classifiers ieee-802.1 ROCE-CLASSIFIER",
+            "set class-of-service forwarding-classes class no-loss queue-num 3 pfc-priority 3",
+            f"set class-of-service interfaces {upstream} congestion-notification-profile PFC-ROCE",
+            f"set class-of-service congestion-notification-profile PFC-ROCE input ieee-802.1 code-point {prio:0>3} pfc",
+        ])
+
+    if vendor == "cisco":
+        return "\n".join([
+            "! --- RoCEv2: classify + enable PFC on this priority so",
+            "! --- RDMA writes get lossless treatment across the fabric.",
+            f"! Netgen sends RoCEv2 on UDP/{udp}, 802.1p priority={prio}, DSCP={dscp}.",
+            "class-map type qos match-all ROCE-CLASS",
+            f" match cos {prio}",
+            f" match dscp {dscp}",
+            "!",
+            "policy-map type qos ROCE-POLICY",
+            " class ROCE-CLASS",
+            "  set qos-group 3",
+            "!",
+            "class-map type network-qos ROCE-NQ",
+            " match qos-group 3",
+            "!",
+            "policy-map type network-qos ROCE-NQ-POLICY",
+            " class type network-qos ROCE-NQ",
+            "  pause pfc-cos 3",
+            "!",
+            f"interface {upstream}",
+            " service-policy type qos input ROCE-POLICY",
+            " priority-flow-control mode on",
+            "!",
+        ])
+
+    if vendor == "arista":
+        return "\n".join([
+            "! --- RoCEv2: classify + enable PFC on this priority so",
+            "! --- RDMA writes get lossless treatment across the fabric.",
+            f"! Netgen sends RoCEv2 on UDP/{udp}, 802.1p priority={prio}, DSCP={dscp}.",
+            "qos map cos 3 to traffic-class 3",
+            f"qos map dscp {dscp} to traffic-class 3",
+            f"interface {upstream}",
+            "   priority-flow-control on",
+            "   priority-flow-control priority 3 no-drop",
+            "!",
+        ])
+
+    return ""
+
+
+def _vxlan_stanza(vendor: str, vlan: str, vxlan_config: dict) -> str:
+    """v0.5.325 (audit rocev2-vxlan-upstream-hint):
+
+    Netgen's VXLAN device puts UDP/4789-encapped frames on the
+    wire with a given VNI, source VTEP IP, and one or more
+    remote VTEP peers. For the packets to actually reach a peer,
+    the upstream switch (acting as a VTEP or transiting VTEP
+    traffic) needs:
+
+      * A matching VNI-to-VLAN mapping (so the switch decaps
+        into the right VLAN when a remote VTEP sends to it).
+      * Its own loopback advertised as source-interface.
+      * A static peer list for head-end replication (or an EVPN
+        control plane, out of scope for this hint).
+      * The VXLAN UDP port (defaults to 4789).
+
+    Netgen provides:
+      * vni — the VXLAN Network Identifier
+      * local_ip — netgen device's VTEP source
+      * remote_peers / remote_endpoints — list of remote VTEPs
+      * udp_port — usually 4789
+      * vlan_id — the tenant VLAN behind this VNI
+    """
+    vni = _first(
+        vxlan_config.get("vni"), "10010",
+    )
+    local_ip = _first(
+        vxlan_config.get("local_ip"), "<netgen-VTEP-IP>",
+    )
+    udp_port = _first(
+        vxlan_config.get("udp_port"), "4789",
+    )
+    tenant_vlan = _first(
+        vxlan_config.get("vlan_id"), vlan, "10",
+    )
+    remote_raw = (
+        vxlan_config.get("remote_peers")
+        or vxlan_config.get("remote_endpoints")
+        or []
+    )
+    if isinstance(remote_raw, str):
+        remotes = [r.strip() for r in remote_raw.replace(";", ",").split(",") if r.strip()]
+    elif isinstance(remote_raw, (list, tuple, set)):
+        remotes = [str(r).strip() for r in remote_raw if str(r).strip()]
+    else:
+        remotes = []
+    if not remotes:
+        remotes = ["<remote-VTEP-IP>"]
+
+    if vendor == "juniper":
+        lines = [
+            "# --- VXLAN: decap incoming frames from netgen's VTEP into the",
+            "# --- matching tenant VLAN, and set up head-end replication",
+            "# --- back to the netgen VTEP so BUM traffic can complete.",
+            f"# Netgen VTEP source: {local_ip}, VXLAN UDP port: {udp_port},",
+            f"# VNI {vni} maps to VLAN {tenant_vlan}.",
+            f"set protocols evpn extended-vni-list {vni}",
+            f"set vlans TENANT-{tenant_vlan} vlan-id {tenant_vlan}",
+            f"set vlans TENANT-{tenant_vlan} vxlan vni {vni}",
+        ]
+        for r in remotes:
+            lines.append(f"# Static VTEP peer (netgen side): {r}")
+        lines.append("# Point your switch loopback + BGP EVPN toward this peer for full mesh.")
+        return "\n".join(lines)
+
+    if vendor == "cisco":
+        lines = [
+            "! --- VXLAN: decap incoming frames from netgen's VTEP into the",
+            "! --- matching tenant VLAN, and set up head-end replication",
+            "! --- back to the netgen VTEP so BUM traffic can complete.",
+            f"! Netgen VTEP source: {local_ip}, VXLAN UDP port: {udp_port},",
+            f"! VNI {vni} maps to VLAN {tenant_vlan}.",
+            "feature vn-segment-vlan-based",
+            "feature nv overlay",
+            f"vlan {tenant_vlan}",
+            f"  vn-segment {vni}",
+            "!",
+            "interface nve1",
+            "  no shutdown",
+            "  source-interface loopback0",
+            f"  member vni {vni}",
+            "    ingress-replication protocol static",
+        ]
+        for r in remotes:
+            lines.append(f"      peer-ip {r}")
+        lines.append("!")
+        return "\n".join(lines)
+
+    if vendor == "arista":
+        lines = [
+            "! --- VXLAN: decap incoming frames from netgen's VTEP into the",
+            "! --- matching tenant VLAN, and set up head-end replication",
+            "! --- back to the netgen VTEP so BUM traffic can complete.",
+            f"! Netgen VTEP source: {local_ip}, VXLAN UDP port: {udp_port},",
+            f"! VNI {vni} maps to VLAN {tenant_vlan}.",
+            f"vlan {tenant_vlan}",
+            "!",
+            "interface Vxlan1",
+            "   vxlan source-interface Loopback0",
+            f"   vxlan udp-port {udp_port}",
+            f"   vxlan vlan {tenant_vlan} vni {vni}",
+            f"   vxlan vlan {tenant_vlan} flood vtep " + " ".join(remotes),
             "!",
         ]
         return "\n".join(lines)

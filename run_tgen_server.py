@@ -4247,6 +4247,16 @@ def apply_device():
         interface = data.get("interface", "")
         vlan = data.get("vlan", "0")
         mtu = data.get("mtu", "1500")  # MTU field, default to 1500
+        # v0.5.325 (audit mac-not-applied): operator entered a MAC
+        # in the Add Device dialog, but the server never extracted
+        # it — the payload's `mac` field (widgets/devices_tab.py:
+        # ~10861 sends it as `"mac": device_info.get("MAC Address")`)
+        # was silently dropped here. Downstream: no `ip link set
+        # <iface> address <mac>` ever ran, so the kernel-auto-
+        # assigned MAC stayed put + BGP/OSPF neighbors on the
+        # switch keyed off the wrong MAC + scale-address-increment
+        # (v0.5.324) had no effect on the wire. Extract now.
+        mac_address = (data.get("mac") or data.get("mac_address") or "").strip()
         ipv4 = data.get("ipv4", "")
         ipv6 = data.get("ipv6", "")
         ipv4_mask = data.get("ipv4_mask", "24")
@@ -4854,6 +4864,69 @@ def apply_device():
                 logging.warning(f"[DEVICE APPLY] Error creating VLAN interface {iface_name}: {e}")
                 result["vlan_created"] = False
         
+        # v0.5.325 (audit mac-not-applied): Step 1b — apply the
+        # operator-configured MAC to the interface BEFORE MTU and
+        # before bring-up. Order matters:
+        #   * MAC must be set while iface is DOWN (kernel refuses
+        #     `ip link set <iface> address` on an UP interface with
+        #     "RTNETLINK answers: Device or resource busy"). We're
+        #     between VLAN create and Step 3's `up`, so iface is
+        #     still administratively DOWN — safe to set.
+        #   * MTU can be set before or after MAC — we do MAC first
+        #     so scale-address-increment (v0.5.324) has effect on
+        #     the wire before any traffic starts.
+        # If mac_address is empty (operator didn't provide one),
+        # skip — kernel-auto-assigned MAC stays put, same as
+        # pre-v0.5.325 behavior. Non-VLAN parent interfaces also
+        # get their MAC set here (iface_name_for_commands falls
+        # back to the raw parent iface when vlan is 0/omitted, per
+        # the existing branch above).
+        if mac_address:
+            # Basic sanity: xx:xx:xx:xx:xx:xx pattern. Junk MACs
+            # would fail `ip link set address` with a cryptic
+            # errno; validate up-front so the operator sees WHY.
+            import re as _re
+            if not _re.fullmatch(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}", mac_address):
+                logging.warning(
+                    f"[DEVICE APPLY] Rejecting MAC '{mac_address}' — "
+                    f"not xx:xx:xx:xx:xx:xx format. Interface will "
+                    f"keep its kernel-auto MAC."
+                )
+                result["mac_configured"] = False
+                result["mac_reason"] = "invalid_format"
+            else:
+                try:
+                    mac_result = subprocess.run(
+                        ["ip", "link", "set", iface_name_for_commands,
+                         "address", mac_address.lower()],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if mac_result.returncode == 0:
+                        logging.info(
+                            f"[DEVICE APPLY] Set MAC {mac_address} on "
+                            f"{iface_name_for_commands}"
+                        )
+                        result["mac_configured"] = True
+                    else:
+                        # Common failures: iface UP (busy), invalid
+                        # locally-administered bit (multicast MAC =
+                        # first octet's LSB set), duplicate MAC on
+                        # same L2 (some kernels refuse).
+                        logging.warning(
+                            f"[DEVICE APPLY] Failed to set MAC "
+                            f"{mac_address} on {iface_name_for_commands}: "
+                            f"{mac_result.stderr.strip()}"
+                        )
+                        result["mac_configured"] = False
+                        result["mac_reason"] = mac_result.stderr.strip()
+                except Exception as _mac_exc:
+                    logging.warning(
+                        f"[DEVICE APPLY] Error setting MAC on "
+                        f"{iface_name_for_commands}: {_mac_exc}"
+                    )
+                    result["mac_configured"] = False
+                    result["mac_reason"] = str(_mac_exc)
+
         # Step 2: Configure MTU (if provided)
         mtu = data.get("mtu", "1500")
         if mtu:

@@ -2371,6 +2371,37 @@ class AddDeviceDialog(QDialog):
                 ),
             }
 
+        # v0.5.325 (audit rocev2-vxlan-upstream-hint): emit
+        # rocev2_config so the renderer can add the switch-side
+        # RoCEv2 classifier + PFC stanza when RoCEv2 is enabled.
+        # Without this, netgen produces RoCE packets but the
+        # switch doesn't classify them → PFC never engages →
+        # RDMA writes hang under any congestion.
+        if checked("rocev2_enable_checkbox"):
+            data["rocev2_config"] = {
+                "rocev2_priority": txt("rocev2_priority_input") or "3",
+                "rocev2_dscp":     txt("rocev2_dscp_input") or "26",
+                "rocev2_udp_port": txt("rocev2_udp_port_input") or "4791",
+            }
+
+        # v0.5.325: emit vxlan_config so the renderer can add the
+        # switch-side VNI-to-VLAN mapping + VTEP peer list. Without
+        # this, netgen's VXLAN packets leave the box but the
+        # upstream has no VTEP peering to complete the tunnel.
+        if checked("vxlan_enable_checkbox"):
+            _remote_raw = txt("vxlan_remote_input")
+            _remote_list = [
+                r.strip() for r in _remote_raw.replace(";", ",").split(",")
+                if r.strip()
+            ]
+            data["vxlan_config"] = {
+                "vni":           txt("vxlan_vni_input") or "10010",
+                "local_ip":      txt("vxlan_local_ip_input"),
+                "remote_peers":  _remote_list,
+                "udp_port":      txt("vxlan_udp_port_input") or "4789",
+                "vlan_id":       txt("vxlan_vlan_id_input"),
+            }
+
         # v0.5.318 (audit dhcp-client-upstream-relay-hint): emit
         # dhcp_config so the renderer can add the dhcp-relay
         # stanza when this device is a DHCP client. Client mode

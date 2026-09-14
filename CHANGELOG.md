@@ -2,6 +2,130 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.325] - 2026-09-14
+
+**Three-way audit: (1) DHCPv4/v6 server templates verified
+distinct; (2) ROCEv2 + VXLAN upstream-hint stanzas added
+(all 3 vendors); (3) operator-entered MAC now actually applied
+to the Linux interface at Apply time.**
+
+Operator report: three issues on top of the scale work:
+  1. dhcp ipv4 server and dhcp ipv6 server template is using
+     same config;
+  2. no config suggestion for ROCEv2 and VXLAN;
+  3. user configured MAC address is not being applied on the
+     device interface for vlan and non vlan.
+
+### #1 — DHCPv4 vs DHCPv6 server templates ARE distinct (verified)
+
+Read both templates at source: `dhcp_server` populates
+`dhcp_pool_start_input`/`dhcp_pool_end_input` at 172.16.30.10/200
+with `ipv4_checkbox=True`; `dhcp_server_ipv6` populates
+`dhcp6_pool_start_input`/`dhcp6_pool_end_input` at
+2001:db8:30::100/1ff with `ipv6_checkbox=True` and
+`dhcp_ipv6_enabled_checkbox=True`. Zero overlap. Verified by
+runtime render: v4 template emits `family inet` on the interface
+stanza, v6 template emits `family inet6`. Two lock-in tests pin
+the distinction; a third asserts the runtime hint output differs.
+If the operator sees identical output, that would be a
+template-apply bug on the dialog side (not the templates
+themselves) — please share exact reproduction.
+
+### #2 — ROCEv2 + VXLAN upstream-hint stanzas
+
+Pre-fix `utils/upstream_hints._render` had no ROCEv2 or VXLAN
+branch, and `_snapshot_for_upstream_hint` never emitted their
+config dicts. Two new renderers:
+
+**`_rocev2_stanza`** — netgen sends RoCEv2 on UDP/4791 tagged with
+a PCP + DSCP. Without a matching classifier on the switch, the
+fabric ignores priority marks and drops RoCE under any congestion
+→ RDMA writes hang with CQE timeouts. Emits per-vendor:
+  * Juniper: `class-of-service classifiers ieee-802.1
+    ROCE-CLASSIFIER` + `pfc-priority 3` +
+    `congestion-notification-profile PFC-ROCE`.
+  * Cisco IOS: `class-map type qos` + `policy-map` for
+    classification, `class-map type network-qos` +
+    `policy-map type network-qos` for PFC, `service-policy`
+    + `priority-flow-control mode on` on the interface.
+  * Arista EOS: `qos map` + `priority-flow-control priority N
+    no-drop`.
+
+Reads `rocev2_config.rocev2_priority` (default 3),
+`rocev2_dscp` (26), `rocev2_udp_port` (4791) from the dialog.
+
+**`_vxlan_stanza`** — netgen sends UDP/4789 with a VNI + source
+VTEP IP + peer VTEP list. Switch needs matching VNI-to-VLAN
+mapping + peer VTEP list. Emits per-vendor:
+  * Juniper: `set protocols evpn extended-vni-list <VNI>` +
+    `set vlans TENANT-<VLAN> vxlan vni <VNI>` + peer-VTEP
+    comments (BGP EVPN pointed out as follow-up).
+  * Cisco NX-OS: `feature nv overlay` + `interface nve1` with
+    `source-interface loopback0` + `ingress-replication
+    protocol static` + `peer-ip <VTEP>` per peer.
+  * Arista EOS: `interface Vxlan1` + `vxlan vlan <VLAN> vni
+    <VNI>` + `vxlan vlan <VLAN> flood vtep <peers>`.
+
+Reads `vxlan_config.vni`, `local_ip`, `remote_peers`,
+`udp_port`, `vlan_id` from the dialog. Placeholder
+`<netgen-VTEP-IP>` / `<remote-VTEP-IP>` when fields are empty
+so the operator sees what to fill in.
+
+Snapshot: `_snapshot_for_upstream_hint` now emits
+`rocev2_config` when `rocev2_enable_checkbox` is on, and
+`vxlan_config` when `vxlan_enable_checkbox` is on.
+
+### #3 — Operator MAC now actually applied
+
+Pre-fix `/api/device/apply` extracted every dialog field EXCEPT
+`mac`. Client sent it (`widgets/devices_tab.py:~10861`
+`"mac": device_info.get("MAC Address")`), server silently dropped
+it. Downstream:
+  * No `ip link set <iface> address <mac>` ever ran.
+  * Kernel-auto-assigned MAC stayed put on the VLAN subif.
+  * Scale MAC-increment from v0.5.324 had no effect on the wire.
+  * BGP/OSPF neighbors on the switch keyed off the wrong MAC.
+
+Fix in `run_tgen_server.py.apply_device`:
+  * Extract `mac_address = (data.get("mac") or
+    data.get("mac_address") or "").strip()` alongside the other
+    fields.
+  * New Step 1b (between VLAN create and MTU): if `mac_address`
+    is non-empty and matches `xx:xx:xx:xx:xx:xx`, run
+    `["ip", "link", "set", <iface>, "address", <mac>]` while the
+    iface is still DOWN (kernel refuses `ip link set address` on
+    an UP iface with EBUSY — our Step 3 is the bring-up).
+  * Format validation before subprocess so bad input surfaces
+    with a clear log line instead of a cryptic kernel errno.
+  * Reports `result["mac_configured"]` + `result["mac_reason"]`
+    so the client can surface a warning if the set fails
+    (locally-administered bit issue, duplicate MAC on L2, etc.).
+  * Empty MAC is a no-op (kernel-auto MAC stays put, unchanged
+    from pre-v0.5.325 behavior for operators who don't provide
+    one).
+
+Works for both VLAN subifs (`vlan10@ens2f0`) and non-VLAN parent
+interfaces (`ens2f0` directly) since `iface_name_for_commands`
+already handles the VLAN/no-VLAN distinction upstream.
+
+### Verification
+
+25 lock-in tests in
+`tests/test_v05325_mac_and_rocev2_vxlan_hints.py` covering:
+  * Templates: v4/v6 field distinction, runtime hint distinction
+  * ROCEv2: Juniper/Cisco/Arista stanza content + UDP port
+    annotation + no-emit when config absent
+  * VXLAN: Juniper EVPN + Cisco NVE + Arista Vxlan1 stanzas +
+    peer list + no-emit when config absent + placeholder for
+    empty peer list
+  * Dialog snapshot: rocev2_config + vxlan_config wired
+  * MAC: extraction + `ip link set address` invocation + format
+    validation + BEFORE-bringup ordering + result-field
+    reporting + empty-MAC no-op
+  * AST-parse guards on all 3 touched files
+
+All 223 pre-existing upstream-hint tests still pass (248 total).
+
 ## [0.5.324] - 2026-09-14
 
 **Scale increment: sane defaults + loopback support. Fixes
