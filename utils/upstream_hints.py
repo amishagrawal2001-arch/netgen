@@ -203,6 +203,91 @@ def _render_all_scale(devices: List[dict]) -> Dict[str, str]:
     return {v: _dedupe_and_emit(devices, v) for v in ("juniper", "cisco", "arista")}
 
 
+def _detect_scale_collisions(devices: List[dict]) -> List[dict]:
+    """v0.5.322 (audit scale-collision-warning): fields that MUST
+    be unique per netgen device (IPv4, MAC) are checked across
+    the scale set; if all N devices share the same value, emit a
+    collision-warning that gets rendered as a `!!! WARNING !!!`
+    block at the top of the hint output.
+
+    Trigger: operator sets count>N without ticking the per-field
+    increment checkbox. Currently the dialog produces N devices
+    with the same MAC + IPv4, which:
+
+      * On the netgen box: `ip addr add` will EEXIST on the
+        second device — the second apply silently fails.
+
+      * On the upstream: BGP won't establish two sessions to the
+        same peer IP (single-peer identity); OSPF/ISIS will
+        adjacency-flap because of duplicate router-ids/system-ids.
+
+    Returns a list of {field, label, value, why} dicts — one per
+    field found to be shared-but-should-be-unique. Empty list
+    when the scale set looks internally consistent.
+    """
+    if len(devices) < 2:
+        return []
+    warnings: List[dict] = []
+    critical = [
+        ("ipv4_address", "IPv4 address",
+         "the switch/router can't establish separate BGP/OSPF/ISIS "
+         "adjacencies to N peers with the same address; only one "
+         "session survives"),
+        ("ipv6_address", "IPv6 address",
+         "same as IPv4 for the v6 side — a duplicate ipv6 makes "
+         "OSPFv3 / IS-IS / BGP-IPv6 peers unresolvable"),
+        ("mac_address", "MAC address",
+         "two interfaces with the same MAC on the same L2 fight for "
+         "frames — packet loss and adjacency flap"),
+        ("loopback_ipv4", "Loopback IPv4",
+         "OSPF router-id and BGP router-id both default to the "
+         "loopback — duplicate router-id causes adjacency flap or "
+         "route table churn"),
+        ("loopback_ipv6", "Loopback IPv6",
+         "same as v4 for the v6-only BGP/OSPFv3 case — the loopback "
+         "seeds router-id/session-id"),
+    ]
+    for field, label, why in critical:
+        values = [str(d.get(field) or "").strip() for d in devices]
+        non_empty = [v for v in values if v]
+        if non_empty and len(set(non_empty)) == 1 and len(non_empty) == len(devices):
+            warnings.append({
+                "field": field, "label": label,
+                "value": non_empty[0], "why": why,
+            })
+    return warnings
+
+
+def _format_scale_collision_banner(warnings: List[dict], marker: str, count: int) -> str:
+    """Render the collision warnings as a comment-marker block for
+    the given vendor (`#` for Junos, `!` for Cisco/Arista)."""
+    if not warnings:
+        return ""
+    lines = [
+        f"{marker} !!! SCALE COLLISION WARNING !!!",
+        f"{marker} All {count} netgen devices share values that MUST be unique per device.",
+        f"{marker} Fix in the Add Device dialog: tick the relevant checkbox under",
+        f"{marker} 'Increment Options' so netgen assigns a unique per-device value.",
+        f"{marker}",
+    ]
+    for w in warnings:
+        # Map field-name to dialog checkbox label so the operator
+        # knows exactly what to click.
+        checkbox = {
+            "ipv4_address":  "IPv4",
+            "ipv6_address":  "IPv6",
+            "mac_address":   "MAC",
+            "loopback_ipv4": "Loopback",
+            "loopback_ipv6": "Loopback",
+        }.get(w["field"], w["field"])
+        lines.append(
+            f"{marker} - All devices have the same {w['label']} '{w['value']}' "
+            f"→ tick the '{checkbox}' checkbox."
+        )
+        lines.append(f"{marker}   Reason: {w['why']}.")
+    return "\n".join(lines)
+
+
 def _dedupe_and_emit(devices: List[dict], vendor: str) -> str:
     """v0.5.321: two-tier dedupe.
 
@@ -301,6 +386,12 @@ def _dedupe_and_emit(devices: List[dict], vendor: str) -> str:
         f"(applies to all {len(devices)} netgen devices) ==="
     )
     banner_per_dev = f"{marker} " + "=" * 68
+
+    # v0.5.322: collision warning is the FIRST thing the operator
+    # sees. Emit before the shared banner so it can't be missed.
+    warnings = _detect_scale_collisions(devices)
+    if warnings:
+        chunks.append(_format_scale_collision_banner(warnings, marker, len(devices)))
 
     if shared_blocks:
         chunks.append(banner_shared)

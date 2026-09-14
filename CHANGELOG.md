@@ -2,6 +2,100 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.322] - 2026-09-14
+
+**Upstream Config Hint: SCALE COLLISION WARNING banner when N
+scale devices share fields that MUST be unique per device.
+Covers all templates — BGP/OSPF/ISIS/DHCP.**
+
+Operator report on v0.5.321: BGP scale of 2 emitted two BGP
+neighbor blocks with the SAME peer IP (`192.168.0.2` on both)
+because the operator hadn't ticked the IPv4 increment checkbox.
+That's not a hint-rendering bug — but the hint is the operator's
+surface for this class of misconfiguration; letting them apply
+silently produces:
+
+  * BGP: refuses to establish two sessions to the same peer
+    identity — only one session survives (or session-flaps).
+  * L2: two interfaces with the same MAC on the same segment
+    fight for frames → packet loss + STP flap.
+  * OSPF/ISIS: duplicate router-id (derived from loopback) →
+    adjacency flap + LSA churn.
+
+Operator confirmed the same problem across other templates:
+"i see similar problem with other config templates."
+
+### Fix
+
+New `_detect_scale_collisions(devices)` walks the scale set and
+checks 5 fields that must be unique per device:
+
+  * `ipv4_address`, `ipv6_address` — interface addresses
+  * `mac_address` — L2 identity
+  * `loopback_ipv4`, `loopback_ipv6` — router-id seed
+
+When every device has the same non-empty value in any of these,
+emit a `!!! SCALE COLLISION WARNING !!!` block at the TOP of
+the hint output (before the Shared banner) naming:
+
+  * the specific field label ("IPv4 address", "Loopback IPv4"…)
+  * the specific offending value ('192.168.0.2', '02:00:00:...')
+  * the specific dialog checkbox to tick ("IPv4", "MAC",
+    "Loopback")
+  * the reason it matters (BGP session collision, L2 fight,
+    router-id flap)
+
+Warning is protocol-agnostic — the detector reads underlying
+fields not `bgp_config` / `ospf_config` / etc — so it works
+uniformly for BGP, OSPF, ISIS, DHCP scale runs. Uses the
+vendor's comment marker (`#` for Junos, `!` for Cisco/Arista)
+so pasted output is still a valid config-fragment (warning is
+commented out).
+
+Conservative: only fires when ALL N devices share the value —
+if only 2 out of 3 collide, the operator likely knows what they
+are doing (e.g. a shared virtual IP), so no false positive.
+
+### Example (operator's exact repro — count=2, no increment)
+
+```
+# !!! SCALE COLLISION WARNING !!!
+# All 2 netgen devices share values that MUST be unique per device.
+# Fix in the Add Device dialog: tick the relevant checkbox under
+# 'Increment Options' so netgen assigns a unique per-device value.
+#
+# - All devices have the same IPv4 address '192.168.0.2' → tick the 'IPv4' checkbox.
+#   Reason: the switch/router can't establish separate BGP/OSPF/ISIS adjacencies
+#           to N peers with the same address; only one session survives.
+# - All devices have the same MAC address '02:00:00:00:00:01' → tick the 'MAC' checkbox.
+#   Reason: two interfaces with the same MAC on the same L2 fight for frames —
+#           packet loss and adjacency flap.
+
+# === Shared upstream config (applies to all 2 netgen devices) ===
+...
+```
+
+### What this doesn't do
+
+Doesn't yet block Save/Apply on the dialog — the operator can
+still create colliding devices if they close the hint dialog
+and click Add. Follow-up would be a validation on
+`validate_and_accept` that hits the same detector before Save.
+This ship is the hint-only surface.
+
+### Verification
+
+21 lock-in tests in
+`tests/test_v05322_upstream_hint_scale_collision_warning.py`
+covering: detector (empty for single-device, flags v4/v6/MAC/
+loopback-v4/loopback-v6, ignores empty fields, ignores partial
+overlap, no false-positive when properly incremented); render
+integration (banner at top, names field + value + checkbox to
+tick, vendor-correct comment marker, all 3 vendors); protocol-
+agnostic (BGP + OSPF + ISIS + DHCP scale all trigger); Reason:
+line present. Plus all 100 pre-existing upstream-hint tests
+still pass (121 total).
+
 ## [0.5.321] - 2026-09-14
 
 **Upstream Config Hint scale mode: line-level dedupe within
