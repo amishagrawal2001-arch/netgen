@@ -927,6 +927,46 @@ class AddDeviceDialog(QDialog):
         self.dhcp_relay_return_hop_input.setEnabled(False)
         dhcp_left_layout.addRow("Relay Return Hop:", self.dhcp_relay_return_hop_input)
 
+        # v0.5.315 (audit dhcp-pool-router-vs-relay-return-hop):
+        # separate field for the "router" DHCP option (option 3)
+        # emitted to clients in the OFFER. Pre-v0.5.315, dnsmasq's
+        # dhcp-option=3,X used the device's OWN iface gateway
+        # (ipv4_gateway_input). Fine for direct-attached mode where
+        # server + clients share an L2. In RELAY mode the pool
+        # subnet is L3-REMOTE — the iface gateway is on the SERVER's
+        # L2 (e.g. 172.16.30.1) and is UNREACHABLE from clients on
+        # the pool subnet (e.g. 192.16.30.0/24). Clients receive an
+        # OFFER with an off-subnet router → dhclient can't install
+        # a default route via that peer → dhcp_lease_gateway stays
+        # empty in the DB + no visible gateway in the UI + no L3
+        # egress on the client. Operator on srv06 2026-09-14 hit
+        # exactly this (device4 got 192.16.30.105/24 but blank
+        # gateway despite dnsmasq sending option 3 = 172.16.30.1
+        # which the client couldn't use).
+        #
+        # New field lets the operator explicitly specify the
+        # client-subnet gateway (e.g. 192.16.30.1). Empty = fall
+        # back to the iface gateway (direct-attached, unchanged).
+        self.dhcp_pool_router_input = QLineEdit()
+        self.dhcp_pool_router_input.setPlaceholderText(
+            "e.g. 192.16.30.1 (client-subnet gateway — leave empty to reuse the iface gateway)"
+        )
+        self.dhcp_pool_router_input.setToolTip(
+            "Router IP advertised to DHCP clients in the OFFER (DHCP\n"
+            "option 3). MUST be on the CLIENT's subnet — otherwise\n"
+            "dhclient can't ARP it, no default route gets installed,\n"
+            "and the client has no L3 egress even though the lease\n"
+            "landed.\n\n"
+            "Use this in RELAY mode where the pool subnet is L3-\n"
+            "remote from the server (server on 172.16.30.0/24, pool\n"
+            "on 192.16.30.0/24 — clients need 192.16.30.1, not\n"
+            "172.16.30.1). In direct-attached mode leave EMPTY;\n"
+            "netgen falls back to the device's own IPv4 Gateway,\n"
+            "which is already on the client L2."
+        )
+        self.dhcp_pool_router_input.setEnabled(False)
+        dhcp_left_layout.addRow("Pool Router:", self.dhcp_pool_router_input)
+
         dhcp_right_layout = QFormLayout()
         dhcp_right_layout.setSpacing(8)
 
@@ -1331,6 +1371,7 @@ class AddDeviceDialog(QDialog):
         self.dhcp_lease_time_input.setEnabled(False)
         self.dhcp_gateway_route_input.setEnabled(False)
         self.dhcp_relay_return_hop_input.setEnabled(False)
+        self.dhcp_pool_router_input.setEnabled(False)
         self.dhcp_mode_combo.setEnabled(False)
         
         # ROCEv2 fields
@@ -1478,6 +1519,7 @@ class AddDeviceDialog(QDialog):
             self.dhcp_lease_time_input,
             self.dhcp_gateway_route_input,
             self.dhcp_relay_return_hop_input,
+            self.dhcp_pool_router_input,
         ):
             widget.setEnabled(ipv4_active)
 
@@ -1947,6 +1989,17 @@ class AddDeviceDialog(QDialog):
                     # propagation both see the operator'''s intent.
                     dhcp_config["relay_return_hop"] = (
                         self.dhcp_relay_return_hop_input.text().strip()
+                    )
+                    # v0.5.315 (audit dhcp-pool-router-vs-relay-return-hop):
+                    # persist the pool_router — the router IP advertised
+                    # to clients in the DHCP OFFER (dnsmasq's dhcp-option=3).
+                    # Distinct from `gateway` (server's own iface gw) and
+                    # `relay_return_hop` (server-side path back to the relay);
+                    # this is the CLIENT-SUBNET gateway. Empty → backend
+                    # falls back to `gateway` (direct-attached mode where
+                    # server + clients share L2).
+                    dhcp_config["pool_router"] = (
+                        self.dhcp_pool_router_input.text().strip()
                     )
 
                 if ipv6_enabled:
@@ -2503,6 +2556,28 @@ class AddDeviceDialog(QDialog):
                         self, "Validation Error",
                         f"DHCP IPv4 Lease Time '{v4_lease}' must be a "
                         "positive integer between 60 and 4294967295 seconds.",
+                    )
+                    return
+            # v0.5.315 (audit dhcp-pool-router-vs-relay-return-hop):
+            # validate the new Pool Router field. Must be a bare IPv4
+            # address (dhcp-option=3 accepts one router IP per pool;
+            # no CIDR, no comma-list, no hostname). Empty is legal —
+            # backend falls back to `gateway`.
+            v4_pool_router = (
+                self.dhcp_pool_router_input.text().strip()
+                if hasattr(self, "dhcp_pool_router_input") else ""
+            )
+            if v4_pool_router:
+                try:
+                    ipaddress.IPv4Address(v4_pool_router)
+                except ipaddress.AddressValueError:
+                    QMessageBox.warning(
+                        self, "Validation Error",
+                        f"DHCP Pool Router '{v4_pool_router}' is not a "
+                        "valid IPv4 address. Enter one bare IP (e.g. "
+                        "192.16.30.1) — this is the router advertised "
+                        "to clients in the DHCP OFFER (option 3), and "
+                        "must be on the client subnet.",
                     )
                     return
 

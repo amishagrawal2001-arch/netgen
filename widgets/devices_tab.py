@@ -7870,6 +7870,16 @@ class DevicesTab(QWidget):
                     _rrh = dhcp_config.get("relay_return_hop") if isinstance(dhcp_config, dict) else ""
                     if _rrh is not None and hasattr(dialog, "dhcp_relay_return_hop_input"):
                         dialog.dhcp_relay_return_hop_input.setText(str(_rrh))
+                    # v0.5.315 (audit dhcp-pool-router-vs-relay-return-hop):
+                    # preload the pool_router the same way. Missing preload
+                    # here would silently drop the operator's value on any
+                    # subsequent Edit (the save-path always writes what the
+                    # field CURRENTLY holds), and re-Save would then clear
+                    # dhcp-option=3 to the iface-gateway fallback — clients
+                    # would lose their default route on the very next apply.
+                    _pool_router = dhcp_config.get("pool_router") if isinstance(dhcp_config, dict) else ""
+                    if _pool_router is not None and hasattr(dialog, "dhcp_pool_router_input"):
+                        dialog.dhcp_pool_router_input.setText(str(_pool_router))
 
                 # IPv6 pool + prefix + server IP + gateway + routes + lease
                 if hasattr(dialog, "dhcp6_pool_start_input"):

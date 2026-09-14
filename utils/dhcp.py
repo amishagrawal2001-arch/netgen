@@ -3618,8 +3618,45 @@ def start_dhcp_server(
                     config_lines.append(
                         f"dhcp-range={extra_start},{extra_end},{extra_lease}s"
                     )
-        if gateway:
-            config_lines.append("dhcp-option=3," + gateway)
+        # v0.5.315 (audit dhcp-pool-router-vs-relay-return-hop):
+        # `pool_router` is the router IP advertised to clients in the
+        # DHCP OFFER (option 3). It's DIFFERENT from `gateway` (the
+        # server device's own iface gateway) and from `relay_return_hop`
+        # (the server-side hop back to the relay). Pre-fix, we emitted
+        # `dhcp-option=3,<iface_gateway>` regardless of mode:
+        #
+        #   direct-attached: server + clients share L2 → iface gateway
+        #     IS the client's gateway → no problem.
+        #
+        #   relay-mode: pool subnet is L3-REMOTE from the server. The
+        #     server's iface gateway is on the SERVER'S subnet (e.g.
+        #     172.16.30.1), which is UNREACHABLE from clients living on
+        #     the pool subnet (e.g. 192.16.30.0/24). Clients received
+        #     an OFFER whose router option pointed to an off-subnet
+        #     address that dhclient couldn't ARP → no default route
+        #     installed → `dhcp_lease_gateway` stayed EMPTY in the DB
+        #     → gateway column blank in the UI → client had a lease
+        #     but no L3 egress. Operator hit this on srv06 2026-09-14
+        #     with device4 (leased 192.16.30.105 but blank gateway
+        #     because dnsmasq sent `dhcp-option=3,172.16.30.1`).
+        #
+        # Fix: prefer explicit `pool_router` (client-subnet gateway,
+        # entered in the DHCP-server dialog's new "Pool Router" field),
+        # fall back to `gateway` for backward compat (direct-attached
+        # devices, and pre-v0.5.315 configs that never had the new
+        # field). No-op when neither is set.
+        pool_router = (dhcp_config.get("pool_router", "") or "").strip() if ipv4_enabled else ""
+        router_option = pool_router or gateway
+        if router_option:
+            if pool_router and pool_router != gateway:
+                logger.info(
+                    "[DHCP] Server device: dhcp-option=3 uses explicit "
+                    "pool_router=%s (client-subnet gateway) instead of "
+                    "iface gateway=%r — this is correct for RELAY-mode "
+                    "servers where the pool subnet is L3-remote.",
+                    pool_router, gateway,
+                )
+            config_lines.append("dhcp-option=3," + router_option)
 
     ipv6_gateway_routes = []
     if ipv6_enabled:

@@ -2,6 +2,111 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.315] - 2026-09-13
+
+**Add distinct "Pool Router" field on the DHCP-server device
+dialog — fixes "DHCP client leases IP but gets no default
+gateway" in RELAY-mode DHCP servers.**
+
+Operator report on srv06 device4 (DHCP client) post-v0.5.314:
+IPv4 lease came through (`192.16.30.105/24`) but the IPv4
+Gateway column stayed BLANK — the client had a lease but no L3
+egress. On the server (device5, RELAY mode with
+`relay_return_hop=172.16.30.1`), dnsmasq's generated config
+carried `dhcp-option=3,172.16.30.1`.
+
+### Root cause
+
+Pre-fix, `utils/dhcp.start_dhcp_server` emitted
+`dhcp-option=3,<gateway>` where `<gateway>` was the DHCP-server
+device's OWN interface gateway (`dhcp_config.gateway`). Fine in
+direct-attached mode where server + clients share an L2:
+server's iface gw IS the client's gateway.
+
+Broken in RELAY mode: the pool subnet is L3-remote from the
+server. The server's iface gateway lives on the SERVER's subnet
+(e.g. 172.16.30.0/24), which is UNREACHABLE from clients living
+on the pool subnet (e.g. 192.16.30.0/24). Clients received an
+OFFER whose router option pointed to an off-subnet address that
+`dhclient` couldn't ARP → no default route installed →
+`dhcp_lease_gateway` in the DB stayed empty → UI blank + no
+egress.
+
+### Fix
+
+Introduce a THIRD explicit field on the DHCP-server dialog —
+"Pool Router" (`dhcp_pool_router_input`) — placed adjacent to
+the existing "Relay Return Hop" field. Distinct from:
+
+  * `gateway` — the server device's OWN iface gateway
+  * `relay_return_hop` — the server-side hop back to the relay
+
+Backend `start_dhcp_server` now emits:
+
+```
+router_option = pool_router or gateway
+if router_option:
+    config_lines.append("dhcp-option=3," + router_option)
+```
+
+Prefers `pool_router` for `dhcp-option=3` (the OFFER's router
+option); falls back to `gateway` for backward compat with
+pre-v0.5.315 configs and direct-attached servers. Logs INFO
+when the two diverge so `journalctl -u netgen-server` traces
+the decision.
+
+### Files touched
+
+* `widgets/add_device_dialog.py` — new `dhcp_pool_router_input`
+  QLineEdit with tooltip warning that the value MUST be on the
+  client subnet; wired into disable-all + enable-gate blocks;
+  save-path emits `dhcp_config["pool_router"]` inside the
+  `if ipv4_enabled:` gate (v0.5.229 B5: emit even when blank so
+  clear-field means clear); validator rejects non-IPv4 strings.
+
+* `widgets/devices_tab.py` — edit-load preloads
+  `dhcp_pool_router_input` from `dhcp_config.pool_router`
+  (guarded `is not None` for pre-v0.5.315 devices).
+
+* `utils/dhcp.py` — reads `pool_router` (gated on `ipv4_enabled`),
+  computes `router_option`, emits `dhcp-option=3,<router_option>`,
+  logs when `pool_router != gateway`.
+
+### Backward compatibility
+
+* Devices upgraded from pre-v0.5.315: `pool_router` absent from
+  `dhcp_config` → backend falls back to `gateway`, identical
+  behavior to pre-fix. No migration needed (dhcp_config is a
+  JSON blob).
+
+* Direct-attached DHCP servers: operator leaves "Pool Router"
+  empty → fallback to `gateway` → same as pre-fix.
+
+* Relay-mode DHCP servers: operator fills "Pool Router" with
+  the client-subnet gateway → dnsmasq emits the correct router
+  option → clients install a default route → `dhcp_lease_gateway`
+  populates in the DB → UI shows the gateway.
+
+### Verification
+
+21 lock-in tests in
+`tests/test_v05315_dhcp_pool_router.py` covering: dialog field
+creation, tooltip content, disable/enable gates, save-path emit
+(inside IPv4 gate), IPv4 validator, edit-load preload,
+None-safety, backend read + prefer-over-gateway + emit + backward
+compat + INFO log + ipv4_enabled gating, plus AST-parse on all
+three touched files.
+
+### Bonus fix — v0.5.307 test drift
+
+`test_v05307_frr_v4_widget_default_leak.py` still asserted the
+v0.5.307 shape (`dhcp_mode == "client" or (...)` + `_dc.get("ipv4_enabled") is False`)
+that v0.5.308 replaced with the simpler
+`dhcp_mode in ("client", "server")`. Updated to lock in the
+v0.5.308 pattern instead and PIN that the fragile
+`ipv4_enabled` propagation check must stay removed
+(feedback_close_gap_at_authoritative_side).
+
 ## [0.5.314] - 2026-09-14
 
 **DHCP lease fields sync into `all_devices` on poll refresh —

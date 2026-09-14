@@ -59,34 +59,53 @@ def test_marker_present_in_both_configure_blocks():
 
 
 def test_v6_only_dhcp_server_gets_empty_ipv4_addr():
-    """The `else` branch that used to hardcode 192.168.0.2 now
-    routes DHCP-server + ipv4_enabled=False into the empty-string
-    path (same as the DHCP-client branch)."""
+    """v0.5.308 widened the guard: any DHCP mode (client OR
+    server) skips the 192.168.0.2 widget-default fallback and
+    lands in the empty-string branch. The v0.5.307 shape
+    (`dhcp_mode == "client" or (dhcp_mode == "server" and
+    _v4_off_by_config)`) depended on dhcp_config being present
+    in device_config — but 6 callsites in run_tgen_server inline-
+    build container_device_config WITHOUT dhcp_config, so the
+    guard silently missed and re-injected the widget default.
+    The v0.5.308 fix broadened to `dhcp_mode in ("client",
+    "server")` which needs only dhcp_mode (always present)."""
     src = _src()
-    # Marker: the widened guard checks both dhcp_mode == "client"
-    # AND (server AND ipv4_enabled=False).
-    assert 'dhcp_mode == "client" or (' in src
-    assert 'dhcp_mode == "server" and _v4_off_by_config' in src
+    # v0.5.308 shape — appears at BOTH _configure_interfaces
+    # blocks (main + startup).
+    assert src.count('if dhcp_mode in ("client", "server"):') >= 2, (
+        "v0.5.308 widened guard must apply in both "
+        "_configure_interfaces blocks"
+    )
 
 
-def test_dhcp_config_parsed_defensively_from_device_config():
-    """dhcp_config in device_config may arrive as dict or JSON
-    string (depending on which layer built device_config).
-    Both cases must yield a dict for the ipv4_enabled check."""
+def test_v6_only_dhcp_server_no_hardcoded_widget_default_reachable():
+    """After v0.5.308, no code path in _configure_interfaces
+    should assign ipv4_addr = '192.168.0.2' when dhcp_mode is
+    'client' or 'server'. The hardcoded 192.168.0.2 must live
+    ONLY in the else-branch that fires when dhcp is disabled."""
     src = _src()
-    assert 'device_config.get("dhcp_config")' in src
-    assert 'json.loads(_dc)' in src
-    assert '_dc = _dc if isinstance(_dc, dict) else {}' in src
-
-
-def test_json_module_imported():
-    """The v0.5.307 fix uses json.loads for the string form of
-    dhcp_config — make sure the module is available at the top of
-    the file (was already imported for other paths, but pin it)."""
-    src = _src()
-    # Grab the top-of-file imports.
-    head = src[:600]
-    assert "\nimport json" in head or "^import json" in head or "import json\n" in head
+    # find each 'if dhcp_mode in ("client", "server"):' block and
+    # verify the immediate body does NOT contain 192.168.0.2 —
+    # the widget default must be relegated to the else branch.
+    idx = 0
+    seen = 0
+    while True:
+        marker = 'if dhcp_mode in ("client", "server"):'
+        i = src.find(marker, idx)
+        if i < 0:
+            break
+        # Grab the next 200 chars — the if-body up to else:
+        body = src[i:i + 400]
+        # Split at else: — everything before is the true branch
+        else_i = body.find("else:")
+        true_branch = body[:else_i] if else_i > 0 else body
+        assert "192.168.0.2" not in true_branch, (
+            "192.168.0.2 leaked into the dhcp-mode true branch "
+            "at offset {} — v0.5.308 fix regressed".format(i)
+        )
+        idx = i + 1
+        seen += 1
+    assert seen >= 2, "expected at least 2 dhcp_mode guards"
 
 
 def test_widget_default_still_used_for_non_dhcp_devices():
@@ -102,17 +121,26 @@ def test_widget_default_still_used_for_non_dhcp_devices():
     assert "ipv4_mask = '24'" in src
 
 
-def test_v6_only_check_uses_is_False_not_truthiness():
-    """`_dc.get("ipv4_enabled") is False` — strict identity check.
-    A missing key returns None (NOT False), so a device with no
-    dhcp_config or dhcp_config missing the ipv4_enabled key
-    would NOT trip the divert path — safe default. Truthiness
-    (`not _dc.get("ipv4_enabled")`) would wrongly divert those
-    devices too and break legacy behavior."""
+def test_v0308_widened_guard_does_not_need_ipv4_enabled_check():
+    """v0.5.307 tried to check `_dc.get("ipv4_enabled") is False`
+    to distinguish IPv6-only DHCP-server from IPv4 DHCP-server.
+    v0.5.308 discovered that `dhcp_config` isn't propagated to
+    every callsite (6 inline-built container_device_config
+    callsites in run_tgen_server), so the check silently failed.
+    The v0.5.308 fix widened the guard to depend only on
+    `dhcp_mode` (always present) — a DHCP-server device with
+    ipv4_enabled=True now also skips the widget default and gets
+    the anchor written by utils/dhcp._ensure_ipv4_address (v0.5.222)
+    or via the DHCP lease. This test PINS that we no longer
+    depend on the fragile ipv4_enabled propagation."""
     src = _src()
-    assert '_dc.get("ipv4_enabled") is False' in src
-    # And NOT the loose truthiness variant.
-    assert 'not _dc.get("ipv4_enabled")' not in src
+    # v0.5.307's fragile check must be GONE — the fix is at the
+    # authoritative side now (feedback_close_gap_at_authoritative_side).
+    assert '_dc.get("ipv4_enabled") is False' not in src, (
+        "v0.5.308 removed the fragile ipv4_enabled propagation "
+        "check — reintroducing it would re-open the v0.5.306/307 "
+        "leak on any callsite that doesn't propagate dhcp_config"
+    )
 
 
 def test_frr_docker_ast_parses():
