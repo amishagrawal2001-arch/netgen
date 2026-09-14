@@ -2718,6 +2718,39 @@ def start_dhcp_client(
     pidfile_v6 = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}-ipv6.pid")
     leasefile_v6 = os.path.join(DHCLIENT_LEASE_DIR, f"dhcp6c-{interface}.leases")
 
+    # v0.5.313 (audit dhcp-lease-stale-on-reapply): clear the stale
+    # lease-surface fields in the DB BEFORE spawning dhclient/dhcp6c.
+    # Operator hit this after editing a DHCP-client device to change
+    # its interface (vlan30 → new iface): the OLD lease IP
+    # (192.16.30.105) kept showing in the row's IPv4 column until
+    # (or unless) the new lease landed. Root cause: the DB row's
+    # dhcp_lease_ip / _mask / _gateway / _ip6 / _prefix6 / _gateway6
+    # persist runtime lease state; the poll refresh reads them into
+    # device_info and the display code shows "<addr> (leased)".
+    # After an interface change, those fields describe a lease that
+    # no longer exists on the new interface. Clearing here means
+    # the next poll (within 30 s) sees empty → shows blank until
+    # the new dhclient's lease lands and repopulates. If the new
+    # lease succeeds quickly the operator may see a brief blank
+    # window; that's honest — the old lease is gone.
+    if device_id:
+        _update_device_db(
+            device_db,
+            device_id,
+            {
+                "dhcp_lease_ip": "",
+                "dhcp_lease_mask": "",
+                "dhcp_lease_gateway": "",
+                "dhcp_lease_server": "",
+                "dhcp_lease_expires": None,
+                "dhcp_lease_subnet": "",
+                # v0.5.302 v6 lease surface — same treatment.
+                "dhcp_lease_ip6": "",
+                "dhcp_lease_prefix6": "",
+                "dhcp_lease_gateway6": "",
+            },
+        )
+
     ipv4_enabled = _truthy(dhcp_config.get("ipv4_enabled", True)) if dhcp_config else True
     ipv6_enabled = _truthy(dhcp_config.get("ipv6_enabled", True)) if dhcp_config else True
 

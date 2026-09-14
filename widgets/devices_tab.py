@@ -3635,6 +3635,35 @@ class DevicesTab(QWidget):
                             with QSignalBlocker(self.devices_table):
                                 _ipv4_item.setText("")
                                 _ipv4_item.setData(_Qt.UserRole + 2, "")
+
+                    # v0.5.313 (audit dhcp-lease-gateway-display-gap):
+                    # v0.5.294 populated COL[IPv4] with the leased
+                    # address but never populated COL[IPv4 Gateway]
+                    # from `dhcp_lease_gateway`. Operator noticed on
+                    # srv06 2026-09-14 — device4 row showed
+                    # "192.16.30.105 (leased)" in the IPv4 column but
+                    # IPv4 Gateway was blank even though the lease
+                    # included a gateway. The v0.5.302 IPv6 branch
+                    # below does populate both IPv6 + IPv6 Gateway,
+                    # so this is missed v4 parity. Same
+                    # QSignalBlocker discipline as the address cell —
+                    # setText must not fire cellChanged → inline-edit
+                    # handler (v0.5.301 lesson).
+                    _gw_now = str(device_data.get("dhcp_lease_gateway") or "").strip()
+                    _gw_item = self.devices_table.item(row, self.COL.get("IPv4 Gateway"))
+                    if _gw_item is not None:
+                        _existing_gw = _gw_item.text() or ""
+                        if _gw_now:
+                            _desired_gw = f"{_gw_now} (leased)"
+                            if _existing_gw != _desired_gw:
+                                with QSignalBlocker(self.devices_table):
+                                    _gw_item.setText(_desired_gw)
+                                    _gw_item.setData(_Qt.UserRole + 2, _desired_gw)
+                        elif _existing_gw.endswith(" (leased)"):
+                            # Lease released — clear the gateway cell.
+                            with QSignalBlocker(self.devices_table):
+                                _gw_item.setText("")
+                                _gw_item.setData(_Qt.UserRole + 2, "")
             except Exception as _lease_display_exc:
                 logger.debug(
                     f"[DEVICE POLL] v0.5.294 lease-IPv4 refresh for "
@@ -4568,6 +4597,26 @@ class DevicesTab(QWidget):
                     ipv4_mask = device_info.get("ipv4_mask", "24")
                     ipv6_mask = device_info.get("ipv6_mask", "64")
                     ipv4_gateway = device_info.get("IPv4 Gateway", device_info.get("Gateway", ""))
+                    # v0.5.313 (audit dhcp-lease-gateway-display-gap):
+                    # same fallback for IPv4 gateway column that
+                    # v0.5.302 already does for IPv6 below. For a
+                    # DHCP-client device with an empty operator-
+                    # declared gateway, prefer dhcp_lease_gateway
+                    # (from the lease) with " (leased)" marker.
+                    if not ipv4_gateway:
+                        _dhcp_mode4 = str(
+                            device_info.get("dhcp_mode")
+                            or device_info.get("DHCP Mode")
+                            or ""
+                        ).lower()
+                        if _dhcp_mode4 == "client":
+                            _gw4 = str(
+                                device_info.get("dhcp_lease_gateway")
+                                or device_info.get("ipv4_gateway")
+                                or ""
+                            ).strip()
+                            if _gw4:
+                                ipv4_gateway = f"{_gw4} (leased)"
                     ipv6_gateway = device_info.get("IPv6 Gateway", "")
                     # v0.5.302: same fallback for IPv6 gateway column.
                     if not ipv6_gateway:

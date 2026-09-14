@@ -2,6 +2,97 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.313] - 2026-09-14
+
+**DHCP-client display polish + admin dependency dashboard.**
+
+Operator report on srv06: device4 (DHCP client on vlan30) shows
+"192.16.30.105 (leased)" in the IPv4 column but IPv4 Gateway
+column is blank. Also, when the operator edits a DHCP-client
+device to change its interface, the OLD lease IP keeps showing
+in the row until (or unless) a new lease lands.
+
+### Fix 1 — IPv4 Gateway populated from `dhcp_lease_gateway`
+
+v0.5.294 populated `COL[IPv4]` with the leased address but never
+touched `COL[IPv4 Gateway]`. v0.5.302's IPv6 twin populated both
+IPv6 AND IPv6 Gateway columns — v4 parity was missed. Adding
+the IPv4 Gateway population in both places:
+
+  * `_apply_device_status_row` poll-refresh — reads
+    `dhcp_lease_gateway` and writes `"<gw> (leased)"` into
+    `COL[IPv4 Gateway]`. Same `QSignalBlocker` discipline as the
+    address cell (v0.5.301 inline-edit-loop lesson).
+  * `populate_device_table` initial-add — same fallback pattern
+    as v0.5.302's IPv6 gateway: DHCP-client device with empty
+    operator gateway shows the leased gateway.
+
+### Fix 2 — Stale lease cleared on re-apply
+
+Root cause: DB row's `dhcp_lease_ip` / `_mask` / `_gateway`
+persist runtime lease state. After operator edits the device
+to change its interface, those fields describe a lease that no
+longer exists on the new interface. Poll refresh reads them into
+device_info; display code shows "<addr> (leased)" from the old
+lease.
+
+Fix in `utils/dhcp.py:start_dhcp_client`: BEFORE spawning
+`dhclient` / `dhcp6c`, clear all 9 runtime lease fields (v4
++ v6):
+
+  * `dhcp_lease_ip`, `dhcp_lease_mask`, `dhcp_lease_gateway`
+  * `dhcp_lease_server`, `dhcp_lease_expires`, `dhcp_lease_subnet`
+  * `dhcp_lease_ip6`, `dhcp_lease_prefix6`, `dhcp_lease_gateway6`
+
+Next poll (within 30s) shows blank; the new lease repopulates
+once dhclient/dhcp6c writes it. If the new lease succeeds
+quickly the operator may see a brief blank window — that's
+honest: the old lease is gone on the new interface.
+
+### Also shipping — admin dependency dashboard (v0.5.312 commit)
+
+Committed on `19cdcadc` between v0.5.311 and v0.5.313, bundled
+into this release so operators upgrading to fix the DHCP
+display issues also get the deps dashboard.
+
+New "System Dependencies" card in the admin console
+(http://<host>:5050/admin) enumerates 7 host-side apt packages
+netgen needs (iputils-arping, lldpd, libpcap0.8, ethtool,
+iproute2, iputils-ping, dnsmasq) with installed status +
+per-row Install button. Backend: `GET /api/admin/deps`
+(viewer role, returns manifest + status) +
+`POST /api/admin/deps/install` (admin role, whitelisted-name
+apt-get install — HTTP session cannot install arbitrary
+packages).
+
+Answer to "why did arping not get installed automatically" —
+tarball installer only auto-provisions on FRESH installs.
+Operators upgrading from pre-v0.5.310 builds silently missed
+the arping addition. This card is the source of truth going
+forward — every dep enumerated, one-click install for any
+that go missing after an upgrade.
+
+### Verification
+
+10 lock-in tests in
+`tests/test_v05313_dhcp_client_gw_display_and_stale_clear.py`
++ 19 lock-in tests in
+`tests/test_v05312_admin_deps_dashboard.py` (bundled). All
+pass. ast.parse clean on all edited files.
+
+### Operator action
+
+Upgrade server + client to v0.5.313. device4 row should show
+its gateway in the IPv4 Gateway column within one poll (~30s).
+For future device edits that change interface, the old lease
+clears immediately in the DB → next poll shows blank → new
+lease populates once dhclient obtains it.
+
+Visit http://<host>:5050/admin to see the System Dependencies
+card. On srv06, `iputils-arping` should show as missing —
+click Install to add it (or `sudo apt install iputils-arping`
+directly if you prefer the shell).
+
 ## [0.5.311] - 2026-09-14
 
 **ARP IPv4 metric now targets the gateway, not the device's own
