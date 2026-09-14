@@ -2,6 +2,85 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.326] - 2026-09-14
+
+**Two operator-reported fixes:
+  (1) Scale count defaults to 1 (was 2);
+  (2) IPv6 same-subnet stale-address cleanup on Apply
+      (mirror of v0.5.236 IPv4 cleanup).**
+
+### #1 — Scale count default = 1
+
+v0.5.324 defaulted `increment_count` to 2 to make scale
+demonstrable at first click. Operator report: this silently
+opts operators into scale mode when they just wanted to add
+a single device — they'd hit the SCALE COLLISION WARNING or
+end up with an unintended second device. Scale should be an
+explicit operator decision.
+
+Fix: `self.increment_count.setValue(1)` at dialog init.
+Scale runs now require bumping count to ≥ 2 explicitly.
+
+### #2 — IPv6 same-subnet stale-address cleanup on Apply
+
+Operator report on srv06 2026-09-14: editing vlan20 IPv6
+address left THREE addresses on the interface:
+
+```
+431: vlan20@ens2f0np0: <BROADCAST,MULTICAST,UP,LOWER_UP> ...
+    inet6 2001:db8:20::2/64 scope global   ← newly-set
+    inet6 2001:db8:30::1/64 scope global   ← stale (cross-subnet)
+    inet6 2001:db8:20::1/64 scope global   ← stale (SAME subnet)
+    inet6 fe80::5e25:73ff:fe3f:3056/64 scope link
+```
+
+Root cause: Step 4 (IPv6 configure) had only
+`ip addr del {ipv6}/{ipv6_mask}` before the `ip addr add` —
+which is a no-op when the stale address DIFFERS from the new
+one (same-subnet stray like `2001:db8:20::1/64` when setting
+`2001:db8:20::2/64`). Multiple edits accumulate.
+
+The IPv4 path already had a v0.5.236 same-subnet cleanup that
+enumerates every IPv4 on the iface and removes those in the
+same /prefix as the new address. This ship adds the mirror for
+IPv6:
+
+  * Probe existing IPv6 addresses via
+    `ip -6 -o addr show dev <iface>`.
+  * For each `inet6 <addr>/<prefix>`:
+    * Skip link-local (`fe80::/10`) — kernel-managed, always
+      present, never operator-configured.
+    * Skip the exact new address (no del-then-re-add churn).
+    * Skip cross-subnet strays (deliberate multi-net configs
+      shouldn't be disturbed — matches IPv4 conservative
+      default). The `2001:db8:30::1/64` in the operator's
+      example WOULD stay if the new address is on
+      `2001:db8:20::/64`; deleting cross-subnet addresses
+      requires the operator to either restart the device or
+      delete-then-re-add it.
+    * Same-subnet strays get `ip addr del <cidr> dev <iface>`.
+  * Exception-safe so a parse error doesn't abort the Apply.
+
+After the fix, the operator's edit scenario cleans the
+`2001:db8:20::1/64` stray before adding `2001:db8:20::2/64` →
+iface ends up with exactly one operator-configured IPv6 plus
+the kernel's link-local.
+
+### Verification
+
+15 lock-in tests in
+`tests/test_v05326_count_default_and_ipv6_stale_cleanup.py`:
+  * 2 tests for count default (== 1, not 2; marker present)
+  * 9 tests for IPv6 cleanup (marker; ip -6 probe; inet6
+    parsing; link-local skip; cross-subnet preservation;
+    exact-match skip; IPv6Network parsing; del-before-add
+    ordering; exception-safe)
+  * 1 test that v0.5.236 IPv4 cleanup still present (regression
+    guard while adding the mirror)
+  * 3 AST-parse guards
+
+All 248 pre-existing upstream-hint tests still pass; total 263.
+
 ## [0.5.325] - 2026-09-14
 
 **Three-way audit: (1) DHCPv4/v6 server templates verified

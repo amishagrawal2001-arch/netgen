@@ -5118,6 +5118,73 @@ def apply_device():
                         f"on {iface_name_for_commands}: {_sysctl_exc}"
                     )
 
+                # v0.5.326 (audit ipv6-stale-cleanup): mirror of the
+                # v0.5.236 IPv4 cleanup — enumerate every IPv6 on the
+                # interface and remove any that lives in the SAME
+                # /prefix as the new one but is a different host.
+                # Operator report 2026-09-14: editing vlan20 from
+                # 2001:db8:30::1/64 to 2001:db8:20::2/64 left THREE
+                # IPv6 addresses on the iface (both old ones plus the
+                # new one) because pre-fix only `ip addr del {new_ipv6}`
+                # ran — no-op when the stale addresses are DIFFERENT
+                # from the new one. Skip fe80:: link-local (kernel-
+                # managed, always present) and cross-subnet addresses
+                # (deliberate multi-net configurations should be left
+                # alone).
+                try:
+                    import ipaddress as _ipa
+                    _new_net6 = _ipa.IPv6Network(f"{ipv6}/{ipv6_mask}", strict=False)
+                    _probe6 = subprocess.run(
+                        ["ip", "-6", "-o", "addr", "show", "dev", iface_name_for_commands],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    for _ln in (_probe6.stdout or "").splitlines():
+                        _toks = _ln.split()
+                        _i = 0
+                        while _i < len(_toks) - 1:
+                            if _toks[_i] == "inet6":
+                                _cidr6 = _toks[_i + 1]
+                                break
+                            _i += 1
+                        else:
+                            continue
+                        if "/" not in _cidr6:
+                            continue
+                        _addr_str6, _mask_str6 = _cidr6.split("/", 1)
+                        # Skip link-local (fe80::/10) — kernel-managed,
+                        # always present, never operator-configured.
+                        try:
+                            _addr_obj = _ipa.IPv6Address(_addr_str6)
+                            if _addr_obj.is_link_local:
+                                continue
+                        except (ValueError, _ipa.AddressValueError):
+                            continue
+                        # Skip the exact new address — no need to remove
+                        if _addr_str6 == ipv6 and _mask_str6 == str(ipv6_mask):
+                            continue
+                        try:
+                            _existing_net6 = _ipa.IPv6Network(_cidr6, strict=False)
+                        except ValueError:
+                            continue
+                        # Only remove same-subnet strays; leave cross-
+                        # subnet addresses (deliberate multi-net)
+                        # alone.
+                        if (_existing_net6.network_address == _new_net6.network_address
+                                and _existing_net6.prefixlen == _new_net6.prefixlen):
+                            logging.info(
+                                f"[DEVICE APPLY] Removing stale same-subnet IPv6 "
+                                f"{_cidr6} on {iface_name_for_commands} before "
+                                f"setting {ipv6}/{ipv6_mask}"
+                            )
+                            subprocess.run(
+                                ["ip", "addr", "del", _cidr6, "dev", iface_name_for_commands],
+                                capture_output=True, text=True, timeout=5,
+                            )
+                except Exception as _clean_exc6:
+                    logging.debug(
+                        f"[DEVICE APPLY] Same-subnet stale-IPv6 cleanup skipped: {_clean_exc6}"
+                    )
+
                 # Remove existing IPv6 address if any
                 subprocess.run(["ip", "addr", "del", f"{ipv6}/{ipv6_mask}", "dev", iface_name_for_commands],
                              capture_output=True, text=True, timeout=5)

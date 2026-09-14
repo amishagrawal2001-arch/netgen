@@ -553,7 +553,14 @@ class AddDeviceDialog(QDialog):
         self.increment_count = QSpinBox()
         self.increment_count.setMinimum(1)
         self.increment_count.setMaximum(10000)
-        self.increment_count.setValue(2)  # Default to 2
+        # v0.5.326 (audit count-default): scale count defaults to 1
+        # (single device). Pre-fix defaulted to 2, which surprised
+        # operators who just wanted to add one device — they'd
+        # inadvertently create a scale run, then hit the SCALE
+        # COLLISION WARNING or end up with unintended duplicates.
+        # Scale is now an EXPLICIT operator decision: bump count
+        # >= 2 to opt in.
+        self.increment_count.setValue(1)  # Default to 1 (single device)
         self.increment_count.setFixedWidth(80)
         
         # Add all to the same row
