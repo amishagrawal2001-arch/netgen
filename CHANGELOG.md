@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.323] - 2026-09-14
+
+**Audit + regression guard: no template shape produces double-
+rendered warning + shared-banner in Upstream Hint scale output.**
+
+Operator asked: "did you check other template twice rendering
+issue" — worried a specific template or protocol combination
+might trip a code path that emits the SCALE COLLISION WARNING
+banner or Shared upstream config banner twice.
+
+### Audit result
+
+Ran `render_all(expand_for_scale(base, {"count": 2}))` across
+9 template shapes × 3 vendors = 27 renders. **Every single one
+emits EXACTLY 1 warning banner, 1 shared banner, and 2 device-
+header lines.** No double-render exists in any code path.
+
+Shapes audited:
+
+  * bare host (no protocols)
+  * iBGP peer (bgp only)
+  * eBGP with IPv6 (bgp only, dualstack)
+  * OSPF backbone v4 only
+  * OSPF dualstack (v4 + v6)
+  * ISIS L1/L2
+  * DHCP client
+  * BGP + OSPF combined (bgp_ospf_pe template)
+  * Kitchen sink: BGP + OSPF + ISIS + DHCP-client all enabled
+
+### Regression guard
+
+Added `tests/test_v05323_no_double_render_across_templates.py`
+with parametrized coverage over all 9 shapes × 3 vendors = 27
+runtime renders, checking:
+
+  * `SCALE COLLISION WARNING` appears exactly 1×
+  * `Shared upstream config` appears exactly 1×
+  * device-header comment lines appear exactly count× (2 for
+    scale=2)
+
+Plus source-level guards:
+
+  * `UpstreamHintDialog` calls `render_all` exactly once per open
+  * Only one `UpstreamHintDialog(...)` instantiation site exists
+    in the entire codebase (Add Device dialog button); pin so a
+    future refactor that adds a second entry point (e.g. a
+    devices-table right-click menu) triggers a review to ensure
+    the two entry points can't both fire on one operator click.
+
+84 tests total; all pass. No runtime code changed — this ship
+is testing infrastructure only.
+
+### Note on prior operator paste
+
+The earlier operator paste showed a warning + shared banner
+appearing twice. Confirmed via AskUserQuestion: that was a
+manual concatenation of two separate dialog runs (one BGP-only,
+one OSPF-only), not a code-path bug. Both dialog runs rendered
+correctly on their own.
+
 ## [0.5.322] - 2026-09-14
 
 **Upstream Config Hint: SCALE COLLISION WARNING banner when N
