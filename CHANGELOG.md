@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.317] - 2026-09-14
+
+**Upstream DHCP-relay agent config hint on the Add Device
+dialog — visible whenever DHCP Client mode is selected.**
+
+Operator report: even after v0.5.315 (Pool Router) + v0.5.316
+(nav-blank fallback), the "DHCP client device fails to lease"
+symptom keeps returning — because a netgen DHCP-client device
+can't reach a netgen DHCP-server device on a different L2
+without a dhcp-relay agent on the L3 gateway between them.
+That config lives on the switch, not on netgen — and pre-fix,
+this requirement was invisible in the dialog. The operator
+would set up Client mode, watch it fail, and have no way of
+knowing the missing piece was upstream.
+
+### Fix
+
+Add `self.dhcp_client_relay_hint` — a QLabel below the DHCP
+IPv4/IPv6 containers — that renders a static help panel with:
+
+  * One-line explanation of why the relay is needed
+  * Copyable Junos `set` commands (based on the operator's
+    reference config from srv06 QFX5130):
+
+    ```
+    set forwarding-options dhcp-relay overrides allow-snooped-clients
+    set forwarding-options dhcp-relay forward-only
+    set forwarding-options dhcp-relay server-group DHCP-SERVERS 172.16.30.2
+    set forwarding-options dhcp-relay active-server-group DHCP-SERVERS
+    set forwarding-options dhcp-relay group CLIENTS interface irb.30
+    ```
+
+  * Substitution callouts: `172.16.30.2` → operator's DHCP-
+    server device IP, `irb.30` → SVI on the client's VLAN
+  * Direct-attached carveout: hint says the relay is NOT
+    needed when server + client share L2
+
+Visibility is bound to `is_client and dhcp_mode_combo.isEnabled()`
+in `_on_dhcp_mode_changed`. Server mode + DHCP-off both hide
+the hint. Text is selectable-by-mouse so the operator can
+copy-paste directly into their switch CLI. RichText format so
+the `<pre>` code block renders correctly.
+
+### Verification
+
+11 lock-in tests in
+`tests/test_v05317_dhcp_client_upstream_relay_hint.py` covering:
+marker presence, widget creation, layout attachment, default
+hidden, visibility bound to client mode, all 5 Junos set-lines
+present, substitution callouts explained, direct-attached
+carveout mentioned, selectable-by-mouse flag, RichText format,
+and AST-parse.
+
+### Not a fix for empty `dhcp_lease_gateway`
+
+The relay hint is documentation — the operator still needs the
+v0.5.315 Pool Router field on the DHCP-server device to hand
+clients a reachable default route. Two independent things:
+
+  * Upstream switch has dhcp-relay agent (this hint) → DHCP
+    OFFER reaches the client at all.
+  * Server's Pool Router = client-subnet gateway (v0.5.315) →
+    the OFFER's router option is usable by the client.
+
+Both are required for a working RELAY-mode DHCP-client
+deployment; neither substitutes for the other.
+
 ## [0.5.316] - 2026-09-14
 
 **DHCP-client lease fallback in `update_device_table` —

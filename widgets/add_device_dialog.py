@@ -1035,6 +1035,57 @@ class AddDeviceDialog(QDialog):
         dhcp_main_layout.addWidget(self.dhcp_ipv4_container)
         dhcp_main_layout.addWidget(self.dhcp_ipv6_container)
 
+        # v0.5.317 (audit dhcp-client-upstream-relay-hint):
+        # For a netgen DHCP-CLIENT device to actually reach a netgen
+        # DHCP-SERVER device that lives on a different L2, the
+        # upstream switch (the L3 gateway between the two segments)
+        # needs a dhcp-relay agent configured. Netgen can't configure
+        # the switch itself — the operator has to. Pre-fix, this
+        # requirement was invisible: the operator set up a DHCP
+        # client device, saw it fail to lease, and had no idea the
+        # missing piece was upstream. Ship a static hint pane inside
+        # the DHCP config section that appears whenever Client mode
+        # is selected, with a copyable Juniper example config so the
+        # operator can start from a known-good template and adapt
+        # server-IP + client-VLAN interface to their topology.
+        #
+        # Example is Junos-flavored (matches srv06 lab QFX5130). The
+        # hint says WHAT to substitute; the config is a starting
+        # point, not final.
+        self.dhcp_client_relay_hint = QLabel()
+        self.dhcp_client_relay_hint.setTextFormat(Qt.RichText)
+        self.dhcp_client_relay_hint.setWordWrap(True)
+        self.dhcp_client_relay_hint.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+        )
+        self.dhcp_client_relay_hint.setStyleSheet(
+            "QLabel { background-color: #fff8dc; border: 1px solid "
+            "#d4b400; border-radius: 4px; padding: 8px; color: "
+            "#5c4400; }"
+        )
+        self.dhcp_client_relay_hint.setText(
+            "<b>Upstream switch (DHCP relay agent) required</b> — "
+            "netgen can't reach a DHCP server on a different L2 "
+            "without this. Example Junos config to configure on the "
+            "L3 gateway between this client's VLAN and the DHCP-"
+            "server device:"
+            "<pre style='margin-top:4px;margin-bottom:0'>"
+            "set forwarding-options dhcp-relay overrides allow-snooped-clients\n"
+            "set forwarding-options dhcp-relay forward-only\n"
+            "set forwarding-options dhcp-relay server-group DHCP-SERVERS 172.16.30.2\n"
+            "set forwarding-options dhcp-relay active-server-group DHCP-SERVERS\n"
+            "set forwarding-options dhcp-relay group CLIENTS interface irb.30"
+            "</pre>"
+            "Substitute:<br>"
+            "&nbsp;&nbsp;• <code>172.16.30.2</code> → your DHCP-server device's IP<br>"
+            "&nbsp;&nbsp;• <code>irb.30</code> → the SVI on this client's VLAN<br>"
+            "For direct-attached (server + client on same L2), no "
+            "relay is needed — this hint is only relevant for relay-"
+            "mode topologies."
+        )
+        self.dhcp_client_relay_hint.setVisible(False)
+        dhcp_main_layout.addWidget(self.dhcp_client_relay_hint)
+
         # ROCEv2 Configuration Widget with multi-column layout
         self.rocev2_config_widget = QWidget()
         rocev2_main_layout = QVBoxLayout(self.rocev2_config_widget)
@@ -1644,6 +1695,16 @@ class AddDeviceDialog(QDialog):
         if not getattr(self, "_dhcp_suppress_updates", False):
             self._on_protocol_enabled_changed()
         self._update_dhcp_field_states()
+
+        # v0.5.317 (audit dhcp-client-upstream-relay-hint):
+        # show the upstream-relay config hint only when the device is
+        # a DHCP CLIENT. Suppress in Server mode (server-side operator
+        # doesn't need to configure a relay agent) and when DHCP is
+        # disabled entirely (dhcp_mode_combo.isEnabled() is False).
+        if hasattr(self, "dhcp_client_relay_hint"):
+            self.dhcp_client_relay_hint.setVisible(
+                bool(is_client and self.dhcp_mode_combo.isEnabled())
+            )
 
     def _enable_rocev2_fields(self):
         """Enable ROCEv2 configuration fields."""
