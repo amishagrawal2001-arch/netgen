@@ -2,6 +2,94 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.327] - 2026-09-14
+
+**Juniper upstream-hint: add IRB-style variant (QFX/EX/ACX
+switching) with a `# CRITICAL:` note about the shared-MAC gotcha
+that just cost an hour on srv06.**
+
+Operator report on srv06 2026-09-14: `ping 2001:db8:20::2` from
+QFX5130 (`san-q5130-48c-02`) failed one-way — echo requests
+arrived at netgen fine, but netgen's NS for the switch's irb.20
+`2001:db8:20::1` got no NA back. Diagnosis: all IRBs on the
+switch shared the chassis MAC (`d0:48:a1:d0:27:06` — default
+Junos behavior). When multiple IRBs are trunked to a peer that
+L2-terminates each VLAN separately (netgen creates a `vlanN`
+subif per netgen device), NDP replies to one IRB clobber another
+in the peer's neighbor table → asymmetric ping failure. Operator
+fixed with a single switch commit:
+
+```
+set interfaces irb.20 mac d0:48:a1:d0:27:20
+commit
+```
+(unique per-IRB MAC, last byte = VLAN ID as visual convention).
+
+Operator asked: **how do we fix this for future from netgen
+side?**
+
+### Fix — bake it into the hint
+
+Juniper upstream-hint's interface stanza now emits BOTH:
+
+**Option A: subif style (MX / vMX / router-mode)** — unchanged
+from v0.5.226. `set interfaces ge-0/0/0 unit <vlan> family inet
+address ...` — for point-to-point router-mode uplinks.
+
+**Option B: IRB style (QFX / EX / ACX switching)** — new in
+v0.5.327. Emits the correct QFX idiom:
+
+```
+set interfaces ge-0/0/0 unit 0 family ethernet-switching interface-mode trunk vlan members v20
+set vlans v20 vlan-id 20
+set vlans v20 l3-interface irb.20
+set interfaces irb.20 description "peer:device5"
+set interfaces irb.20 family inet6 address 2001:db8:20::1/64
+# CRITICAL: on QFX/EX all IRBs share the chassis MAC by default.
+# When multiple IRBs are trunked to one peer, NDP resolution
+# gets clobbered — ping fails one-way. Fix: unique per-IRB MAC.
+# Get chassis base with: `show interfaces irb extensive | match hard`
+# then substitute the first 5 octets below (VLAN 20 → last byte 20):
+set interfaces irb.20 mac <chassis-base>:20
+```
+
+Uses the srv06 operator convention (last byte = VLAN ID as
+visible number, e.g. irb.20 → `..:20`, irb.30 → `..:30`) for
+readability. Anything unique across IRBs works; the visual
+convention just makes it grep-able.
+
+Cisco and Arista tabs are unchanged — those platforms use
+per-subinterface MACs by default and don't hit the shared-MAC
+problem.
+
+Also saved to project memory:
+`memory/project_srv06_junos_irb_shared_mac.md` so this class
+of problem is remembered across future sessions.
+
+### Verification
+
+15 lock-in tests in
+`tests/test_v05327_junos_irb_variant_and_shared_mac_note.py`:
+  * Both Option A + Option B markers present in Juniper output
+  * Subif variant uses `ge-0/0/0.<vlan>` (unchanged)
+  * IRB variant uses `ethernet-switching trunk` + `l3-interface`
+  * IRB variant puts L3 address on `irb.<vlan>` (not on subif)
+  * `# CRITICAL:` note present with actionable fix
+  * Last-byte convention matches VLAN ID (`irb.20 → ..:20`,
+    `irb.30 → ..:30`)
+  * `show interfaces irb extensive | match hard` referenced
+  * IRB variant carries IPv4 too (not just IPv6)
+  * Cisco/Arista have NO IRB variant (unchanged)
+  * Subif variant still writes `family inet6` on subunit
+    (regression guard against v0.5.226 loss)
+  * VLAN 0 + non-numeric VLAN edge cases don't crash
+
+2 v0.5.319 tests updated to reflect the new "descriptions
+appear on both subif AND IRB variants" reality — Juniper
+descriptions now count 2 per device, not 1.
+
+All 262 pre-existing upstream-hint tests pass; total 277.
+
 ## [0.5.326] - 2026-09-14
 
 **Two operator-reported fixes:

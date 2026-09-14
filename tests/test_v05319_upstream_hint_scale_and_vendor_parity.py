@@ -237,10 +237,28 @@ def test_render_all_accepts_list_form():
     })
     out = u.render_all(devs)
     assert set(out.keys()) == {"juniper", "cisco", "arista"}
-    # Three distinct peer descriptions per vendor.
-    assert out["juniper"].count('description "peer:netgen-device"') == 1
-    assert out["juniper"].count('description "peer:netgen-device-2"') == 1
-    assert out["juniper"].count('description "peer:netgen-device-3"') == 1
+    # Three distinct per-device descriptions must appear.
+    # v0.5.327 emits BOTH subif-style and IRB-style Juniper
+    # descriptions per device (Option A `ge-0/0/0.<vlan>
+    # description ...` + Option B `irb.<vlan> description ...`),
+    # so the raw count is 2 per device on the Juniper tab.
+    # What matters is each device's description IS present at
+    # least once — that's what makes the paste-body actually
+    # distinguish devices for the operator.
+    assert 'description "peer:netgen-device"' in out["juniper"]
+    assert 'description "peer:netgen-device-2"' in out["juniper"]
+    assert 'description "peer:netgen-device-3"' in out["juniper"]
+    # Regression guard: exactly 2 (subif + IRB) — not 3 (would mean
+    # something got duplicated) and not 1 (would mean we lost a
+    # variant).
+    assert out["juniper"].count('description "peer:netgen-device-2"') == 2
+    # Cisco/Arista still have per-device descriptions (no IRB
+    # variant emitted for those vendors). Descriptions actually
+    # appear TWICE per device on Cisco/Arista: once on the
+    # interface stanza and once as a BGP neighbor description —
+    # that's unchanged from pre-v0.5.327. Check both are present.
+    assert "description peer:netgen-device-2" in out["cisco"]
+    assert "description peer:netgen-device-2" in out["arista"]
 
 
 def test_render_all_list_separates_by_divider():

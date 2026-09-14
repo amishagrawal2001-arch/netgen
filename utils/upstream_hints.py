@@ -667,18 +667,88 @@ def _iface_stanza(
     isis_enabled: bool,
 ) -> str:
     if vendor == "juniper":
-        lines = [
-            f"set interfaces {_upstream_iface(vendor)} vlan-tagging",
-            f"set interfaces {_upstream_iface(vendor)} unit {vlan} vlan-id {vlan}",
-            f"set interfaces {_upstream_iface(vendor)} unit {vlan} description \"peer:{name}\"",
+        upstream = _upstream_iface(vendor)
+        # === Subif style: MX / vMX / older SRX routing (family-inet
+        # direct on a physical subunit). Simple point-to-point.
+        subif_lines = [
+            "# --- Option A: subif style (MX / vMX / router-mode) ---",
+            f"set interfaces {upstream} vlan-tagging",
+            f"set interfaces {upstream} unit {vlan} vlan-id {vlan}",
+            f"set interfaces {upstream} unit {vlan} description \"peer:{name}\"",
         ]
         if ipv4_gw and ipv4_mask:
-            lines.append(f"set interfaces {_upstream_iface(vendor)} unit {vlan} family inet address {ipv4_gw}/{ipv4_mask}")
+            subif_lines.append(
+                f"set interfaces {upstream} unit {vlan} family inet address {ipv4_gw}/{ipv4_mask}"
+            )
         if ipv6_gw and ipv6_mask:
-            lines.append(f"set interfaces {_upstream_iface(vendor)} unit {vlan} family inet6 address {ipv6_gw}/{ipv6_mask}")
+            subif_lines.append(
+                f"set interfaces {upstream} unit {vlan} family inet6 address {ipv6_gw}/{ipv6_mask}"
+            )
         if isis_enabled:
-            lines.append(f"set interfaces {_upstream_iface(vendor)} unit {vlan} family iso")
-        return "\n".join(lines)
+            subif_lines.append(
+                f"set interfaces {upstream} unit {vlan} family iso"
+            )
+
+        # v0.5.327 (audit junos-irb-shared-mac):
+        # === IRB style: QFX / EX / ACX switching (ethernet-switching
+        # trunk + VLAN with l3-interface + irb.N gateway). Emit this
+        # variant so operators running QFX-style topologies (e.g.
+        # srv06 lab QFX5130) can paste the correct idiom without
+        # translating from the router-style block above.
+        #
+        # CRITICAL: on QFX/EX all IRBs share the chassis MAC by
+        # default. When multiple IRBs are trunked to one peer that
+        # L2-terminates each VLAN separately (netgen creates a
+        # vlanN subif per netgen device), the peer's kernel can't
+        # distinguish IRBs — NDP replies to one IRB clobber another
+        # in the neighbor table → ping fails asymmetrically (echo
+        # request arrives at netgen but netgen's NS for the switch
+        # gateway gets no NA back). Fix: unique per-IRB MAC. srv06
+        # convention: last byte of MAC = VLAN ID (irb.20 →
+        # `..:20`). Confirmed working on srv06 2026-09-14.
+        # Reference: memory/project_srv06_junos_irb_shared_mac.md
+        # Match srv06 operator convention: last MAC byte = VLAN ID
+        # as-written (interpreted as hex). VLAN 20 → `..:20`,
+        # VLAN 30 → `..:30`. Works cleanly for VLAN 0-99; VLAN 100+
+        # wraps to the last two decimal digits — operator adjusts.
+        # The critical property is UNIQUENESS across IRBs, not the
+        # specific representation.
+        try:
+            _v = int(str(vlan) or "0")
+            _last_byte = f"{_v % 100:02d}"
+        except (ValueError, TypeError):
+            _last_byte = "20"
+        # Use a placeholder base MAC — operator MUST substitute the
+        # first 5 octets with their chassis's actual base MAC (from
+        # `show interfaces irb extensive | match hard`).
+        _placeholder_mac = f"<chassis-base>:{_last_byte}"
+        irb_lines = [
+            "# --- Option B: IRB style (QFX / EX / ACX switching) ---",
+            "# Configure the physical uplink as an ethernet-switching trunk",
+            "# member of this VLAN, then let irb.<vlan> own the L3 address.",
+            f"set interfaces {upstream} unit 0 family ethernet-switching interface-mode trunk vlan members v{vlan}",
+            f"set vlans v{vlan} vlan-id {vlan}",
+            f"set vlans v{vlan} l3-interface irb.{vlan}",
+            f"set interfaces irb.{vlan} description \"peer:{name}\"",
+        ]
+        if ipv4_gw and ipv4_mask:
+            irb_lines.append(
+                f"set interfaces irb.{vlan} family inet address {ipv4_gw}/{ipv4_mask}"
+            )
+        if ipv6_gw and ipv6_mask:
+            irb_lines.append(
+                f"set interfaces irb.{vlan} family inet6 address {ipv6_gw}/{ipv6_mask}"
+            )
+        irb_lines.extend([
+            "# CRITICAL: on QFX/EX all IRBs share the chassis MAC by default.",
+            "# When multiple IRBs are trunked to one peer, NDP resolution",
+            "# gets clobbered — ping fails one-way. Fix: unique per-IRB MAC.",
+            "# Get chassis base with: `show interfaces irb extensive | match hard`",
+            f"# then substitute the first 5 octets below (VLAN {vlan} → last byte {_last_byte}):",
+            f"set interfaces irb.{vlan} mac {_placeholder_mac}",
+        ])
+
+        return "\n".join(subif_lines) + "\n\n" + "\n".join(irb_lines)
 
     if vendor == "cisco":
         sub = _subif_name(vendor, vlan)
