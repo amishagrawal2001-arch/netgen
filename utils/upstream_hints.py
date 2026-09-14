@@ -204,34 +204,96 @@ def _render_all_scale(devices: List[dict]) -> Dict[str, str]:
 
 
 def _dedupe_and_emit(devices: List[dict], vendor: str) -> str:
+    """v0.5.321: two-tier dedupe.
+
+    * BLOCK-level (v0.5.320): a whole `\\n\\n`-separated stanza that
+      is byte-identical across every device is emitted once under
+      the shared banner. Works for the DHCP-relay stanza when all
+      N devices share a client VLAN.
+
+    * LINE-level (v0.5.321): when a stanza varies per-device but
+      LINES within it are identical (e.g. `set routing-options
+      autonomous-system 65000` is the same on every BGP device
+      even though `set protocols bgp group NETGEN-<name> ...`
+      lines differ because the group name carries the `-N` suffix,
+      or the interface `family inet address <gw>/<mask>` line is
+      the same on every device when gateway doesn't increment),
+      split the block by newline, classify each line-position as
+      SHARED or PER_DEVICE, and hoist SHARED lines into the shared
+      section while keeping PER_DEVICE lines per-device.
+
+    Both tiers preserve line ORDER — line at position K in a
+    block is compared to the SAME position K on every other
+    device, so semantic order within a stanza survives the
+    dedupe. Line-level dedupe requires matching shape across
+    devices (same block-line-count); if shapes disagree, fall
+    back to whole-block per-device.
+    """
     marker = {"juniper": "#", "cisco": "!", "arista": "!"}[vendor]
 
-    # Render every device, split each rendered blob into blocks
-    # separated by "\n\n" (each protocol stanza is one block, per
-    # `_render`'s "\n\n".join). Trim trailing/leading whitespace
-    # so identical-content blocks compare equal regardless of tail
-    # newlines.
     per_device_blocks: List[List[str]] = []
     for dev in devices:
         rendered = _render(dev, vendor).rstrip("\n")
         blocks = [b.strip("\n") for b in rendered.split("\n\n") if b.strip()]
         per_device_blocks.append(blocks)
 
-    # Block layout is stable per _render (header, iface, bgp?,
-    # ospf?, isis?, dhcp_relay?) so index i on device j maps to
-    # the "same kind" of block on device k. Classify each index as
-    # SHARED (byte-identical text on every device) or PER_DEVICE.
     max_i = max((len(b) for b in per_device_blocks), default=0)
-    shared_idx: List[int] = []
-    per_device_idx: List[int] = []
+
+    # Per-block-index bucket that either goes into the shared
+    # section (as a full block or as a slice of shared lines) OR
+    # into each device's per-device section.
+    shared_blocks: List[str] = []
+    per_device_blocks_out: List[List[str]] = [[] for _ in devices]
+
     for i in range(max_i):
         texts = [b[i] if i < len(b) else "" for b in per_device_blocks]
-        # The first block is the header (device_name in comment) —
-        # always per-device, never share.
-        if i > 0 and all(t == texts[0] and t != "" for t in texts):
-            shared_idx.append(i)
-        else:
-            per_device_idx.append(i)
+
+        # Index 0 is the header — device_name is in the comment,
+        # so it's always per-device regardless of text-equality.
+        if i == 0:
+            for j, t in enumerate(texts):
+                if t:
+                    per_device_blocks_out[j].append(t)
+            continue
+
+        # Block-level dedupe: whole stanza identical across all →
+        # one shared copy, no per-device carbon.
+        if all(t == texts[0] and t != "" for t in texts):
+            shared_blocks.append(texts[0])
+            continue
+
+        # Line-level dedupe: split each device's copy of this
+        # block into lines. If shapes match (same line count on
+        # every device), classify per-position.
+        line_sets = [t.split("\n") if t else [] for t in texts]
+        shapes = {len(ls) for ls in line_sets if ls}
+        if len(shapes) == 1 and shapes != {0}:
+            nlines = next(iter(shapes))
+            shared_positions: List[int] = []
+            for k in range(nlines):
+                lines_at_k = [ls[k] for ls in line_sets if ls]
+                if all(t == lines_at_k[0] for t in lines_at_k):
+                    shared_positions.append(k)
+
+            if shared_positions:
+                # Slice out the shared line-positions as one shared
+                # block (preserves original ordering). Per-device
+                # gets the remaining lines only.
+                shared_lines = [line_sets[0][k] for k in shared_positions]
+                shared_blocks.append("\n".join(shared_lines))
+                for j, ls in enumerate(line_sets):
+                    if not ls:
+                        continue
+                    remaining = [ls[k] for k in range(nlines) if k not in set(shared_positions)]
+                    if remaining:
+                        per_device_blocks_out[j].append("\n".join(remaining))
+                continue
+
+        # Shape mismatch OR no shared lines: whole block stays
+        # per-device.
+        for j, t in enumerate(texts):
+            if t:
+                per_device_blocks_out[j].append(t)
 
     chunks: List[str] = []
     banner_shared = (
@@ -240,29 +302,16 @@ def _dedupe_and_emit(devices: List[dict], vendor: str) -> str:
     )
     banner_per_dev = f"{marker} " + "=" * 68
 
-    # 1) Emit shared blocks once at top (from device 0 — they're
-    #    all identical by definition).
-    shared_blocks = [per_device_blocks[0][i] for i in shared_idx
-                     if i < len(per_device_blocks[0])]
     if shared_blocks:
         chunks.append(banner_shared)
         chunks.extend(shared_blocks)
 
-    # 2) Emit per-device sections. Each device contributes its
-    #    header block (index 0) plus any per-device unique blocks.
-    for j, blocks in enumerate(per_device_blocks):
-        dev_chunks: List[str] = []
-        for i in per_device_idx:
-            if i < len(blocks):
-                dev_chunks.append(blocks[i])
-        if not dev_chunks:
+    for j, blocks in enumerate(per_device_blocks_out):
+        if not blocks:
             continue
-        # Divider before every per-device section except when this
-        # is the very first thing emitted (no shared banner AND
-        # this is device 0).
         if chunks:
             chunks.append(banner_per_dev)
-        chunks.extend(dev_chunks)
+        chunks.extend(blocks)
 
     return "\n\n".join(chunks) + "\n"
 
@@ -455,7 +504,16 @@ def _render(device_data: dict, vendor: str) -> str:
             sections.append(relay)
 
     header = _header(vendor, device_name, vlan, ipv4, ipv6)
-    return header + "\n" + "\n\n".join(s for s in sections if s) + "\n"
+    # v0.5.321: header + sections joined with blank-line separator
+    # so the header is its own block for the dedupe pass in
+    # `_dedupe_and_emit`. Pre-fix, header was joined to iface_stanza
+    # with a single "\n" — the two stuck together as block 0,
+    # forcing the iface_stanza to inherit the header's always-
+    # per-device classification. That kept identical iface lines
+    # (vlan-tagging, unit N vlan-id N, family inet address <gw>)
+    # duplicated per-device even after the v0.5.321 line-level
+    # dedupe landed.
+    return "\n\n".join([header, *(s for s in sections if s)]) + "\n"
 
 
 def _header(vendor: str, name: str, vlan: str, ipv4: str, ipv6: str) -> str:

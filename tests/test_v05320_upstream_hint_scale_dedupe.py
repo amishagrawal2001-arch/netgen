@@ -117,11 +117,20 @@ def _bgp_scale():
 
 
 def test_bgp_scale_no_shared_banner_when_all_blocks_differ():
-    """Every block varies per device (interface has different
-    family-inet address; BGP has different neighbor IP). Nothing
-    is shared → no banner should appear."""
+    """(v0.5.320 assumption) — retained as a v0.5.321-compat
+    check that a shared banner ONLY appears when there are
+    actually shared lines. In BGP scale the interface's
+    `vlan-tagging` / `unit N vlan-id N` / `family inet address
+    <gw>/<mask>` lines and the BGP `autonomous-system` line are
+    shared (v0.5.321 line-level dedupe surfaces them). So this
+    scale case DOES have a banner — the pre-v0.5.321 assumption
+    that it didn't was wrong. Verify the banner text is correct
+    and the shared block is non-empty."""
     out = u.render_all(_bgp_scale())["juniper"]
-    assert "Shared upstream config" not in out
+    assert "Shared upstream config (applies to all 3 netgen devices)" in out
+    # The 4 shared lines that v0.5.321 hoisted.
+    assert "set interfaces ge-0/0/0 vlan-tagging" in out
+    assert "set routing-options autonomous-system 65000" in out
 
 
 def test_bgp_scale_all_three_bgp_neighbors_present():
@@ -134,15 +143,18 @@ def test_bgp_scale_all_three_bgp_neighbors_present():
 
 
 def test_bgp_scale_has_dividers_between_devices():
-    """When there's no shared block, each device is still separated
-    from the next by the ==== divider line so the operator can
-    visually scan boundaries. Count the FULL 68-char divider line
-    (a substring of `====` alone matches too much because the
-    divider is 68 dashes-of-equals)."""
+    """Each per-device section is separated from the next by the
+    68-char ==== divider. With v0.5.321 shared-lines hoisting,
+    the shared section also has a divider before the first per-
+    device block, so total = N dividers for N per-device sections
+    when a shared banner is present. (Pre-v0.5.321 this scale
+    had no shared banner → N-1 dividers; v0.5.321 surfaces
+    shared lines → N dividers.)"""
     out = u.render_all(_bgp_scale())["juniper"]
     divider_line = "# " + "=" * 68
-    # 3 devices → 2 dividers between them (before dev 1 and dev 2).
-    assert out.count(divider_line) == 2
+    # 3 devices with shared banner → 3 dividers (banner → dev0,
+    # dev0 → dev1, dev1 → dev2).
+    assert out.count(divider_line) == 3
 
 
 # ---------- Single-device unchanged ----------

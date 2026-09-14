@@ -2,6 +2,112 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.321] - 2026-09-14
+
+**Upstream Config Hint scale mode: line-level dedupe within
+blocks. Applies to ALL templates (BGP/OSPF/ISIS/DHCP), not just
+DHCP-relay.**
+
+Operator report on v0.5.320: block-level dedupe fixed DHCP-relay
+duplication but BGP/OSPF/ISIS templates still emit duplicate
+LINES inside their per-device blocks — e.g. `set routing-options
+autonomous-system 65000` appears N times because it lives inside
+the BGP block, and the BGP block varies per-device (group name
+carries the `-N` suffix). Same story for interface `vlan-tagging`
++ `unit N vlan-id N` + `family inet address <gw>/<mask>` — all
+identical across every device but held inside the interface
+block which varies (description line).
+
+### Root cause
+
+Two issues:
+
+1. Block-level dedupe fires only when a WHOLE stanza is byte-
+   identical across every device. When one line inside differs,
+   the whole block gets classified per-device and every other
+   line inside rides along duplicated.
+
+2. `_render` joined the header block to the iface_stanza with a
+   single newline instead of a blank line, gluing them into ONE
+   block at the split-by-`"\\n\\n"` boundary. The header carries
+   the per-device device_name comment, so the merged block was
+   force-classified per-device and iface_stanza never even got
+   a chance to participate in dedupe.
+
+### Fix
+
+**Line-level dedupe in `_dedupe_and_emit`:** when a block varies
+per-device but SHAPES match (same line count), split each device's
+copy by newline. For each line-position K, compare text across
+all devices. If identical → SHARED (hoisted into the shared
+section, preserving original ordering). Otherwise → PER_DEVICE
+(stays in the per-device block with only its unique lines).
+
+Shape mismatch (block has different line count on different
+devices — e.g. one device has an ipv6_gateway line the others
+don't) falls back to whole-block per-device. Safe conservative
+default.
+
+**`_render` header separator:** change from `header + "\\n" +
+"\\n\\n".join(sections)` to `"\\n\\n".join([header, *sections])`
+so the header is its own block and iface_stanza is block 1,
+eligible for line-level dedupe.
+
+### End-to-end
+
+**Before (v0.5.320, BGP scale of 3, IPv4 last-octet increment):**
+
+```
+# ============================
+# Upstream config for netgen device 'bgp-scale'
+set interfaces ge-0/0/0 vlan-tagging                          ← duplicated 3x
+set interfaces ge-0/0/0 unit 100 vlan-id 100                  ← duplicated 3x
+set interfaces ge-0/0/0 unit 100 description "peer:bgp-scale"
+set interfaces ge-0/0/0 unit 100 family inet address 10.0.0.1/24  ← duplicated 3x
+
+set routing-options autonomous-system 65000                    ← duplicated 3x
+set protocols bgp group NETGEN-bgp-scale type external
+...
+
+# ============================
+# ... same 3 shared lines repeated ...
+```
+
+**After (v0.5.321):**
+
+```
+# === Shared upstream config (applies to all 3 netgen devices) ===
+
+set interfaces ge-0/0/0 vlan-tagging                          ← once
+set interfaces ge-0/0/0 unit 100 vlan-id 100                  ← once
+set interfaces ge-0/0/0 unit 100 family inet address 10.0.0.1/24  ← once
+
+set routing-options autonomous-system 65000                    ← once
+
+# ============================
+# Upstream config for netgen device 'bgp-scale'
+set interfaces ge-0/0/0 unit 100 description "peer:bgp-scale"
+
+set protocols bgp group NETGEN-bgp-scale type external
+...
+```
+
+### Verification
+
+18 new lock-in tests in
+`tests/test_v05321_upstream_hint_line_level_dedupe.py` covering:
+interface `vlan-tagging` + `unit vlan-id` + `family inet
+address` all hoisted once; description stays per-device;
+BGP `autonomous-system` hoisted; per-device BGP group lines
+stay per-device N times; BGP neighbor IPs incremented per-device;
+OSPF stanza fully shared when interface subunit is shared;
+shape-mismatch fallback to per-device; Cisco/Arista
+`router bgp <asn>` hoisted; `_render` header-separator
+regression guard. Plus 2 v0.5.320 tests updated to reflect the
+new correct behavior (v0.5.320 assumed BGP-scale had no shared
+blocks; v0.5.321 surfaces them). All 100 upstream-hint tests
+across v05226/v05318/v05319/v05320/v05321 pass.
+
 ## [0.5.320] - 2026-09-14
 
 **Upstream Config Hint scale mode: dedupe shared blocks so
