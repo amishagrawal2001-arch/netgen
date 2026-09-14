@@ -3561,6 +3561,42 @@ class DevicesTab(QWidget):
                 info = self.get_device_info_by_name(device_name)
                 if info is not None:
                     info["Status"] = device_status
+                    # v0.5.314 (audit dhcp-lease-lost-on-nav): sync
+                    # the runtime DHCP-lease surface back into the
+                    # `all_devices` in-memory entry too. Pre-fix,
+                    # only "Status" was propagated. So the poll-
+                    # driven refresh painted the cells correctly
+                    # via _apply_device_status_row's own setText
+                    # code (lines 3587+ v4, 3644+ v6), but the
+                    # underlying `all_devices` entry stayed missing
+                    # dhcp_lease_ip / _mask / _gateway / _ip6 /
+                    # _prefix6 / _gateway6 / dhcp_mode. When the
+                    # operator navigated to a different interface
+                    # in the server tree and then back, the table
+                    # got wiped and populate_device_table re-added
+                    # rows from the STALE all_devices entry — the
+                    # v0.5.294/v0.5.302/v0.5.313 fallback blocks
+                    # in populate saw empty dhcp_lease_* → the
+                    # IPv4 cell went blank until the next 30 s
+                    # poll re-fetched the DB row.
+                    for _sync_field in (
+                        "dhcp_mode",
+                        "dhcp_state",
+                        "dhcp_lease_ip",
+                        "dhcp_lease_mask",
+                        "dhcp_lease_gateway",
+                        "dhcp_lease_server",
+                        "dhcp_lease_subnet",
+                        "dhcp_lease_ip6",
+                        "dhcp_lease_prefix6",
+                        "dhcp_lease_gateway6",
+                        "ipv4_address",
+                        "ipv6_address",
+                        "ipv4_gateway",
+                        "ipv6_gateway",
+                    ):
+                        if _sync_field in device_data:
+                            info[_sync_field] = device_data.get(_sync_field)
             except Exception:
                 pass
 

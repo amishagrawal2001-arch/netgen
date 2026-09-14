@@ -2,6 +2,70 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.314] - 2026-09-14
+
+**DHCP lease fields sync into `all_devices` on poll refresh —
+fixes "IPv4 cell blank after interface navigation" that v0.5.313
+Fix 1 didn't fully cover.**
+
+Operator report on srv06 device4 (DHCP client) post-v0.5.313:
+IPv4 column briefly showed "192.16.30.105 (leased)" — but when
+they switched interfaces in the server tree and came back, the
+IPv4 cell went BLANK and the IPv4 Gateway didn't populate at all.
+Waiting for the next 30 s poll brought it back.
+
+### Root cause
+
+`_apply_device_status_row` (widgets/devices_tab.py:3546) fetches
+the fresh DB row via `/api/device/database/devices/<id>` and
+paints the cells directly (v0.5.294/v0.5.302/v0.5.313 setText
+paths). But the underlying `all_devices` in-memory entry was
+never updated with the runtime DHCP-lease surface — only the
+"Status" field was propagated
+(`info["Status"] = device_status`).
+
+When the operator switched interfaces the table got wiped and
+`populate_device_table` re-added rows from the STALE
+`all_devices` entry. The v0.5.294 / v0.5.302 / v0.5.313
+populate-fallback blocks read `device_info.get("dhcp_lease_ip")`
+etc., saw empty, and the IPv4 cell stayed blank until the next
+30 s poll re-fetched the DB row and re-painted.
+
+### Fix
+
+In `_apply_device_status_row`, after syncing "Status", also copy
+each runtime DHCP-lease field from `device_data` (the fresh DB
+row) into `info` (the `all_devices` entry). Populate now sees
+the current lease on re-add.
+
+Fields synced (14):
+  * `dhcp_mode`, `dhcp_state` — mode gates the populate-fallback
+    branch (`if _dhcp_mode == "client":`)
+  * `dhcp_lease_ip` / `_mask` / `_gateway` / `_server` /
+    `_subnet` — v4 lease surface (v0.5.294)
+  * `dhcp_lease_ip6` / `_prefix6` / `_gateway6` — v6 lease
+    surface (v0.5.302)
+  * `ipv4_address` / `ipv6_address` / `ipv4_gateway` /
+    `ipv6_gateway` — late-fallback fields (v0.5.297 CIDR-strip
+    path)
+
+Guard `if _sync_field in device_data:` so we don't OVERWRITE
+existing `info[field]` with `None` on partial DB fetches.
+
+### Verification
+
+8 lock-in tests in
+`tests/test_v05314_dhcp_lease_sync_to_all_devices.py` covering
+marker presence, correct block placement (inside the existing
+Status-sync try), all v4/v6 lease fields + gate + late-fallback
+fields, and the omit-guard. All pass. ast.parse clean.
+
+### Operator action
+
+Upgrade to v0.5.314. device4 should now retain its
+`192.16.30.105 (leased)` display + IPv4 Gateway across interface
+navigations in the server tree. No re-apply needed.
+
 ## [0.5.313] - 2026-09-14
 
 **DHCP-client display polish + admin dependency dashboard.**
