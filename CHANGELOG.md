@@ -2,6 +2,93 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.319] - 2026-09-14
+
+**Upstream Config Hint: (a) Cisco/Arista relay parity with
+Juniper. (b) Scale expansion — N devices from Increment section
+produce N per-device stanzas.**
+
+Operator report on v0.5.318: Cisco/Arista relay stanzas had 2
+substantive lines (interface Vlan + ip helper-address) vs
+Juniper's 5, so the vendor-neutral concepts didn't line up.
+Also asked for the hint to auto-generate scale configs based on
+the dialog's Increment section — pre-fix, a scale of 100 devices
+produced ONE upstream stanza.
+
+### (a) Cisco / Arista DHCP-relay parity beefup
+
+**Cisco IOS** now also emits:
+  * `service dhcp` — global relay switch, explicitly shown (IOS
+    default is on but operators shouldn't have to remember that)
+  * `ip dhcp relay information trust-all` — closest analogue to
+    Junos `overrides allow-snooped-clients`; accepts giaddr-
+    relayed DHCP with option-82 info from downstream (matters in
+    multi-hop lab setups)
+  * `interface Vlan<N>` + `ip helper-address <IP>` — unchanged
+
+**Arista EOS** now also emits:
+  * `ip dhcp relay information option` — option-82 tagging so
+    the server can identify the source VLAN of a relayed request
+  * `interface Vlan<N>` + `ip helper-address <IP>` — unchanged
+
+Each line now has a leading `!` comment explaining what it does
+so the operator understands the equivalent to Juniper's block
+without cross-referencing docs.
+
+### (b) Scale expansion
+
+New helpers in `utils.upstream_hints`:
+
+  * `expand_for_scale(base, increment_meta) -> List[dict]` —
+    walks 0..count-1 applying per-i step to the axes the
+    operator ticked (MAC / IPv4 / IPv6 / gateway / VLAN), using
+    the octet-index / hextet-index from the dialog's combo
+    boxes. i=0 is the base verbatim; i>=1 gets `-<i+1>` on the
+    device_name so BGP neighbor descriptions read
+    `peer:netgen-device-2`, etc. Increment logic mirrors
+    `widgets/devices_tab._increment_ipv4/ipv6/mac` (same octet
+    layout, same overflow-ripple).
+
+  * `render_all(data)` — now accepts either a single dict
+    (single-device, unchanged) OR a list of dicts (scale mode).
+    Scale mode emits N per-device stanzas separated by a
+    `# ============================================================`
+    divider (comment marker matches the vendor).
+
+**Dialog snapshot** — `_snapshot_for_upstream_hint` now reads
+`increment_count.value()`. When > 1, builds an `increment_meta`
+dict from the 5 checkbox states + 3 octet/hextet/byte combos and
+calls `expand_for_scale`, returning a LIST. Count == 1 returns
+the single-dict form (backward compat).
+
+**Upstream Hint dialog** — title reflects the count:
+`Upstream Router Config Hint — <name> × N` so the operator
+visually knows the paste-body covers N devices. Falls back to
+the single-name title for dict input.
+
+### End-to-end example
+
+Dialog: name=`bgp-scale`, IPv4=`10.0.0.2`, MAC=`00:11:22:33:44:01`,
+BGP enabled, Increment: MAC + IPv4 (both last octet), count=3.
+
+Juniper tab now shows 3 stanzas — one per device — each with the
+correct `neighbor 10.0.0.2` / `neighbor 10.0.0.3` /
+`neighbor 10.0.0.4` and a matching `peer:bgp-scale{,-2,-3}`
+description on the interface subunit.
+
+### Verification
+
+23 new lock-in tests in
+`tests/test_v05319_upstream_hint_scale_and_vendor_parity.py`
+covering: Cisco/Arista parity lines present; Juniper unchanged;
+`expand_for_scale` for count=1/3, first-is-base, per-i BGP
+neighbor increment, MAC byte-carry overflow, VLAN increment,
+device-name suffix, gateway pin-vs-increment, deepcopy safety;
+`render_all(list)` shape + divider + BGP neighbors per device;
+dialog snapshot integration; window title × N. Plus all 26
+pre-existing v0.5.226 tests + 18 v0.5.318 tests still pass — no
+regressions.
+
 ## [0.5.318] - 2026-09-14
 
 **DHCP-relay stanza in the Upstream Config Hint dialog — for all

@@ -2370,6 +2370,56 @@ class AddDeviceDialog(QDialog):
                 # placeholder unless upstream_server_hint is set.
             }
 
+        # v0.5.319 (audit upstream-hint-scale): the Increment section
+        # can turn ONE dialog into N devices (default count=2, up to
+        # 10000). Pre-fix, the upstream-hint dialog only saw the
+        # BASE device — a scale of 100 got exactly one stanza and
+        # the operator had to extrapolate. Expand into a list of
+        # N snapshots by delegating to utils.upstream_hints.
+        # expand_for_scale, then render_all walks the list and emits
+        # N per-device stanzas. Count == 1 returns the single-dict
+        # form (backward compat with pre-v0.5.319 callers).
+        _incr_count = 1
+        try:
+            _incr_count = int(self.increment_count.value())
+        except (AttributeError, TypeError, ValueError):
+            _incr_count = 1
+        if _incr_count > 1:
+            def _combo_idx(name):
+                w = getattr(self, name, None)
+                try:
+                    return int(w.currentIndex()) if w is not None else 0
+                except Exception:
+                    return 0
+            increment_meta = {
+                "count": _incr_count,
+                "mac": {
+                    "on":       checked("increment_checkbox_mac"),
+                    "byte_idx": _combo_idx("mac_byte_combo"),
+                },
+                "ipv4": {
+                    "on":        checked("increment_checkbox_ipv4"),
+                    "octet_idx": _combo_idx("ipv4_octet_combo"),
+                },
+                "ipv6": {
+                    "on":         checked("increment_checkbox_ipv6"),
+                    "hextet_idx": _combo_idx("ipv6_hextet_combo"),
+                },
+                "gateway": {
+                    "on":        checked("increment_checkbox_gateway"),
+                    "octet_idx": _combo_idx("gateway_octet_combo"),
+                },
+                "vlan": {
+                    "on": checked("increment_checkbox_vlan"),
+                },
+            }
+            try:
+                from utils.upstream_hints import expand_for_scale
+                return expand_for_scale(data, increment_meta)
+            except Exception:
+                # Fall through — single-device form remains valid.
+                pass
+
         return data
 
     def validate_and_accept(self):

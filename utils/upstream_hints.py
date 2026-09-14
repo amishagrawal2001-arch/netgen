@@ -38,8 +38,9 @@ doesn't have enabled — the section header just doesn't appear.
 
 from __future__ import annotations
 
+import copy
 import ipaddress
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 
 # --- Small extractors ------------------------------------------------------
@@ -151,12 +152,176 @@ def render_arista(device_data: dict) -> str:
     return _render(device_data, "arista")
 
 
-def render_all(device_data: dict) -> Dict[str, str]:
+def render_all(device_data: Union[dict, List[dict]]) -> Dict[str, str]:
+    """v0.5.319: accepts a single device_data dict (single-device
+    mode, unchanged) OR a LIST of device_data dicts (scale mode).
+    For scale, emits N per-device stanzas separated by a divider.
+
+    Scale mode is how the Add Device dialog's "Increment" section
+    surfaces here — with `increment_count=N` and the MAC/IPv4/IPv6/
+    gateway/VLAN checkboxes ticked, the dialog now expands into a
+    list of N snapshots (base + N-1 incremented copies) so the
+    operator gets N upstream stanzas — one per netgen device —
+    without having to open the dialog N times."""
+    if isinstance(device_data, list):
+        return _render_all_scale(device_data)
     return {
         "juniper": render_juniper(device_data),
         "cisco":   render_cisco(device_data),
         "arista":  render_arista(device_data),
     }
+
+
+def _render_all_scale(devices: List[dict]) -> Dict[str, str]:
+    if not devices:
+        return {"juniper": "", "cisco": "", "arista": ""}
+    dividers = {
+        "juniper": "\n\n# " + "=" * 68 + "\n",
+        "cisco":   "\n\n! " + "=" * 68 + "\n",
+        "arista":  "\n\n! " + "=" * 68 + "\n",
+    }
+    out: Dict[str, List[str]] = {"juniper": [], "cisco": [], "arista": []}
+    for dev in devices:
+        out["juniper"].append(render_juniper(dev))
+        out["cisco"].append(render_cisco(dev))
+        out["arista"].append(render_arista(dev))
+    return {v: dividers[v].join(out[v]) for v in out}
+
+
+# --- Scale expansion --------------------------------------------------------
+#
+# v0.5.319 (audit upstream-hint-scale): the Add Device dialog's
+# Increment section lets the operator generate N devices from one
+# base (MAC/IPv4/IPv6/gateway/VLAN each incrementable in a chosen
+# octet). Pre-fix, the upstream-hint dialog only saw the base
+# device — a 100-device scale had ONE stanza, and the operator
+# would have to manually reason about how to extend it. Now the
+# dialog's snapshot builder calls `expand_for_scale` and hands the
+# renderer a list of N per-device dicts, and `render_all` walks it.
+
+
+def expand_for_scale(base: dict, increment_meta: dict) -> List[dict]:
+    """Return `count` copies of `base`, with per-i increments
+    applied to the fields the operator flagged.
+
+    `increment_meta` shape:
+      {
+        "count": int (>= 1),
+        "mac":        {"on": bool, "byte_idx": 0..5},
+        "ipv4":       {"on": bool, "octet_idx": 0..3},
+        "ipv6":       {"on": bool, "hextet_idx": 0..7},
+        "gateway":    {"on": bool, "octet_idx": 0..3},
+        "vlan":       {"on": bool},
+      }
+
+    Indexes match the dialog's *_combo.currentIndex() layout
+    (0 = last octet/hextet/byte; 3 = 1st octet for IPv4, etc.)
+    so this stays in lockstep with widgets/devices_tab._increment_ipv4.
+
+    The device_name is appended `-i` for i >= 1 so the emitted
+    stanzas don't all say `peer:netgen-device`.
+    """
+    count = int(increment_meta.get("count", 1) or 1)
+    if count <= 1:
+        return [copy.deepcopy(base)]
+
+    out: List[dict] = []
+    base_name = str(base.get("device_name") or "netgen-device")
+    for i in range(count):
+        dev = copy.deepcopy(base)
+        if i == 0:
+            out.append(dev)
+            continue
+
+        dev["device_name"] = f"{base_name}-{i + 1}"
+
+        mac = (increment_meta.get("mac") or {})
+        if mac.get("on") and dev.get("mac_address"):
+            dev["mac_address"] = _incr_mac(dev["mac_address"], i, int(mac.get("byte_idx", 0)))
+
+        ipv4 = (increment_meta.get("ipv4") or {})
+        if ipv4.get("on") and dev.get("ipv4_address"):
+            dev["ipv4_address"] = _incr_ipv4(dev["ipv4_address"], i, int(ipv4.get("octet_idx", 0)))
+
+        gw = (increment_meta.get("gateway") or {})
+        if gw.get("on") and dev.get("ipv4_gateway"):
+            dev["ipv4_gateway"] = _incr_ipv4(dev["ipv4_gateway"], i, int(gw.get("octet_idx", 0)))
+
+        ipv6 = (increment_meta.get("ipv6") or {})
+        if ipv6.get("on") and dev.get("ipv6_address"):
+            dev["ipv6_address"] = _incr_ipv6(dev["ipv6_address"], i, int(ipv6.get("hextet_idx", 0)))
+        if ipv6.get("on") and dev.get("ipv6_gateway"):
+            # v6 gateway rides the v6 hextet index — same as v4
+            # gateway rides the v4 octet index in the widget.
+            dev["ipv6_gateway"] = _incr_ipv6(dev["ipv6_gateway"], i, int(ipv6.get("hextet_idx", 0)))
+
+        vlan = (increment_meta.get("vlan") or {})
+        if vlan.get("on"):
+            try:
+                dev["vlan"] = str(int(str(dev.get("vlan") or "0").strip()) + i)
+            except (ValueError, TypeError):
+                pass
+
+        out.append(dev)
+    return out
+
+
+def _incr_ipv4(addr: str, step: int, octet_idx: int) -> str:
+    """Mirror of widgets/devices_tab._increment_ipv4. octet_idx
+    0 = 4th (last) octet, 3 = 1st octet. Overflow ripples LEFT."""
+    try:
+        parts = list(map(int, str(addr).split(".")))
+        if len(parts) != 4:
+            return addr
+        target = 3 - octet_idx
+        parts[target] += step
+        for j in range(3, -1, -1):
+            while parts[j] > 255:
+                parts[j] -= 256
+                if j > 0:
+                    parts[j - 1] += 1
+        return ".".join(map(str, parts))
+    except (ValueError, TypeError):
+        return addr
+
+
+def _incr_ipv6(addr: str, step: int, hextet_idx: int) -> str:
+    """Mirror of widgets/devices_tab._increment_ipv6. hextet_idx
+    0 = 8th (last) hextet, 7 = 1st hextet."""
+    try:
+        exploded = ipaddress.IPv6Address(str(addr)).exploded
+        hextets = [int(h, 16) for h in exploded.split(":")]
+        target = 7 - hextet_idx
+        hextets[target] += step
+        for j in range(7, -1, -1):
+            while hextets[j] > 0xFFFF:
+                hextets[j] -= 0x10000
+                if j > 0:
+                    hextets[j - 1] += 1
+        packed = ":".join(f"{h:04x}" for h in hextets)
+        # Re-collapse to canonical form for a compact display.
+        return str(ipaddress.IPv6Address(packed))
+    except (ValueError, ipaddress.AddressValueError):
+        return addr
+
+
+def _incr_mac(mac: str, step: int, byte_idx: int) -> str:
+    """Mirror of widgets/devices_tab._increment_mac. byte_idx
+    0 = 6th (last) byte, 5 = 1st byte."""
+    try:
+        parts = [int(b, 16) for b in str(mac).split(":")]
+        if len(parts) != 6:
+            return mac
+        target = 5 - byte_idx
+        parts[target] += step
+        for j in range(5, -1, -1):
+            while parts[j] > 255:
+                parts[j] -= 256
+                if j > 0:
+                    parts[j - 1] += 1
+        return ":".join(f"{b:02x}" for b in parts)
+    except (ValueError, TypeError):
+        return mac
 
 
 def _render(device_data: dict, vendor: str) -> str:
@@ -495,11 +660,24 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
         return "\n".join(lines)
 
     if vendor == "cisco":
+        # v0.5.319: parity with Juniper — include the global service
+        # + trust-info equivalents so the operator sees the full
+        # relay picture, not just `ip helper-address`. IOS defaults
+        # `service dhcp` to ON; we still emit it explicitly so the
+        # operator can verify. `ip dhcp relay information trust-all`
+        # is the closest analogue to Juniper's
+        # `overrides allow-snooped-clients` — accepts giaddr-relayed
+        # DHCP requests that carry option-82 info from a downstream
+        # relay (matters in multi-hop lab setups).
         lines = [
             "! --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
             f"! Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
             f"! Client-VLAN SVI: interface {svi_cisco}{svi_note}",
-            "! (IOS uses `ip helper-address` on the client-facing SVI — global service is on by default.)",
+            "! Global DHCP relay service (usually already on by default in IOS):",
+            "service dhcp",
+            "! Trust relayed DHCP info from downstream (mirror of Junos allow-snooped-clients):",
+            "ip dhcp relay information trust-all",
+            "! Client-facing SVI: forward this VLAN's DHCP requests to the server device:",
             f"interface {svi_cisco}",
             f" ip helper-address {server_ip}",
             "!",
@@ -507,10 +685,19 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
         return "\n".join(lines)
 
     if vendor == "arista":
+        # v0.5.319: parity with Juniper. Arista EOS uses
+        # `ip helper-address` on the SVI (same as IOS) but also has
+        # `ip dhcp relay information option` for option-82 tagging
+        # and a `dhcp relay always-on` mode; include both so the
+        # operator sees the equivalent knobs to Juniper's
+        # forwarding-options block.
         lines = [
             "! --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
             f"! Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
             f"! Client-VLAN SVI: interface {svi_arista}{svi_note}",
+            "! Tag relayed DHCP requests with option-82 so the server can identify the source VLAN:",
+            "ip dhcp relay information option",
+            "! Client-facing SVI: forward this VLAN's DHCP requests to the server device:",
             f"interface {svi_arista}",
             f"   ip helper-address {server_ip}",
             "!",

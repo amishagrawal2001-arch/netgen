@@ -26,14 +26,27 @@ class UpstreamHintDialog(QDialog):
     response; both formats are supported by utils.upstream_hints.
     """
 
-    def __init__(self, device_data: dict, parent=None):
+    def __init__(self, device_data, parent=None):
         super().__init__(parent)
-        name = (
-            device_data.get("device_name")
-            or device_data.get("Device Name")
-            or "device"
-        )
-        self.setWindowTitle(f"Upstream Router Config Hint — {name}")
+        # v0.5.319: accept dict (single) OR list (scale mode from
+        # Increment section — N per-device snapshots).
+        if isinstance(device_data, list) and device_data:
+            first = device_data[0]
+            name = (
+                first.get("device_name")
+                or first.get("Device Name")
+                or "device"
+            )
+            self.setWindowTitle(
+                f"Upstream Router Config Hint — {name} × {len(device_data)}"
+            )
+        else:
+            name = (
+                (device_data or {}).get("device_name")
+                or (device_data or {}).get("Device Name")
+                or "device"
+            )
+            self.setWindowTitle(f"Upstream Router Config Hint — {name}")
         self.resize(720, 560)
 
         snippets = render_all(device_data)
