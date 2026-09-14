@@ -509,13 +509,35 @@ class AddDeviceDialog(QDialog):
         self.increment_enable_all.setChecked(False)
         self.increment_enable_all.toggled.connect(self._on_enable_all_toggled)
         
-        # Individual increment checkboxes
+        # Individual increment checkboxes.
+        # v0.5.324 (audit scale-auto-increment): default MAC + IPv4
+        # + IPv6 + Loopback to CHECKED. count defaults to 2 (scale
+        # is on by default), and without these ticked the operator
+        # gets N devices with the SAME MAC/IPv4/router-id — which:
+        #   * on the netgen box: `ip addr add` EEXIST → silent
+        #     apply-failure on the 2nd device;
+        #   * on the switch: BGP refuses two sessions to the same
+        #     peer, OSPF/ISIS flap on duplicate router-id, L2
+        #     fights for frames.
+        # The SCALE COLLISION WARNING (v0.5.322) catches this at
+        # Upstream Hint time, but it's better to be right by
+        # default than to warn. Operators who WANT shared identity
+        # (rare) can un-tick.
+        #
+        # Gateway + VLAN stay UNCHECKED — those are usually shared
+        # across a scale set (single upstream gateway; single VLAN
+        # per interface). VXLAN also stays UNCHECKED — VNI/UDP
+        # increment is scale-flow-specific.
         self.increment_checkbox_mac = QCheckBox("MAC")
+        self.increment_checkbox_mac.setChecked(True)
         self.increment_checkbox_ipv4 = QCheckBox("IPv4")
+        self.increment_checkbox_ipv4.setChecked(True)
         self.increment_checkbox_ipv6 = QCheckBox("IPv6")
+        self.increment_checkbox_ipv6.setChecked(True)
         self.increment_checkbox_gateway = QCheckBox("Gateway")
         self.increment_checkbox_vlan = QCheckBox("VLAN")
         self.increment_checkbox_loopback = QCheckBox("Loopback")
+        self.increment_checkbox_loopback.setChecked(True)
         self.increment_checkbox_vxlan = QCheckBox("VXLAN")
         
         # Connect individual checkboxes to update "Enable All" state
@@ -2411,6 +2433,19 @@ class AddDeviceDialog(QDialog):
                 },
                 "vlan": {
                     "on": checked("increment_checkbox_vlan"),
+                },
+                # v0.5.324 (audit scale-auto-increment): loopback
+                # increment MUST be wired here — pre-fix the meta
+                # dict omitted the "loopback" key entirely so
+                # `expand_for_scale` had no way to increment even
+                # when the Loopback checkbox was ticked. Result:
+                # N devices with the same loopback → same OSPF/BGP
+                # router-id → SCALE COLLISION WARNING fired without
+                # a code-side path to fix it.
+                "loopback": {
+                    "on":            checked("increment_checkbox_loopback"),
+                    "ipv4_octet_idx":  _combo_idx("loopback_ipv4_octet_combo"),
+                    "ipv6_hextet_idx": _combo_idx("loopback_ipv6_hextet_combo"),
                 },
             }
             try:

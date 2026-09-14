@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.324] - 2026-09-14
+
+**Scale increment: sane defaults + loopback support. Fixes
+"config templates still not rendering correctly" — the default
+scale run now produces unique-per-device identity without
+manual checkbox ticking.**
+
+Operator report post-v0.5.323: every scale render still shows a
+SCALE COLLISION WARNING by default. Two independent bugs:
+
+### Bug 1: Increment checkboxes defaulted UNCHECKED
+
+count defaulted to 2 (scale is on out of the box) but the MAC /
+IPv4 / IPv6 / Loopback increment checkboxes all defaulted to
+UNCHECKED. Combined outcome: the very first scale run always
+emits N devices with the same MAC/IPv4/router-id → collision
+warning always fires by default.
+
+### Bug 2: Loopback increment never implemented
+
+The dialog has a `Loopback` increment checkbox with two combos
+(`loopback_ipv4_octet_combo`, `loopback_ipv6_hextet_combo`) but
+`expand_for_scale` had NO `loopback` handling — the `loopback`
+key was missing from `_snapshot_for_upstream_hint`'s meta dict
+AND from `expand_for_scale`'s increment logic. Even a user who
+ticked the box got identical loopbacks across N devices →
+OSPF/BGP router-id collision → SCALE COLLISION WARNING for
+Loopback IPv4/IPv6.
+
+### Fix
+
+**Dialog defaults (v0.5.324 checkbox init):**
+  * `increment_checkbox_mac.setChecked(True)`
+  * `increment_checkbox_ipv4.setChecked(True)`
+  * `increment_checkbox_ipv6.setChecked(True)`
+  * `increment_checkbox_loopback.setChecked(True)`
+  * Gateway + VLAN + VXLAN stay UNCHECKED (common lab pattern:
+    shared gateway, shared VLAN, VXLAN VNI-per-flow is
+    specialized).
+
+**Loopback increment (`expand_for_scale` + snapshot):**
+  * `expand_for_scale` reads `increment_meta["loopback"]` with
+    `{"on": bool, "ipv4_octet_idx": int, "ipv6_hextet_idx": int}`
+    and applies per-i step to `loopback_ipv4` /
+    `loopback_ipv6` using the same octet/hextet semantics as
+    the primary IPv4/IPv6.
+  * `_snapshot_for_upstream_hint` now emits the `loopback` key
+    with the checkbox state + both combo indexes. Pre-fix the
+    key was missing entirely so `expand_for_scale` had no way
+    to increment even when the box was ticked.
+
+### End-to-end
+
+BGP template, count=2 (defaults, no operator interaction):
+
+**Before (v0.5.323):**
+
+```
+# !!! SCALE COLLISION WARNING !!!
+# All 2 netgen devices share values that MUST be unique per device.
+# - All devices have the same IPv4 address '192.168.0.2' → tick the 'IPv4' checkbox.
+# - All devices have the same MAC address '00:11:22:33:44:55' → tick the 'MAC' checkbox.
+# - All devices have the same Loopback IPv4 '192.255.10.4' → tick the 'Loopback' checkbox.
+# - All devices have the same Loopback IPv6 '2001:ff00:10::3' → tick the 'Loopback' checkbox.
+...
+set protocols bgp group NETGEN-netgen-device neighbor 192.168.0.2 ...
+set protocols bgp group NETGEN-netgen-device-2 neighbor 192.168.0.2 ...   ← same peer IP!
+```
+
+**After (v0.5.324):**
+
+```
+# === Shared upstream config (applies to all 2 netgen devices) ===
+...
+set protocols bgp group NETGEN-netgen-device neighbor 192.168.0.2 ...
+set protocols bgp group NETGEN-netgen-device-2 neighbor 192.168.0.3 ...   ← unique per device
+```
+
+No warning. Zero manual ticks required.
+
+Operators who WANT shared identity across N devices (rare —
+maybe a single-image test where devices deliberately alias)
+explicitly un-tick.
+
+### Verification
+
+18 lock-in tests in
+`tests/test_v05324_scale_auto_increment_defaults.py`:
+  * 7 tests for checkbox defaults (4 checked, 3 unchecked)
+  * 6 tests for loopback increment in `expand_for_scale`
+    (v4 last-octet, v6 last-hextet, 3rd-octet, 5th-hextet,
+    off-keeps-constant, missing-key-safe)
+  * 1 test for snapshot wiring (`loopback` key + combo refs)
+  * 2 end-to-end: default BGP scale has no collision warning +
+    per-device unique BGP neighbors
+  * 2 AST-parse guards
+
+All 205 pre-existing upstream-hint tests still pass (223 total).
+
 ## [0.5.323] - 2026-09-14
 
 **Audit + regression guard: no template shape produces double-

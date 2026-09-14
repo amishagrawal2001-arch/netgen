@@ -481,6 +481,22 @@ def expand_for_scale(base: dict, increment_meta: dict) -> List[dict]:
             except (ValueError, TypeError):
                 pass
 
+        # v0.5.324 (audit scale-auto-increment): loopback IPs
+        # weren't incremented pre-fix, even when the dialog's
+        # Loopback checkbox was ticked. Result: N scaled devices
+        # got the same loopback → same OSPF/BGP router-id → the
+        # SCALE COLLISION WARNING fired but nothing here fixed it.
+        # Same octet/hextet semantics as the primary IPv4/IPv6.
+        loopback = (increment_meta.get("loopback") or {})
+        if loopback.get("on") and dev.get("loopback_ipv4"):
+            dev["loopback_ipv4"] = _incr_ipv4(
+                dev["loopback_ipv4"], i, int(loopback.get("ipv4_octet_idx", 0)),
+            )
+        if loopback.get("on") and dev.get("loopback_ipv6"):
+            dev["loopback_ipv6"] = _incr_ipv6(
+                dev["loopback_ipv6"], i, int(loopback.get("ipv6_hextet_idx", 0)),
+            )
+
         out.append(dev)
     return out
 
