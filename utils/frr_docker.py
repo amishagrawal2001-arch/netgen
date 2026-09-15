@@ -466,11 +466,21 @@ class FRRDockerManager:
         h = hashlib.md5(str(device_id or "").encode()).hexdigest()[:8]
         return self.VRF_TABLE_BASE + (int(h, 16) % 1000)
 
-    def _create_vrf(self, device_id: str, iface_name: str) -> Optional[str]:
+    def _create_vrf(self, device_id: str, iface_name: str,
+                    ipv4_gateway: Optional[str] = None,
+                    ipv6_gateway: Optional[str] = None) -> Optional[str]:
         """Create the VRF for a device and move the iface into it.
 
         Returns the VRF name on success, None on failure. Idempotent:
         re-running on an existing VRF/iface is fine.
+
+        v0.5.340: `ipv4_gateway` / `ipv6_gateway` when provided cause
+        a `default via <gw>` route to be installed in the VRF's table.
+        Without this, replies from any DHCP-server / BGP / OSPF
+        process running inside the VRF fail to reach off-subnet
+        destinations (e.g. a DHCPv6 relay agent's IP on a different
+        VLAN's IRB). Both gateway args are optional — omit to skip
+        the install for that family.
         """
         vrf_name = self._vrf_name(device_id)
         vrf_table = self._vrf_table(device_id)
@@ -667,6 +677,63 @@ class FRRDockerManager:
                     f"raised (self-ping in VRF may fail): {_local_route_exc}"
                 )
 
+            # v0.5.340 (audit vrf-default-route-missing): when the
+            # operator declared a gateway on the device, install a
+            # `default via <gw>` route in the VRF's table so any
+            # process running inside the VRF (DHCP-relay reply
+            # path, BGP-open, OSPF-hello, ping) can reach off-
+            # subnet destinations.
+            #
+            # Operator on srv06 2026-09-15: device5 DHCPv6 relay-mode
+            # server (vlan20, 2001:db8:20::2/64, serving pool
+            # 2001:db8:30::/64 to vlan40 clients via QFX relay).
+            # v0.5.332 installed the connected 2001:db8:20::/64 route
+            # in the VRF, but NO default route — dnsmasq's
+            # ADVERTISE/REPLY back to the QFX's irb.40 IP
+            # (2001:db8:30::1) got "Network is unreachable" and the
+            # kernel silently dropped every reply. Client on vlan40
+            # never leased despite QFX correctly relaying solicits.
+            #
+            # Fix: install `default via <ipv6_gateway>` (and the v4
+            # counterpart) in the VRF's table. Idempotent — swallow
+            # "File exists" so re-apply doesn't error. Both families
+            # gated on operator having declared a gateway; skip
+            # otherwise.
+            for _fam_flag, _fam_gw in (("-4", ipv4_gateway),
+                                       ("-6", ipv6_gateway)):
+                if not _fam_gw:
+                    continue
+                _default_cmd = [
+                    "ip", _fam_flag, "route", "add",
+                    "default",
+                    "via", str(_fam_gw),
+                    "dev", iface_name,
+                    "table", str(vrf_table),
+                ]
+                try:
+                    _dr = subprocess.run(
+                        _default_cmd,
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if _dr.returncode == 0:
+                        logger.info(
+                            f"[VRF] device {device_id}: installed "
+                            f"default via {_fam_gw} dev {iface_name} "
+                            f"table {vrf_table} ({_fam_flag}) (v0.5.340)"
+                        )
+                    elif "File exists" not in (_dr.stderr or ""):
+                        logger.warning(
+                            f"[VRF] device {device_id}: failed to install "
+                            f"default via {_fam_gw} dev {iface_name} "
+                            f"table {vrf_table} ({_fam_flag}): "
+                            f"{_dr.stderr.strip()}"
+                        )
+                except Exception as _dr_exc:
+                    logger.warning(
+                        f"[VRF] device {device_id}: default-route install "
+                        f"raised for {_fam_flag} {_fam_gw}: {_dr_exc}"
+                    )
+
             logger.info(
                 f"[VRF] device {device_id}: {iface_name} → {vrf_name} (table {vrf_table})"
             )
@@ -739,8 +806,20 @@ class FRRDockerManager:
                     else:
                         _reconcile_iface = None
                     if _reconcile_iface:
+                        # v0.5.340: pass operator-declared gateways so
+                        # the VRF's default route gets installed too.
+                        _reap_v4_gw = str(
+                            device_config.get('ipv4_gateway') or ''
+                        ).strip() or None
+                        _reap_v6_gw = str(
+                            device_config.get('ipv6_gateway') or ''
+                        ).strip() or None
                         try:
-                            _reconcile_vrf = self._create_vrf(device_id, _reconcile_iface)
+                            _reconcile_vrf = self._create_vrf(
+                                device_id, _reconcile_iface,
+                                ipv4_gateway=_reap_v4_gw,
+                                ipv6_gateway=_reap_v6_gw,
+                            )
                             if _reconcile_vrf:
                                 device_config['vrf_name'] = _reconcile_vrf
                                 logger.info(
@@ -795,7 +874,20 @@ class FRRDockerManager:
             # blocks. Failure here is non-fatal — single-device
             # deployments still work without VRF; we just lose
             # multi-device isolation.
-            vrf_name = self._create_vrf(device_id, iface_name)
+            # v0.5.340: pass operator-declared gateways so the VRF's
+            # default route gets installed alongside the connected
+            # (v0.5.332) and local (v0.5.310) routes.
+            _fresh_v4_gw = str(
+                device_config.get('ipv4_gateway') or ''
+            ).strip() or None
+            _fresh_v6_gw = str(
+                device_config.get('ipv6_gateway') or ''
+            ).strip() or None
+            vrf_name = self._create_vrf(
+                device_id, iface_name,
+                ipv4_gateway=_fresh_v4_gw,
+                ipv6_gateway=_fresh_v6_gw,
+            )
             if vrf_name:
                 device_config['vrf_name'] = vrf_name
             else:

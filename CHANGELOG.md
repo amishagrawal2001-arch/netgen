@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.340] - 2026-09-15
+
+**`_create_vrf` installs `default via <gateway>` in the VRF's
+routing table. Fixes silent drop of any reply that has to leave
+the VRF's own subnet — including DHCPv6 relay-mode
+ADVERTISE/REPLY back to a cross-VLAN relay agent.**
+
+### Root cause
+
+Operator on srv06 verifying DHCPv6 end-to-end (device5 = relay-
+mode DHCPv6 server on vlan20 `2001:db8:20::2/64` serving pool
+`2001:db8:30::/64` to vlan40 clients via QFX relay). QFX correctly
+relay-forwarded solicits; dnsmasq processed them; ADVERTISE went
+out. Then silence.
+
+VRF v6 table showed:
+```
+2001:db8:20::/64 dev vlan20 proto kernel  ← v0.5.332 fix
+fe80::/64        dev vlan20 proto kernel
+```
+
+No default route. dnsmasq's reply to `2001:db8:30::1` (QFX irb.40)
+returned "Network is unreachable" inside the VRF → kernel silently
+dropped every reply. Client on vlan40 never leased.
+
+Manual `ip -6 route add default via 2001:db8:20::1 dev vlan20 vrf
+vrf-31ed2e776f5` unblocked immediately (verified: vlan40 got
+`2001:db8:30::18a/128`).
+
+### Fix
+
+Extend `_create_vrf` to accept optional `ipv4_gateway` and
+`ipv6_gateway` params and install `default via <gw> dev <iface>
+table <vrf_table>` for each family when supplied. Both call sites
+in `start_frr_container` (fresh launch + v0.5.333 reconcile
+on-re-apply) pass the values from `device_config`.
+
+Idempotent — swallows "File exists" on re-run. Same shape as the
+v0.5.310 (local host route) and v0.5.332 (connected route) fixes
+that already live in `_create_vrf`.
+
+### Files touched
+
+- `utils/frr_docker.py`: v0.5.340 marker + `ipv4_gateway` /
+  `ipv6_gateway` params on `_create_vrf`; default-route install in
+  the fam-flag loop; both fresh-launch and reconcile call sites
+  pass the gateway values
+- `tests/test_v05340_vrf_default_route.py`: 11 source-level guards
+
+### Verification
+
+- 11 new tests pass; v0.5.310, v0.5.332 markers still intact
+- Manually validated on srv06 2026-09-15 with the exact scenario:
+  once the default v6 route was in the VRF, dnsmasq's REPLY reached
+  the QFX and vlan40 client leased `2001:db8:30::18a` on the next
+  SOLICIT
+
+---
+
 ## [0.5.339] - 2026-09-15
 
 **Fix chicken-and-egg where v0.5.335/336's L3-remote detection
