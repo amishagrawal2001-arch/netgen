@@ -3775,10 +3775,30 @@ class DevicesTab(QWidget):
             self.set_status_icon_with_individual_ips(row, arp_results)
 
             # Overall status icon: require only the configured families.
+            # v0.5.334 (audit ipv4-required-on-ipv6-only): operator
+            # on srv06 2026-09-15 hit this on device5 (IPv6-only,
+            # 2001:db8:20::2/64 on vlan20, no IPv4 configured):
+            # v0.5.333 fixed the VRF reconcile so `arp_ipv6_resolved`
+            # flipped True on re-apply, but the overall status still
+            # went yellow because this code seeded `overall_resolved`
+            # with `arp_results["ipv4_resolved"]` UNCONDITIONALLY,
+            # ignoring whether IPv4 was configured at all. On an
+            # IPv6-only device the server correctly stores
+            # `arp_ipv4_resolved=0` (nothing to resolve), which the
+            # client then AND-ed into overall_resolved → False →
+            # yellow icon.
+            #
+            # Fix: mirror the ipv6_configured / gateway_configured
+            # pattern — only require IPv4 to be resolved when IPv4
+            # is actually configured. Start with True and AND in
+            # each family that exists.
             if device_status == "Running":
+                ipv4_configured = bool((device_data.get("ipv4_address") or device_data.get("IPv4") or "").strip())
                 ipv6_configured = bool((device_data.get("ipv6_address") or device_data.get("IPv6") or "").strip())
                 gateway_configured = bool((device_data.get("ipv4_gateway") or device_data.get("IPv4 Gateway") or "").strip())
-                overall_resolved = arp_results["ipv4_resolved"]
+                overall_resolved = True
+                if ipv4_configured:
+                    overall_resolved = overall_resolved and arp_results["ipv4_resolved"]
                 if ipv6_configured:
                     overall_resolved = overall_resolved and arp_results["ipv6_resolved"]
                 if gateway_configured:
@@ -9463,15 +9483,25 @@ class DevicesTab(QWidget):
                 ipv4_resolved = bool(arp_ipv4_resolved)
                 ipv6_resolved = bool(arp_ipv6_resolved)
                 gateway_resolved = bool(arp_gateway_resolved)
-                
-                # Determine whether IPv6/Gateway were actually configured
+
+                # v0.5.334 (audit ipv4-required-on-ipv6-only): also
+                # check whether IPv4 is configured. IPv6-only devices
+                # (device5: 2001:db8:20::2/64 on vlan20, no v4) had
+                # `arp_ipv4_resolved=0` (correctly — nothing to
+                # resolve) but this code AND-ed it into
+                # `overall_resolved`, so the status flipped yellow
+                # even after v0.5.333 fixed the IPv6 ARP path.
+                ipv4_value = (device_data.get("ipv4_address") or device_data.get("IPv4") or "").strip()
+                ipv4_configured = bool(ipv4_value)
                 ipv6_value = (device_data.get("ipv6_address") or device_data.get("IPv6") or "").strip()
                 ipv6_configured = bool(ipv6_value)
                 gateway_value = (device_data.get("ipv4_gateway") or device_data.get("IPv4 Gateway") or "").strip()
                 gateway_configured = bool(gateway_value)
 
                 # Determine overall status - require only the components that exist
-                overall_resolved = ipv4_resolved
+                overall_resolved = True
+                if ipv4_configured:
+                    overall_resolved = overall_resolved and ipv4_resolved
                 if ipv6_configured:
                     overall_resolved = overall_resolved and ipv6_resolved
                 if gateway_configured:
@@ -9538,15 +9568,21 @@ class DevicesTab(QWidget):
                 ipv4_resolved = bool(arp_ipv4_resolved)
                 ipv6_resolved = bool(arp_ipv6_resolved)
                 gateway_resolved = bool(arp_gateway_resolved)
-                
-                # Determine whether IPv6/Gateway were actually configured
+
+                # v0.5.334 (audit ipv4-required-on-ipv6-only): also
+                # check whether IPv4 is configured (see comment at
+                # _check_arp_resolution_sync above).
+                ipv4_value = (device_data.get("ipv4_address") or device_data.get("IPv4") or "").strip()
+                ipv4_configured = bool(ipv4_value)
                 ipv6_value = (device_data.get("ipv6_address") or device_data.get("IPv6") or "").strip()
                 ipv6_configured = bool(ipv6_value)
                 gateway_value = (device_data.get("ipv4_gateway") or device_data.get("IPv4 Gateway") or "").strip()
                 gateway_configured = bool(gateway_value)
 
                 # Determine overall status - require only the components that exist
-                overall_resolved = ipv4_resolved
+                overall_resolved = True
+                if ipv4_configured:
+                    overall_resolved = overall_resolved and ipv4_resolved
                 if ipv6_configured:
                     overall_resolved = overall_resolved and ipv6_resolved
                 if gateway_configured:
@@ -9557,7 +9593,7 @@ class DevicesTab(QWidget):
                     status_message = "ARP resolved"
                 else:
                     failed_parts = []
-                    if not ipv4_resolved:
+                    if ipv4_configured and not ipv4_resolved:
                         failed_parts.append("IPv4")
                     if ipv6_configured and not ipv6_resolved:
                         failed_parts.append("IPv6")

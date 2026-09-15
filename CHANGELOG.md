@@ -2,6 +2,81 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.334] - 2026-09-15
+
+**Client's overall status calculation no longer treats IPv4 as
+required on IPv6-only devices. Fixes device5 yellow-with-ARP-
+resolved after v0.5.333.**
+
+Operator on srv06: after upgrading to v0.5.333 (VRF reconcile
+on re-apply) and re-applying device5 (IPv6-only,
+`2001:db8:20::2/64` on vlan20, no IPv4), the ARP monitor
+correctly reported `arp_ipv6_resolved=1` in the server database.
+But the client status STILL showed yellow.
+
+### Root cause
+
+Three sites in `widgets/devices_tab.py` seeded overall status
+from `arp_ipv4_resolved` UNCONDITIONALLY:
+
+```python
+overall_resolved = ipv4_resolved  # ← always required
+if ipv6_configured:
+    overall_resolved = overall_resolved and ipv6_resolved
+if gateway_configured:
+    overall_resolved = overall_resolved and gateway_resolved
+```
+
+On IPv6-only devices the server correctly stores
+`arp_ipv4_resolved=0` (there's nothing to resolve). The client
+then AND-ed that False into `overall_resolved` → False → yellow
+icon even when everything configured actually resolved.
+
+Same pattern was already correct for IPv6 and Gateway — only
+IPv4 was hardcoded as required.
+
+### Fix
+
+Mirror the ipv6/gateway pattern for IPv4 too. Start
+`overall_resolved = True`, then AND in each family that's
+actually configured:
+
+```python
+overall_resolved = True
+if ipv4_configured:
+    overall_resolved = overall_resolved and ipv4_resolved
+if ipv6_configured:
+    overall_resolved = overall_resolved and ipv6_resolved
+if gateway_configured:
+    overall_resolved = overall_resolved and gateway_resolved
+```
+
+Three sites patched: `_apply_device_status_row`,
+`_check_arp_resolution_sync`, `_check_individual_arp_resolution`.
+The status-message builder in the third site was also updated
+to gate the "IPv4" failed-part behind `ipv4_configured` (was
+reporting `ARP pending: IPv4` on IPv6-only devices).
+
+### Files touched
+
+- `widgets/devices_tab.py`: v0.5.334 marker + `ipv4_configured`
+  guards at all three overall-resolved computation sites; also
+  guards the `failed_parts.append("IPv4")` line
+- `tests/test_v05334_ipv4_required_on_ipv6_only.py`: source-
+  level guards (marker present, no unconditional IPv4 seed
+  survives, exactly 3 `overall_resolved = True` sites, exactly
+  3 `if ipv4_configured:` guards, derivation shape correct,
+  failed_parts gated, comment names srv06 incident, AST parses,
+  v0.5.333 marker still intact)
+
+### Verification
+
+- 8 new tests pass
+- Once upgraded, IPv6-only devices will flip green on Apply
+  when their configured families all resolve
+
+---
+
 ## [0.5.333] - 2026-09-15
 
 **`start_frr_container` reconciles VRF setup on re-apply for
