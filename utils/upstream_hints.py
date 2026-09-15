@@ -951,13 +951,23 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
     upstream L3-gateway config that forwards a netgen DHCP-client's
     requests to a remote netgen DHCP-server device.
 
-    Two values the operator MUST substitute after paste:
+    v0.5.341 (audit dhcpv6-relay-hint-parity): emit BOTH a v4 and a
+    v6 relay stanza when the DHCP-client device has both families
+    enabled, mirroring what a QFX/EX operator verified end-to-end
+    on srv06 2026-09-15. Junos needs the dedicated
+    `forwarding-options dhcp-relay dhcpv6` sub-hierarchy — the
+    top-level dhcp-relay handles v4 only and silently ignores v6
+    solicits. Cisco IOS / Arista EOS need `ipv6 dhcp relay
+    destination` on the SVI alongside the v4 `ip helper-address`.
+
+    Two values the operator MUST substitute after paste (per family):
 
       * DHCP-server device IP — the client-side dialog doesn't
         know its own server's address; render as a placeholder
-        (`<DHCP-SERVER-IP>`) with a comment. Some deployments
-        pin it in `dhcp_config.upstream_server_hint`; use that
-        when present.
+        (`<DHCP-SERVER-IP>` / `<DHCPV6-SERVER-IP>`) with a comment.
+        Some deployments pin them in `dhcp_config.upstream_server_hint`
+        (v4) / `upstream_server_hint_v6` (v6); use those when
+        present.
       * Client-VLAN SVI — inferred from the device's VLAN
         (`irb.<vlan>` / `interface Vlan<vlan>`). No substitution
         needed when the operator's naming matches netgen's guess.
@@ -968,6 +978,21 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
         # from an earlier design; honor it if present.
         dhcp_config.get("relay_server_ip"),
     ) or "<DHCP-SERVER-IP>"
+    server_ip6 = _first(
+        dhcp_config.get("upstream_server_hint_v6"),
+        dhcp_config.get("upstream_server_hint6"),
+        dhcp_config.get("relay_server_ip_v6"),
+    ) or "<DHCPV6-SERVER-IP>"
+
+    # v0.5.341: emit each block only when that AF is enabled on
+    # the client. Default is True so pre-v0.5.341 configs (no
+    # explicit ipv4_enabled/ipv6_enabled fields) still emit v4 to
+    # preserve v0.5.318 behavior; explicit False on either family
+    # suppresses that block.
+    _v4_on = dhcp_config.get("ipv4_enabled", True)
+    _v6_on = dhcp_config.get("ipv6_enabled", False)
+    if not _v4_on and not _v6_on:
+        return ""
 
     svi_note = ""
     if not vlan or vlan == "0":
@@ -983,16 +1008,34 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
         svi_arista = f"Vlan{vlan}"
 
     if vendor == "juniper":
-        lines = [
-            "# --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
-            f"# Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
-            f"# Client-VLAN SVI: {svi_juniper}{svi_note}",
-            "set forwarding-options dhcp-relay overrides allow-snooped-clients",
-            "set forwarding-options dhcp-relay forward-only",
-            f"set forwarding-options dhcp-relay server-group DHCP-SERVERS {server_ip}",
-            "set forwarding-options dhcp-relay active-server-group DHCP-SERVERS",
-            f"set forwarding-options dhcp-relay group CLIENTS interface {svi_juniper}",
-        ]
+        lines = []
+        if _v4_on:
+            lines += [
+                "# --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
+                f"# Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
+                f"# Client-VLAN SVI: {svi_juniper}{svi_note}",
+                "set forwarding-options dhcp-relay overrides allow-snooped-clients",
+                "set forwarding-options dhcp-relay forward-only",
+                f"set forwarding-options dhcp-relay server-group DHCP-SERVERS {server_ip}",
+                "set forwarding-options dhcp-relay active-server-group DHCP-SERVERS",
+                f"set forwarding-options dhcp-relay group CLIENTS interface {svi_juniper}",
+            ]
+        if _v6_on:
+            # v0.5.341: Junos `dhcp-relay dhcpv6` sub-hierarchy —
+            # top-level dhcp-relay handles v4 only. Verified on
+            # srv06 QFX5130 2026-09-15 (operator's working config).
+            if lines:
+                lines.append("")
+            lines += [
+                "# --- DHCPv6 relay: forward this client's SOLICIT upstream to the netgen DHCPv6-server device.",
+                f"# Substitute {server_ip6 if server_ip6 == '<DHCPV6-SERVER-IP>' else '(hinted: ' + server_ip6 + ')'} with the DHCP-server device's IPv6 address.",
+                f"# Client-VLAN SVI: {svi_juniper}{svi_note}",
+                "# Junos NOTE: top-level dhcp-relay handles v4 only; DHCPv6 needs this dedicated dhcpv6 sub-hierarchy.",
+                "set forwarding-options dhcp-relay dhcpv6 overrides allow-snooped-clients",
+                f"set forwarding-options dhcp-relay dhcpv6 server-group DHCPV6-SERVERS {server_ip6}",
+                "set forwarding-options dhcp-relay dhcpv6 group CLIENTS-V6 active-server-group DHCPV6-SERVERS",
+                f"set forwarding-options dhcp-relay dhcpv6 group CLIENTS-V6 interface {svi_juniper}",
+            ]
         return "\n".join(lines)
 
     if vendor == "cisco":
@@ -1005,19 +1048,40 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
         # `overrides allow-snooped-clients` — accepts giaddr-relayed
         # DHCP requests that carry option-82 info from a downstream
         # relay (matters in multi-hop lab setups).
-        lines = [
-            "! --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
-            f"! Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
-            f"! Client-VLAN SVI: interface {svi_cisco}{svi_note}",
-            "! Global DHCP relay service (usually already on by default in IOS):",
-            "service dhcp",
-            "! Trust relayed DHCP info from downstream (mirror of Junos allow-snooped-clients):",
-            "ip dhcp relay information trust-all",
-            "! Client-facing SVI: forward this VLAN's DHCP requests to the server device:",
-            f"interface {svi_cisco}",
-            f" ip helper-address {server_ip}",
-            "!",
-        ]
+        # v0.5.341: interface stanza carries both `ip helper-address`
+        # (v4) and `ipv6 dhcp relay destination` (v6). Global service
+        # lines emit only when their family is enabled.
+        lines = []
+        if _v4_on:
+            lines += [
+                "! --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
+                f"! Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
+                f"! Client-VLAN SVI: interface {svi_cisco}{svi_note}",
+                "! Global DHCP relay service (usually already on by default in IOS):",
+                "service dhcp",
+                "! Trust relayed DHCP info from downstream (mirror of Junos allow-snooped-clients):",
+                "ip dhcp relay information trust-all",
+            ]
+        if _v6_on:
+            if lines:
+                lines.append("")
+            lines += [
+                "! --- DHCPv6 relay: forward this client's SOLICIT upstream to the netgen DHCPv6-server device.",
+                f"! Substitute {server_ip6 if server_ip6 == '<DHCPV6-SERVER-IP>' else '(hinted: ' + server_ip6 + ')'} with the DHCP-server device's IPv6 address.",
+                "! IPv6 DHCP relay is per-SVI on IOS; enable snooping globally so relay honors downstream info:",
+                "ipv6 dhcp-relay information option",
+            ]
+        # Shared SVI block: emit both `ip helper-address` and
+        # `ipv6 dhcp relay destination` on the same interface.
+        if lines:
+            lines.append("")
+            lines.append("! Client-facing SVI: forward this VLAN's DHCP(v6) requests to the server device:")
+            lines.append(f"interface {svi_cisco}")
+            if _v4_on:
+                lines.append(f" ip helper-address {server_ip}")
+            if _v6_on:
+                lines.append(f" ipv6 dhcp relay destination {server_ip6}")
+            lines.append("!")
         return "\n".join(lines)
 
     if vendor == "arista":
@@ -1027,17 +1091,35 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
         # and a `dhcp relay always-on` mode; include both so the
         # operator sees the equivalent knobs to Juniper's
         # forwarding-options block.
-        lines = [
-            "! --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
-            f"! Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
-            f"! Client-VLAN SVI: interface {svi_arista}{svi_note}",
-            "! Tag relayed DHCP requests with option-82 so the server can identify the source VLAN:",
-            "ip dhcp relay information option",
-            "! Client-facing SVI: forward this VLAN's DHCP requests to the server device:",
-            f"interface {svi_arista}",
-            f"   ip helper-address {server_ip}",
-            "!",
-        ]
+        # v0.5.341: v6 companion — `ipv6 dhcp relay destination` on
+        # the same SVI. Emit each family only when enabled.
+        lines = []
+        if _v4_on:
+            lines += [
+                "! --- DHCP relay: forward this client's DISCOVER upstream to the netgen DHCP-server device.",
+                f"! Substitute {server_ip if server_ip == '<DHCP-SERVER-IP>' else '(hinted: ' + server_ip + ')'} with the DHCP-server device's IPv4 address if not already correct.",
+                f"! Client-VLAN SVI: interface {svi_arista}{svi_note}",
+                "! Tag relayed DHCP requests with option-82 so the server can identify the source VLAN:",
+                "ip dhcp relay information option",
+            ]
+        if _v6_on:
+            if lines:
+                lines.append("")
+            lines += [
+                "! --- DHCPv6 relay: forward this client's SOLICIT upstream to the netgen DHCPv6-server device.",
+                f"! Substitute {server_ip6 if server_ip6 == '<DHCPV6-SERVER-IP>' else '(hinted: ' + server_ip6 + ')'} with the DHCP-server device's IPv6 address.",
+                "! Enable IPv6 DHCP-relay info option (v6 counterpart of ip dhcp relay information option):",
+                "ipv6 dhcp relay information option",
+            ]
+        if lines:
+            lines.append("")
+            lines.append("! Client-facing SVI: forward this VLAN's DHCP(v6) requests to the server device:")
+            lines.append(f"interface {svi_arista}")
+            if _v4_on:
+                lines.append(f"   ip helper-address {server_ip}")
+            if _v6_on:
+                lines.append(f"   ipv6 dhcp relay destination {server_ip6}")
+            lines.append("!")
         return "\n".join(lines)
 
     return ""

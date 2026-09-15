@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.341] - 2026-09-15
+
+**Upstream Config Hint emits a DHCPv6 relay-agent stanza alongside
+the existing v0.5.318 v4 stanza. Junos, Cisco IOS, and Arista EOS
+all get the working v6 shape.**
+
+### Root cause
+
+Operator verified end-to-end DHCPv6 on srv06 with a QFX5130 relay.
+The working Junos shape needed a **separate `forwarding-options
+dhcp-relay dhcpv6` sub-hierarchy** — top-level `dhcp-relay` is v4
+only on QFX/EX and silently ignores v6 solicits. netgen's hint
+dialog only emitted the v4 shape, so operators re-adding dual-
+stack DHCP clients had to hand-write the v6 side every time.
+
+### Fix
+
+`_dhcp_relay_stanza` in `utils/upstream_hints.py` now inspects
+`dhcp_config['ipv4_enabled']` and `dhcp_config['ipv6_enabled']`
+and emits one block per enabled family. Default preserves
+v0.5.318 behavior (v4 emitted when flag is absent, v6 skipped
+when flag is absent).
+
+Per vendor:
+
+- **Junos**: adds the `forwarding-options dhcp-relay dhcpv6`
+  block with `server-group DHCPV6-SERVERS`, `group CLIENTS-V6`,
+  and `overrides allow-snooped-clients`. Includes an inline note
+  about the top-level-is-v4-only gotcha.
+- **Cisco IOS**: single SVI stanza carries both `ip helper-address`
+  (v4) and `ipv6 dhcp relay destination` (v6). Global-service
+  lines gate per family.
+- **Arista EOS**: same pattern as Cisco with EOS indentation.
+
+New optional field on `dhcp_config`: `upstream_server_hint_v6` /
+`upstream_server_hint6` — the v6 counterpart of the existing
+`upstream_server_hint`. Placeholder `<DHCPV6-SERVER-IP>` renders
+when absent.
+
+### Files touched
+
+- `utils/upstream_hints.py`
+- `tests/test_v05341_dhcpv6_relay_hint_parity.py`: 13 tests
+
+---
+
 ## [0.5.340] - 2026-09-15
 
 **`_create_vrf` installs `default via <gateway>` in the VRF's
