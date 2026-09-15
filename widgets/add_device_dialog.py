@@ -2419,6 +2419,27 @@ class AddDeviceDialog(QDialog):
         if _dhcp_on and hasattr(self, "dhcp_mode_combo"):
             _mode = (self.dhcp_mode_combo.currentText() or "").strip().lower()
             data["dhcp_mode"] = _mode
+            # v0.5.345 (audit dhcp-hint-flag-source-fix): v0.5.343
+            # forwarded the device-level `ipv4_checkbox` /
+            # `ipv6_checkbox`, but for a DHCP client those are
+            # unrelated to which FAMILIES the client should solicit.
+            # A DHCP-client device that leaves both device-level
+            # checkboxes off (because DHCP is the source of truth
+            # for its IPs) then got EMPTY relay stanzas — regression
+            # observed by operator on srv06 2026-09-15 (v0.5.343
+            # emitted the header + iface but no relay block).
+            # Use the DHCP-specific enables instead:
+            # `dhcp_ipv4_enabled_checkbox` / `dhcp_ipv6_enabled_checkbox`.
+            _dhcp_v4_on = checked("dhcp_ipv4_enabled_checkbox")
+            _dhcp_v6_on = checked("dhcp_ipv6_enabled_checkbox")
+            # Backward-compat fallback: pre-v0.5.231 dialogs had no
+            # DHCP-specific v4/v6 checkboxes. If the widget is absent
+            # (getattr returned None → checked() returned False for
+            # BOTH), fall back to the device-level checkboxes so
+            # legacy dialogs don't emit blank stanzas.
+            if not _dhcp_v4_on and not _dhcp_v6_on:
+                _dhcp_v4_on = ipv4_on
+                _dhcp_v6_on = ipv6_on
             data["dhcp_config"] = {
                 "mode": _mode,
                 # v0.5.343 (audit dhcpv6-relay-hint-flag-propagation):
@@ -2432,8 +2453,8 @@ class AddDeviceDialog(QDialog):
                 # pasted a hint for a "netgen-device on VLAN 10" and
                 # only the v4 block appeared despite the device being
                 # v6-only.
-                "ipv4_enabled": ipv4_on,
-                "ipv6_enabled": ipv6_on,
+                "ipv4_enabled": _dhcp_v4_on,
+                "ipv6_enabled": _dhcp_v6_on,
                 # `pool_router` (v0.5.315) doubles as a hint for
                 # the DHCP-server IP when the operator has
                 # already filled it out — but the SERVER's IP

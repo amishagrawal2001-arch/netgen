@@ -2,6 +2,32 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.345] - 2026-09-15
+
+**Fix v0.5.343 regression: relay hint stanza was reading the
+wrong checkboxes and returning empty for typical DHCP clients.**
+
+v0.5.343 propagated `ipv4_checkbox` / `ipv6_checkbox` (device-
+level static-IP boxes) into `dhcp_config`. For a DHCP-client
+device those are unrelated to which families the client wants —
+a DHCP client typically leaves both device-level static-IP boxes
+off because DHCP is the source of truth for its IPs.
+
+Operator on srv06 post-v0.5.343 upgrade: hint dialog stopped
+emitting the v4 relay block that had been emitting fine
+pre-v0.5.343.
+
+Fix: read `dhcp_ipv4_enabled_checkbox` / `dhcp_ipv6_enabled_checkbox`
+which are DHCP-specific enables (v0.5.231, default v4=True /
+v6=False). Backward-compat fallback to the device-level flags
+when the DHCP-specific widgets aren't present (pre-v0.5.231
+dialogs).
+
+- `widgets/add_device_dialog.py`
+- `tests/test_v05345_dhcp_hint_flag_source.py`: 7 tests
+
+---
+
 ## [0.5.344] - 2026-09-15
 
 **Manage Pools → Add Pool now accepts v6-only pools.**
