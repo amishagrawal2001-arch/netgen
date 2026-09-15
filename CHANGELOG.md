@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.337] - 2026-09-15
+
+**Three v4→v6 DHCP parity fixes bundled** — DAD-before-anchor for
+v6, first-host-≠-gateway skip for v6, and DHCPv6 SOLICIT in-flight
+monitor gate.
+
+Part 2 of 4 in the v4→v6 DHCP parity audit follow-up.
+
+### A. DAD-before-anchor for v6 (v0.5.290/291 mirror)
+
+`_ensure_ipv6_address` was running `ip -6 addr add` blindly.
+External devices claiming the same v6 (e.g. a relay agent's IP on
+the same L2) triggered kernel DAD but netgen never noticed → dnsmasq
+bound to a duplicate address.
+
+Fix: two new helpers, `_v6_probe_conflict` (uses `ndisc6` with a
+`ping -6` fallback) and `_v6_dad_poll` (checks the iface for the
+`dadfailed` flag post-add and removes on conflict). Wired into
+`start_dhcp_server`'s v6-anchor path: probe first, then anchor,
+then poll. Failures surface via `dhcp_last_error`.
+
+### B. v6 first-host ≠ gateway skip (v0.5.287 Fix A mirror)
+
+`start_dhcp_server`'s direct-attached v6 branch picked `_hosts6[0]`
+unconditionally. When the operator's `ipv6_gateway` equals the
+first host of the pool subnet (common relay-agent shape — QFX
+irb.30 = `2001:db8:30::1`, pool starts at `::100`), netgen claimed
+the gateway's IP on its own iface.
+
+Fix: iterate `_hosts6` and take the first non-gateway host,
+matching the v4 iterator's shape at `_derive_server_ip_from_pool`.
+
+### C. DHCPv6 SOLICIT in-flight monitor gate (v0.5.229 audit B1 mirror)
+
+The dhcp_monitor's DORA-in-flight gate only knew `"Requesting" /
+"Renewing" / "Rebinding"` — all v4 states. A v6-only client
+mid-SOLICIT (v6 lease timing race, slow server, first-boot ND
+resolution) looked like `dhcp_state="No Lease"` → monitor
+restarted every poll → SOLICIT never converged.
+
+Fix: `_is_dhcp6c_running` helper (whole-token argv match, same
+anti-`eth1`-matches-`eth10` guard as v0.5.218 fix M for dhclient).
+`get_dhcp_client_snapshot` flips state to `"Soliciting"` when
+dhcp6c is running with no lease yet. `dhcp_monitor._mid_handshake`
+set now includes `"Soliciting"`.
+
+### Files touched
+
+- `utils/dhcp.py`: `_v6_probe_conflict`, `_v6_dad_poll`,
+  `_is_dhcp6c_running` helpers; `start_dhcp_server` v6 anchor
+  path rewritten to probe→anchor→poll with `dhcp_last_error`
+  surfacing; `get_dhcp_client_snapshot` sets `"Soliciting"` when
+  dhcp6c mid-SOLICIT
+- `utils/dhcp_monitor.py`: DORA-in-flight gate includes
+  `"Soliciting"`
+- `tests/test_v05337_dhcpv6_parity_bundle.py`: 24 source-level
+  guards across three fixes
+
+### Verification
+
+- 24 new tests pass, plus regression guards for v0.5.335, v0.5.336,
+  v0.5.290, v0.5.287
+- Once upgraded:
+  - IPv6 anchor refuses when the wire says the address is taken
+  - Direct-attached v6 servers with gateway at pool's first host
+    now anchor at `_hosts6[1]` instead of collision
+  - v6-only clients mid-SOLICIT complete instead of being restarted
+
+---
+
 ## [0.5.336] - 2026-09-15
 
 **arp_monitor's v6 anchor replay honors the same L3-remote (relay

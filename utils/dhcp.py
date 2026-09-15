@@ -1691,6 +1691,161 @@ def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=No
     return False
 
 
+def _v6_probe_conflict(interface: str, address: str, container=None) -> str:
+    """v0.5.337 (audit dhcpv6-dad-before-anchor): probe whether
+    <address> is already claimed on the L2 before we attach it to
+    <interface>. Mirrors the v4-side `_probe_ip_conflict` (v0.5.290).
+
+    Returns the conflicting node's identity (as a short string) on
+    conflict, or an empty string on "clear to claim".
+
+    Method: send an ICMPv6 Neighbor Solicitation for the target
+    with source `::` (unspecified) — that's exactly how the kernel
+    runs DAD. Any Neighbor Advertisement we hear back means the
+    address is taken. Uses `ndisc6` (from the `ndisc6` package,
+    already required by DHCPv6 client path) when available, else
+    falls back to a `ping6 -c 1 -W 1` probe (weaker: relies on
+    ICMP echo which some hosts drop, but a positive reply is still
+    a definite conflict).
+
+    Fully best-effort: any exception → "" (proceed with anchor).
+    Loud failure is worse than a rare DAD race.
+    """
+    if not interface or not address:
+        return ""
+    try:
+        _which = _run_command(
+            ["which", "ndisc6"], timeout=3, container=container,
+        )
+        _have_ndisc6 = (_which.returncode == 0 and (_which.stdout or "").strip())
+    except Exception:
+        _have_ndisc6 = False
+
+    if _have_ndisc6:
+        try:
+            _r = _run_command(
+                [
+                    "ndisc6",
+                    "-1",       # single query
+                    "-w", "500",  # 500ms wait
+                    "-q",
+                    address, interface,
+                ],
+                timeout=3, container=container,
+            )
+            if _r.returncode == 0 and (_r.stdout or "").strip():
+                _mac = (_r.stdout or "").strip().split()[0]
+                logger.warning(
+                    "[DHCP] v0.5.337 DADv6 conflict: %s answered by %s "
+                    "on %s (ndisc6)", address, _mac, interface,
+                )
+                return f"ndisc6 got NA from {_mac}"
+        except Exception as _exc:
+            logger.debug(
+                "[DHCP] v0.5.337 ndisc6 probe raised for %s on %s: %s "
+                "(non-fatal; treating as clear-to-claim)",
+                address, interface, _exc,
+            )
+
+    # ping fallback — weaker, but a positive reply is definitive.
+    try:
+        _p = _run_command(
+            ["ping", "-6", "-c", "1", "-W", "1", "-I", interface, address],
+            timeout=3, container=container,
+        )
+        if _p.returncode == 0:
+            logger.warning(
+                "[DHCP] v0.5.337 DADv6 conflict: %s answered `ping -6` "
+                "on %s — address already in use", address, interface,
+            )
+            return "ping -6 reply from claimant"
+    except Exception as _exc:
+        logger.debug(
+            "[DHCP] v0.5.337 ping -6 probe raised for %s on %s: %s "
+            "(non-fatal)", address, interface, _exc,
+        )
+    return ""
+
+
+def _v6_dad_poll(
+    interface: str, address: str, device_id: str, device_db=None,
+    container=None, timeout_seconds: int = 3,
+) -> bool:
+    """v0.5.337: after `_ensure_ipv6_address` adds an address, poll
+    the iface's `ip -6 addr show` output for the `dadfailed` flag.
+    The kernel runs DAD asynchronously post-add, so a conflict shows
+    up on the address for a second or two after we return from
+    `ip -6 addr add`. If the address ends up dadfailed, remove it
+    and surface via dhcp_last_error so the operator sees WHY the
+    subsequent dnsmasq bind fails.
+
+    Returns True on clean (address is in `tentative`-cleared state
+    and NOT `dadfailed`), False on dadfailed.
+    """
+    if not interface or not address:
+        return True
+    _deadline = time.time() + max(1, timeout_seconds)
+    while time.time() < _deadline:
+        try:
+            _r = _run_command(
+                ["ip", "-6", "-o", "addr", "show", "dev", interface],
+                timeout=3, container=container,
+            )
+            for _line in (_r.stdout or "").splitlines():
+                _toks = _line.split()
+                try:
+                    _idx = _toks.index("inet6")
+                except ValueError:
+                    continue
+                if _idx + 1 >= len(_toks):
+                    continue
+                _cidr = _toks[_idx + 1]
+                if not _cidr.startswith(f"{address}/"):
+                    continue
+                _flags = _toks[_idx + 2:] if len(_toks) > _idx + 2 else []
+                if "dadfailed" in _flags:
+                    logger.warning(
+                        "[DHCP] v0.5.337 DAD post-add: %s on %s "
+                        "reports dadfailed — kernel detected the "
+                        "address is already claimed elsewhere. "
+                        "Removing so dnsmasq doesn't bind to a dead "
+                        "address.", address, interface,
+                    )
+                    _remove_ipv6_address(
+                        interface, address, "128", container=container,
+                    )
+                    if device_db and device_id:
+                        _update_device_db(
+                            device_db, device_id,
+                            {
+                                "dhcp_last_error": (
+                                    f"IPv6 anchor {address} on "
+                                    f"{interface} failed kernel DAD "
+                                    f"(dadfailed) — address is "
+                                    f"claimed on the wire. Fix pool "
+                                    f"config."
+                                ),
+                                "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                    return False
+                if "tentative" not in _flags:
+                    # Address is bound and past DAD — clean.
+                    return True
+                # Still tentative — keep polling until deadline.
+                break
+        except Exception as _exc:
+            logger.debug(
+                "[DHCP] v0.5.337 DAD poll raised for %s on %s: %s",
+                address, interface, _exc,
+            )
+        time.sleep(0.2)
+    # Deadline reached with still-tentative — assume clean (best
+    # effort). Kernel will still emit dadfailed later if truly a
+    # conflict; dhcp_monitor will catch the resulting bind failure.
+    return True
+
+
 def _remove_ipv4_address(interface: str, address: str, prefix: str, container=None) -> None:
     """v0.5.235 (audit U1): mirror of _remove_ipv6_address. Called
     on stop_dhcp_server so the IPv4 anchor that _ensure_ipv4_address
@@ -2213,6 +2368,42 @@ def _is_dhclient_running(interface: str, container=None) -> bool:
         return False
 
 
+def _is_dhcp6c_running(interface: str, container=None) -> bool:
+    """v0.5.337 (audit dhcpv6-monitor-in-flight-gate): dhcp6c
+    counterpart of `_is_dhclient_running`. Used by the client-
+    snapshot code to detect mid-SOLICIT v6 clients and by
+    dhcp_monitor to gate its restart loop — without this, a
+    v6-only client mid-SOLICIT looks like `dhcp_state="No Lease"`,
+    monitor restarts it every poll, and SOLICIT never finishes.
+
+    Uses whole-token argv match (same trick as v0.5.218 fix M for
+    dhclient) so `vlan1` doesn't false-positive for `vlan10`.
+    """
+    if not interface:
+        return False
+    try:
+        result = _run_command(
+            ["pgrep", "-a", "-f", "dhcp6c"],
+            timeout=5, container=container,
+        )
+        if result.returncode not in (0, 1):
+            return False
+        for line in (result.stdout or "").splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) < 2:
+                continue
+            argv = parts[1].split()
+            if interface in argv:
+                return True
+        return False
+    except Exception as exc:
+        logger.debug(
+            "[DHCP] Failed to determine dhcp6c status for %s: %s",
+            interface, exc,
+        )
+        return False
+
+
 def get_dhcp_client_snapshot(
     device_db,
     device_id: str,
@@ -2321,6 +2512,28 @@ def get_dhcp_client_snapshot(
             snapshot["dhcp_running"] = True
     elif gateway6:
         snapshot["dhcp_lease_gateway6"] = gateway6
+
+    # v0.5.337 (audit dhcpv6-monitor-in-flight-gate): detect mid-
+    # SOLICIT v6 clients and flip state to "Soliciting" so the
+    # dhcp_monitor's DORA-in-flight gate (v0.5.229 audit B1) treats
+    # them as "handshake in progress" instead of "No Lease → restart
+    # every poll." Pre-fix, a v6-only client whose SOLICIT was in
+    # flight (server slow, relay hop, first-boot ND resolution)
+    # would be killed and restarted every 60s, never completing.
+    #
+    # Only override the state when v4 isn't already driving the
+    # picture — if v4 says "Leased" or v4 says "Requesting" (v4
+    # dhclient is mid-DORA), keep that. A dual-stack client with
+    # v4 mid-DORA + v6 mid-SOLICIT looks like "Requesting" (single
+    # gate; monitor sees it's mid-handshake).
+    _v6_enabled = _truthy((dhcp_config or {}).get("ipv6_enabled", False))
+    if _v6_enabled and not ip6_info and snapshot["dhcp_state"] in (
+        "No Lease", ""
+    ):
+        dhcp6c_running = _is_dhcp6c_running(interface, container=container)
+        if dhcp6c_running:
+            snapshot["dhcp_state"] = "Soliciting"
+            snapshot["dhcp_running"] = True
 
     return snapshot
 
@@ -3564,26 +3777,125 @@ def start_dhcp_server(
             # fixed to avoid.
             _v6_ip = ipv6_server_ip
             if not _v6_ip and ipv6_pool_start:
+                # v0.5.337 (audit dhcpv6-server-ip-gateway-collision):
+                # mirror the v0.5.287 Fix A gateway-skip iterator from
+                # the v4 derivation (`_derive_server_ip_from_pool` at
+                # line ~1148). Pre-fix, if the operator's ipv6_gateway
+                # happened to be the first host of the pool subnet
+                # (common relay-agent shape — e.g. QFX irb.30 =
+                # 2001:db8:30::1, pool 2001:db8:30::10-100), netgen
+                # claimed the gateway's IP on its own iface. Same
+                # class of bug as v0.5.287 Fix A on the v4 side.
+                _gw6_addr = None
+                if ipv6_gateway:
+                    try:
+                        _gw6_addr = ipaddress.IPv6Address(ipv6_gateway)
+                    except (ipaddress.AddressValueError, ValueError):
+                        _gw6_addr = None
                 try:
                     _v6_net = ipaddress.IPv6Network(
                         f"{ipv6_pool_start}/{ipv6_prefix}", strict=False,
                     )
                     _hosts6 = list(_v6_net.hosts())
                     if _hosts6:
-                        _v6_ip = str(_hosts6[0])
+                        # v0.5.337: iterate hosts and take the first
+                        # non-gateway one. Preserves the ::1-first
+                        # preference in the common case (gateway not
+                        # inside pool subnet) and correctly picks the
+                        # next when gateway sits at the head.
+                        for _h6 in _hosts6:
+                            if _gw6_addr is None or _h6 != _gw6_addr:
+                                _v6_ip = str(_h6)
+                                break
+                        if not _v6_ip:
+                            logger.warning(
+                                "[DHCP] v0.5.337: pool subnet %s has no "
+                                "non-gateway host for the IPv6 server "
+                                "anchor (every candidate equals "
+                                "gateway=%s). Skipping v6 anchor — the "
+                                "operator must widen the pool or "
+                                "change the gateway.",
+                                _v6_net, ipv6_gateway,
+                            )
                     else:
-                        _v6_ip = str(_v6_net.network_address)
-                    logger.info(
-                        "[DHCP] Derived IPv6 server IP %s from pool %s (no explicit ipv6_server_ip)",
-                        _v6_ip, _v6_net,
-                    )
+                        _cand = _v6_net.network_address
+                        if _gw6_addr is None or _cand != _gw6_addr:
+                            _v6_ip = str(_cand)
+                    if _v6_ip:
+                        logger.info(
+                            "[DHCP] Derived IPv6 server IP %s from pool %s (no explicit ipv6_server_ip)",
+                            _v6_ip, _v6_net,
+                        )
                 except (ipaddress.AddressValueError, ValueError) as _v6_exc:
                     logger.warning(
                         "[DHCP] Could not derive IPv6 server IP from pool %s/%s: %s",
                         ipv6_pool_start, ipv6_prefix, _v6_exc,
                     )
             if _v6_ip:
-                _ensure_ipv6_address(interface, _v6_ip, ipv6_prefix, container=container)
+                # v0.5.337 (audit dhcpv6-dad-before-anchor): probe DAD
+                # before claiming the address. `_ensure_ipv6_address`
+                # calls `ip -6 addr add` blindly — the kernel then
+                # runs DAD asynchronously, and a conflict shows up as
+                # `dadfailed` on the address only AFTER dnsmasq has
+                # already tried to bind. This mirrors v0.5.290 for v4
+                # (`_probe_ip_conflict` before add). See _v6_dad_
+                # probe / _v6_dad_poll helpers.
+                _v6_conflict = _v6_probe_conflict(
+                    interface, _v6_ip, container=container,
+                )
+                if _v6_conflict:
+                    logger.warning(
+                        "[DHCP] v0.5.337 device %s: refusing to anchor "
+                        "%s/%s on %s — DAD found the address is "
+                        "already claimed on the wire (%s). dnsmasq "
+                        "would bind to a duplicate IP and break the "
+                        "L2. Fix the pool config to pick a different "
+                        "server IP, or resolve the external claimant.",
+                        device_id, _v6_ip, ipv6_prefix, interface,
+                        _v6_conflict,
+                    )
+                    _update_device_db(
+                        device_db,
+                        device_id,
+                        {
+                            "dhcp_last_error": (
+                                f"IPv6 anchor {_v6_ip} already claimed "
+                                f"on {interface} (DAD conflict: "
+                                f"{_v6_conflict})"
+                            ),
+                            "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                else:
+                    _v6_anchor_ok = _ensure_ipv6_address(
+                        interface, _v6_ip, ipv6_prefix, container=container,
+                    )
+                    if not _v6_anchor_ok:
+                        # v0.5.337 (audit dhcpv6-anchor-failure-surface):
+                        # v4 path surfaces anchor failure via
+                        # dhcp_last_error (v0.5.222); v6 path was
+                        # dropping the bool return on the floor. Mirror
+                        # the surfacing so the UI's Last-Error column
+                        # tells the operator why v6 dnsmasq bind will
+                        # imminently fail.
+                        _update_device_db(
+                            device_db,
+                            device_id,
+                            {
+                                "dhcp_last_error": (
+                                    f"IPv6 anchor {_v6_ip}/{ipv6_prefix} "
+                                    f"failed to attach to {interface} — "
+                                    f"see server log for `ip -6 addr add` "
+                                    f"stderr. dnsmasq v6 bind will fail."
+                                ),
+                                "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                    else:
+                        _v6_dad_poll(
+                            interface, _v6_ip, device_id, device_db,
+                            container=container,
+                        )
 
     pidfile = os.path.join(DNSMASQ_PID_DIR, f"dnsmasq-{interface}.pid")
     leasefile = os.path.join(DNSMASQ_LEASE_DIR, f"dnsmasq-{interface}.leases")

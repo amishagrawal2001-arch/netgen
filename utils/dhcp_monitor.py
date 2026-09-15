@@ -710,7 +710,16 @@ class DHCPClientMonitor:
                     # truly stopped or has fallen off the container.
                     _state = snapshot.get("dhcp_state") or ""
                     _running = bool(snapshot.get("dhcp_running"))
-                    _mid_handshake = _state in ("Requesting", "Renewing", "Rebinding")
+                    # v0.5.337 (audit dhcpv6-monitor-in-flight-gate):
+                    # add "Soliciting" (DHCPv6 SOLICIT phase, set by
+                    # get_dhcp_client_snapshot when dhcp6c is running
+                    # but no lease yet). Pre-fix, a v6-only client
+                    # mid-SOLICIT looked like "No Lease" → monitor
+                    # restarted every poll → SOLICIT never converged.
+                    # See v0.5.229 audit B1 for the v4 rationale.
+                    _mid_handshake = _state in (
+                        "Requesting", "Renewing", "Rebinding", "Soliciting",
+                    )
                     if _running and _mid_handshake:
                         logger.debug(
                             "[DHCP MONITOR] Skipping restart for %s: dhclient is running and in %s (DORA in flight)",
