@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.329] - 2026-09-15
+
+**Systemd drop-in self-heal that neutralizes bad
+WorkingDirectory / RootDirectory from ANY other drop-in.
+Prevents `status=200/CHDIR` startup-lockout after future
+upgrades.**
+
+Operator on srv06 hit this immediately after
+`pip install --upgrade ... && systemctl restart netgen-server`
+for v0.5.328:
+
+```
+Sep 15 00:13:03 systemd[1]: netgen-server.service: Main process exited,
+                            code=exited, status=200/CHDIR
+   Active: activating (auto-restart) (Result: exit-code)
+      CPU: 1ms
+```
+
+systemd rejected `chdir()` before ANY Python could run, so no
+in-process code could recover. Operator had to hand-write a
+defensive drop-in to unblock.
+
+### Root cause (not in netgen code)
+
+None of the netgen scripts write bad `WorkingDirectory=`. But
+the merged unit on srv06 has 4 drop-ins:
+  * `10-netgen-rlimits.conf` — from netgen-upgrade (safe)
+  * `netgen-caps.conf` — from netgen server startup (safe)
+  * `mlx5-rlimits.conf` — operator-created (from srv06 setup notes)
+  * `tx-worker.conf` — operator-created (from srv06 setup notes)
+
+One of the operator-created drop-ins carried a stale
+`WorkingDirectory=` or `RootDirectory=` pointing at a path
+that no longer exists after the upgrade wiped and reinstalled
+`/opt/netgen-server/netgen-venv/`.
+
+### Fix — netgen-side self-heal
+
+Write `/etc/systemd/system/netgen-server.service.d/
+50-netgen-workdir-safe.conf` on every healthy startup. Content:
+
+```
+[Service]
+WorkingDirectory=
+WorkingDirectory=/
+RootDirectory=
+```
+
+Empty-string first line CLEARS the merged list (systemd drop-in
+semantics), then the second line sets a safe default. `50-`
+prefix sorts AFTER any operator-created drop-in (which have no
+numeric prefix, so they sort BEFORE `50-` in lexical order),
+so this file WINS the merge. App uses absolute paths → `/` is
+functionally equivalent to any install root, just safer.
+
+Idempotent — no-op when the file already matches the sha256
+of desired content (no daemon-reload churn on every startup).
+Bails silently on non-tarball installs (dev checkouts,
+containers).
+
+### Doesn't rescue currently-locked-out installs
+
+Because the self-heal runs INSIDE the server process, an
+operator who's ALREADY in the 200/CHDIR lockout must apply
+the drop-in manually first:
+
+```bash
+sudo mkdir -p /etc/systemd/system/netgen-server.service.d
+sudo tee /etc/systemd/system/netgen-server.service.d/99-workdir-safe.conf <<'EOF'
+[Service]
+WorkingDirectory=
+WorkingDirectory=/
+RootDirectory=
+EOF
+sudo systemctl daemon-reload
+sudo systemctl start netgen-server
+```
+
+Once the server comes back up on v0.5.329, its startup self-heal
+writes the (identical) 50- prefixed version — future restarts
+are protected without operator intervention.
+
+### Verification
+
+11 lock-in tests in
+`tests/test_v05329_systemd_workdir_safe_selfheal.py`:
+  * marker present
+  * drop-in path uses `50-` prefix (merge-order dominance)
+  * content has both `WorkingDirectory=` reset + `/` default
+  * content has `RootDirectory=` reset
+  * self-heal function defined + bails on non-tarball
+  * idempotent (sha256 check before write)
+  * runs `systemctl daemon-reload` after write
+  * wired into startup guarded by try/except
+  * ordered AFTER the v0.5.56 caps self-heal
+  * server AST parses
+
+All 293 pre-existing tests pass (304 total).
+
 ## [0.5.328] - 2026-09-14
 
 **Two bundled operator asks:

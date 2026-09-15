@@ -19982,6 +19982,107 @@ def _resolve_dpdk_bind_script():
     return candidates[0]
 
 
+# v0.5.329 (audit systemd-chdir-lockout): self-heal a defensive
+# drop-in that neutralizes bad WorkingDirectory / RootDirectory /
+# sandbox-path overrides carried by ANY other drop-in in the same
+# directory. Operator on srv06 2026-09-15 hit `status=200/CHDIR`
+# in 1ms after v0.5.328 upgrade — systemd rejected chdir BEFORE
+# any Python ran, so no in-process self-heal could recover. Root
+# cause was an operator-created drop-in (`tx-worker.conf` or
+# `mlx5-rlimits.conf`) that shipped a `WorkingDirectory=` pointing
+# at a stale path. This drop-in fixes the class:
+#
+#   * `50-` prefix — sorts LATER than the two operator-created
+#     drop-ins (which have no numeric prefix, so they sort BEFORE
+#     "50-" but AFTER "10-"). Also sorts later than `netgen-
+#     caps.conf` (no prefix). Systemd applies drop-ins in
+#     lexical order; the LAST setter of any list-valued directive
+#     wins the reset. Empty-string on the first line clears the
+#     merged list; explicit value on the second line sets a safe
+#     default.
+#   * `WorkingDirectory=/` — safe because the app uses absolute
+#     paths everywhere; WorkingDirectory is cosmetic.
+#   * `RootDirectory=` empty — clears any stale chroot.
+#
+# Written on server startup, so a healthy server keeps it in
+# sync. If a bad drop-in appears LATER (operator edit, upgrade
+# artifact), this defensive layer catches it on the next restart.
+_NETGEN_WORKDIR_SAFE_PATH = (
+    "/etc/systemd/system/netgen-server.service.d/50-netgen-workdir-safe.conf"
+)
+_NETGEN_WORKDIR_SAFE_CONTENT = """\
+# Written by netgen-server at startup (v0.5.329+).
+# Defensive override of chdir-related directives so a bad
+# WorkingDirectory / RootDirectory / ProtectSystem in ANY other
+# drop-in can't lock the server out with `status=200/CHDIR`. The
+# 50- prefix ensures this file wins the merge order.
+#
+# App uses absolute paths everywhere — WorkingDirectory=/ is
+# functionally equivalent to the install root, just safer.
+[Service]
+WorkingDirectory=
+WorkingDirectory=/
+RootDirectory=
+"""
+
+
+def _ensure_netgen_workdir_safe_deployed():
+    """v0.5.329: write the defensive workdir drop-in on startup.
+    Safe-idempotent (no-op if file already matches)."""
+    import hashlib
+    dst = _NETGEN_WORKDIR_SAFE_PATH
+    dst_dir = os.path.dirname(dst)
+    if not os.path.isdir("/opt/netgen-server"):
+        logging.debug(
+            "[WORKDIR-SAFE SELFHEAL] /opt/netgen-server missing; "
+            "not a tarball install — skipping"
+        )
+        return
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+    except Exception as e:
+        logging.warning(
+            f"[WORKDIR-SAFE SELFHEAL] couldn't mkdir {dst_dir}: {e}"
+        )
+        return
+    desired = _NETGEN_WORKDIR_SAFE_CONTENT.encode("utf-8")
+    desired_sha = hashlib.sha256(desired).hexdigest()
+    existing = b""
+    if os.path.isfile(dst):
+        try:
+            with open(dst, "rb") as f:
+                existing = f.read()
+        except Exception:
+            pass
+    if hashlib.sha256(existing).hexdigest() == desired_sha:
+        logging.debug(f"[WORKDIR-SAFE SELFHEAL] {dst} already in sync")
+        return
+    try:
+        tmp = dst + ".new"
+        with open(tmp, "wb") as f:
+            f.write(desired)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dst)
+        logging.info(
+            f"[WORKDIR-SAFE SELFHEAL] wrote {dst}; effective on next "
+            f"netgen-server restart"
+        )
+        try:
+            import subprocess as _sp
+            _sp.run(
+                ["systemctl", "daemon-reload"],
+                capture_output=True, timeout=10,
+            )
+        except Exception as _de:
+            logging.debug(
+                f"[WORKDIR-SAFE SELFHEAL] daemon-reload failed: {_de}"
+            )
+    except Exception as e:
+        logging.warning(
+            f"[WORKDIR-SAFE SELFHEAL] couldn't write {dst}: {e}"
+        )
+
+
 _NETGEN_CAPS_OVERRIDE_PATH = (
     "/etc/systemd/system/netgen-server.service.d/netgen-caps.conf"
 )
@@ -28152,6 +28253,19 @@ def main(argv=None):
     except Exception as e:
         logging.warning(
             f"[NETGEN-CAPS SELFHEAL] Unexpected error: {e}"
+        )
+
+    # v0.5.329 (audit systemd-chdir-lockout): self-heal a
+    # defensive drop-in that neutralizes bad WorkingDirectory /
+    # RootDirectory carried by ANY other drop-in — takes effect
+    # on the NEXT restart. If we're running now, we already have
+    # a working chdir; this defense is for future restarts where
+    # an operator-created drop-in might carry a bad path.
+    try:
+        _ensure_netgen_workdir_safe_deployed()
+    except Exception as e:
+        logging.warning(
+            f"[WORKDIR-SAFE SELFHEAL] Unexpected error: {e}"
         )
 
     # If a wheel upgrade changed Dockerfile.frr (e.g. v0.2.27 adding
