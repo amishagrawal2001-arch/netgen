@@ -2,6 +2,34 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.342] - 2026-09-15
+
+**DHCP tab's Lease IP / Gateway columns fall back to v6 lease
+fields when v4 is empty. Mirror of v0.5.294 for the DHCP subtab.**
+
+Operator on srv06: device6 finally leased `2001:db8:30::18a` v6
+end-to-end. Server DB + `/api/device/dhcp/status` correctly
+returned `lease_ip6=2001:db8:30::18a`. But the DHCP tab's Lease IP
+column stayed blank — the client only read `entry["lease_ip"]`
+(v4-only), never falling back to `lease_ip6`. Same class of bug
+that v0.5.294 fixed on the Devices tab.
+
+Fix: when `lease_ip` is empty and `lease_ip6` is populated, render
+`<addr>/<prefix> (v6)`. Same fallback for the Gateway column via
+`lease_gateway6`. Dual-stack rows still show the v4 lease
+unchanged (v4-wins-when-both-present).
+
+### Files touched
+
+- `utils/devices_tab_dhcp.py`
+- `tests/test_v05342_dhcp_tab_v6_lease_fallback.py`: 7 tests
+
+Client-side change — after `netgen-upgrade` on srv06, also
+`git pull` in `/Users/surajsharma/dev/netgen` on the machine
+running the client.
+
+---
+
 ## [0.5.341] - 2026-09-15
 
 **Upstream Config Hint emits a DHCPv6 relay-agent stanza alongside

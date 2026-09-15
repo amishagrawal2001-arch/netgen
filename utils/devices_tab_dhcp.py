@@ -1409,8 +1409,37 @@ class DHCPHandler:
                 self._set_item(row, "Lease IP", _server_ip)
                 self._set_item(row, "Gateway", _served_gw)
             else:
-                self._set_item(row, "Lease IP", entry.get("lease_ip", ""))
-                self._set_item(row, "Gateway", entry.get("lease_gateway", ""))
+                # v0.5.342 (audit dhcpv6-lease-visibility-tab): mirror
+                # v0.5.294's Devices-tab fallback into the DHCP tab.
+                # For a DHCP-client whose v4 is empty (v6-only device
+                # like operator's device6 on srv06), the Lease IP column
+                # stayed blank even after the v6 lease landed —
+                # `lease_ip` is v4-only. Fall back to `lease_ip6` +
+                # `lease_prefix6` and mark with `(v6)` so a dual-stack
+                # row still shows the v4 lease unambiguously. Same
+                # pattern for Gateway → `lease_gateway6`.
+                _v4_lease = entry.get("lease_ip") or ""
+                _v6_lease = entry.get("lease_ip6") or ""
+                _v6_prefix = entry.get("lease_prefix6") or ""
+                if _v4_lease:
+                    _lease_display = _v4_lease
+                elif _v6_lease:
+                    _lease_display = (
+                        f"{_v6_lease}/{_v6_prefix} (v6)"
+                        if _v6_prefix else f"{_v6_lease} (v6)"
+                    )
+                else:
+                    _lease_display = ""
+                self._set_item(row, "Lease IP", _lease_display)
+                _v4_gw = entry.get("lease_gateway") or ""
+                _v6_gw = entry.get("lease_gateway6") or ""
+                if _v4_gw:
+                    _gw_display = _v4_gw
+                elif _v6_gw:
+                    _gw_display = f"{_v6_gw} (v6)"
+                else:
+                    _gw_display = ""
+                self._set_item(row, "Gateway", _gw_display)
             self._set_item(row, "Last Check", str(entry.get("last_check") or ""))
 
             metadata = {
