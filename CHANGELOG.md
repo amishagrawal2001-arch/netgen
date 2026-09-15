@@ -2,6 +2,72 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.338] - 2026-09-15
+
+**Four v4→v6 DHCP parity fixes bundled** — dhcp6c stragglers
+sweep, v6 VRF connected-route post-check, v6 local-table
+`/128` host-route probe, v6 mask reconcile.
+
+Part 3 of 4 in the v4→v6 DHCP parity audit follow-up. Closes
+gaps #5, #7, #8, #9 (#6 was folded into v0.5.337). Gap #10
+(`ipv6_additional_pools`) is latent behind a UI that doesn't
+exist yet — deferred.
+
+### A. Stale-dhcp6c sweep (Gap #5)
+
+Pre-fix, the v6 client path did:
+```
+pkill -f "dhcp6c.*{interface}"
+```
+— an unanchored substring match (vlan1 matches vlan10, same
+class of bug v0.5.218 fix M rejected for the v4 side). Also a
+single pkill doesn't survive dhcp6c's fork-and-drop-parent
+pattern → orphans accumulate across Restart cycles.
+
+Fix: `_kill_stale_dhcp6c` helper (whole-token argv match,
+SIGKILL survivors), mirror of v0.5.240's `_kill_stale_dhclients`.
+
+### B. v6 VRF connected-route post-check (Gap #7)
+
+Mirror of v0.5.275 for v6. When the kernel skips auto-installing
+the connected route on a VRF-slaved interface, dnsmasq binds but
+egress from the VRF fails silently. New helper
+`_vrf_has_connected_route_v6`; call site in `start_dhcp_server`'s
+v6-anchor path installs the route explicitly on miss.
+
+### C. v6 local-table `/128` host-route probe (Gap #8)
+
+Mirror of v0.5.282/286 for v6. Rare kernel race skips
+auto-installing `local <ip>/128 dev lo table local` — inbound
+frames to the server's own v6 then get treated as martian and
+dropped. New helper `_v6_has_local_host_route`; call site
+installs on miss.
+
+### D. v6 mask reconcile (Gap #9)
+
+Mirror of v0.5.236 for v6. If the iface already carries a v6
+address whose subnet contains the anchor address, prefer the
+iface's declared prefix over the caller-supplied one. Prevents
+anchoring `2001:db8::1/125` on an iface declared /64 (would
+install a too-narrow connected route and misroute off-pool
+hosts in the /64).
+
+### Files touched
+
+- `utils/dhcp.py`: `_kill_stale_dhcp6c`, `_vrf_has_connected_route_v6`,
+  `_v6_has_local_host_route` helpers; `start_dhcp_client` uses the
+  new sweep instead of `pkill`; `start_dhcp_server` v6 anchor path
+  runs both route post-checks; `_ensure_ipv6_address` gets mask
+  reconcile
+- `tests/test_v05338_dhcpv6_parity_meds.py`: 20 source-level guards
+
+### Verification
+
+- 20 new tests pass
+- v0.5.335-337 markers all still intact
+
+---
+
 ## [0.5.337] - 2026-09-15
 
 **Three v4→v6 DHCP parity fixes bundled** — DAD-before-anchor for

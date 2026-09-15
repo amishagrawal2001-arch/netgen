@@ -1656,11 +1656,107 @@ def _vrf_has_connected_route(vrf_name: str, subnet: str,
     return False
 
 
+def _vrf_has_connected_route_v6(vrf_name: str, subnet: str,
+                                interface: str,
+                                container=None) -> bool:
+    """v0.5.338 (audit dhcpv6-vrf-connected-route-check): IPv6
+    mirror of v0.5.275's `_vrf_has_connected_route`. Same class of
+    kernel race: an IPv6 address added to a VRF-slaved interface
+    should auto-install a connected route in the VRF's routing
+    table, but the kernel skips it on some race conditions
+    (interface flap during enslavement, VRF just created, etc.).
+    Symptom: dnsmasq bind succeeds but egress from the VRF fails
+    because there's no route to the pool subnet.
+
+    Returns True iff the VRF has a connected route to `subnet`
+    via `interface`.
+    """
+    try:
+        res = _run_command(
+            ["ip", "-6", "route", "show", subnet, "vrf", vrf_name],
+            timeout=3, container=container,
+        )
+        if res.returncode != 0:
+            return False
+        # Kernel-emitted v6 connected routes look like:
+        #   2001:db8:20::/64 dev vlan20 proto kernel metric 256
+        for line in (res.stdout or "").splitlines():
+            if subnet in line and f"dev {interface}" in line:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _v6_has_local_host_route(address: str, container=None) -> bool:
+    """v0.5.338 (audit dhcpv6-local-host-route-check): IPv6 mirror
+    of v0.5.282/286's v4 local-table probe. When the kernel skips
+    auto-installing `local <ip>/128 dev lo table local`, packets
+    destined to the netgen server's own IPv6 get treated as martian
+    (no local match → drop). Rare on modern kernels but silently
+    lethal — the operator sees "server up" but every ping/DHCPv6
+    reply gets dropped.
+
+    Returns True iff table `local` has a host route to `address`.
+    """
+    if not address:
+        return False
+    try:
+        res = _run_command(
+            ["ip", "-6", "route", "show", "table", "local",
+             f"{address}/128"],
+            timeout=3, container=container,
+        )
+        if res.returncode != 0:
+            return False
+        for line in (res.stdout or "").splitlines():
+            if address in line and "local" in line:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=None) -> bool:
     """Ensure the interface has the specified IPv6 address configured."""
     if not interface or not address or prefix is None:
         return False
     existing = _parse_ipv6(interface, container=container) or []
+    # v0.5.338 (audit dhcpv6-mask-reconcile): mirror v0.5.236's v4
+    # mask reconcile. If the iface already has an IPv6 address whose
+    # subnet CONTAINS `address`, prefer that address's prefix over
+    # the caller-supplied one. Prevents anchoring `2001:db8::1/125`
+    # on an iface the operator declared /64 (which would install a
+    # too-narrow connected route and misroute off-pool hosts in the
+    # /64). Rare on v6 (most operators stick with /64) but harmless
+    # to guard.
+    try:
+        _target_addr = ipaddress.IPv6Address(address)
+        for entry in existing:
+            _e_ip = entry.get("ip") or ""
+            _e_pfx = entry.get("prefix")
+            if not _e_ip or _e_pfx in (None, ""):
+                continue
+            try:
+                if ipaddress.IPv6Address(_e_ip).is_link_local:
+                    continue
+                _e_net = ipaddress.IPv6Network(
+                    f"{_e_ip}/{_e_pfx}", strict=False,
+                )
+                if _target_addr in _e_net and str(_e_pfx) != str(prefix):
+                    logger.info(
+                        "[DHCP] v0.5.338 mask reconcile: iface %s "
+                        "already carries %s/%s covering the anchor "
+                        "%s — using operator's declared /%s instead "
+                        "of caller-supplied /%s",
+                        interface, _e_ip, _e_pfx, address, _e_pfx, prefix,
+                    )
+                    prefix = str(_e_pfx)
+                    break
+            except (ipaddress.AddressValueError, ValueError):
+                continue
+    except (ipaddress.AddressValueError, ValueError):
+        pass
     for entry in existing:
         if entry.get("ip") == address and str(entry.get("prefix")) == str(prefix):
             return True
@@ -2366,6 +2462,80 @@ def _is_dhclient_running(interface: str, container=None) -> bool:
             interface, exc,
         )
         return False
+
+
+def _kill_stale_dhcp6c(interface: str, container=None) -> int:
+    """v0.5.338 (audit dhcpv6-stragglers-sweep): dhcp6c counterpart
+    of v0.5.240's `_kill_stale_dhclients`. Sweep every dhcp6c bound
+    to `interface` and kill it before spawning a fresh one.
+
+    Pre-fix, the v6 client path at `start_dhcp_client` did a bare
+    `pkill -f "dhcp6c.*{interface}"` — the same UNANCHORED
+    substring match that v0.5.218 fix M explicitly rejected for
+    the v4 side: `vlan1` matches `vlan10`, so a dhcp6c bound to
+    vlan10 gets killed when you meant to restart vlan1's. And a
+    single pkill doesn't survive dhcp6c's fork-and-drop-parent
+    pattern the way `_kill_stale_dhclients` does — orphaned dhcp6c
+    processes accumulate across Restart cycles.
+
+    Uses `_is_dhcp6c_running`'s whole-token argv match logic.
+    Returns count killed for logging.
+    """
+    if not interface:
+        return 0
+    try:
+        _probe = _run_command(
+            ["pgrep", "-a", "-f", "dhcp6c"],
+            timeout=5, container=container,
+        )
+    except Exception as exc:
+        logger.debug("[DHCP] pgrep dhcp6c failed: %s", exc)
+        return 0
+    if _probe.returncode not in (0, 1):
+        return 0
+    _pids: List[str] = []
+    for line in (_probe.stdout or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        argv = parts[1].split()
+        if interface in argv:
+            _pids.append(parts[0])
+    if not _pids:
+        return 0
+    logger.info(
+        "[DHCP] v0.5.338 Sweeping %d stray dhcp6c(s) on %s: pids=%s",
+        len(_pids), interface, ",".join(_pids),
+    )
+    for _pid in _pids:
+        try:
+            _run_command(["kill", _pid], timeout=3, container=container)
+        except Exception as exc:
+            logger.debug("[DHCP] kill %s failed: %s", _pid, exc)
+    time.sleep(0.3)
+    # SIGKILL survivors.
+    try:
+        _probe2 = _run_command(
+            ["pgrep", "-a", "-f", "dhcp6c"],
+            timeout=5, container=container,
+        )
+        if _probe2.returncode == 0:
+            for line in (_probe2.stdout or "").splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) < 2:
+                    continue
+                argv = parts[1].split()
+                if interface in argv:
+                    try:
+                        _run_command(
+                            ["kill", "-9", parts[0]],
+                            timeout=3, container=container,
+                        )
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return len(_pids)
 
 
 def _is_dhcp6c_running(interface: str, container=None) -> bool:
@@ -3125,10 +3295,15 @@ def start_dhcp_client(
             except Exception as exc:
                 logger.warning("[DHCP] Failed to write dhcp6c config for %s: %s", interface, exc)
 
-            try:
-                _run_command(["pkill", "-f", f"dhcp6c.*{interface}"], timeout=5, container=container)
-            except Exception:
-                pass
+            # v0.5.338 (audit dhcpv6-stragglers-sweep): pre-fix used
+            # `pkill -f "dhcp6c.*{interface}"` — an unanchored
+            # substring match (vlan1 → vlan10 collision, same class
+            # of bug v0.5.218 fix M rejected for dhclient). Also a
+            # single pkill leaks orphans across Restart cycles.
+            # `_kill_stale_dhcp6c` uses whole-token argv match and
+            # SIGKILLs survivors, mirroring v0.5.240's dhclient
+            # sweep.
+            _kill_stale_dhcp6c(interface, container=container)
 
             dhcp6_exec = _run_command(dhcp6_cmd, timeout=10, container=container)
             if dhcp6_exec.returncode != 0:
@@ -3896,6 +4071,84 @@ def start_dhcp_server(
                             interface, _v6_ip, device_id, device_db,
                             container=container,
                         )
+                        # v0.5.338 (audit dhcpv6-vrf-connected-route-check):
+                        # mirror v0.5.275's v4 VRF connected-route post-
+                        # check. Kernel usually installs the v6 connected
+                        # route in the VRF's table automatically when the
+                        # iface is VRF-slaved, but some race conditions
+                        # (interface flap during enslavement, VRF just
+                        # created) skip it. Silent egress failure from the
+                        # VRF is the resulting bug. Probe and heal.
+                        try:
+                            _vrf_v6 = _detect_iface_vrf(
+                                interface, container=container,
+                            )
+                            if _vrf_v6:
+                                _v6_pool_net_str = str(
+                                    ipaddress.IPv6Network(
+                                        f"{_v6_ip}/{ipv6_prefix}",
+                                        strict=False,
+                                    )
+                                )
+                                if not _vrf_has_connected_route_v6(
+                                    _vrf_v6, _v6_pool_net_str, interface,
+                                    container=container,
+                                ):
+                                    logger.info(
+                                        "[DHCP] v0.5.338 VRF %s missing "
+                                        "v6 connected %s dev %s (kernel "
+                                        "auto-install didn't fire) — "
+                                        "installing explicitly",
+                                        _vrf_v6, _v6_pool_net_str, interface,
+                                    )
+                                    _run_command(
+                                        [
+                                            "ip", "-6", "route", "add",
+                                            _v6_pool_net_str, "dev", interface,
+                                            "proto", "kernel", "metric", "256",
+                                            "vrf", _vrf_v6,
+                                        ],
+                                        timeout=5, container=container,
+                                    )
+                        except Exception as _v6_route_exc:
+                            logger.debug(
+                                "[DHCP] v0.5.338 v6 VRF-route post-check "
+                                "failed for %s on %s: %s",
+                                _v6_ip, interface, _v6_route_exc,
+                            )
+
+                        # v0.5.338 (audit dhcpv6-local-host-route-check):
+                        # mirror v0.5.282's v4 local-table probe. If the
+                        # kernel skipped auto-installing `local <ip>/128
+                        # dev lo table local`, inbound frames to this
+                        # address get treated as martian and dropped.
+                        # Rare but silently lethal — dnsmasq bind
+                        # succeeds and log shows nothing.
+                        try:
+                            if not _v6_has_local_host_route(
+                                _v6_ip, container=container,
+                            ):
+                                logger.info(
+                                    "[DHCP] v0.5.338 v6 local-table "
+                                    "missing local %s (kernel didn't "
+                                    "auto-install) — installing explicitly",
+                                    _v6_ip,
+                                )
+                                _run_command(
+                                    [
+                                        "ip", "-6", "route", "add",
+                                        "local", f"{_v6_ip}/128",
+                                        "dev", interface,
+                                        "table", "local",
+                                    ],
+                                    timeout=5, container=container,
+                                )
+                        except Exception as _v6_local_exc:
+                            logger.debug(
+                                "[DHCP] v0.5.338 v6 local-host-route "
+                                "post-check failed for %s: %s",
+                                _v6_ip, _v6_local_exc,
+                            )
 
     pidfile = os.path.join(DNSMASQ_PID_DIR, f"dnsmasq-{interface}.pid")
     leasefile = os.path.join(DNSMASQ_LEASE_DIR, f"dnsmasq-{interface}.leases")
