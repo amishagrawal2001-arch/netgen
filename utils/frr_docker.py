@@ -574,6 +574,93 @@ class FRRDockerManager:
                                 f"local {_addr}/{_host_pfx} dev {iface_name} "
                                 f"table {vrf_table}: {_r.stderr.strip()}"
                             )
+                        # v0.5.332 (audit vrf-connected-route-missing):
+                        # v0.5.310 installed the LOCAL route above
+                        # (`local <addr>/128 dev <iface> table <vrf>`),
+                        # but NOT the CONNECTED route (`<net>/<prefix>
+                        # dev <iface> table <vrf>`). On IPv6 in
+                        # particular, when the address is added to the
+                        # iface BEFORE VRF enslavement, the kernel
+                        # installs the connected route in the DEFAULT
+                        # table (254) and enslavement doesn't reliably
+                        # migrate it to the VRF's table.
+                        #
+                        # Operator on srv06 2026-09-15 hit this on
+                        # device5 (2001:db8:20::2/64 on vlan20 in
+                        # vrf-b710e366aec): switch's `ping 2001:db8:20::2`
+                        # worked, but netgen's ARP monitor's
+                        # `ip vrf exec <vrf> ping -6 2001:db8:20::1`
+                        # returned "Network is unreachable" because the
+                        # VRF's IPv6 routing table had NO route for
+                        # `2001:db8:20::/64`. All 5 v0.5.328 fallback
+                        # tiers failed → device5 stayed yellow.
+                        #
+                        # Fix: also install the CONNECTED route in the
+                        # VRF's table so any code path running inside
+                        # the VRF (ping, ARP monitor, DHCP, BGP) can
+                        # reach the connected subnet. Idempotent —
+                        # "File exists" swallowed.
+                        try:
+                            import ipaddress as _ipa2
+                            if _fam_flag == "-4":
+                                _net = _ipa2.IPv4Network(_cidr, strict=False)
+                            else:
+                                _net = _ipa2.IPv6Network(_cidr, strict=False)
+                            _conn_cidr = str(_net)
+                            _conn_cmd = [
+                                "ip", _fam_flag, "route", "add",
+                                _conn_cidr,
+                                "dev", iface_name,
+                                "table", str(vrf_table),
+                                "proto", "kernel",
+                                "scope", "link",
+                                "metric", "256",
+                            ]
+                            _rc = subprocess.run(
+                                _conn_cmd,
+                                capture_output=True, text=True, timeout=5,
+                            )
+                            if _rc.returncode == 0:
+                                logger.info(
+                                    f"[VRF] device {device_id}: installed "
+                                    f"connected {_conn_cidr} dev {iface_name} "
+                                    f"table {vrf_table} (v0.5.332)"
+                                )
+                            elif "File exists" not in (_rc.stderr or ""):
+                                # IPv6 doesn't accept `scope link` on
+                                # connected routes — retry without it.
+                                # (IPv4 requires scope link; IPv6 uses
+                                # scope global by default for on-link.)
+                                _conn_cmd_v6 = [
+                                    "ip", _fam_flag, "route", "add",
+                                    _conn_cidr,
+                                    "dev", iface_name,
+                                    "table", str(vrf_table),
+                                    "proto", "kernel",
+                                    "metric", "256",
+                                ]
+                                _rc2 = subprocess.run(
+                                    _conn_cmd_v6,
+                                    capture_output=True, text=True, timeout=5,
+                                )
+                                if _rc2.returncode == 0:
+                                    logger.info(
+                                        f"[VRF] device {device_id}: installed "
+                                        f"connected {_conn_cidr} dev {iface_name} "
+                                        f"table {vrf_table} (v0.5.332 no-scope)"
+                                    )
+                                elif "File exists" not in (_rc2.stderr or ""):
+                                    logger.warning(
+                                        f"[VRF] device {device_id}: failed to "
+                                        f"install connected {_conn_cidr} dev "
+                                        f"{iface_name} table {vrf_table}: "
+                                        f"{_rc2.stderr.strip()}"
+                                    )
+                        except Exception as _conn_exc:
+                            logger.warning(
+                                f"[VRF] device {device_id}: connected-route "
+                                f"install raised: {_conn_exc}"
+                            )
             except Exception as _local_route_exc:
                 logger.warning(
                     f"[VRF] device {device_id}: local-route install "

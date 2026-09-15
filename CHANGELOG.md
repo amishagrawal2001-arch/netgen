@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.332] - 2026-09-15
+
+**`_create_vrf` also installs the CONNECTED route in the VRF's
+routing table, not just the LOCAL host route. Fixes device5
+yellow when the interface's IPv6 subnet isn't reachable from
+inside its own VRF.**
+
+Operator on srv06: device5 (IPv6-only, `2001:db8:20::2/64` on
+vlan20 in `vrf-b710e366aec`) stayed yellow even after v0.5.331
+switched `ping6` → `ping -6`. Switch's `ping 2001:db8:20::2`
+worked from outside, but netgen's ARP monitor kept reporting
+`arp_ipv6_resolved=False`.
+
+### Root cause
+
+v0.5.310 installed the LOCAL route in the VRF's table:
+```
+ip -6 route add local 2001:db8:20::2/128 dev vlan20 table <vrf_table>
+```
+which lets the VRF ACCEPT packets destined to netgen's own IP.
+
+But it did NOT install the CONNECTED route:
+```
+ip -6 route add 2001:db8:20::/64 dev vlan20 proto kernel metric 256 table <vrf_table>
+```
+which is what the VRF needs to SEND packets to any address in
+the /64 (including the switch's gateway `2001:db8:20::1`).
+
+On IPv6, the kernel doesn't reliably migrate connected routes
+to the VRF's table when an address is added to the iface BEFORE
+enslavement. The connected route stays in the default table
+(254) only. From inside the VRF:
+```
+$ ip vrf exec vrf-b710e366aec ping -6 2001:db8:20::1
+connect: Network is unreachable
+```
+
+That kills v0.5.328's Tier 1 (VRF-scoped ping-6). Tiers 3/4
+(neigh cache) fail because netgen never resolved the neighbor
+(no route to send NS). Tier 5 (`ping -6 -I vlan20`) is kernel-
+version-dependent — often blocked on VRF-enslaved ifaces even
+with `-I`. All 5 tiers → yellow.
+
+### Fix
+
+Extend v0.5.310's local-route install in `_create_vrf` to also
+install the connected route:
+
+```
+ip -4 route add <net>/<pfx> dev <iface> table <vrf_table> \
+  proto kernel scope link metric 256
+
+ip -6 route add <net>/<pfx> dev <iface> table <vrf_table> \
+  proto kernel metric 256      # no `scope link` — IPv6 rejects it
+```
+
+The IPv6 form drops `scope link` (kernel rejects it on IPv6
+connected routes — IPv6 uses global scope by default for on-
+link). Fallback: if the first attempt with `scope link` fails
+(IPv4 accepts, IPv6 rejects), retry without `scope link`.
+
+Idempotent — `"File exists"` on stderr is swallowed. Runs
+inside the existing `for _fam_flag in ("-4", "-6"):` loop so
+both address families get the fix.
+
+### Recovery for existing broken state
+
+An existing device with the bad VRF state won't fix itself just
+by upgrading — the connected route needs to be installed. On
+srv06 that means either:
+  1. **Restart netgen-server + re-apply device5** (Apply button
+     in the Devices tab). `_create_vrf` is idempotent; on
+     re-apply it'll add the missing connected route.
+  2. **Or add it manually right now** (one command per stuck device):
+     ```
+     sudo ip -6 route add 2001:db8:20::/64 dev vlan20 \
+       table $(ip -o link show vlan20 | grep -oE 'master vrf-[a-f0-9]+' | sed 's/master vrf-//;s/^/1000/' | cut -c1-10) \
+       proto kernel metric 256
+     ```
+     (VRF table number is derived from the VRF name — check
+     `ip -d link show vrf-...` for the actual value.)
+
+Post-fix, netgen's ARP monitor's Tier 1 `ip vrf exec <vrf> ping
+-6 2001:db8:20::1` succeeds → device turns green.
+
+### Verification
+
+8 lock-in tests in `tests/test_v05332_vrf_connected_route.py`:
+  * marker present
+  * `ip route add` command shape (proto kernel + scope link +
+    metric 256 + table)
+  * uses `ipaddress.IPvN_Network(strict=False)` for network
+    computation
+  * IPv6 `scope link` fallback (retry without scope for IPv6)
+  * swallows `File exists` for idempotency
+  * ordered AFTER v0.5.310 local-route install (same loop iter)
+  * runs for BOTH IPv4 and IPv6 (inside fam-flag loop)
+  * frr_docker.py AST parses
+
 ## [0.5.331] - 2026-09-15
 
 **ARP status endpoint: `ping6` → `ping -6`. Fixes device5 yellow
