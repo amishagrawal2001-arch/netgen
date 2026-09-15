@@ -21177,6 +21177,11 @@ def api_admin_health():
         try:
             _u = _shutil.disk_usage(_path)
             disk[_label] = {
+                # v0.5.330: stash raw bytes so the "Disk critical:
+                # X MB free" formatter can drop to KB/bytes when
+                # free < 1 MB (integer-divide otherwise floors to 0
+                # → operator can't tell 0-bytes from 900-KB).
+                "free_bytes": _u.free,
                 "free_mb": _u.free // (1024 * 1024),
                 "total_mb": _u.total // (1024 * 1024),
             }
@@ -21295,13 +21300,34 @@ def api_admin_health():
     # not just the three (tmp / var_lib_netgen / opt_netgen)
     # dict entries. Skip non-dict values — the mounts list has
     # its own per-row used_pct in the rendering layer.
+    # v0.5.330 (audit disk-issue-precision): when actual free is
+    # in the (0, 1 MB) range, `free // (1024*1024)` rounds to 0 —
+    # operator sees "Disk critical: tmp only 0 MB free" and can't
+    # tell if the disk is genuinely full (0 bytes) OR sandbox-
+    # small (a few KB) OR the check is bogus (units bug). Add a
+    # human-friendly `free_display` that shows KB/bytes when free
+    # < 1 MB so the message is unambiguous. Threshold logic stays
+    # on `free_mb` so the alert firing conditions are unchanged.
+    def _fmt_free_bytes(free_bytes: int) -> str:
+        if free_bytes >= 1024 * 1024:
+            return f"{free_bytes // (1024 * 1024)} MB"
+        if free_bytes >= 1024:
+            return f"{free_bytes // 1024} KB"
+        return f"{free_bytes} bytes"
     _disk_issues = []
     for _label, _info in disk.items():
         if not isinstance(_info, dict):
             continue
+        # Re-read raw bytes for accurate low-space labeling. Fall
+        # back to the pre-computed MB when the raw isn't stashed
+        # (older code path).
+        _free_bytes = _info.get("free_bytes")
+        if _free_bytes is None:
+            _free_bytes = _info["free_mb"] * 1024 * 1024
+        _free_display = _fmt_free_bytes(_free_bytes)
         if _info["free_mb"] < 100:
             _disk_issues.append(
-                f"Disk critical: {_label} only {_info['free_mb']} MB free"
+                f"Disk critical: {_label} only {_free_display} free"
             )
         elif _info["free_mb"] < 1024:
             _disk_issues.append(

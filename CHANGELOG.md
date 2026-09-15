@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.330] - 2026-09-15
+
+**Disk-critical health issue formatter shows KB/bytes precision
+when free < 1 MB, instead of always rounding to `0 MB free`.**
+
+Operator on srv06 got:
+```
+"issues": [
+    "Disk critical: tmp only 0 MB free",
+    "Disk critical: opt_netgen only 0 MB free"
+]
+```
+
+with no way to distinguish four scenarios that all render as
+`0 MB free`:
+  * disk genuinely at 0 bytes
+  * 100 KB free (still critical but not literally 0)
+  * some systemd sandbox artifact making the process see a
+    tiny view of the filesystem (PrivateTmp, ProtectSystem)
+  * units bug in the check
+
+### Fix
+
+`/api/admin/health` now stashes raw `free_bytes` on each per-path
+disk dict alongside the pre-computed `free_mb`. The alert
+formatter (`_fmt_free_bytes`) picks the largest whole-unit
+representation that stays ≥ 1:
+  * `>= 1 MB` → `"N MB"`
+  * `1 KB - 1 MB` → `"N KB"`
+  * `< 1 KB` → `"N bytes"`
+
+So the operator's message becomes one of:
+  * `"Disk critical: tmp only 0 bytes free"` — genuinely empty
+  * `"Disk critical: tmp only 900 KB free"` — nearly empty
+  * `"Disk critical: tmp only 42 MB free"` — under threshold
+    but not near zero (this shape existed pre-fix)
+
+Threshold logic unchanged — critical still fires at `free_mb <
+100`, low at `free_mb < 1024`. The DISPLAY is the only change.
+
+Also: the "low" branch (100 MB ≤ free < 1 GB) still uses MB
+since the display isn't ambiguous there.
+
+Fallback: if a stale/older code path constructs the dict
+without `free_bytes`, the formatter falls back to
+`free_mb * 1024 * 1024` — loses sub-MB precision but doesn't
+crash.
+
+### Verification
+
+10 lock-in tests in `tests/test_v05330_disk_issue_precision.py`:
+  * marker present + `free_bytes` stashed
+  * `_fmt_free_bytes` helper defined
+  * formatter uses MB (≥ 1 MB), KB (< 1 MB, ≥ 1 KB), bytes
+    (< 1 KB)
+  * critical alert uses `_free_display` (not raw `free_mb`)
+  * threshold logic (100 / 1024 MB) unchanged
+  * fallback when `free_bytes` missing
+  * server AST parses
+
 ## [0.5.329] - 2026-09-15
 
 **Systemd drop-in self-heal that neutralizes bad
