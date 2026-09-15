@@ -2,6 +2,37 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.336] - 2026-09-15
+
+**arp_monitor's v6 anchor replay honors the same L3-remote (relay
+mode) carve-out that v0.5.335 added to `start_dhcp_server`.
+Regression guard.**
+
+Without this, the arp_monitor tick's v0.5.309 v6-anchor replay
+would silently re-add a pool-subnet IP to the server's iface every
+minute — undoing the v0.5.335 sweep that ran at Apply time. Any
+relay-mode DHCPv6 server (device5 on srv06) would regress within
+one poll interval.
+
+Fix: mirror the `_pool_is_l3_remote` computation from v0.5.335 in
+`arp_monitor._replay_dhcp_anchors` — if the pool subnet doesn't
+overlap with the iface's own IPv6 subnets, skip the anchor. Direct-
+attached devices still hit the replay (v0.5.309's original intent).
+
+Uses the same `_parse_ipv6` helper from `utils/dhcp` so the two
+sites can't drift.
+
+### Files touched
+
+- `utils/arp_monitor.py`: v0.5.336 marker + L3-remote guard in the
+  v6 anchor replay branch
+- `tests/test_v05336_arp_monitor_v6_replay_l3_remote.py`: 9 source-
+  level guards
+
+Part 1 of 4 in the v4→v6 DHCP parity audit follow-up (v0.5.336-339).
+
+---
+
 ## [0.5.335] - 2026-09-15
 
 **DHCPv6 server no longer anchors a pool-subnet IP on its own

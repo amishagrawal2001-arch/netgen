@@ -573,6 +573,71 @@ class ARPStatusMonitor:
                 or ""
             )
             if _v6_enabled_dc and _v6_pool_start and _v6_pool_end:
+                # v0.5.336 (audit dhcpv6-monitor-replay-l3-remote):
+                # mirror the v0.5.335 relay-mode carve-out from
+                # start_dhcp_server. Pre-fix, this replay path
+                # unconditionally re-added a pool-subnet IP to the
+                # server's iface on every tick, which SILENTLY UNDOES
+                # v0.5.335 — the fix in start_dhcp_server swept the
+                # stale anchor on Apply, but then the next arp_monitor
+                # tick re-added it. Any relay-mode DHCPv6 server (like
+                # srv06 device5 serving 2001:db8:30::/64 from vlan20
+                # 2001:db8:20::2) would regress within a minute of
+                # applying v0.5.335.
+                #
+                # Detect L3-remote by comparing the pool's IPv6
+                # network with the iface's own IPv6 subnets (link-
+                # local excluded). Same shape used by start_dhcp_server.
+                import ipaddress as _ipa6
+                _pool_is_l3_remote_v6 = False
+                try:
+                    _pool_net6 = _ipa6.IPv6Network(
+                        f"{_v6_pool_start}/{_v6_prefix}", strict=False,
+                    )
+                    _iface_v6_nets = []
+                    try:
+                        from utils.dhcp import _parse_ipv6 as _pv6
+                        for _entry in (_pv6(_iface, container=None) or []):
+                            _e_ip = _entry.get("ip") or ""
+                            _e_pfx = _entry.get("prefix")
+                            if not _e_ip or _e_pfx in (None, ""):
+                                continue
+                            try:
+                                if _ipa6.IPv6Address(_e_ip).is_link_local:
+                                    continue
+                                _iface_v6_nets.append(
+                                    _ipa6.IPv6Network(
+                                        f"{_e_ip}/{_e_pfx}", strict=False,
+                                    )
+                                )
+                            except (_ipa6.AddressValueError, ValueError):
+                                continue
+                    except Exception as _iface_probe_exc:
+                        logger.debug(
+                            f"[ARP MONITOR] v0.5.336 iface v6 probe "
+                            f"failed for {_iface}: {_iface_probe_exc} "
+                            f"(non-fatal; falling through to anchor)"
+                        )
+                    if _iface_v6_nets:
+                        _pool_is_l3_remote_v6 = not any(
+                            _pool_net6.overlaps(_n) for _n in _iface_v6_nets
+                        )
+                except (_ipa6.AddressValueError, ValueError) as _remote_exc:
+                    logger.debug(
+                        f"[ARP MONITOR] v0.5.336 pool-remote check "
+                        f"failed for {_v6_pool_start}/{_v6_prefix}: "
+                        f"{_remote_exc} (non-fatal)"
+                    )
+
+                if _pool_is_l3_remote_v6:
+                    logger.debug(
+                        f"[ARP MONITOR] v0.5.336 anchor replay skip: "
+                        f"device {_dev_id} iface={_iface} v6 pool "
+                        f"{_v6_pool_start}/{_v6_prefix} is L3-REMOTE "
+                        f"(relay mode) — no anchor to replay"
+                    )
+                    continue
+
                 # Derive the anchor address the same way start_dhcp_
                 # server does: prefer the operator-set ipv6_server_ip;
                 # else default to the first host of the /prefix
