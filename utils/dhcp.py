@@ -3451,34 +3451,139 @@ def start_dhcp_server(
                 )
 
     if ipv6_enabled and ipv6_prefix:
-        # v0.5.230 (audit P server-10): auto-derive IPv6 server IP
-        # from the pool subnet when the operator didn't supply one,
-        # matching the IPv4-side v0.5.222 fix. Pre-fix, an IPv6-only
-        # pool with no explicit server_ip failed to bind with the
-        # same "no interface with matching address" that IPv4 was
-        # fixed to avoid.
-        _v6_ip = ipv6_server_ip
-        if not _v6_ip and ipv6_pool_start:
+        # v0.5.335 (audit dhcpv6-relay-mode-anchor-collision): skip
+        # the v6 pool anchor when the pool subnet is L3-REMOTE from
+        # the server's own interface — the v4 side has had this
+        # relay-mode carve-out since v0.5.245 (`relay_return_hop`)
+        # but v6 kept unconditionally anchoring, which for cross-
+        # subnet setups adds a pool-subnet IP to the server's iface
+        # that collides with the upstream L3-hop's own IP.
+        #
+        # Operator on srv06 2026-09-15: device5 on vlan20
+        # (2001:db8:20::2/64) serving pool 2001:db8:30::100-1ff for
+        # DHCPv6 clients on vlan40 (behind QFX relay). Auto-anchor
+        # added `2001:db8:30::1/64` to vlan20 (server's own iface)
+        # — but that's ALSO the QFX's irb.40 IP. Two effects:
+        #   1. Duplicate address on the L2 (both srv06's vlan20 and
+        #      QFX's irb.40 claim 2001:db8:30::1).
+        #   2. Kernel installs connected route
+        #      `2001:db8:30::/64 dev vlan20 proto kernel` in the
+        #      default table. When dnsmasq (bound via bind-dynamic
+        #      to vlan20) sends the relay-reply to source
+        #      2001:db8:30::1, kernel resolves it via the newly-
+        #      added connected route → ND on vlan20 → answers
+        #      itself → reply never reaches the QFX relay →
+        #      DHCPv6 client on vlan40 never leases.
+        #
+        # Detect L3-remote pools by comparing the pool's IPv6
+        # network with the interface's own IPv6 subnets (link-local
+        # excluded). Direct-attached devices (server + clients on
+        # same L2) still get the anchor — that's the v0.5.230 case
+        # which is correct.
+        _pool_is_l3_remote = False
+        try:
+            _pool_net = ipaddress.IPv6Network(
+                f"{ipv6_pool_start}/{ipv6_prefix}", strict=False,
+            )
+            _iface_v6_nets = []
+            for _entry in (_parse_ipv6(interface, container=container) or []):
+                _e_ip = _entry.get("ip") or ""
+                _e_pfx = _entry.get("prefix")
+                if not _e_ip or _e_pfx in (None, ""):
+                    continue
+                try:
+                    if ipaddress.IPv6Address(_e_ip).is_link_local:
+                        continue
+                    _iface_v6_nets.append(
+                        ipaddress.IPv6Network(f"{_e_ip}/{_e_pfx}", strict=False)
+                    )
+                except (ipaddress.AddressValueError, ValueError):
+                    continue
+            if _iface_v6_nets:
+                _pool_is_l3_remote = not any(
+                    _pool_net.overlaps(_n) for _n in _iface_v6_nets
+                )
+        except (ipaddress.AddressValueError, ValueError) as _remote_check_exc:
+            logger.debug(
+                "[DHCP] v0.5.335 pool-remote check failed for %s/%s: %s "
+                "(non-fatal; falling through to direct-attached anchor path)",
+                ipv6_pool_start, ipv6_prefix, _remote_check_exc,
+            )
+
+        if _pool_is_l3_remote:
+            logger.info(
+                "[DHCP] v0.5.335 device %s: pool %s/%s is L3-REMOTE "
+                "from server iface %s — skipping v6 anchor (relay "
+                "mode; pool subnet lives on the upstream relay, "
+                "not the server).",
+                device_id, ipv6_pool_start, ipv6_prefix, interface,
+            )
+            # v0.5.335 cleanup: a pre-fix apply may have already
+            # attached a pool-subnet IP to this iface. Sweep any
+            # iface IPv6 addresses that live in the pool subnet —
+            # they can only be leftovers from the old auto-anchor
+            # code path, since no legitimate direct-attached
+            # configuration reaches this branch (we're in relay
+            # mode). Non-link-local only; link-locals are kernel-
+            # managed.
             try:
-                _v6_net = ipaddress.IPv6Network(
-                    f"{ipv6_pool_start}/{ipv6_prefix}", strict=False,
+                for _entry in (_parse_ipv6(interface, container=container) or []):
+                    _stale_ip = _entry.get("ip") or ""
+                    _stale_pfx = _entry.get("prefix")
+                    if not _stale_ip or _stale_pfx in (None, ""):
+                        continue
+                    try:
+                        if ipaddress.IPv6Address(_stale_ip).is_link_local:
+                            continue
+                        if ipaddress.IPv6Address(_stale_ip) in _pool_net:
+                            _remove_ipv6_address(
+                                interface, _stale_ip, str(_stale_pfx),
+                                container=container,
+                            )
+                            logger.info(
+                                "[DHCP] v0.5.335 device %s: removed "
+                                "stale pool-subnet anchor %s/%s from "
+                                "%s (leftover from pre-v0.5.335 "
+                                "apply).",
+                                device_id, _stale_ip, _stale_pfx, interface,
+                            )
+                    except (ipaddress.AddressValueError, ValueError):
+                        continue
+            except Exception as _stale_sweep_exc:
+                logger.debug(
+                    "[DHCP] v0.5.335 stale-anchor sweep raised for "
+                    "%s: %s (non-fatal)",
+                    interface, _stale_sweep_exc,
                 )
-                _hosts6 = list(_v6_net.hosts())
-                if _hosts6:
-                    _v6_ip = str(_hosts6[0])
-                else:
-                    _v6_ip = str(_v6_net.network_address)
-                logger.info(
-                    "[DHCP] Derived IPv6 server IP %s from pool %s (no explicit ipv6_server_ip)",
-                    _v6_ip, _v6_net,
-                )
-            except (ipaddress.AddressValueError, ValueError) as _v6_exc:
-                logger.warning(
-                    "[DHCP] Could not derive IPv6 server IP from pool %s/%s: %s",
-                    ipv6_pool_start, ipv6_prefix, _v6_exc,
-                )
-        if _v6_ip:
-            _ensure_ipv6_address(interface, _v6_ip, ipv6_prefix, container=container)
+        else:
+            # v0.5.230 (audit P server-10): auto-derive IPv6 server IP
+            # from the pool subnet when the operator didn't supply one,
+            # matching the IPv4-side v0.5.222 fix. Pre-fix, an IPv6-only
+            # pool with no explicit server_ip failed to bind with the
+            # same "no interface with matching address" that IPv4 was
+            # fixed to avoid.
+            _v6_ip = ipv6_server_ip
+            if not _v6_ip and ipv6_pool_start:
+                try:
+                    _v6_net = ipaddress.IPv6Network(
+                        f"{ipv6_pool_start}/{ipv6_prefix}", strict=False,
+                    )
+                    _hosts6 = list(_v6_net.hosts())
+                    if _hosts6:
+                        _v6_ip = str(_hosts6[0])
+                    else:
+                        _v6_ip = str(_v6_net.network_address)
+                    logger.info(
+                        "[DHCP] Derived IPv6 server IP %s from pool %s (no explicit ipv6_server_ip)",
+                        _v6_ip, _v6_net,
+                    )
+                except (ipaddress.AddressValueError, ValueError) as _v6_exc:
+                    logger.warning(
+                        "[DHCP] Could not derive IPv6 server IP from pool %s/%s: %s",
+                        ipv6_pool_start, ipv6_prefix, _v6_exc,
+                    )
+            if _v6_ip:
+                _ensure_ipv6_address(interface, _v6_ip, ipv6_prefix, container=container)
 
     pidfile = os.path.join(DNSMASQ_PID_DIR, f"dnsmasq-{interface}.pid")
     leasefile = os.path.join(DNSMASQ_LEASE_DIR, f"dnsmasq-{interface}.leases")

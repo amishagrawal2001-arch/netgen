@@ -2,6 +2,81 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.335] - 2026-09-15
+
+**DHCPv6 server no longer anchors a pool-subnet IP on its own
+interface when the pool is L3-REMOTE (relay mode). Fixes cross-
+subnet DHCPv6 where a client behind a switch DHCPv6 relay never
+leases despite the relay forwarding solicits correctly.**
+
+### Root cause
+
+`start_dhcp_server`'s v0.5.230 auto-anchor was unconditional:
+for every v6 pool it computed the first host of the pool subnet
+and attached it to the server's interface, matching the v0.5.222
+IPv4 fix. But the v4 side got a relay-mode carve-out in v0.5.245
+(`relay_return_hop`) — the v6 side never did.
+
+Operator on srv06: device5 on vlan20 (`2001:db8:20::2/64`) as
+DHCPv6 server for pool `2001:db8:30::100-1ff/64`. Clients on
+vlan40 sit behind the QFX (irb.40 = `2001:db8:30::1/64`) acting
+as a DHCPv6 relay. The relay was forwarding solicits correctly
+to `2001:db8:20::2`, but the client never leased.
+
+Auto-anchor added `2001:db8:30::1/64` to srv06's vlan20 — the
+same IP the QFX's irb.40 holds. Two effects:
+
+1. Duplicate address on the L2.
+2. Kernel installed `2001:db8:30::/64 dev vlan20 proto kernel` in
+   the default table. When dnsmasq (bound to vlan20 via
+   bind-dynamic) sent the relay-reply back to `2001:db8:30::1`,
+   the kernel resolved that via the newly-added connected route
+   → ND on vlan20 → answered ITSELF → the relay-reply never
+   escaped srv06 → the DHCPv6 client on vlan40 timed out.
+
+### Fix
+
+Detect L3-remote pools by comparing the pool's IPv6 network with
+the interface's own IPv6 subnets (link-local excluded). If NONE
+overlap, we're in relay mode → skip the anchor entirely. The
+v0.5.230 auto-derive (first host → `ipv6_server_ip`) still fires
+on direct-attached devices where the pool subnet IS on the
+iface — no regression for that path.
+
+Also sweeps any stale pool-subnet IPv6 the pre-v0.5.335 anchor
+left on the iface, so a re-apply on an already-broken device
+retro-heals without needing to delete + re-add.
+
+### Files touched
+
+- `utils/dhcp.py`: v0.5.335 marker + relay-mode detection in
+  `start_dhcp_server`, split into `if _pool_is_l3_remote:` (skip
+  + sweep leftover anchor) vs `else:` (existing v0.5.230 anchor
+  path)
+- `tests/test_v05335_dhcpv6_relay_mode_anchor.py`: 10 source-
+  level guards (marker, detection uses `.overlaps()`, link-local
+  excluded, relay branch skips `_ensure_ipv6_address`, relay
+  branch sweeps stale anchors, direct-attached still derives
+  first host, comment names incident, v0.5.230 marker preserved,
+  AST parses, v0.5.334 marker still intact)
+
+### Verification
+
+- 10 new tests pass
+- Once upgraded, on next Apply of device5:
+  - stale `2001:db8:30::1/64` gets swept off vlan20
+  - dnsmasq stays bound only to vlan20 (`2001:db8:20::2`)
+  - kernel no longer thinks vlan20 owns `2001:db8:30::/64`
+  - relay-reply routes via the VRF's default → QFX → vlan40 client
+
+Also required (separate, operator-side): QFX must have a VRF
+default route to reach `2001:db8:30::1` from vrf-b710e366aec.
+v0.5.332 installed the connected route for `2001:db8:20::/64`;
+if pings from device5's VRF to `2001:db8:30::1` fail, that's a
+separate VRF-default-route gap to close.
+
+---
+
 ## [0.5.334] - 2026-09-15
 
 **Client's overall status calculation no longer treats IPv4 as
