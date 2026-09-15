@@ -2,6 +2,72 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.333] - 2026-09-15
+
+**`start_frr_container` reconciles VRF setup on re-apply for
+already-running devices. Fixes device5 still yellow after
+v0.5.332 upgrade + re-apply.**
+
+Operator on srv06: after upgrading to v0.5.332 (VRF connected-
+route install) and re-applying device5, status was STILL yellow.
+v0.5.332's fix lives inside `_create_vrf`, but `_create_vrf` is
+only called on the FRESH-launch path of `start_frr_container` —
+the already-running path returns early. An operator upgrading
+netgen and re-applying an existing device NEVER sees any fix
+that lives inside `_create_vrf` unless they first delete and
+re-add the device.
+
+### Root cause
+
+`utils/frr_docker.py::start_frr_container` at line ~707:
+
+```python
+existing_container = self.client.containers.get(container_name)
+if existing_container.status == "running":
+    logger.info(f"[FRR] Container {container_name} already running")
+    self._configure_global_router_id(container_name, device_id, device_config)
+    return container_name  # ← returns before _create_vrf at line ~752
+```
+
+Any fix inside `_create_vrf` (v0.5.310 local host-route install,
+v0.5.332 connected subnet-route install, future v0.5.334+ fixes)
+never fires on re-apply. Only fresh-launch fires them.
+
+### Fix
+
+On the already-running path, ALSO call `_create_vrf` — which is
+fully idempotent (swallows "File exists" from VRF-create, link-
+set-master, local-route-add, connected-route-add). The reconcile
+retro-heals existing devices that missed the fix at their
+original launch.
+
+`iface_name` is derived identically to the fresh-launch path
+(VLAN → `vlan{N}` else the raw `interface` field), and the
+resulting `vrf_name` is stashed back into `device_config` so
+downstream BGP/OSPF/ISIS configurators see it too. Failure is
+non-fatal — the reconcile block is wrapped in try/except; the
+container is already up and serving traffic, so a broken
+reconcile is a warning, not a crash.
+
+### Files touched
+
+- `utils/frr_docker.py`: v0.5.333 marker + reconcile block on
+  the already-running path in `start_frr_container`
+- `tests/test_v05333_vrf_reconcile_on_reapply.py`: source-level
+  guards (marker present, reconcile executes before return,
+  reconcile lives inside the running branch, iface derivation
+  matches fresh-launch, vrf_name stashed, try/except wrap,
+  single `_create_vrf` call site per path, v0.5.310 + v0.5.332
+  still intact, comment names srv06 incident, AST parses)
+
+### Verification
+
+- 10 new tests pass; v0.5.332 regressions still pass
+- Once upgraded, existing running devices retro-heal on Apply
+  without requiring delete + re-add
+
+---
+
 ## [0.5.332] - 2026-09-15
 
 **`_create_vrf` also installs the CONNECTED route in the VRF's

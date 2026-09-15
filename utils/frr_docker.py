@@ -711,6 +711,52 @@ class FRRDockerManager:
                     logger.info(f"[FRR] Container {container_name} already running")
                     # Ensure global router-id is configured (may have been missing)
                     self._configure_global_router_id(container_name, device_id, device_config)
+                    # v0.5.333 (audit vrf-reconcile-on-reapply): when the
+                    # container is already running we return here without
+                    # calling `_create_vrf` at line ~752 below. That means
+                    # route-install fixes (v0.5.310 local, v0.5.332
+                    # connected) NEVER FIRE on a re-apply for an existing
+                    # device — an operator upgrading netgen only sees the
+                    # fix after DELETING and re-adding the device. Operator
+                    # on srv06 2026-09-15 hit this on device5: after
+                    # upgrading to v0.5.332 and re-applying, device5
+                    # (2001:db8:20::2/64 on vlan20) still stayed yellow
+                    # because the VRF's IPv6 table was never re-populated.
+                    #
+                    # Reconcile VRF setup here so re-applies retro-heal
+                    # already-running devices. `_create_vrf` is fully
+                    # idempotent (swallows "File exists" from VRF-create,
+                    # link-set-master, local-route-add, connected-route-
+                    # add). Failure is non-fatal — we still return the
+                    # container name; the missing VRF just leaves the
+                    # device where it was before this reconcile pass.
+                    _interface = device_config.get('interface', '')
+                    _vlan = device_config.get('vlan', '0')
+                    if _vlan and _vlan != "0":
+                        _reconcile_iface = f"vlan{_vlan}"
+                    elif _interface:
+                        _reconcile_iface = _interface
+                    else:
+                        _reconcile_iface = None
+                    if _reconcile_iface:
+                        try:
+                            _reconcile_vrf = self._create_vrf(device_id, _reconcile_iface)
+                            if _reconcile_vrf:
+                                device_config['vrf_name'] = _reconcile_vrf
+                                logger.info(
+                                    f"[FRR] device {device_id}: VRF reconciled on "
+                                    f"re-apply → {_reconcile_vrf} (v0.5.333)"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[FRR] device {device_id}: VRF reconcile "
+                                    f"returned None on re-apply (v0.5.333)"
+                                )
+                        except Exception as _reconcile_exc:
+                            logger.warning(
+                                f"[FRR] device {device_id}: VRF reconcile raised "
+                                f"on re-apply: {_reconcile_exc} (v0.5.333)"
+                            )
                     return container_name
                 else:
                     existing_container.remove(force=True)
