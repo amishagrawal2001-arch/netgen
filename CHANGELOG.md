@@ -2,6 +2,81 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.339] - 2026-09-15
+
+**Fix chicken-and-egg where v0.5.335/336's L3-remote detection
+used runtime iface state — corrupted by the very stale anchor it
+was supposed to sweep — and re-anchored every arp_monitor tick.
+Also adds an autonomous tick-time sweep that heals existing
+devices without requiring a manual Apply.**
+
+### Root cause
+
+v0.5.335 + v0.5.336 detected "relay-mode" by comparing the pool's
+IPv6 network against the iface's RUNTIME v6 subnets (via
+`_parse_ipv6`). But the stale pool-subnet anchor a pre-v0.5.335
+apply left on the iface makes the runtime state CONTAIN the pool
+subnet — the runtime check then flips to "direct-attached" and:
+
+1. `start_dhcp_server`'s v0.5.335 sweep never runs (thinks it's
+   direct-attached, so no cleanup path).
+2. `arp_monitor._replay_dhcp_anchors`' v0.5.336 skip never fires
+   → the replay re-adds the stale anchor every tick, cementing
+   the corruption.
+3. `start_dhcp_server`'s v0.5.337 DAD probe (`ping -6 -I vlan20
+   2001:db8:30::1`) reaches SELF via the stale connected route
+   → false-positive "duplicate address" → dnsmasq bind refused.
+
+Observed on srv06 after v0.5.338 upgrade: device5 (vlan20,
+`2001:db8:20::2/64`, pool `2001:db8:30::100-1ff/64`) never
+recovered. Log:
+```
+[ARP MONITOR] anchor replay: device 31ed2e77... iface=vlan20 v6
+anchor=2001:db8:30::1/64 pool=2001:db8:30::100-2001:db8:30::1ff
+replayed
+[DHCP] v0.5.337 DADv6 conflict: 2001:db8:30::1 answered `ping -6`
+on vlan20 — address already in use
+[DHCP] v0.5.337 device 31ed2e77...: refusing to anchor
+2001:db8:30::1/64 on vlan20 — DAD found the address is already
+claimed on the wire
+```
+
+### Fix
+
+Use the **device's declared `ipv6_address`** from `device_db` as
+the source of truth for L3-remote detection. Operator intent is
+invariant to runtime anchor drift.
+
+Applied in both:
+- `utils/dhcp.py::start_dhcp_server` — reads `device_db.get_device(
+  device_id)["ipv6_address"]`, builds the device's declared subnet,
+  and compares against the pool subnet. Falls back to the v0.5.335
+  runtime-iface check when device_db is absent (test harness).
+- `utils/arp_monitor.py::_replay_dhcp_anchors` — same pattern
+  using the `_dev.get("ipv6_address")` already available in the
+  loop iteration.
+
+Also adds **autonomous tick-time sweep** to arp_monitor's L3-remote
+branch: any non-link-local iface v6 address that falls in the
+pool subnet gets `_remove_ipv6_address`-swept. Existing devices
+now heal on the next monitor tick — no manual Apply required.
+
+### Files touched
+
+- `utils/dhcp.py`
+- `utils/arp_monitor.py`
+- `tests/test_v05339_l3remote_authoritative_source.py`: 13 tests
+
+### Verification
+
+- 13 new tests pass; v0.5.335/336 markers still intact
+- Once upgraded, arp_monitor's next tick logs `v0.5.339 swept
+  stale pool-subnet anchor 2001:db8:30::1/64 off vlan20 (relay
+  mode; anchor is a pre-v0.5.335 leftover)`, then continues to
+  print the v0.5.336 skip on every subsequent tick
+
+---
+
 ## [0.5.338] - 2026-09-15
 
 **Four v4→v6 DHCP parity fixes bundled** — dhcp6c stragglers

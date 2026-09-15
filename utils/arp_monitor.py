@@ -588,40 +588,91 @@ class ARPStatusMonitor:
                 # Detect L3-remote by comparing the pool's IPv6
                 # network with the iface's own IPv6 subnets (link-
                 # local excluded). Same shape used by start_dhcp_server.
+                # v0.5.339 (audit dhcpv6-l3remote-authoritative-source):
+                # use the DEVICE's declared ipv6_address as the source
+                # of truth, NOT the iface's runtime v6 subnets. See
+                # start_dhcp_server's twin comment. Rationale: the
+                # stale pool-subnet anchor from a pre-v0.5.335 apply
+                # LIVES on the iface, so the runtime check flips to
+                # "direct-attached" and this replay re-adds the
+                # anchor forever. Operator on srv06 2026-09-15: after
+                # v0.5.338 upgrade, arp_monitor kept re-anchoring
+                # `2001:db8:30::1/64` on vlan20 (device5 device
+                # subnet is `2001:db8:20::/64`, pool subnet is
+                # `2001:db8:30::/64` — L3-remote per operator intent,
+                # runtime says direct-attached because of the stale
+                # anchor).
+                #
+                # Fall back to the v0.5.336 runtime-iface check only
+                # when the device row has no ipv6_address (test
+                # harness, dry-run).
                 import ipaddress as _ipa6
                 _pool_is_l3_remote_v6 = False
                 try:
                     _pool_net6 = _ipa6.IPv6Network(
                         f"{_v6_pool_start}/{_v6_prefix}", strict=False,
                     )
-                    _iface_v6_nets = []
-                    try:
-                        from utils.dhcp import _parse_ipv6 as _pv6
-                        for _entry in (_pv6(_iface, container=None) or []):
-                            _e_ip = _entry.get("ip") or ""
-                            _e_pfx = _entry.get("prefix")
-                            if not _e_ip or _e_pfx in (None, ""):
-                                continue
-                            try:
-                                if _ipa6.IPv6Address(_e_ip).is_link_local:
+                    _dev_ipv6_raw = str(
+                        _dev.get("ipv6_address") or ""
+                    ).strip()
+                    _dev_v6_addr = ""
+                    _dev_v6_pfx = ""
+                    if _dev_ipv6_raw:
+                        if "/" in _dev_ipv6_raw:
+                            _dev_v6_addr, _dev_v6_pfx = _dev_ipv6_raw.split("/", 1)
+                        else:
+                            _dev_v6_addr = _dev_ipv6_raw
+                            _dev_v6_pfx = "64"
+                    if _dev_v6_addr and _dev_v6_pfx:
+                        try:
+                            _dev_net = _ipa6.IPv6Network(
+                                f"{_dev_v6_addr}/{_dev_v6_pfx}",
+                                strict=False,
+                            )
+                            _pool_is_l3_remote_v6 = not _pool_net6.overlaps(
+                                _dev_net
+                            )
+                            logger.debug(
+                                f"[ARP MONITOR] v0.5.339 L3-remote "
+                                f"check for device {_dev_id}: pool "
+                                f"{_v6_pool_start}/{_v6_prefix} vs "
+                                f"device subnet {_dev_net} → "
+                                f"l3_remote={_pool_is_l3_remote_v6} "
+                                f"(source: device_db.ipv6_address)"
+                            )
+                        except (_ipa6.AddressValueError, ValueError):
+                            _dev_v6_addr = ""  # fall back to runtime
+                    if not _dev_v6_addr:
+                        # Fallback: v0.5.336 runtime-iface check.
+                        _iface_v6_nets = []
+                        try:
+                            from utils.dhcp import _parse_ipv6 as _pv6
+                            for _entry in (_pv6(_iface, container=None) or []):
+                                _e_ip = _entry.get("ip") or ""
+                                _e_pfx = _entry.get("prefix")
+                                if not _e_ip or _e_pfx in (None, ""):
                                     continue
-                                _iface_v6_nets.append(
-                                    _ipa6.IPv6Network(
-                                        f"{_e_ip}/{_e_pfx}", strict=False,
+                                try:
+                                    if _ipa6.IPv6Address(_e_ip).is_link_local:
+                                        continue
+                                    _iface_v6_nets.append(
+                                        _ipa6.IPv6Network(
+                                            f"{_e_ip}/{_e_pfx}",
+                                            strict=False,
+                                        )
                                     )
-                                )
-                            except (_ipa6.AddressValueError, ValueError):
-                                continue
-                    except Exception as _iface_probe_exc:
-                        logger.debug(
-                            f"[ARP MONITOR] v0.5.336 iface v6 probe "
-                            f"failed for {_iface}: {_iface_probe_exc} "
-                            f"(non-fatal; falling through to anchor)"
-                        )
-                    if _iface_v6_nets:
-                        _pool_is_l3_remote_v6 = not any(
-                            _pool_net6.overlaps(_n) for _n in _iface_v6_nets
-                        )
+                                except (_ipa6.AddressValueError, ValueError):
+                                    continue
+                        except Exception as _iface_probe_exc:
+                            logger.debug(
+                                f"[ARP MONITOR] v0.5.336 iface v6 probe "
+                                f"failed for {_iface}: {_iface_probe_exc} "
+                                f"(non-fatal; falling through to anchor)"
+                            )
+                        if _iface_v6_nets:
+                            _pool_is_l3_remote_v6 = not any(
+                                _pool_net6.overlaps(_n) for _n in _iface_v6_nets
+                            )
                 except (_ipa6.AddressValueError, ValueError) as _remote_exc:
                     logger.debug(
                         f"[ARP MONITOR] v0.5.336 pool-remote check "
@@ -636,6 +687,49 @@ class ARPStatusMonitor:
                         f"{_v6_pool_start}/{_v6_prefix} is L3-REMOTE "
                         f"(relay mode) — no anchor to replay"
                     )
+                    # v0.5.339 (audit dhcpv6-l3remote-authoritative-source):
+                    # tick-time sweep of stale pool-subnet anchors. Prior
+                    # to v0.5.339, an operator who upgraded and left the
+                    # stale anchor in place would need to explicitly
+                    # re-apply device5 for start_dhcp_server's sweep to
+                    # fire. With this, arp_monitor's next tick heals the
+                    # state autonomously as soon as the device_db-based
+                    # L3-remote detection kicks in. Uses the same
+                    # `_remove_ipv6_address` the start_dhcp_server sweep
+                    # uses.
+                    try:
+                        from utils.dhcp import (
+                            _parse_ipv6 as _pv6_clean,
+                            _remove_ipv6_address as _rmv6,
+                        )
+                        for _stale in (_pv6_clean(_iface, container=None) or []):
+                            _stale_ip = _stale.get("ip") or ""
+                            _stale_pfx = _stale.get("prefix")
+                            if not _stale_ip or _stale_pfx in (None, ""):
+                                continue
+                            try:
+                                if _ipa6.IPv6Address(_stale_ip).is_link_local:
+                                    continue
+                                if _ipa6.IPv6Address(_stale_ip) in _pool_net6:
+                                    _rmv6(
+                                        _iface, _stale_ip, str(_stale_pfx),
+                                        container=None,
+                                    )
+                                    logger.info(
+                                        f"[ARP MONITOR] v0.5.339 swept "
+                                        f"stale pool-subnet anchor "
+                                        f"{_stale_ip}/{_stale_pfx} off "
+                                        f"{_iface} (relay mode; anchor "
+                                        f"is a pre-v0.5.335 leftover)"
+                                    )
+                            except (_ipa6.AddressValueError, ValueError):
+                                continue
+                    except Exception as _sweep_exc:
+                        logger.debug(
+                            f"[ARP MONITOR] v0.5.339 tick-time stale "
+                            f"anchor sweep raised for {_iface}: "
+                            f"{_sweep_exc} (non-fatal)"
+                        )
                     continue
 
                 # Derive the anchor address the same way start_dhcp_

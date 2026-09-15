@@ -3868,29 +3868,105 @@ def start_dhcp_server(
         # excluded). Direct-attached devices (server + clients on
         # same L2) still get the anchor — that's the v0.5.230 case
         # which is correct.
+        # v0.5.339 (audit dhcpv6-l3remote-authoritative-source): the
+        # v0.5.335 detection used the iface's RUNTIME v6 subnets — but
+        # the very bug it was supposed to fix (stale pool-subnet
+        # anchor on the iface, left by a pre-v0.5.335 apply) makes
+        # the iface CONTAIN the pool subnet, so remote-detection
+        # flips to "direct-attached" and the sweep never runs.
+        # Chicken-and-egg observed on srv06 2026-09-15: after upgrade
+        # to v0.5.338, `2001:db8:30::1/64` was still stuck on vlan20,
+        # arp_monitor re-anchored every tick, and start_dhcp_server's
+        # DAD probe reached self via the stale route and mis-refused
+        # the fresh apply.
+        #
+        # Fix: use the DEVICE's operator-declared `ipv6_address`
+        # (from device_db) as the source of truth for "what subnet
+        # does the server device sit on?" — that's operator intent,
+        # invariant to runtime anchor drift. If the pool subnet
+        # overlaps the DEVICE'S subnet → direct-attached. Otherwise
+        # → relay mode.
+        #
+        # Fall back to the v0.5.335 runtime-iface check only when
+        # device_db lookup is unavailable (test harness, dry-run
+        # without a real device row) — that path still has the
+        # chicken-and-egg but at least matches pre-v0.5.339 behavior.
         _pool_is_l3_remote = False
         try:
             _pool_net = ipaddress.IPv6Network(
                 f"{ipv6_pool_start}/{ipv6_prefix}", strict=False,
             )
-            _iface_v6_nets = []
-            for _entry in (_parse_ipv6(interface, container=container) or []):
-                _e_ip = _entry.get("ip") or ""
-                _e_pfx = _entry.get("prefix")
-                if not _e_ip or _e_pfx in (None, ""):
-                    continue
+            _device_v6_addr = ""
+            _device_v6_pfx = ""
+            try:
+                _device_row = (
+                    device_db.get_device(device_id)
+                    if device_db and device_id
+                    else None
+                )
+                if _device_row:
+                    _dev_ipv6_raw = str(
+                        _device_row.get("ipv6_address") or ""
+                    ).strip()
+                    if _dev_ipv6_raw:
+                        if "/" in _dev_ipv6_raw:
+                            _device_v6_addr, _device_v6_pfx = (
+                                _dev_ipv6_raw.split("/", 1)
+                            )
+                        else:
+                            _device_v6_addr = _dev_ipv6_raw
+                            _device_v6_pfx = "64"
+            except Exception as _row_exc:
+                logger.debug(
+                    "[DHCP] v0.5.339 device_db lookup for L3-remote "
+                    "check failed for %s: %s (non-fatal; falling back "
+                    "to runtime-iface check)",
+                    device_id, _row_exc,
+                )
+
+            if _device_v6_addr and _device_v6_pfx:
+                # Authoritative source: device's declared subnet.
                 try:
-                    if ipaddress.IPv6Address(_e_ip).is_link_local:
-                        continue
-                    _iface_v6_nets.append(
-                        ipaddress.IPv6Network(f"{_e_ip}/{_e_pfx}", strict=False)
+                    _dev_net = ipaddress.IPv6Network(
+                        f"{_device_v6_addr}/{_device_v6_pfx}",
+                        strict=False,
+                    )
+                    _pool_is_l3_remote = not _pool_net.overlaps(_dev_net)
+                    logger.info(
+                        "[DHCP] v0.5.339 L3-remote check for device "
+                        "%s: pool %s/%s vs device subnet %s → "
+                        "l3_remote=%s (source: device_db.ipv6_address)",
+                        device_id, ipv6_pool_start, ipv6_prefix,
+                        _dev_net, _pool_is_l3_remote,
                     )
                 except (ipaddress.AddressValueError, ValueError):
-                    continue
-            if _iface_v6_nets:
-                _pool_is_l3_remote = not any(
-                    _pool_net.overlaps(_n) for _n in _iface_v6_nets
-                )
+                    _device_v6_addr = ""  # trigger runtime fallback
+                    _device_v6_pfx = ""
+
+            if not _device_v6_addr:
+                # Fallback: v0.5.335 runtime-iface check. Only
+                # reached when device_db is absent or the device
+                # row has no ipv6_address.
+                _iface_v6_nets = []
+                for _entry in (_parse_ipv6(interface, container=container) or []):
+                    _e_ip = _entry.get("ip") or ""
+                    _e_pfx = _entry.get("prefix")
+                    if not _e_ip or _e_pfx in (None, ""):
+                        continue
+                    try:
+                        if ipaddress.IPv6Address(_e_ip).is_link_local:
+                            continue
+                        _iface_v6_nets.append(
+                            ipaddress.IPv6Network(
+                                f"{_e_ip}/{_e_pfx}", strict=False,
+                            )
+                        )
+                    except (ipaddress.AddressValueError, ValueError):
+                        continue
+                if _iface_v6_nets:
+                    _pool_is_l3_remote = not any(
+                        _pool_net.overlaps(_n) for _n in _iface_v6_nets
+                    )
         except (ipaddress.AddressValueError, ValueError) as _remote_check_exc:
             logger.debug(
                 "[DHCP] v0.5.335 pool-remote check failed for %s/%s: %s "
