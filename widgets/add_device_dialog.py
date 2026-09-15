@@ -2421,6 +2421,19 @@ class AddDeviceDialog(QDialog):
             data["dhcp_mode"] = _mode
             data["dhcp_config"] = {
                 "mode": _mode,
+                # v0.5.343 (audit dhcpv6-relay-hint-flag-propagation):
+                # forward the dialog's ipv4/ipv6 checkbox state into
+                # `dhcp_config` so v0.5.341's `_dhcp_relay_stanza` can
+                # emit the v6 relay block for v6-only / dual-stack
+                # DHCP-client devices. Pre-fix, dhcp_config carried
+                # only `mode` — the renderer's default (v4-only)
+                # kicked in for every hint, so a v6-only client got
+                # a v4-only relay stanza. Operator on srv06 2026-09-15
+                # pasted a hint for a "netgen-device on VLAN 10" and
+                # only the v4 block appeared despite the device being
+                # v6-only.
+                "ipv4_enabled": ipv4_on,
+                "ipv6_enabled": ipv6_on,
                 # `pool_router` (v0.5.315) doubles as a hint for
                 # the DHCP-server IP when the operator has
                 # already filled it out — but the SERVER's IP

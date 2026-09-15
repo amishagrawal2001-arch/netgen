@@ -2,6 +2,33 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.343] - 2026-09-15
+
+**`_snapshot_for_upstream_hint` propagates the dialog's ipv4/ipv6
+checkbox state into `dhcp_config` so v0.5.341's DHCPv6 relay
+stanza actually emits for v6-only / dual-stack DHCP clients.**
+
+Operator on srv06 2026-09-15: pasted an Upstream Config Hint for
+a v6-only DHCP-client device; expected v0.5.341's Junos
+`dhcp-relay dhcpv6` block; got only the v4 relay block. Root
+cause: dialog snapshot built `dhcp_config` with only `mode` —
+v0.5.341's `_dhcp_relay_stanza` defaults `_v4_on=True`,
+`_v6_on=False` (preserves pre-v0.5.341 behavior for callers not
+passing the flags). No flags → v4 emitted, v6 skipped.
+
+Fix: propagate `ipv4_on`/`ipv6_on` from `checked("ipv4_checkbox")`
+/ `checked("ipv6_checkbox")` into
+`dhcp_config["ipv4_enabled"]`/`["ipv6_enabled"]`. Same pattern
+already used by BGP/OSPF snapshot blocks.
+
+Client-side change — `git pull` in `/Users/surajsharma/dev/netgen`
+after `netgen-upgrade`.
+
+- `widgets/add_device_dialog.py`
+- `tests/test_v05343_dhcp_config_flag_propagation.py`: 6 tests
+
+---
+
 ## [0.5.342] - 2026-09-15
 
 **DHCP tab's Lease IP / Gateway columns fall back to v6 lease
