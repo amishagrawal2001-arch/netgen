@@ -2,6 +2,47 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.347] - 2026-09-15
+
+**Upstream Config Hint appends a Router Advertisement block for
+every IPv6-enabled DHCP client. RA is REQUIRED — without it, the
+client's DHCPv6 lease is a /128 host address with no route to any
+peer in the pool nor any egress off-subnet.**
+
+DHCPv6 IA_NA delivers the client's address ONLY. The on-link /64
+prefix + default gateway MUST come from a separate Router
+Advertisement with a Prefix Information Option (PIO). Operator
+on srv06 hit this exactly: DHCPv6 lease succeeded end-to-end,
+but the client's VRF had no on-link route until `protocols
+router-advertisement interface irb.40 ...` landed on the QFX.
+
+### Fix
+
+`_dhcp_relay_stanza` now emits the vendor-appropriate RA block
+inside the `if _v6_on:` branch:
+
+- **Junos:** `set protocols router-advertisement interface <svi>
+  managed-configuration / other-stateful-configuration / prefix
+  <CLIENT-VLAN-PREFIX> on-link / prefix <CLIENT-VLAN-PREFIX>
+  autonomous`
+- **Cisco IOS:** `ipv6 nd managed-config-flag / other-config-flag
+  / prefix <CLIENT-VLAN-PREFIX> 2592000 604800` on the SVI
+- **Arista EOS:** same shape as IOS with EOS indentation
+
+`<CLIENT-VLAN-PREFIX>` is a placeholder — the client-side dialog
+doesn't know what /64 the switch's IRB owns. Explanatory comment
+above the block spells out WHY RA is required.
+
+### Files touched
+
+- `utils/upstream_hints.py`
+- `tests/test_v05347_dhcpv6_ra_hint.py`: 11 tests
+
+Client-side change — `git pull` in `/Users/surajsharma/dev/netgen`
+after `netgen-upgrade` on srv06.
+
+---
+
 ## [0.5.346] - 2026-09-15
 
 **DHCPv6 client sets `accept_ra=2` (not `0`) so the kernel still

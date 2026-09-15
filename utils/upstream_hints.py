@@ -1035,6 +1035,28 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
                 f"set forwarding-options dhcp-relay dhcpv6 server-group DHCPV6-SERVERS {server_ip6}",
                 "set forwarding-options dhcp-relay dhcpv6 group CLIENTS-V6 active-server-group DHCPV6-SERVERS",
                 f"set forwarding-options dhcp-relay dhcpv6 group CLIENTS-V6 interface {svi_juniper}",
+                "",
+                # v0.5.347 (audit dhcpv6-ra-hint): DHCPv6 IA_NA leases
+                # deliver only the client's ADDRESS (as /128). The
+                # on-link /64 prefix + default gateway MUST come from
+                # a Router Advertisement — otherwise the client has
+                # a leased /128 and no route to any peer in the pool
+                # nor egress off-subnet. Operator on srv06 2026-09-15
+                # verified end-to-end DHCPv6 with this block on the
+                # QFX.
+                "# --- Router Advertisement: REQUIRED so client's kernel installs the on-link /64",
+                "# connected route and RA-derived default. Without this the DHCPv6 lease sits as",
+                "# a /128 host address and the client cannot reach any peer in the pool subnet.",
+                "# `managed-configuration` (M-bit) tells clients to use DHCPv6 for addresses.",
+                "# `other-stateful-configuration` (O-bit) tells clients to use DHCPv6 for DNS/etc.",
+                "# `on-link` on the prefix installs the connected route; `autonomous` allows any",
+                "# non-netgen client to SLAAC-derive an address (netgen ignores it — dhcp6c wins).",
+                f"# Prefix = the /64 on this SVI ({svi_juniper}). Substitute <CLIENT-VLAN-PREFIX>",
+                "# with the actual /64 you assigned to this IRB (e.g. 2001:db8:30::/64).",
+                f"set protocols router-advertisement interface {svi_juniper} managed-configuration",
+                f"set protocols router-advertisement interface {svi_juniper} other-stateful-configuration",
+                f"set protocols router-advertisement interface {svi_juniper} prefix <CLIENT-VLAN-PREFIX> on-link",
+                f"set protocols router-advertisement interface {svi_juniper} prefix <CLIENT-VLAN-PREFIX> autonomous",
             ]
         return "\n".join(lines)
 
@@ -1081,6 +1103,15 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
                 lines.append(f" ip helper-address {server_ip}")
             if _v6_on:
                 lines.append(f" ipv6 dhcp relay destination {server_ip6}")
+                # v0.5.347: IPv6 RA is REQUIRED for the client's kernel
+                # to get the on-link /64 route and default. Without
+                # these three IOS defaults the DHCPv6 lease is /128-
+                # only and reachability is broken. See Junos block for
+                # the full explanation.
+                lines.append(" ipv6 nd managed-config-flag")
+                lines.append(" ipv6 nd other-config-flag")
+                lines.append(" ! Substitute <CLIENT-VLAN-PREFIX> with the /64 you assigned to this SVI (e.g. 2001:db8:30::/64).")
+                lines.append(" ipv6 nd prefix <CLIENT-VLAN-PREFIX> 2592000 604800")
             lines.append("!")
         return "\n".join(lines)
 
@@ -1119,6 +1150,14 @@ def _dhcp_relay_stanza(vendor: str, vlan: str, dhcp_config: dict) -> str:
                 lines.append(f"   ip helper-address {server_ip}")
             if _v6_on:
                 lines.append(f"   ipv6 dhcp relay destination {server_ip6}")
+                # v0.5.347: RA is REQUIRED for the client's kernel to
+                # get the on-link /64 and default route. Without these
+                # the DHCPv6 lease sits as /128 and reachability is
+                # broken. See Junos block for the full explanation.
+                lines.append("   ipv6 nd managed-config-flag")
+                lines.append("   ipv6 nd other-config-flag")
+                lines.append("   ! Substitute <CLIENT-VLAN-PREFIX> with the /64 you assigned to this SVI (e.g. 2001:db8:30::/64).")
+                lines.append("   ipv6 nd prefix <CLIENT-VLAN-PREFIX> 2592000 604800")
             lines.append("!")
         return "\n".join(lines)
 
