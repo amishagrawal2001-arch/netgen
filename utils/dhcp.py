@@ -3236,28 +3236,50 @@ def start_dhcp_client(
         # 2001:db8:30::5e25:73ff:fe3f:3056 derived from MAC) instead
         # of the lease (2001:db8:30::100).
         #
-        # Setting accept_ra=0 blocks RA processing entirely; setting
-        # autoconf=0 blocks SLAAC only (keeps RA-derived default
-        # route). We disable BOTH here because a DHCPv6-client-mode
-        # device is explicitly asking dhcp6c to manage all v6
-        # addressing, so RA-derived state is noise. Restored in
-        # stop_dhcp_client so a subsequent v4-only apply doesn't
-        # inherit v6 lockdown. Best-effort: sysctl failure is logged
-        # but doesn't block the lease request.
-        for _sysctl_key in (
-            f"net.ipv6.conf.{interface}.accept_ra",
-            f"net.ipv6.conf.{interface}.autoconf",
+        # v0.5.346 (audit dhcpv6-client-accept-ra-vs-autoconf):
+        # v0.5.309 disabled BOTH accept_ra AND autoconf to prevent
+        # SLAAC from racing dhcp6c. But `accept_ra=0` blocks the
+        # kernel from processing RAs at ALL — which means:
+        #   * no `<prefix>/64 dev <if> proto ra` connected route
+        #     (client can't reach any host in the pool subnet
+        #     directly, only self via /128 DHCPv6 lease)
+        #   * no `default via <router-linklocal> dev <if> proto ra`
+        #     (client can't egress the subnet)
+        # Operator on srv06 2026-09-15: device6 leased
+        # 2001:db8:30::1f3/128 via DHCPv6 but had ZERO IPv6 routes
+        # in the VRF beyond fe80/64 + the /128 host. Fix required
+        # `sysctl net.ipv6.conf.vlan40.accept_ra=2` (accept even
+        # with forwarding=1, which netgen sets on VRF-slaved
+        # interfaces) to make routes appear. Also `forwarding=1`
+        # is netgen's default for these interfaces, so the kernel's
+        # "hosts accept RAs (=1), routers don't (=0)" default flips
+        # accept_ra to 0 auto-magically — hence need =2 to override.
+        #
+        # New behavior:
+        #   * autoconf=0     : blocks SLAAC address derivation from
+        #                      PIO — keeps dhcp6c authoritative for
+        #                      addresses. v0.5.309's original intent.
+        #   * accept_ra=2    : kernel STILL processes RAs, installs
+        #                      the on-link /64 connected route and
+        #                      the default route via router link-
+        #                      local — even with forwarding=1.
+        # Best-effort: sysctl failure is logged but doesn't block
+        # the lease request. Restored in stop_dhcp_client so a
+        # subsequent v4-only apply doesn't inherit v6 lockdown.
+        for _sysctl_key, _sysctl_val in (
+            (f"net.ipv6.conf.{interface}.accept_ra", "2"),
+            (f"net.ipv6.conf.{interface}.autoconf", "0"),
         ):
             try:
                 _run_command(
-                    ["sysctl", "-w", f"{_sysctl_key}=0"],
+                    ["sysctl", "-w", f"{_sysctl_key}={_sysctl_val}"],
                     timeout=3, container=container,
                 )
             except Exception as _sysctl_exc:
                 logger.debug(
-                    "[DHCP] v0.5.309: sysctl %s=0 failed on %s (SLAAC "
-                    "may race dhcp6c): %s",
-                    _sysctl_key, interface, _sysctl_exc,
+                    "[DHCP] v0.5.346: sysctl %s=%s failed on %s "
+                    "(RA processing / SLAAC guard may not fire): %s",
+                    _sysctl_key, _sysctl_val, interface, _sysctl_exc,
                 )
 
         lease_deadline = time.time() + lease_timeout

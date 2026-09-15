@@ -2,6 +2,62 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.346] - 2026-09-15
+
+**DHCPv6 client sets `accept_ra=2` (not `0`) so the kernel still
+processes RAs for on-link + default route while dhcp6c stays
+authoritative for addresses.**
+
+### Root cause
+
+v0.5.309 disabled BOTH `accept_ra` AND `autoconf` before spawning
+dhcp6c to prevent SLAAC from racing the authoritative DHCPv6
+lease. But `accept_ra=0` blocks the kernel from processing RAs
+ENTIRELY, killing:
+- the on-link `<prefix>/64 dev <if> proto ra` connected route
+- the RA-derived `default via <router-linklocal>` route
+
+Operator on srv06: device6 leased `2001:db8:30::1f3` via DHCPv6
+but VRF had ONLY `fe80::/64` + the /128 host route in its IPv6
+table. Ping to any host in the /64 or off-subnet dst failed with
+"Network is unreachable". Manual `sysctl accept_ra=2` + Router
+Solicit → routes appeared, ping to `2001:db8:20::2` worked.
+
+Compounding factor: netgen sets `forwarding=1` on VRF-slaved
+interfaces (BGP/OSPF need it). Linux's default `accept_ra=1 if
+forwarding=0, else 0`. So even without v0.5.309's explicit
+`accept_ra=0`, the kernel wouldn't accept RAs on these
+interfaces — need `accept_ra=2` explicitly to override.
+
+### Fix
+
+Keep `autoconf=0` (v0.5.309's original SLAAC guard — still
+correct) but change `accept_ra` from `0` to `2`:
+- `autoconf=0` blocks SLAAC address derivation → dhcp6c stays
+  authoritative for addresses.
+- `accept_ra=2` lets kernel process RAs even with forwarding=1
+  → on-link `/64` route + default via router link-local get
+  installed automatically.
+
+### Files touched
+
+- `utils/dhcp.py`
+- `tests/test_v05346_dhcpv6_client_accept_ra.py`: 7 tests
+
+### Verification
+
+Manually validated on srv06 2026-09-15: after `sysctl accept_ra=2`
++ Router Solicit, device6's VRF gained `2001:db8:30::/64 dev
+vlan40` + `default via fe80::d248:a100:28d0:2706 dev vlan40 proto
+ra`. Ping to `2001:db8:20::2` (device5 via QFX) succeeded. This
+release makes that automatic on every DHCPv6-client Apply.
+
+QFX must ALSO be configured with `protocols router-advertisement`
+on the client's IRB, prefix + on-link + managed-configuration.
+See srv06 lab notes.
+
+---
+
 ## [0.5.345] - 2026-09-15
 
 **Fix v0.5.343 regression: relay hint stanza was reading the
