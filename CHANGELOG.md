@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.331] - 2026-09-15
+
+**ARP status endpoint: `ping6` → `ping -6`. Fixes device5 yellow
+status on Ubuntu 22.04+ where `ping6` binary is deprecated /
+uninstalled.**
+
+Operator on srv06 (Ubuntu 22.04) reported: even after upgrading
+server to v0.5.330 (which includes v0.5.328's IPv6 NDP resolution
+parity fix), device5 still shows yellow — despite successful
+switch → netgen ping.
+
+### Root cause (nobody caught this earlier)
+
+Ubuntu 22.04+ deprecated and removed the standalone `ping6`
+binary. iputils moved to a unified `ping` binary that autodetects
+the address family, invoked as `ping <ipv6-addr>` or the
+explicit `ping -6 <addr>`. `ping6` returns exit code 127
+(command not found) → subprocess `returncode != 0` → every IPv6
+tier that used `ping6` reports FAILED.
+
+All 5 fallback tiers in v0.5.328's `/api/device/arp/<device_id>`
+IPv6 block used `ping6` → every tier failed silently →
+`arp_ipv6_resolved=False` → yellow icon regardless of actual
+NDP state.
+
+### Fix
+
+Both places the ARP status endpoint runs an IPv6 reachability
+probe now use `ping -6 <addr>`:
+
+  * Line ~15592 (primary VRF-scoped check): `ping_prefix +
+    ["ping", "-6", "-c", "1", "-W", "1", ipv6_target]`
+  * Line ~15637 (H3 interface-bound NDP warm): `["ping", "-6",
+    "-c", "1", "-W", "2", "-I", <iface>, ipv6_target]`
+
+`ping -6` is portable across Ubuntu 18-24, RHEL 7-9, Debian 10+.
+Older distros' `ping` binaries have supported `-6` since
+iputils ~s20180629.
+
+The other `ping6` callsites (5364, 8831, 9029, 9030) are
+separate features (link-diag, gateway-status monitor, apply-time
+gateway ping) and will migrate in follow-up ships on their own
+cadence — this ship is targeted at the operator's
+immediately-broken device5 status.
+
+### Verification
+
+7 lock-in tests in
+`tests/test_v05331_ping6_to_ping_dash_6.py`:
+  * marker present + explains Ubuntu 22 context
+  * primary check uses `ping -6`
+  * interface-bound warm uses `ping -6`
+  * no bare `ping6` as subprocess arg anywhere in the ARP
+    endpoint's IPv6 block (regression guard against a partial
+    migration reintroducing it)
+  * IPv4 gateway check UNTOUCHED (still uses `arping` + `ping`
+    for v4 — no v0.5.331 leak into v4 path)
+  * server AST parses
+
 ## [0.5.330] - 2026-09-15
 
 **Disk-critical health issue formatter shows KB/bytes precision

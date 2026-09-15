@@ -15588,8 +15588,25 @@ def get_device_arp_status(device_id):
                 elif device.get("isis_established"):
                     _v6_short_circuit = "isis"
 
-                # First try: VRF-scoped ping6 (existing behavior).
-                ping6_cmd = ping_prefix + ["ping6", "-c", "1", "-W", "1", ipv6_target]
+                # v0.5.331 (audit ping6-deprecated-on-ubuntu-22):
+                # `ping6` was removed as a standalone binary from
+                # iputils on Ubuntu 22.04+ (deprecated in favor of
+                # `ping -6` which autodetects the address family
+                # and works on every distro since ~2018). On srv06
+                # (Ubuntu 22.04 host) `ping6` returns errno 2
+                # (command not found) → subprocess.run returncode
+                # is non-zero → all v6 tiers that used ping6 fail
+                # silently. Result: device5 stayed yellow even
+                # though the actual NDP was fine.
+                #
+                # Fix: use `ping -6 <addr>` which is portable
+                # across every currently-supported distro (works
+                # on Ubuntu 18-24, RHEL 7-9, Debian 10+). If the
+                # host STILL lacks `ping`, that's a much bigger
+                # problem than this endpoint.
+                #
+                # First try: VRF-scoped ping (existing behavior).
+                ping6_cmd = ping_prefix + ["ping", "-6", "-c", "1", "-W", "1", ipv6_target]
                 result = subprocess.run(ping6_cmd, capture_output=True, text=True, timeout=5)
                 ping_ok = result.returncode == 0
                 arp_results["details"]["ipv6_ping"] = "success" if ping_ok else "failed"
@@ -15633,8 +15650,12 @@ def get_device_arp_status(device_id):
                         _v6_warm_kind = "skip"
                         if _iface_for_ndp:
                             try:
+                                # v0.5.331: `ping -6` not `ping6`
+                                # (same reason as the top-of-block
+                                # comment — Ubuntu 22+ removed
+                                # ping6 as a standalone binary).
                                 _v6_warm = subprocess.run(
-                                    ["ping6", "-c", "1", "-W", "2",
+                                    ["ping", "-6", "-c", "1", "-W", "2",
                                      "-I", _iface_for_ndp, ipv6_target],
                                     capture_output=True, text=True, timeout=5,
                                 )
