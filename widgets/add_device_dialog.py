@@ -112,6 +112,43 @@ class AddDeviceDialog(QDialog):
         self.main_layout.addWidget(self.button_box)
         self.setLayout(self.main_layout)
 
+    def _generate_unique_lab_mac(self) -> str:
+        """v0.5.348 (audit auto-mac-generation): return a locally-
+        administered MAC (`02:XX:XX:XX:XX:XX`) not already used by
+        any device in `self._existing_devices`.
+
+        Random 40-bit lower half gives negligible collision odds
+        even for hundreds of lab devices; we still explicitly check
+        against the caller-supplied `_existing_devices` list so a
+        rare collision retries. Falls back to whatever the last
+        attempt produced if 8 tries somehow all collide (never
+        happens in practice).
+
+        Works for both tagged (vlan subif) and untagged devices
+        because `ip link set <iface> address <mac>` (v0.5.325 apply
+        step) accepts any valid unicast MAC on either iface kind.
+        """
+        import random
+        _seen = set()
+        for _dev in (self._existing_devices or []):
+            _m = str(
+                _dev.get("mac_address")
+                or _dev.get("MAC Address")
+                or _dev.get("mac")
+                or ""
+            ).strip().lower()
+            if _m:
+                _seen.add(_m)
+        for _ in range(8):
+            _bytes = [0x02] + [random.randint(0, 0xFF) for _ in range(5)]
+            _mac = ":".join(f"{b:02x}" for b in _bytes)
+            if _mac not in _seen:
+                return _mac
+        # 8 collisions on a 40-bit random space is not possible in
+        # practice; return the last-generated MAC anyway so the
+        # dialog always has SOMETHING valid rather than raising.
+        return _mac
+
     def setup_basic_device_form(self):
         """Setup a well-organized form for basic device information."""
         # ── Template picker (one-click preset profiles) ─────────────
@@ -179,11 +216,39 @@ class AddDeviceDialog(QDialog):
         self.vlan_input.setMinimumWidth(80)
         
         # MAC Address field
-        self.mac_input = QLineEdit("00:11:22:33:44:55")
+        # v0.5.348 (audit auto-mac-generation): default was hard-
+        # coded `00:11:22:33:44:55` — every fresh Add Device dialog
+        # produced the SAME MAC. Adding a second device without
+        # editing the field caused an immediate L2 collision on the
+        # shared switch, breaking ARP/NDP for both. Auto-generate a
+        # unique locally-administered MAC (LAA prefix `02:`) on
+        # dialog open, collision-checked against the existing
+        # devices the caller passed in.
+        #
+        # Applies to both tagged (vlan subif) and untagged devices:
+        # `ip link set <iface> address <mac>` works on either. The
+        # v0.5.325 apply flow already runs that command with
+        # whatever MAC lands in this field, so the server side
+        # needs no change.
+        #
+        # Only auto-generate for mode="add"; mode="edit" callers
+        # pre-fill the field with the device's saved MAC and this
+        # would clobber it.
+        _default_mac = self._generate_unique_lab_mac() if self.mode == "add" else ""
+        self.mac_input = QLineEdit(_default_mac)
         self.mac_input.setPlaceholderText("AA:BB:CC:DD:EE:FF")
         mac_re = QRegExp(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
         self.mac_input.setValidator(QRegExpValidator(mac_re, self))
         self.mac_input.setMinimumWidth(150)
+        self.mac_input.setToolTip(
+            "MAC address for this device's interface (both tagged\n"
+            "vlan subifs and untagged parent NICs use `ip link set\n"
+            "<iface> address <mac>` at Apply time).\n\n"
+            "Auto-generated as a locally-administered address (02:...)\n"
+            "unique across existing devices. Override with your own\n"
+            "if the lab has a required MAC. Regenerated each time the\n"
+            "dialog opens for a NEW device."
+        )
         
         # MTU field
         self.mtu_input = QLineEdit("1500")

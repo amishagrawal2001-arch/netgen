@@ -2,6 +2,40 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.348] - 2026-09-15
+
+**Add Device dialog auto-generates a unique locally-administered
+MAC per new device instead of seeding the same hardcoded
+`00:11:22:33:44:55` every time.**
+
+Operator on srv06: adding a second device without hand-editing
+the MAC field caused an immediate L2 collision (identical MACs
+on the shared switch), breaking ARP/NDP for both.
+
+### Fix
+
+New `_generate_unique_lab_mac()` helper on `AddDeviceDialog`
+returns `02:XX:XX:XX:XX:XX` — LAA prefix, 40 random bits below
+it, collision-checked against `self._existing_devices`. Called
+in `mode="add"` only; `mode="edit"` callers pre-fill the field
+with the device's saved MAC and the auto-gen must not clobber
+that.
+
+Works for both tagged (vlan subif) and untagged (parent NIC)
+devices — the v0.5.325 apply flow already runs `ip link set
+<iface> address <mac>` on either interface kind, so the server
+side needs no change.
+
+### Files touched
+
+- `widgets/add_device_dialog.py`
+- `tests/test_v05348_auto_mac_generation.py`: 12 tests
+
+Client-side change — `git pull` in `/Users/surajsharma/dev/netgen`
+after `netgen-upgrade`.
+
+---
+
 ## [0.5.347] - 2026-09-15
 
 **Upstream Config Hint appends a Router Advertisement block for
