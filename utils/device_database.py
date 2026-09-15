@@ -513,6 +513,31 @@ class DeviceDatabase:
                     logger.info("[DEVICE DB] Migrated dhcp_pools: added relay_return_hop column")
             except Exception as _mig_exc:
                 logger.warning("[DEVICE DB] dhcp_pools.relay_return_hop migration skipped: %s", _mig_exc)
+            # v0.5.344 (audit dhcp-pool-v6-only-allowed): add v6 pool
+            # columns so Manage Pools → Add Pool accepts v6-only pools
+            # (operator's request 2026-09-15 while wiring device5's
+            # DHCPv6 relay-mode server). SQLite doesn't let us change
+            # existing NOT NULL columns to nullable via ALTER, but
+            # storing empty strings in pool_start/pool_end is legal
+            # (TEXT NOT NULL rejects NULL, accepts ""), so a v6-only
+            # pool persists as pool_start="" pool_end="" plus the
+            # new pool6_* fields.
+            try:
+                _cols = {r[1] for r in conn.execute("PRAGMA table_info(dhcp_pools)").fetchall()}
+                for _v6_col in ("pool6_start", "pool6_end", "prefix6"):
+                    if _v6_col not in _cols:
+                        conn.execute(
+                            f"ALTER TABLE dhcp_pools ADD COLUMN {_v6_col} TEXT"
+                        )
+                        logger.info(
+                            "[DEVICE DB] Migrated dhcp_pools: added %s column (v0.5.344)",
+                            _v6_col,
+                        )
+            except Exception as _v6_mig_exc:
+                logger.warning(
+                    "[DEVICE DB] dhcp_pools v6-columns migration skipped: %s",
+                    _v6_mig_exc,
+                )
             
             # Create device DHCP pool attachments table
             conn.execute("""
@@ -2323,8 +2348,47 @@ class DeviceDatabase:
 
             pool_start = (pool_data.get("pool_start") or pool_data.get("start") or "").strip()
             pool_end = (pool_data.get("pool_end") or pool_data.get("end") or "").strip()
-            if not pool_start or not pool_end:
-                logger.error("[DEVICE DB] Cannot add DHCP pool without pool_start and pool_end")
+            # v0.5.344 (audit dhcp-pool-v6-only-allowed): v6 fields.
+            pool6_start = (
+                pool_data.get("pool6_start")
+                or pool_data.get("ipv6_pool_start")
+                or ""
+            ).strip()
+            pool6_end = (
+                pool_data.get("pool6_end")
+                or pool_data.get("ipv6_pool_end")
+                or ""
+            ).strip()
+            prefix6 = str(
+                pool_data.get("prefix6")
+                or pool_data.get("ipv6_prefix")
+                or ""
+            ).strip()
+            # A partial family is an error; require BOTH v4 endpoints
+            # if either is set, and BOTH v6 endpoints + prefix if any
+            # is set.
+            _v4_any = bool(pool_start or pool_end)
+            _v6_any = bool(pool6_start or pool6_end or prefix6)
+            if not _v4_any and not _v6_any:
+                logger.error(
+                    "[DEVICE DB] Cannot add DHCP pool '%s' without any address family "
+                    "(need either IPv4 pool_start+pool_end or IPv6 pool6_start+pool6_end+prefix6)",
+                    pool_name,
+                )
+                return False
+            if _v4_any and not (pool_start and pool_end):
+                logger.error(
+                    "[DEVICE DB] Cannot add DHCP pool '%s' with partial IPv4 config "
+                    "(need BOTH pool_start and pool_end, or neither)",
+                    pool_name,
+                )
+                return False
+            if _v6_any and not (pool6_start and pool6_end and prefix6):
+                logger.error(
+                    "[DEVICE DB] Cannot add DHCP pool '%s' with partial IPv6 config "
+                    "(need pool6_start + pool6_end + prefix6, or none)",
+                    pool_name,
+                )
                 return False
 
             gateway = (pool_data.get("gateway") or "").strip() or None
@@ -2349,14 +2413,18 @@ class DeviceDatabase:
                     logger.info(f"[DEVICE DB] DHCP pool '{pool_name}' exists, updating instead of adding")
                     return self.update_dhcp_pool(pool_name, pool_data)
 
+                # v0.5.344: pool_start/pool_end may be empty strings
+                # for v6-only pools. Schema is TEXT NOT NULL — empty
+                # strings are legal; only NULL is rejected.
                 conn.execute(
                     """
                     INSERT INTO dhcp_pools (
                         pool_name, pool_start, pool_end, gateway, lease_time,
                         gateway_routes, description, relay_return_hop,
+                        pool6_start, pool6_end, prefix6,
                         created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         pool_name,
@@ -2367,6 +2435,9 @@ class DeviceDatabase:
                         gateway_routes,
                         description,
                         relay_return_hop,
+                        pool6_start,
+                        pool6_end,
+                        prefix6,
                         timestamp,
                         timestamp,
                     ),
@@ -2400,6 +2471,11 @@ class DeviceDatabase:
                     "lease_time": "lease_time",
                     "description": "description",
                     "relay_return_hop": "relay_return_hop",
+                    # v0.5.344: v6 pool fields — mirror updates so an
+                    # operator adding v6 to an existing pool persists.
+                    "pool6_start": "pool6_start",
+                    "pool6_end": "pool6_end",
+                    "prefix6": "prefix6",
                 }
 
                 for key, column in field_mapping.items():

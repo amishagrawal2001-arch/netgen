@@ -2,6 +2,53 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.344] - 2026-09-15
+
+**Manage Pools → Add Pool now accepts v6-only pools.**
+
+Pre-fix, IPv4 `pool_start`/`pool_end` were mandatory at three
+layers (client validator, server POST endpoint, and DB
+`add_dhcp_pool`). Operator asked for parity: v4 or v6 or both,
+with at least one required.
+
+### Fix
+
+New rule at every layer: `name` required + at least one address
+family. Partial family (one v4 endpoint or one v6 endpoint missing)
+still errors clearly.
+
+- `widgets/utils/devices_tab_dhcp.py::DHCPPoolDialog._validate` —
+  swaps the unconditional v4 check for `_v4_any`/`_v6_any` gates.
+- `run_tgen_server.py::create_dhcp_pool` — required_fields drops
+  to `["name"]`; adds coarse family-present check. Forwards new
+  `pool6_start` / `pool6_end` / `prefix6` (and legacy
+  `ipv6_pool_*` aliases) into `add_dhcp_pool`.
+- `utils/device_database.py::add_dhcp_pool` — same partial-family
+  validation, writes v6 columns via INSERT; `update_dhcp_pool`
+  field_mapping includes v6; DB migration adds `pool6_start`,
+  `pool6_end`, `prefix6` columns to the `dhcp_pools` table.
+- `_dhcp_pool_to_api` exposes the v6 fields so Manage Pools UI
+  can re-hydrate them on edit.
+- `ManageDHCPPoolsDialog.edit_selected_pool` preloads v6 fields
+  into defaults + forwards them on save.
+
+Because SQLite doesn't let us change existing NOT NULL columns to
+nullable via ALTER, `pool_start`/`pool_end` remain NOT NULL — v6-
+only pools store them as empty strings (legal — TEXT NOT NULL
+rejects NULL, accepts "").
+
+### Files touched
+
+- `widgets/utils/devices_tab_dhcp.py`
+- `utils/device_database.py`
+- `run_tgen_server.py`
+- `tests/test_v05344_dhcp_pool_v6_only.py`: 15 tests
+
+Client + server change — `netgen-upgrade` on srv06 AND
+`git pull` in `/Users/surajsharma/dev/netgen` on the client.
+
+---
+
 ## [0.5.343] - 2026-09-15
 
 **`_snapshot_for_upstream_hint` propagates the dialog's ipv4/ipv6

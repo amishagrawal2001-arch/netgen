@@ -182,17 +182,44 @@ class DHCPPoolDialog(QDialog):
         if not name:
             return "Pool name is required."
 
+        # v0.5.344 (audit dhcp-pool-v6-only-allowed): allow v6-only
+        # pools. Pre-fix, v4 pool_start / pool_end were mandatory
+        # even when the operator wanted a pure v6 pool — the
+        # validator refused with "Pool start and end addresses are
+        # required" before even inspecting the v6 fields. Operator
+        # on srv06 2026-09-15 hit this creating a v6-only pool for
+        # device5's relay-mode DHCPv6 server.
+        #
+        # New rule: require at LEAST ONE family (v4 or v6). The v4
+        # block only validates when at least one of pool_start /
+        # pool_end is filled (matching the "partial config is an
+        # error" pattern the v6 block already uses).
         pool_start = self.pool_start_edit.text().strip()
         pool_end = self.pool_end_edit.text().strip()
-        if not pool_start or not pool_end:
-            return "Pool start and end addresses are required."
-        try:
-            start_ip = ipaddress.IPv4Address(pool_start)
-            end_ip = ipaddress.IPv4Address(pool_end)
-            if int(start_ip) > int(end_ip):
-                return "Pool start IP must be less than or equal to pool end IP."
-        except ValueError as exc:
-            return f"Invalid pool address: {exc}"
+        pool6_start_probe = self.pool6_start_edit.text().strip()
+        pool6_end_probe = self.pool6_end_edit.text().strip()
+        prefix6_probe = self.prefix6_edit.text().strip()
+        _v4_any = bool(pool_start or pool_end)
+        _v6_any = bool(pool6_start_probe or pool6_end_probe or prefix6_probe)
+        if not _v4_any and not _v6_any:
+            return (
+                "Pool needs at least one address family — fill either "
+                "the IPv4 (Pool Start + Pool End) or the IPv6 (Pool "
+                "Start + Pool End + Prefix Length) fields, or both."
+            )
+        if _v4_any:
+            if not (pool_start and pool_end):
+                return (
+                    "IPv4 pool needs BOTH Pool Start and Pool End. "
+                    "Leave both blank for a v6-only pool."
+                )
+            try:
+                start_ip = ipaddress.IPv4Address(pool_start)
+                end_ip = ipaddress.IPv4Address(pool_end)
+                if int(start_ip) > int(end_ip):
+                    return "Pool start IP must be less than or equal to pool end IP."
+            except ValueError as exc:
+                return f"Invalid pool address: {exc}"
 
         # v0.5.230 (audit U client-8): validate the gateway address.
         # Pre-fix, arbitrary strings were accepted and saved to the
@@ -542,6 +569,12 @@ class ManageDHCPPoolsDialog(QDialog):
             "lease_time": pool.get("lease_time") or 0,
             "gateway_routes": pool.get("gateway_routes") or [],
             "description": pool.get("description") or "",
+            # v0.5.344 (audit dhcp-pool-v6-only-allowed): preload the
+            # v6 fields on edit so a pool created v6-only doesn't
+            # lose them on save.
+            "pool6_start": pool.get("pool6_start") or "",
+            "pool6_end": pool.get("pool6_end") or "",
+            "prefix6": pool.get("prefix6") or "",
         }
         dialog = DHCPPoolDialog(self, defaults=defaults, is_edit=True)
         if dialog.exec_() != QDialog.Accepted:
@@ -554,6 +587,11 @@ class ManageDHCPPoolsDialog(QDialog):
             "gateway": payload["gateway"],
             "gateway_routes": payload["gateway_routes"],
             "description": payload["description"],
+            # v0.5.344: propagate v6 fields on update so operator's
+            # edit doesn't drop the v6 half of a dual-stack pool.
+            "pool6_start": payload.get("pool6_start", ""),
+            "pool6_end": payload.get("pool6_end", ""),
+            "prefix6": payload.get("prefix6", ""),
         }
         if payload.get("lease_time"):
             update_payload["lease_time"] = payload["lease_time"]

@@ -16160,6 +16160,12 @@ def _dhcp_pool_to_api(pool: Dict[str, Any]) -> Dict[str, Any]:
         # client-side Manage/Attach dialogs can render the field
         # and re-emit it on save without losing it.
         "relay_return_hop": pool.get("relay_return_hop") or "",
+        # v0.5.344 (audit dhcp-pool-v6-only-allowed): expose the v6
+        # pool fields so the Manage/Attach dialogs can render them
+        # for v6-only + dual-stack pools.
+        "pool6_start": pool.get("pool6_start") or "",
+        "pool6_end": pool.get("pool6_end") or "",
+        "prefix6": pool.get("prefix6") or "",
         "created_at": pool.get("created_at"),
         "updated_at": pool.get("updated_at"),
     }
@@ -16185,10 +16191,32 @@ def create_dhcp_pool():
         if not data:
             return jsonify({"error": "Invalid JSON payload"}), 400
 
-        required_fields = ["name", "pool_start", "pool_end"]
-        for field in required_fields:
-            if not data.get(field):
-                return jsonify({"error": f"Missing required field: {field}"}), 400
+        # v0.5.344 (audit dhcp-pool-v6-only-allowed): only `name` is
+        # unconditionally required. At least one address family must
+        # be supplied — either v4 (pool_start + pool_end) or v6
+        # (pool6_start + pool6_end + prefix6), or both. add_dhcp_pool
+        # does the deeper partial-family validation and rejects with
+        # a specific error; here we just gate on the coarse "any
+        # family present at all" check.
+        if not data.get("name"):
+            return jsonify({"error": "Missing required field: name"}), 400
+        _has_v4 = bool(data.get("pool_start") or data.get("pool_end"))
+        _has_v6 = bool(
+            data.get("pool6_start")
+            or data.get("pool6_end")
+            or data.get("prefix6")
+            or data.get("ipv6_pool_start")
+            or data.get("ipv6_pool_end")
+            or data.get("ipv6_prefix")
+        )
+        if not _has_v4 and not _has_v6:
+            return jsonify({
+                "error": (
+                    "Pool needs at least one address family — supply "
+                    "either IPv4 (pool_start + pool_end) or IPv6 "
+                    "(pool6_start + pool6_end + prefix6), or both."
+                )
+            }), 400
 
         pool_data = {
             "name": data.get("name"),
@@ -16208,6 +16236,10 @@ def create_dhcp_pool():
             #      dev <iface>` so OFFERs traverse back correctly
             # Absent (or empty) → direct-attached mode, unchanged.
             "relay_return_hop": data.get("relay_return_hop"),
+            # v0.5.344: v6 pool fields.
+            "pool6_start": data.get("pool6_start") or data.get("ipv6_pool_start"),
+            "pool6_end": data.get("pool6_end") or data.get("ipv6_pool_end"),
+            "prefix6": data.get("prefix6") or data.get("ipv6_prefix"),
         }
 
         success = device_db.add_dhcp_pool(pool_data)
