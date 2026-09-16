@@ -3803,6 +3803,35 @@ class DevicesTab(QWidget):
                     overall_resolved = overall_resolved and arp_results["ipv6_resolved"]
                 if gateway_configured:
                     overall_resolved = overall_resolved and arp_results["gateway_resolved"]
+                # v0.5.349 (audit dhcp-client-no-lease-shows-green):
+                # v0.5.334 correctly stopped requiring IPv4 on IPv6-
+                # only devices, but a DHCP-client device with NO
+                # lease yet has ALL THREE _configured flags False →
+                # overall_resolved stayed True (nothing to check →
+                # green). Operator on srv06 2026-09-16 hit this on
+                # device7 (v6 DHCP client) — showed green despite
+                # having no v6 lease and no ARP resolution.
+                #
+                # Fix: for DHCP-CLIENT devices (dhcp_mode=='client')
+                # with NO lease acquired yet on the enabled families,
+                # force overall_resolved=False. That surfaces
+                # "waiting for lease" as yellow, matching operator
+                # intuition. Non-DHCP devices (server / no DHCP) are
+                # untouched.
+                _dhcp_mode_ov = str(
+                    device_data.get("dhcp_mode") or ""
+                ).strip().lower()
+                if _dhcp_mode_ov == "client":
+                    _has_v4_lease = bool(
+                        (device_data.get("dhcp_lease_ip") or "").strip()
+                    )
+                    _has_v6_lease = bool(
+                        (device_data.get("dhcp_lease_ip6") or "").strip()
+                    )
+                    # If no v4 lease and no v6 lease, client is
+                    # still soliciting/requesting — force yellow.
+                    if not _has_v4_lease and not _has_v6_lease:
+                        overall_resolved = False
                 self.set_status_icon(row, resolved=overall_resolved,
                                      status_text=arp_results["overall_status"], device_status=device_status)
             else:
@@ -9506,6 +9535,24 @@ class DevicesTab(QWidget):
                     overall_resolved = overall_resolved and ipv6_resolved
                 if gateway_configured:
                     overall_resolved = overall_resolved and gateway_resolved
+                # v0.5.349 (audit dhcp-client-no-lease-shows-green):
+                # DHCP-client devices with no lease yet have all
+                # three _configured flags False → overall_resolved
+                # stays True (green). Force yellow when the client
+                # is still soliciting/requesting. See twin comment
+                # in `_apply_device_status_row`.
+                _dhcp_mode_ov = str(
+                    device_data.get("dhcp_mode") or ""
+                ).strip().lower()
+                if _dhcp_mode_ov == "client":
+                    _has_v4_lease = bool(
+                        (device_data.get("dhcp_lease_ip") or "").strip()
+                    )
+                    _has_v6_lease = bool(
+                        (device_data.get("dhcp_lease_ip6") or "").strip()
+                    )
+                    if not _has_v4_lease and not _has_v6_lease:
+                        overall_resolved = False
 
                 if overall_resolved:
                     return True, "ARP resolved"
@@ -9587,10 +9634,29 @@ class DevicesTab(QWidget):
                     overall_resolved = overall_resolved and ipv6_resolved
                 if gateway_configured:
                     overall_resolved = overall_resolved and gateway_resolved
+                # v0.5.349 (audit dhcp-client-no-lease-shows-green):
+                # DHCP-client-with-no-lease → yellow. Same guard as
+                # in the two sister sites above.
+                _dhcp_mode_ov = str(
+                    device_data.get("dhcp_mode") or ""
+                ).strip().lower()
+                _dhcp_client_no_lease = False
+                if _dhcp_mode_ov == "client":
+                    _has_v4_lease = bool(
+                        (device_data.get("dhcp_lease_ip") or "").strip()
+                    )
+                    _has_v6_lease = bool(
+                        (device_data.get("dhcp_lease_ip6") or "").strip()
+                    )
+                    if not _has_v4_lease and not _has_v6_lease:
+                        overall_resolved = False
+                        _dhcp_client_no_lease = True
 
                 # Provide more descriptive status message when unresolved
                 if overall_resolved:
                     status_message = "ARP resolved"
+                elif _dhcp_client_no_lease:
+                    status_message = "DHCP client: waiting for lease"
                 else:
                     failed_parts = []
                     if ipv4_configured and not ipv4_resolved:

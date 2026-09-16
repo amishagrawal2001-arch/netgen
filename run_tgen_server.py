@@ -4257,6 +4257,39 @@ def apply_device():
         # switch keyed off the wrong MAC + scale-address-increment
         # (v0.5.324) had no effect on the wire. Extract now.
         mac_address = (data.get("mac") or data.get("mac_address") or "").strip()
+        # v0.5.349 (audit auto-mac-server-fallback): defense-in-depth
+        # for v0.5.348. The client-side dialog auto-generates a
+        # unique LAA MAC on Add, but a stale client (not `git
+        # pull`ed since v0.5.348), an imported device row, or an
+        # apply call from a script may still arrive with an empty
+        # mac. Operator on srv06 2026-09-16 hit exactly this:
+        # device7 apply landed with mac_address="" → v0.5.325's
+        # `if mac_address:` guard skipped the `ip link set` → the
+        # vlan41 subif kept its parent NIC MAC (5c:25:73:3f:30:57).
+        #
+        # Fix: if payload has no MAC, derive one deterministically
+        # from device_id (so re-apply of the same device produces
+        # the same MAC across restarts) and persist to DB alongside
+        # the apply so subsequent reads see it. Uses LAA prefix
+        # `02:` to avoid vendor-OUI conflicts.
+        if not mac_address and device_id:
+            import hashlib as _hashlib_mac
+            _digest = _hashlib_mac.md5(str(device_id).encode()).hexdigest()
+            mac_address = "02:" + ":".join(
+                _digest[i:i + 2] for i in (0, 2, 4, 6, 8)
+            )
+            logging.info(
+                f"[DEVICE APPLY] v0.5.349 auto-generated MAC "
+                f"{mac_address} for device {device_id} (empty in "
+                f"payload; deterministic hash of device_id)"
+            )
+            try:
+                device_db.update_device(device_id, {"mac_address": mac_address})
+            except Exception as _mac_persist_exc:
+                logging.warning(
+                    f"[DEVICE APPLY] v0.5.349 failed to persist auto-"
+                    f"generated MAC for {device_id}: {_mac_persist_exc}"
+                )
         ipv4 = data.get("ipv4", "")
         ipv6 = data.get("ipv6", "")
         ipv4_mask = data.get("ipv4_mask", "24")

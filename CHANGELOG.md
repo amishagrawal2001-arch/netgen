@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.349] - 2026-09-16
+
+**Two fixes bundled:** server-side MAC auto-generation fallback
+(defense in depth for v0.5.348) + DHCP-client-with-no-lease no
+longer shows green (regression from v0.5.334).
+
+### A. Server-side MAC auto-generation fallback
+
+Operator on srv06: added device7 (v6 DHCP client on vlan41),
+DB row landed with `mac_address=""` (client hadn't `git pull`ed
+to v0.5.348 yet — memory `[Client runs from git checkout]`
+warned about this class of issue). Server's v0.5.325
+`if mac_address:` guard silently skipped `ip link set`, leaving
+vlan41 with its parent NIC MAC (5c:25:73:3f:30:57).
+
+Fix: `/api/device/apply` now derives a MAC from
+`md5(device_id).hexdigest()[:10]` prefixed with `02:` (LAA) when
+the payload arrives empty. Deterministic — same device_id
+produces the same MAC across restarts. Persisted to the DB so
+subsequent reads see it.
+
+### B. DHCP-client-with-no-lease shows green
+
+v0.5.334 fixed "IPv6-only device incorrectly requires v4" by
+switching to "seed True, AND in only configured families". But
+when NOTHING is configured (DHCP client whose lease is still in
+flight — no `ipv4_address`, no `ipv6_address`, no
+`ipv4_gateway`), `overall_resolved` stays True and the status
+icon goes green despite no ARP resolution.
+
+Fix: at all three v0.5.334 call sites in `widgets/devices_tab.py`,
+add a `dhcp_mode == 'client'` special-case that forces
+`overall_resolved = False` when the device has neither a v4
+lease (`dhcp_lease_ip`) nor a v6 lease (`dhcp_lease_ip6`). The
+individual-ARP-resolution status message gains a new "DHCP
+client: waiting for lease" branch to disambiguate from
+ARP-pending-with-a-configured-IP.
+
+### Files touched
+
+- `run_tgen_server.py` — v0.5.349 marker + MAC hash fallback +
+  persist
+- `widgets/devices_tab.py` — v0.5.349 guard at all three
+  v0.5.334 sites
+- `tests/test_v05349_mac_and_dhcp_status.py`: 12 tests
+
+Client + server change — `netgen-upgrade` on srv06 AND
+`git pull` in `/Users/surajsharma/dev/netgen`.
+
+---
+
 ## [0.5.348] - 2026-09-15
 
 **Add Device dialog auto-generates a unique locally-administered
