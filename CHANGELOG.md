@@ -2,6 +2,92 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.350] - 2026-09-16
+
+**Six HIGH-severity DHCP fixes bundled** from the post-cadence
+audit. First of three planned batches (HIGH first, then MED,
+then LOW).
+
+### A. Monitor mis-labels v6-only server as "No Pool"
+
+`utils/dhcp_monitor.py::_has_dhcp_pool` only checked `pool6_start`
+/ `pool6_end`. Devices persist the v6 pool under `ipv6_pool_start`
+/ `ipv6_pool_end` (see `start_dhcp_server` at
+`utils/dhcp.py:3309-3323`). v6-only server bounced to "No Pool"
+every monitor tick + auto-restart suppressed.
+
+Fix: accept EITHER key spelling.
+
+### B. Client→Server mode transition swallows TypeError
+
+`utils/dhcp.py:5279-5282` passed `dhcp_config=` kwarg to
+`stop_dhcp_client` — signature (`utils/dhcp.py:3426`) has no such
+kwarg. TypeError raised, silently swallowed by the outer except,
+dhclient/dhcp6c NEVER stopped, `start_dhcp_server` ran on top of
+a live client → collision (the exact v0.5.229 audit-U-server-6
+bug).
+
+Fix: drop the phantom kwarg.
+
+### C. Attach v6-only pool → no v6 range in dnsmasq
+
+`run_tgen_server.py::attach_dhcp_pools` copied only v4 fields
+from the named pool into `dhcp_cfg`. v0.5.344 lets the operator
+create v6-only pools, but attaching one silently produced dnsmasq
+with no v6 range.
+
+Fix: mirror the v4 field copy for v6 — write
+`ipv6_pool_start`/`ipv6_pool_end`/`ipv6_prefix` from the pool's
+`pool6_start`/`pool6_end`/`prefix6`. Also flip `ipv4_enabled` /
+`ipv6_enabled` on the resulting config to match which families
+the pool actually covers.
+
+### D. AttachDHCPPoolsDialog is v4-only
+
+`utils/devices_tab_dhcp.py::AttachDHCPPoolsDialog` had 9
+v4-focused columns. v6-only pools showed Name + blank cells;
+operator couldn't tell what they were attaching.
+
+Fix: expand to 12 columns with explicit "IPv6 Pool Start / End /
+Prefix". `populate_table` reads v6 fields from the pool dict
+(populated by v0.5.344's `_dhcp_pool_to_api`).
+
+### E. Dual-stack client hides one-family failure behind green
+
+`utils/dhcp.py::start_dhcp_client` did `success = ipv4_result OR
+ipv6_result` and wrote `dhcp_state="Leased"` with no
+`dhcp_last_error` for the failed family. A dual-stack client
+whose v4 leased but v6 failed (or vice versa) went green with
+no signal.
+
+Fix: emit `Leased (partial)` when some-but-not-all enabled
+families succeeded, surface the failed family's message via
+`dhcp_last_error`, clear it when all succeed so the tooltip
+doesn't linger post-recovery.
+
+### F. Delete-pool has no in-use check
+
+`run_tgen_server.py::delete_dhcp_pool` DELETE'd unconditionally.
+Any server device using the pool → orphaned attachment → next
+Apply / monitor tick resolved an empty pool → dnsmasq refused
+on next restart.
+
+Fix: return HTTP 409 with `in_use_by: [device_ids]` unless
+`?force=true`. Operator sees the exact devices to detach first.
+
+### Files touched
+
+- `utils/dhcp.py` (fixes B, E)
+- `utils/dhcp_monitor.py` (fix A)
+- `run_tgen_server.py` (fixes C, F)
+- `utils/devices_tab_dhcp.py` (fix D)
+- `tests/test_v05350_dhcp_high_bundle.py`: 18 tests
+
+Client + server change — `netgen-upgrade` on srv06 AND `git pull`
+in `/Users/surajsharma/dev/netgen`.
+
+---
+
 ## [0.5.349] - 2026-09-16
 
 **Two fixes bundled:** server-side MAC auto-generation fallback

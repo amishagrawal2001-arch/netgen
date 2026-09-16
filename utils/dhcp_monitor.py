@@ -70,8 +70,23 @@ def _has_dhcp_pool(dhcp_config: dict) -> bool:
         return False
     v4 = (str(dhcp_config.get("pool_start") or "").strip() != "" and
           str(dhcp_config.get("pool_end") or "").strip() != "")
-    v6 = (str(dhcp_config.get("pool6_start") or "").strip() != "" and
-          str(dhcp_config.get("pool6_end") or "").strip() != "")
+    # v0.5.350 (audit v6-only-server-mislabeled-no-pool): also honor
+    # the `ipv6_pool_start`/`ipv6_pool_end` keys — the Add Device
+    # dialog and `start_dhcp_server` persist v6 pool fields under
+    # those names, not `pool6_start`/`pool6_end`. Pre-fix, a v6-only
+    # server device (v0.5.344's use case) had `pool_start=""` +
+    # `ipv6_pool_start="2001:db8::100"` → this returned False →
+    # dhcp_state bounced to "No Pool" on every monitor tick even
+    # though dnsmasq was serving fine. And "No Pool" suppresses
+    # auto-restart, so a real Server Down on a v6-only device would
+    # never recover. Accept EITHER key spelling for parity.
+    v6 = (
+        (str(dhcp_config.get("pool6_start") or "").strip() != ""
+         and str(dhcp_config.get("pool6_end") or "").strip() != "")
+        or
+        (str(dhcp_config.get("ipv6_pool_start") or "").strip() != ""
+         and str(dhcp_config.get("ipv6_pool_end") or "").strip() != "")
+    )
     return v4 or v6
 
 

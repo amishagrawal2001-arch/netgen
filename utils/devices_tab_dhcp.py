@@ -701,15 +701,28 @@ class AttachDHCPPoolsDialog(QDialog):
         info_label.setStyleSheet("color: #555; background: #f7f7f7; padding: 6px; border-radius: 3px;")
         layout.addWidget(info_label)
 
-        self.table = QTableWidget(0, 9)
+        # v0.5.350 (audit attach-pool-dialog-v4-only): add v6 columns
+        # so the operator can see + confidently attach v6-only or
+        # dual-stack pools created via v0.5.344's Manage Pools. Pre-
+        # fix, a v6-only pool showed Name + blank Pool Start/End/
+        # Gateway cells — the operator couldn't tell what was in it
+        # or if it was even a real pool. Column layout now:
+        #   0 Primary | 1 Attach | 2 Name | 3 v4 Pool Start |
+        #   4 v4 Pool End | 5 v4 Gateway | 6 v6 Pool Start |
+        #   7 v6 Pool End | 8 v6 Prefix | 9 Gateway Routes |
+        #   10 Lease | 11 Description
+        self.table = QTableWidget(0, 12)
         self.table.setHorizontalHeaderLabels(
             [
                 "Primary",
                 "Attach",
                 "Name",
-                "Pool Start",
-                "Pool End",
-                "Gateway",
+                "IPv4 Pool Start",
+                "IPv4 Pool End",
+                "IPv4 Gateway",
+                "IPv6 Pool Start",
+                "IPv6 Pool End",
+                "IPv6 Prefix",
                 "Gateway Routes",
                 "Lease",
                 "Description",
@@ -718,7 +731,7 @@ class AttachDHCPPoolsDialog(QDialog):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        for idx in range(2, 9):
+        for idx in range(2, 12):
             header.setSectionResizeMode(idx, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.NoSelection)
@@ -793,11 +806,19 @@ class AttachDHCPPoolsDialog(QDialog):
             checkbox.stateChanged.connect(lambda state, r=row: self._on_attach_toggled(r, state))
             self.table.setCellWidget(row, 1, checkbox)
 
+            # v0.5.350: display v4 columns then v6 columns then
+            # the shared metadata. Empty strings render as blank
+            # cells (visually clear that this pool doesn't cover
+            # that family). Pool6 fields come from v0.5.344's DB
+            # migration + `_dhcp_pool_to_api` fields.
             display = [
                 pool.get("name", ""),
-                pool.get("pool_start", ""),
-                pool.get("pool_end", ""),
+                pool.get("pool_start", "") or "",
+                pool.get("pool_end", "") or "",
                 pool.get("gateway", "") or "",
+                pool.get("pool6_start", "") or "",
+                pool.get("pool6_end", "") or "",
+                str(pool.get("prefix6", "") or ""),
                 ", ".join(pool.get("gateway_routes") or []),
                 str(pool.get("lease_time") or ""),
                 pool.get("description", "") or "",

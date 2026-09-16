@@ -3409,17 +3409,66 @@ def start_dhcp_client(
                     "addresses": addr6,
                 }
 
-    success = ipv4_result.get("success") or ipv6_result.get("success")
-    _update_device_db(
-        device_db,
-        device_id,
-        {
-            "dhcp_mode": "client",
-            "dhcp_state": "Leased" if success else "Failed",
-            "dhcp_running": success,
-            "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    # v0.5.350 (audit dual-stack-partial-success-hidden): pre-fix,
+    # `success = ipv4_result.success OR ipv6_result.success` — a
+    # dual-stack client where v4 leased but v6 failed (or vice
+    # versa) got `dhcp_state="Leased"` with NO `dhcp_last_error`,
+    # so the UI showed green and the operator had no signal about
+    # the failed family. Now compute per-family enable/success and
+    # emit a specific state:
+    #   * Fully Leased  — every enabled family succeeded
+    #   * Partial       — some but not all enabled families succeeded
+    #                     (dhcp_last_error carries the failed side)
+    #   * Failed        — no enabled family succeeded
+    #   * No Lease      — no family was enabled (defensive)
+    _v4_ok = bool(ipv4_result.get("success"))
+    _v6_ok = bool(ipv6_result.get("success"))
+    _v4_wanted = ipv4_enabled
+    _v6_wanted = ipv6_enabled
+    _wanted = [f for f, on in (("v4", _v4_wanted), ("v6", _v6_wanted)) if on]
+    _leased = [
+        f for f, on, ok in
+        (("v4", _v4_wanted, _v4_ok), ("v6", _v6_wanted, _v6_ok))
+        if on and ok
+    ]
+    _failed_msgs = []
+    if _v4_wanted and not _v4_ok:
+        _failed_msgs.append(
+            f"IPv4: {ipv4_result.get('error') or 'no lease'}"
+        )
+    if _v6_wanted and not _v6_ok:
+        _failed_msgs.append(
+            f"IPv6: {ipv6_result.get('error') or 'no global IPv6 observed'}"
+        )
+
+    if not _wanted:
+        _new_state = "No Lease"
+        success = False
+    elif len(_leased) == len(_wanted):
+        _new_state = "Leased"
+        success = True
+    elif _leased:
+        _new_state = "Leased (partial)"
+        success = True
+    else:
+        _new_state = "Failed"
+        success = False
+
+    _db_update = {
+        "dhcp_mode": "client",
+        "dhcp_state": _new_state,
+        "dhcp_running": success,
+        "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+    }
+    # Surface the failed-family message via dhcp_last_error so the
+    # UI's Last-Error tooltip shows the operator WHICH family broke.
+    # Clear it when all wanted families succeeded so the tooltip
+    # doesn't stick.
+    if _failed_msgs:
+        _db_update["dhcp_last_error"] = " | ".join(_failed_msgs)
+    else:
+        _db_update["dhcp_last_error"] = ""
+    _update_device_db(device_db, device_id, _db_update)
     return {"success": success, "ipv4": ipv4_result, "ipv6": ipv6_result}
 
 
@@ -5277,9 +5326,18 @@ def _ensure_dhcp_services_locked(
                     stop_dhcp_server(device_db, device_id, interface,
                                      container=_ensure_dhcp_container(device_id, mode="server"))
                 elif _prev_mode == "client":
+                    # v0.5.350 (audit stop-client-typeerror-swallowed):
+                    # pre-fix passed `dhcp_config=` — a kwarg that
+                    # DOES NOT exist on `stop_dhcp_client` (signature
+                    # is `(device_db, device_id, interface, container=None)`).
+                    # The TypeError was silently swallowed by the
+                    # outer except at ~5283-5288, so the dhclient /
+                    # dhcp6c NEVER stopped and `start_dhcp_server`
+                    # ran on top of a live client → the exact
+                    # collision v0.5.229 audit-U-server-6 was meant
+                    # to prevent. Drop the phantom kwarg.
                     stop_dhcp_client(device_db, device_id, interface,
-                                     container=_ensure_dhcp_container(device_id, mode="client"),
-                                     dhcp_config=_prev.get("dhcp_config") if _prev else None)
+                                     container=_ensure_dhcp_container(device_id, mode="client"))
             except Exception as _trans_exc:
                 logger.warning(
                     "[DHCP] Mode-transition stop for %s (%s → %s) raised: %s "

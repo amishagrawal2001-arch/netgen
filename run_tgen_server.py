@@ -8410,6 +8410,36 @@ def attach_dhcp_pools_to_server():
     dhcp_cfg.pop("pool_networks", None)
     dhcp_cfg.pop("gateway_route_normalized", None)
 
+    # v0.5.350 (audit v6-pool-attach-not-propagated): mirror the v4
+    # field copy for v6. v0.5.344 lets the operator CREATE a v6-only
+    # (or dual-stack) DHCP pool, but the attach path was copying
+    # only v4 keys — the resulting dnsmasq had no v6 dhcp-range and
+    # silently didn't serve v6 clients. Fields land under
+    # `ipv6_pool_start`/`ipv6_pool_end`/`ipv6_prefix` because that's
+    # what `start_dhcp_server` reads (see utils/dhcp.py:3309-3323
+    # for the read-side).
+    dhcp_cfg["ipv6_pool_start"] = primary_pool.get("pool6_start") or ""
+    dhcp_cfg["ipv6_pool_end"] = primary_pool.get("pool6_end") or ""
+    dhcp_cfg["ipv6_prefix"] = primary_pool.get("prefix6") or ""
+    # If the pool is v4-only, remove the v6 keys entirely on
+    # replace_existing so a subsequent attach of a v4-only pool
+    # doesn't leave stale v6 fields from an earlier attach.
+    if replace_existing:
+        for _k in ("ipv6_pool_start", "ipv6_pool_end", "ipv6_prefix"):
+            if not dhcp_cfg.get(_k):
+                dhcp_cfg.pop(_k, None)
+    # Flip ipv6_enabled to True when a v6 pool is attached; leave
+    # False otherwise so the server-mode start doesn't emit v6
+    # dnsmasq lines for a v4-only pool.
+    dhcp_cfg["ipv6_enabled"] = bool(
+        dhcp_cfg.get("ipv6_pool_start") and dhcp_cfg.get("ipv6_pool_end")
+    )
+    # Same-shape flip for v4 so a v6-only pool doesn't leave
+    # ipv4_enabled=True from an older dhcp_cfg.
+    dhcp_cfg["ipv4_enabled"] = bool(
+        dhcp_cfg.get("pool_start") and dhcp_cfg.get("pool_end")
+    )
+
     if primary_pool.get("lease_time") is not None:
         dhcp_cfg["lease_time"] = primary_pool.get("lease_time")
     elif "lease_time" in dhcp_cfg and replace_existing:
@@ -16334,6 +16364,50 @@ def update_dhcp_pool_endpoint(pool_name):
 def delete_dhcp_pool(pool_name):
     """Delete a DHCP pool definition."""
     try:
+        # v0.5.350 (audit delete-pool-no-in-use-check): pre-fix, the
+        # DELETE unconditionally removed the pool row. If any DHCP-
+        # server device had it attached (via device_dhcp_pools),
+        # the FK became orphaned; next Apply / monitor tick
+        # resolved an empty pool → dnsmasq refused on next restart
+        # with "no pool defined". Query the join table first and
+        # refuse with 409 + the list of device_ids using it, so
+        # the operator can detach or delete those devices first.
+        # An `?force=true` query param bypasses the check for the
+        # rare case an operator knows the devices are being torn
+        # down and wants to sweep everything at once.
+        _force = str(request.args.get("force", "")).lower() in ("1", "true", "yes")
+        if not _force:
+            try:
+                import sqlite3 as _sqlite3
+                with _sqlite3.connect(device_db.db_path) as _conn:
+                    _conn.row_factory = _sqlite3.Row
+                    _rows = _conn.execute(
+                        "SELECT device_id, is_primary FROM device_dhcp_pools "
+                        "WHERE pool_name = ?",
+                        (pool_name,),
+                    ).fetchall()
+                    _in_use = [dict(r) for r in _rows]
+            except Exception as _use_exc:
+                logging.warning(
+                    f"[DHCP POOLS API] v0.5.350 in-use lookup for "
+                    f"'{pool_name}' failed: {_use_exc} — allowing "
+                    f"delete (best-effort guard, not authoritative)"
+                )
+                _in_use = []
+            if _in_use:
+                _ids = [str(r.get("device_id")) for r in _in_use]
+                return jsonify({
+                    "error": (
+                        f"DHCP pool '{pool_name}' is attached to "
+                        f"{len(_ids)} device(s): {', '.join(_ids)}. "
+                        f"Detach or delete those devices first, "
+                        f"or re-issue DELETE with ?force=true to "
+                        f"remove the pool anyway (leaves orphaned "
+                        f"attachments in device_dhcp_pools)."
+                    ),
+                    "in_use_by": _in_use,
+                }), 409
+
         success = device_db.remove_dhcp_pool(pool_name)
         if success:
             return jsonify({"message": f"DHCP pool '{pool_name}' deleted"}), 200
