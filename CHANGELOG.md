@@ -2,6 +2,98 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.351] - 2026-09-16
+
+**MED stop-path bundle** — three complementary Stop-side cleanups
+that each mirror a guard the START-path already carried. Second of
+three planned batches after v0.5.350's HIGH bundle.
+
+Also folds in a drive-by cleanup of accumulated test-drift from
+v0.5.337 / v0.5.339 / v0.5.340 / v0.5.345 that had left
+`tests/test_v0533*.py` and `tests/test_v0534*.py` red against
+current code but structurally correct — no functional regressions,
+just stale exact-string assertions.
+
+### A. `stop_dhcp_client` misses forked/orphaned dhcp6c
+
+`utils/dhcp.py::stop_dhcp_client` only did a single `dhcp6c -x`
+release + one pkill sweep. Same class of bug as v0.5.240 on the
+v4 side, where `_kill_stale_dhclients` had to be added a few
+lines below to catch stragglers with mismatched pidfile names
+or forked parents. The v6 side never got the equivalent even
+though v0.5.338 already added `_kill_stale_dhcp6c` for the
+START-path.
+
+Fix: call `_kill_stale_dhcp6c` after the pkill in
+`stop_dhcp_client`, so orphan dhcp6c parents get swept the same
+way v0.5.240 handles orphan dhclients. Marker
+`v0.5.351 (audit stop-client-v6-stragglers-sweep)`.
+
+### B. `stop_dhcp_client` leaves iface in permanent v6 lockdown
+
+v0.5.346 set `net.ipv6.conf.<iface>.accept_ra=2` and
+`.autoconf=0` on the START-path so RA could still install the
+on-link + default route while dhcp6c stayed authoritative for
+addresses. That comment promised "restored on stop" but no
+restore code actually existed. Symptom: after Stop DHCP the
+iface's SLAAC stayed disabled indefinitely; a later v4-only
+re-apply on the same container inherited the v6 lockdown.
+
+Fix: after the dhcp6c/dhclient sweeps, restore both sysctls to
+`1` (Linux default for a host iface). Best-effort — sysctl
+failure is a debug log, not an abort. Marker
+`v0.5.351 (audit stop-client-accept-ra-restore)`.
+
+### C. `stop_dhcp_server` leaves stale /64 anchor when v6 pool rotates
+
+`utils/dhcp.py::stop_dhcp_server` called
+`_remove_ipv6_address(interface, ipv6_server_ip, ipv6_prefix)`
+for exactly ONE (ip, prefix) pair — whatever the CURRENT config
+carries. When an operator rotated a server's v6 pool (attached
+a different /64 pool, or edited `ipv6_server_ip`), the OLD /64
+anchor stayed stuck on the iface. Same class of bug as v0.5.239
+had to fix on the v4 side by introducing
+`_remove_matching_ipv4_anchors` (collect candidates → intersect
+with current iface addrs → remove only what's really there).
+
+Fix: new helper `_remove_matching_ipv6_anchors` mirrors the v4
+sister API (skips link-local, uses `_parse_ipv6` to read the
+iface's current v6 assignments, matches either exact `(ip,pfx)`
+or ip-only). `stop_dhcp_server` collects v6 candidates from both
+key spellings (`ipv6_pool_start`/`ipv6_prefix` AND legacy
+`pool6_start`/`prefix6`) plus the first-host derivation used by
+v0.5.230's auto-anchor, then calls the helper. Best-effort:
+sweep failure is a debug log, not an abort. Marker
+`v0.5.351 (audit stop-server-v6-anchor-sweep-missing)`.
+
+### Tests
+
+- `tests/test_v05351_stop_path_bundle.py` — 16 new tests for A/B/C,
+  helper existence, wiring, best-effort semantics, and regression
+  guards on the sister v4 helpers (v0.5.239, v0.5.240) that these
+  fixes are patterned on.
+- `tests/test_v05333_vrf_reconcile_on_reapply.py` — 3 assertions
+  widened from 3000-char to 6000-char body windows (v0.5.340
+  added ~60 lines of default-route install between the reconcile
+  block and `return container_name`); exact-string call-site
+  count changed to structural `str.count` on the new multi-line
+  `_create_vrf(device_id, iface_name, ipv4_gateway=..., ...)`
+  signature. No behavior change.
+- `tests/test_v05335_dhcpv6_relay_mode_anchor.py` — 4 assertions
+  updated for post-v0.5.337 / v0.5.339 code shape (12000-16000-
+  char body windows to reach `else:` past the new device_db
+  lookup + DAD probe; `_hosts6[0]` → gateway-skip iterator).
+- `tests/test_v05336_arp_monitor_v6_replay_l3_remote.py` — 2
+  assertions widened to 16000-char body windows to reach the
+  anchor call past v0.5.339's tick-time sweep; branch-boundary
+  detection made structural (indentation-level `\n<20-space>
+  continue`) so the inner sweep's own `continue` doesn't confuse
+  the branch-end check.
+- `tests/test_v05343_dhcp_config_flag_propagation.py` — 1
+  assertion updated to match v0.5.345's rename `ipv4_on` →
+  `_dhcp_v4_on` / `ipv6_on` → `_dhcp_v6_on` (separate DHCP-
+  scoped checkbox flags with fallback to the general ones).
+
 ## [0.5.350] - 2026-09-16
 
 **Six HIGH-severity DHCP fixes bundled** from the post-cadence

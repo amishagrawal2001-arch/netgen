@@ -62,9 +62,16 @@ def test_pool_remote_detection_uses_ipv6network_overlaps():
     `2001:0db8::`)."""
     src = _dhcp_src()
     idx = src.index("v0.5.335 (audit dhcpv6-relay-mode-anchor-collision)")
-    body = src[idx:idx + 6000]
+    # v0.5.339 added the device_db-based path (`_pool_net.overlaps(_dev_net)`)
+    # PLUS kept the runtime-iface fallback (`_pool_net.overlaps(_n)`).
+    # Body widened from 6000 → 12000 chars so both paths land in slice.
+    body = src[idx:idx + 12000]
     assert "ipaddress.IPv6Network" in body
-    assert "_pool_net.overlaps(_n)" in body
+    # Either the device-db comparison or the iface fallback qualifies.
+    assert (
+        "_pool_net.overlaps(_dev_net)" in body
+        or "_pool_net.overlaps(_n)" in body
+    )
 
 
 def test_pool_remote_check_excludes_link_local():
@@ -75,7 +82,7 @@ def test_pool_remote_check_excludes_link_local():
     subnet list."""
     src = _dhcp_src()
     idx = src.index("v0.5.335 (audit dhcpv6-relay-mode-anchor-collision)")
-    body = src[idx:idx + 6000]
+    body = src[idx:idx + 12000]
     assert "is_link_local" in body
 
 
@@ -86,19 +93,23 @@ def test_relay_mode_branch_skips_ensure_ipv6_address():
     branch (else)."""
     src = _dhcp_src()
     idx = src.index("v0.5.335 (audit dhcpv6-relay-mode-anchor-collision)")
-    # Slice from the marker up through the else block.
-    body = src[idx:idx + 8000]
+    # Body widened 8000 → 16000: v0.5.337/339 added ~150 lines of
+    # device_db lookup + DAD probe + gateway-skip iteration between
+    # the marker and the `else:` (direct-attached) branch.
+    body = src[idx:idx + 16000]
     # Locate the `if _pool_is_l3_remote:` and `else:` boundaries.
     relay_if = body.index("if _pool_is_l3_remote:")
     else_idx = body.index("else:", relay_if)
     relay_branch = body[relay_if:else_idx]
-    direct_branch = body[else_idx:else_idx + 4000]
+    direct_branch = body[else_idx:else_idx + 8000]
     # Relay branch must NOT anchor.
     assert "_ensure_ipv6_address" not in relay_branch, (
         "v0.5.335 relay-mode branch must not call _ensure_ipv6_address"
     )
     # Direct-attached branch must still anchor (v0.5.230 kept intact).
-    assert "_ensure_ipv6_address(interface, _v6_ip" in direct_branch, (
+    # v0.5.337 wrapped the call in a DAD-probe if/else and reformatted
+    # it multi-line, so match on the bare function name.
+    assert "_ensure_ipv6_address(" in direct_branch, (
         "direct-attached branch (post-else) must keep the "
         "v0.5.230 _ensure_ipv6_address call"
     )
@@ -112,7 +123,8 @@ def test_relay_mode_branch_sweeps_stale_pool_subnet_anchors():
     subnet."""
     src = _dhcp_src()
     idx = src.index("v0.5.335 (audit dhcpv6-relay-mode-anchor-collision)")
-    body = src[idx:idx + 8000]
+    # Widened 8000 → 16000 for the same v0.5.337/339 growth.
+    body = src[idx:idx + 16000]
     relay_if = body.index("if _pool_is_l3_remote:")
     else_idx = body.index("else:", relay_if)
     relay_branch = body[relay_if:else_idx]
@@ -129,17 +141,28 @@ def test_direct_attached_still_derives_first_host_when_no_server_ip():
     """The v0.5.230 auto-derive (first host of pool subnet →
     ipv6_server_ip) must SURVIVE for direct-attached devices — that
     branch's original purpose was to avoid a `bind_interfaces
-    failed: no interface with matching address` crash. Regression
-    guard: the code must still say `_hosts6[0]` in the direct-
-    attached path."""
+    failed: no interface with matching address` crash. v0.5.337
+    replaced the naive `_hosts6[0]` with a gateway-skip iterator
+    (`for _h6 in _hosts6:`) but the derivation path itself must
+    still exist."""
     src = _dhcp_src()
     idx = src.index("v0.5.335 (audit dhcpv6-relay-mode-anchor-collision)")
-    body = src[idx:idx + 8000]
-    else_idx = body.index("else:")
-    direct_branch = body[else_idx:else_idx + 4000]
-    assert "_hosts6[0]" in direct_branch, (
-        "v0.5.230 auto-derive (first host of pool subnet) must "
-        "still fire on the direct-attached branch"
+    body = src[idx:idx + 16000]
+    # Grab the `else:` for `if _pool_is_l3_remote:` — same
+    # boundary logic as the other two tests so we look at the
+    # direct-attached branch, not the earlier device_db else.
+    relay_if = body.index("if _pool_is_l3_remote:")
+    else_idx = body.index("else:", relay_if)
+    direct_branch = body[else_idx:else_idx + 8000]
+    # v0.5.337: gateway-skip iterator over hosts of the pool net.
+    # `_hosts6` list must exist; `_hosts6[0]` is no longer used.
+    assert "_hosts6 = list(_v6_net.hosts())" in direct_branch, (
+        "v0.5.230 auto-derive (hosts of pool subnet) must still "
+        "fire on the direct-attached branch"
+    )
+    assert "for _h6 in _hosts6" in direct_branch, (
+        "v0.5.337 gateway-skip iterator must still fire on the "
+        "direct-attached branch"
     )
 
 

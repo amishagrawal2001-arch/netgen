@@ -37,13 +37,20 @@ def test_marker_present():
 def test_snapshot_populates_ipv4_enabled_and_ipv6_enabled():
     """The dhcp_config snapshot built by _snapshot_for_upstream_hint
     must include the ipv4/ipv6 checkbox state so the renderer emits
-    the correct per-family relay blocks."""
+    the correct per-family relay blocks.
+
+    v0.5.345 refined the flag source: separate DHCP-scoped checkboxes
+    (`dhcp_ipv4_enabled_checkbox` / `dhcp_ipv6_enabled_checkbox`)
+    hoisted into `_dhcp_v4_on` / `_dhcp_v6_on`, with fallback to the
+    top-level `ipv4_on` / `ipv6_on` when both DHCP checkboxes are
+    unset. Assertion updated to match the post-v0.5.345 shape."""
     src = _dialog_src()
     fn_idx = src.index("def _snapshot_for_upstream_hint(")
     body = src[fn_idx:fn_idx + 8000]
-    # The dhcp_config dict must include both flag entries.
-    assert '"ipv4_enabled": ipv4_on' in body
-    assert '"ipv6_enabled": ipv6_on' in body
+    # The dhcp_config dict must include both flag entries — post-
+    # v0.5.345 these come from `_dhcp_v4_on` / `_dhcp_v6_on`.
+    assert '"ipv4_enabled": _dhcp_v4_on' in body
+    assert '"ipv6_enabled": _dhcp_v6_on' in body
 
 
 def test_flags_use_the_dialogs_checkbox_state():

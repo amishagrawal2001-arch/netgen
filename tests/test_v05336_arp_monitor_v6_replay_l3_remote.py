@@ -61,17 +61,35 @@ def test_replay_skips_anchor_when_l3_remote():
     then this replay used to add it right back on the next tick."""
     src = _arp_monitor_src()
     idx = src.index("v0.5.336 (audit dhcpv6-monitor-replay-l3-remote)")
-    body = src[idx:idx + 8000]
-    # Locate `if _pool_is_l3_remote_v6:` and inspect the branch.
+    # Body widened 8000 → 16000 so both the L3-remote branch
+    # (extended by v0.5.339's tick-time sweep) AND the direct-
+    # attached anchor call land in the slice.
+    body = src[idx:idx + 16000]
+    # Boundary between L3-remote branch and the direct-attached
+    # derivation is the "if not _v6_server_ip:" line — that is
+    # OUTSIDE the L3-remote branch (unindented), so it marks the
+    # end of the branch.
     remote_if = body.index("if _pool_is_l3_remote_v6:")
-    # The branch must end with `continue` (loop-skip) — not fall
-    # through — so the _ensure_ipv6_address call below never fires
-    # for relay-mode devices.
-    branch_tail = body[remote_if:remote_if + 800]
-    assert "continue" in branch_tail
-    # And no `_ensure_ipv6_address(` inside the branch.
-    end_of_branch = branch_tail.index("continue")
-    assert "_ensure_ipv6_address" not in branch_tail[:end_of_branch]
+    direct_derive = body.index("if not _v6_server_ip:", remote_if)
+    relay_branch = body[remote_if:direct_derive]
+    # v0.5.339 added a stale-anchor sweep inside the L3-remote
+    # branch — that sweep uses `_remove_ipv6_address` (NOT the
+    # `_ensure_ipv6_address` this test guards against).
+    assert "_ensure_ipv6_address" not in relay_branch, (
+        "L3-remote branch must not call _ensure_ipv6_address — "
+        "that would silently undo v0.5.335 on every tick"
+    )
+    # And the branch must contain a `continue` (loop-skip) so the
+    # anchor call below never fires for relay-mode devices. Matches
+    # the outer-loop `continue`, not the inner sweep's continues.
+    # Look for a line whose indentation matches the L3-remote if:
+    # `                    continue` (20 spaces = one level inside
+    # the `if _pool_is_l3_remote_v6:` block).
+    assert "\n                    continue\n" in relay_branch, (
+        "L3-remote branch must include a top-level `continue` at "
+        "the branch's own indentation to loop-skip the direct-"
+        "attached anchor call"
+    )
 
 
 def test_replay_still_anchors_direct_attached():
@@ -80,7 +98,9 @@ def test_replay_still_anchors_direct_attached():
     v0.5.309 anchor-drift-recovery reason is real for them."""
     src = _arp_monitor_src()
     idx = src.index("v0.5.336 (audit dhcpv6-monitor-replay-l3-remote)")
-    body = src[idx:idx + 8000]
+    # Widened 8000 → 16000: v0.5.337/339 growth pushed the anchor
+    # call past the 8000-char window.
+    body = src[idx:idx + 16000]
     # Both the L3-remote skip and the anchor call must exist.
     assert "_ensure_ipv6_address(" in body
 

@@ -2293,6 +2293,58 @@ def _remove_matching_ipv4_anchors(
     return _removed
 
 
+def _remove_matching_ipv6_anchors(
+    interface: str, candidates: set, container=None,
+) -> List[str]:
+    """v0.5.351 (audit stop-server-v6-anchor-sweep-missing): v6
+    mirror of v0.5.239's `_remove_matching_ipv4_anchors`. Removes
+    each `(ip, prefix)` in `candidates` from `interface`, but only
+    when the address actually exists on the interface's current
+    v6 assignment list. Pre-fix, `stop_dhcp_server` only removed
+    the exact `ipv6_server_ip` — rotating a server's v6 pool
+    (server_ip / prefix change) left the OLD /64 anchor stuck on
+    the interface until the operator manually cleaned it.
+
+    Returns the list of anchors actually removed (for logging).
+    Empty candidates → no-op.
+    """
+    if not interface or not candidates:
+        return []
+    _current = set()
+    for _entry in (_parse_ipv6(interface, container=container) or []):
+        _ip = _entry.get("ip") or ""
+        _pfx = _entry.get("prefix")
+        if not _ip or _pfx in (None, ""):
+            continue
+        # Skip link-local — never a DHCPv6 anchor.
+        try:
+            if ipaddress.IPv6Address(_ip).is_link_local:
+                continue
+        except (ipaddress.AddressValueError, ValueError):
+            continue
+        _current.add((_ip, str(_pfx)))
+    if not _current:
+        return []
+    _removed: List[str] = []
+    for anchor_ip, anchor_pfx in list(candidates):
+        _key = (str(anchor_ip), str(anchor_pfx))
+        # Match either exact (ip,pfx) OR ip-only (mask may have
+        # drifted from what the caller guessed).
+        _match = None
+        if _key in _current:
+            _match = _key
+        else:
+            for _cur_ip, _cur_pfx in _current:
+                if _cur_ip == str(anchor_ip):
+                    _match = (_cur_ip, _cur_pfx)
+                    break
+        if not _match:
+            continue
+        _remove_ipv6_address(interface, _match[0], _match[1], container=container)
+        _removed.append(f"{_match[0]}/{_match[1]}")
+    return _removed
+
+
 def _remove_ipv6_address(interface: str, address: str, prefix: str, container=None) -> None:
     """Remove an IPv6 address from an interface."""
     if not interface or not address or prefix is None:
@@ -3535,6 +3587,17 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
     except Exception as exc:
         logger.debug("[DHCP] dhcp6c pkill error (safe to ignore): %s", exc)
 
+    # v0.5.351 (audit stop-client-v6-stragglers-sweep): mirror the
+    # v0.5.240 v4 straggler sweep for dhcp6c. The single-pkill above
+    # reads one pattern and misses forked/orphaned dhcp6c parents
+    # the same way v0.5.240's `_kill_stale_dhclients` fix documents
+    # for dhclient. Without this, repeated Restart cycles accumulate
+    # orphan dhcp6c (parallel to the v4 bug fixed in v0.5.240) and
+    # the next Start's dhcp6c fights them. v0.5.338 added
+    # `_kill_stale_dhcp6c` for the START-path; add it here so STOP
+    # is symmetric.
+    _kill_stale_dhcp6c(interface, container=container)
+
     # v0.5.240 (audit U client-restart): defensive sweep after the
     # per-pidfile release. dhclient -r reads ONE pidfile and only
     # kills that entry; stale-pidfile / mismatched-pidfile-name /
@@ -3544,6 +3607,34 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
     # _kill_stale_dhclients() for the full context (srv06 observed
     # 3 duplicate dhclients on vlan30 after ~3 restart cycles).
     _kill_stale_dhclients(interface, container=container)
+
+    # v0.5.351 (audit stop-client-accept-ra-restore): v0.5.346's
+    # start-path set `accept_ra=2` + `autoconf=0` to let RA install
+    # on-link + default routes while dhcp6c stayed authoritative
+    # for addresses. The comment there promised "restored in stop"
+    # but no restore actually existed. Symptom: after Stop DHCP the
+    # iface's SLAAC stays disabled indefinitely; a subsequent role
+    # (or a v4-only re-apply on the same container) inherits the
+    # v6 lockdown. Restore both sysctls to `1` — the Linux default
+    # for a host interface (accept_ra=1 means "accept if forwarding
+    # off"; when netgen later sets forwarding=1 for a v4 protocol
+    # role, kernel auto-flips accept_ra back to 0 which is correct
+    # for that role). Best-effort: sysctl failure is logged.
+    for _sysctl_key in (
+        f"net.ipv6.conf.{interface}.accept_ra",
+        f"net.ipv6.conf.{interface}.autoconf",
+    ):
+        try:
+            _run_command(
+                ["sysctl", "-w", f"{_sysctl_key}=1"],
+                timeout=3, container=container,
+            )
+        except Exception as _sysctl_exc:
+            logger.debug(
+                "[DHCP] v0.5.351: sysctl %s=1 restore failed on %s: %s "
+                "(non-fatal; next role will overwrite regardless)",
+                _sysctl_key, interface, _sysctl_exc,
+            )
 
     _flush_ipv4(interface, container=container)
     # v0.5.218: also flush non-link-local IPv6 addresses so a
@@ -5071,6 +5162,61 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
 
     if ipv6_server_ip and ipv6_prefix:
         _remove_ipv6_address(interface, ipv6_server_ip, ipv6_prefix, container=container)
+
+    # v0.5.351 (audit stop-server-v6-anchor-sweep-missing): v6
+    # mirror of v0.5.239's v4 anchor sweep above. Rotating a
+    # server's `ipv6_server_ip` / `ipv6_prefix` (e.g. operator
+    # attaches a v6 pool with a different /64 than the previous
+    # one) leaves the OLD /64 anchor stuck on the iface — the
+    # single `_remove_ipv6_address(ipv6_server_ip, ipv6_prefix)`
+    # above only removes the CURRENT config's server IP, not the
+    # historical one. Collect v6 anchor candidates from EVERY key
+    # the config might carry them under (`ipv6_server_ip`, first
+    # host of `ipv6_pool_start/ipv6_prefix`, first host of
+    # `pool6_start/prefix6`), then intersect against the iface's
+    # current v6 assignments. Same safety net as v4: never blindly
+    # remove a v6 address we didn't add.
+    try:
+        _v6_candidates = set()
+        if ipv6_server_ip and ipv6_prefix:
+            _v6_candidates.add((ipv6_server_ip, str(ipv6_prefix)))
+        # First host of each pool subnet (netgen's server-IP
+        # auto-derive from v0.5.230 picks this if no explicit
+        # ipv6_server_ip). Iterate both key spellings so a
+        # config edited between v0.5.344 (ipv6_pool_start) and
+        # legacy (pool6_start) still catches the anchor.
+        for _start_key, _pfx_key in (
+            ("ipv6_pool_start", "ipv6_prefix"),
+            ("pool6_start", "prefix6"),
+        ):
+            _pool_start = str(dhcp_cfg.get(_start_key) or "").strip()
+            _pool_pfx = str(dhcp_cfg.get(_pfx_key) or "").strip()
+            if not _pool_start or not _pool_pfx:
+                continue
+            try:
+                _net = ipaddress.IPv6Network(
+                    f"{_pool_start}/{_pool_pfx}", strict=False,
+                )
+                _hosts = list(_net.hosts())
+                if _hosts:
+                    _v6_candidates.add((str(_hosts[0]), _pool_pfx))
+            except (ipaddress.AddressValueError, ValueError):
+                continue
+        if _v6_candidates:
+            _v6_removed = _remove_matching_ipv6_anchors(
+                interface, _v6_candidates, container=container,
+            )
+            if _v6_removed:
+                logger.info(
+                    "[DHCP] v0.5.351 stop_dhcp_server: swept "
+                    "v6 anchor(s) %s off %s",
+                    ", ".join(_v6_removed), interface,
+                )
+    except Exception as _v6_sweep_exc:
+        logger.debug(
+            "[DHCP] v0.5.351 v6 anchor sweep raised for %s: %s "
+            "(non-fatal)", interface, _v6_sweep_exc,
+        )
 
     # v0.5.235 (audit U1): remove the IPv4 anchor that
     # _ensure_ipv4_address added at start. Pre-fix, only the IPv6

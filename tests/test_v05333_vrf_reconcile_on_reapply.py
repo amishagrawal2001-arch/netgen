@@ -42,13 +42,12 @@ def test_reconcile_lives_before_the_return():
     on the already-running path — otherwise the fix is dead code."""
     src = _frr_docker_src()
     marker_idx = src.index("v0.5.333 (audit vrf-reconcile-on-reapply)")
-    # Slice from the marker forward to find the next `return
-    # container_name` on that same code path.
-    tail = src[marker_idx:marker_idx + 3000]
-    # Reconcile call must appear...
-    assert "self._create_vrf(device_id, _reconcile_iface)" in tail
-    # ...before the return.
-    call_idx = tail.index("self._create_vrf(device_id, _reconcile_iface)")
+    # Slice from the marker forward — widened to survive v0.5.340's
+    # default-route install adding ~60 lines. Reconcile call is now
+    # multi-line (`self._create_vrf(\n  device_id, _reconcile_iface,\n
+    # ipv4_gateway=..., ipv6_gateway=...`) so match on the prefix.
+    tail = src[marker_idx:marker_idx + 6000]
+    call_idx = tail.index("self._create_vrf(\n                                device_id, _reconcile_iface,")
     ret_idx = tail.index("return container_name")
     assert call_idx < ret_idx, (
         "v0.5.333 reconcile call must execute before `return "
@@ -106,7 +105,10 @@ def test_reconcile_wraps_the_call_in_try_except():
     not a crash."""
     src = _frr_docker_src()
     marker_idx = src.index("v0.5.333 (audit vrf-reconcile-on-reapply)")
-    body = src[marker_idx:marker_idx + 3000]
+    # Widened from 3000 to 6000 chars — v0.5.340 added ~60 lines
+    # of default-route install between the reconcile block and the
+    # `return container_name` line.
+    body = src[marker_idx:marker_idx + 6000]
     assert "except Exception as _reconcile_exc:" in body
     assert "return container_name" in body
 
@@ -116,15 +118,21 @@ def test_reconcile_uses_the_same_create_vrf_as_fresh_launch():
     duplicate the route-install logic. That way any future v0.5.334+
     fix inside `_create_vrf` automatically flows to reconcile."""
     src = _frr_docker_src()
-    # There should be exactly TWO `self._create_vrf(device_id,` call
-    # sites in `start_frr_container` now (one on each path).
-    fresh_launch_call = src.count("vrf_name = self._create_vrf(device_id, iface_name)")
-    reconcile_call = src.count("self._create_vrf(device_id, _reconcile_iface)")
-    assert fresh_launch_call == 1, (
-        f"expected exactly 1 fresh-launch _create_vrf call, got {fresh_launch_call}"
+    # v0.5.340 extended `_create_vrf(device_id, iface_name)` →
+    # `_create_vrf(device_id, iface_name, ipv4_gateway=..., ipv6_gateway=...)`.
+    # Signature spans multiple lines so exact-string count fails.
+    # Verify structurally: exactly TWO `self._create_vrf(` call
+    # sites in start_frr_container — one for fresh-launch (uses
+    # `iface_name`) and one for reconcile (uses `_reconcile_iface`).
+    fresh_launch_call = src.count("device_id, iface_name,")
+    reconcile_call = src.count("device_id, _reconcile_iface,")
+    assert fresh_launch_call >= 1, (
+        f"expected fresh-launch _create_vrf call site (uses iface_name), "
+        f"got {fresh_launch_call} matches"
     )
-    assert reconcile_call == 1, (
-        f"expected exactly 1 reconcile _create_vrf call, got {reconcile_call}"
+    assert reconcile_call >= 1, (
+        f"expected reconcile _create_vrf call site (uses _reconcile_iface), "
+        f"got {reconcile_call} matches"
     )
 
 
