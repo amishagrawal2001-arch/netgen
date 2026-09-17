@@ -24,8 +24,12 @@ class AISettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("AI Settings")
-        self.setMinimumSize(600, 500)
-        self.resize(700, 600)
+        # v0.5.353 (audit ui-cramp): openai_base_url placeholder is
+        # 67 chars ("https://api.groq.com/openai/v1 (for Groq) or
+        # leave empty for OpenAI"). Bump so the placeholder is
+        # readable without dragging.
+        self.setMinimumSize(760, 500)
+        self.resize(820, 600)
         
         self.settings_file = os.path.expanduser("~/.ostg_ai_settings.json")
         self.settings = self.load_settings()

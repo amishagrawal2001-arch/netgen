@@ -222,7 +222,12 @@ class _L2ConfigDialog(QDialog):
     def __init__(self, parent=None, default_iface: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Start L2 emulation session")
-        self.setMinimumWidth(560)
+        # v0.5.353 (audit ui-cramp): IGMP `_igmp_type_code` placeholder
+        # is 102 chars ("(default: 0x12 Report for v1, 0x16 for v2,
+        # 0x22 for v3 — override to 0x17 for Leave or 0x11 for
+        # Query)"). At 560px it clips mid-word. Bump the minimum so
+        # the longest per-protocol field fits without dragging.
+        self.setMinimumWidth(880)
         self._payload: Optional[Dict[str, Any]] = None
 
         outer = QVBoxLayout(self)

@@ -268,9 +268,14 @@ class AIChatDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("NetGenAI Chat")
-        # Make the chat window more compact by default
-        self.setMinimumSize(520, 450)
-        self.resize(600, 520)
+        # v0.5.353 (audit ui-cramp): message_input placeholder is
+        # 85 chars ("Type your message here... (e.g., 'Troubleshoot
+        # device-123', 'Generate pytest script')") and clipped mid-
+        # example at 520px. Bump both the minimum and the default
+        # resize so the placeholder fits and the chat area is
+        # readable without dragging.
+        self.setMinimumSize(780, 450)
+        self.resize(820, 560)
         
         self.server_url = getattr(parent, 'server_url', 'http://localhost:5051')
         self.context = self._get_context(parent)

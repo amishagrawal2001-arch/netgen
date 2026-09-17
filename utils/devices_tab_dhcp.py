@@ -80,6 +80,14 @@ class DHCPPoolDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self):
+        # v0.5.353 (audit ui-cramp): Qt auto-size produced a ~700px
+        # window that clipped the Relay Return-Hop placeholder
+        # ("Optional. Relay's IP on the SERVER's segment (e.g.
+        # 172.16.30.10).") and left every field cramped. Set a
+        # roomier minimum so the longest placeholder fits and the
+        # label column doesn't crowd the inputs.
+        self.setMinimumWidth(960)
+
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
@@ -763,7 +771,11 @@ class AttachDHCPPoolsDialog(QDialog):
         self.gateway_override_edit.setPlaceholderText(
             "Blank = clear override; enter an IP to override the pool-defined gateway"
         )
-        self.gateway_override_edit.setFixedWidth(240)
+        # v0.5.353 (audit ui-cramp): field previously pinned to 240px
+        # even though the dialog itself is 900px wide — the 72-char
+        # placeholder clipped mid-word. Widen so it fits and let the
+        # dialog's layout absorb the extra room.
+        self.gateway_override_edit.setMinimumWidth(500)
         options_layout.addWidget(self.gateway_override_edit)
         _clear_btn = QPushButton("Clear")
         _clear_btn.setToolTip("Clear the gateway override — device will use each pool's own gateway.")

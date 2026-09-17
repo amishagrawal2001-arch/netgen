@@ -2,6 +2,35 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.353] - 2026-09-16
+
+**UI cramp bundle** — six dialogs get roomier minimum widths.
+
+Post-v0.5.352 sweep audit across every `QDialog` subclass found
+several dialogs whose explicit `setMinimumWidth` / `setMinimumSize`
+values sat below their longest placeholder or label. Qt rendered
+them at the cramped minimum and clipped mid-word until the operator
+manually dragged them wider. Client-only, zero server impact.
+
+| Dialog | Longest placeholder | Was | Now |
+|--------|---------------------|-----|-----|
+| Add DHCP Pool (`DHCPPoolDialog`) | "Optional. Relay's IP on the SERVER's segment (e.g. 172.16.30.10)." (65c) | Qt-auto (~700) | 960 |
+| Start L2 emulation (`_L2ConfigDialog`) | IGMP `_igmp_type_code` (102c) | 560 | 880 |
+| NetGenAI Chat (`AIChatDialog`) | `message_input` (85c) | 520 min / 600 default | 780 min / 820 default |
+| Start stateful-TCP (`_StatefulTcpConfigDialog`) | `_cli_vrf` (82c) | 560 | 760 |
+| AI Settings (`AISettingsDialog`) | `openai_base_url` (67c) | 600 min / 700 default | 760 min / 820 default |
+| AttachDHCPPools gateway override | 72c gateway-override placeholder pinned inside a 900px dialog | `setFixedWidth(240)` | `setMinimumWidth(500)` |
+
+All six carry the `v0.5.353 (audit ui-cramp)` marker for grep-audit
+traceability.
+
+### Tests
+
+- `tests/test_v05353_ui_cramp_bundle.py` — 9 tests: per-dialog width
+  values, marker presence in every touched file, AST-parse safety
+  net, and a "no dialog got shrunk" regression guard that grep-
+  checks the width values actually landed.
+
 ## [0.5.352] - 2026-09-16
 
 **v6 helper consolidation** — four fixes from a fresh post-v0.5.351

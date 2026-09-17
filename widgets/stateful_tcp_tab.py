@@ -195,7 +195,11 @@ class _StatefulTcpConfigDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Start stateful-TCP session")
-        self.setMinimumWidth(560)
+        # v0.5.353 (audit ui-cramp): _cli_vrf placeholder is 82 chars
+        # ("optional — Linux VRF / iface (no-op on macOS, falls
+        # back to default routing table)"). At 560px the tail is
+        # clipped. Bump so the longest field fits.
+        self.setMinimumWidth(760)
         self._payload: Optional[Dict[str, Any]] = None
 
         outer = QVBoxLayout(self)
