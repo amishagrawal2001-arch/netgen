@@ -202,7 +202,11 @@ def test_C_sweep_is_best_effort():
     next_fn = src.index("\ndef ", fn_idx + 1)
     body = src[fn_idx:next_fn]
     marker_idx = body.index("v0.5.351 (audit stop-server-v6-anchor-sweep-missing)")
-    sweep_body = body[marker_idx:marker_idx + 3000]
+    # Body widened 3000 → 5000: v0.5.352 (audit stop-server-v6-
+    # parent-nic-sweep) inserted the parent-NIC sweep between the
+    # v0.5.351 subif sweep and its except, pushing the except past
+    # 3000 chars.
+    sweep_body = body[marker_idx:marker_idx + 5000]
     assert "except Exception as _v6_sweep_exc:" in sweep_body
     assert "non-fatal" in sweep_body
 

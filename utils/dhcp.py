@@ -1717,6 +1717,89 @@ def _v6_has_local_host_route(address: str, container=None) -> bool:
     return False
 
 
+def _ensure_ipv6_post_add_plumbing(
+    interface: str, address: str, prefix: str, container=None,
+) -> None:
+    """v0.5.352 (audit dhcpv6-helper-post-add-plumbing): VRF connected-
+    route + local-table install for a v6 anchor. Extracted out of
+    `start_dhcp_server` (v0.5.338) so every caller of
+    `_ensure_ipv6_address` — including `arp_monitor`'s anchor-replay
+    at tick time — inherits the healing. Prior to this consolidation
+    only the initial Apply ran the checks; a netgen-server restart
+    that fell through to arp_monitor's `_replay_dhcp_anchor_setup`
+    reattached the v6 address but left the VRF egress route and
+    local-table entry missing whenever the kernel had skipped auto-
+    install (rare but silently lethal — dnsmasq bind succeeded, all
+    packets martian-dropped).
+
+    Best-effort. Every step is guarded; a kernel EEXIST from the
+    address-already-present path just falls through as a no-op.
+    """
+    if not interface or not address or prefix is None:
+        return
+    try:
+        _pool_net_str = str(
+            ipaddress.IPv6Network(
+                f"{address}/{prefix}", strict=False,
+            )
+        )
+    except (ipaddress.AddressValueError, ValueError):
+        return
+
+    # v0.5.352 (mirrors v0.5.275 v4): VRF connected-route heal.
+    try:
+        _vrf_v6 = _detect_iface_vrf(interface, container=container)
+        if _vrf_v6:
+            if not _vrf_has_connected_route_v6(
+                _vrf_v6, _pool_net_str, interface, container=container,
+            ):
+                logger.info(
+                    "[DHCP] v0.5.352 VRF %s missing v6 connected "
+                    "%s dev %s (kernel auto-install didn't fire) — "
+                    "installing explicitly",
+                    _vrf_v6, _pool_net_str, interface,
+                )
+                _run_command(
+                    [
+                        "ip", "-6", "route", "add",
+                        _pool_net_str, "dev", interface,
+                        "proto", "kernel", "metric", "256",
+                        "vrf", _vrf_v6,
+                    ],
+                    timeout=5, container=container,
+                )
+    except Exception as _v6_route_exc:
+        logger.debug(
+            "[DHCP] v0.5.352 v6 VRF-route post-check failed for "
+            "%s on %s: %s",
+            address, interface, _v6_route_exc,
+        )
+
+    # v0.5.352 (mirrors v0.5.282/286 v4): local-table host-route heal.
+    try:
+        if not _v6_has_local_host_route(address, container=container):
+            logger.info(
+                "[DHCP] v0.5.352 v6 local-table missing local %s "
+                "(kernel didn't auto-install) — installing explicitly",
+                address,
+            )
+            _run_command(
+                [
+                    "ip", "-6", "route", "add",
+                    "local", f"{address}/128",
+                    "dev", interface,
+                    "table", "local",
+                ],
+                timeout=5, container=container,
+            )
+    except Exception as _v6_local_exc:
+        logger.debug(
+            "[DHCP] v0.5.352 v6 local-host-route post-check failed "
+            "for %s: %s",
+            address, _v6_local_exc,
+        )
+
+
 def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=None) -> bool:
     """Ensure the interface has the specified IPv6 address configured."""
     if not interface or not address or prefix is None:
@@ -1759,6 +1842,13 @@ def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=No
         pass
     for entry in existing:
         if entry.get("ip") == address and str(entry.get("prefix")) == str(prefix):
+            # v0.5.352: even when the address is already present,
+            # re-run the plumbing so a mid-life restart of netgen-
+            # server (arp_monitor replay path) still heals a missing
+            # VRF route or local-table entry.
+            _ensure_ipv6_post_add_plumbing(
+                interface, address, prefix, container=container,
+            )
             return True
     try:
         result = _run_command(
@@ -1768,6 +1858,11 @@ def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=No
         )
         if result.returncode == 0:
             logger.info("[DHCP] Added IPv6 address %s/%s to %s", address, prefix, interface)
+            # v0.5.352: mirror the v0.5.275 v4 post-add plumbing —
+            # VRF connected-route + local-table host-route heal.
+            _ensure_ipv6_post_add_plumbing(
+                interface, address, prefix, container=container,
+            )
             return True
         logger.warning(
             "[DHCP] Failed to add IPv6 address %s/%s to %s: %s",
@@ -2367,6 +2462,54 @@ def _remove_ipv6_address(interface: str, address: str, prefix: str, container=No
             prefix,
             interface,
             exc,
+        )
+
+    # v0.5.352 (audit dhcpv6-local-table-cleanup): mirror v0.5.290's
+    # v4 local-table cleanup. `_ensure_ipv6_post_add_plumbing` (also
+    # v0.5.352) installs `local <address>/128 dev <iface> table
+    # local` after every anchor add. Without a paired remove here,
+    # every anchor rotation leaves a v6 `/128` local ghost in table
+    # local — a later address that lands anywhere else will match
+    # this stale local entry and get martian-dropped. Kernel usually
+    # GCs when the last iface reference goes away, but VRF-slaved
+    # ifaces + secondary anchors defeat the GC. Explicit remove
+    # mirrors the v0.5.290 v4 pattern verbatim.
+    try:
+        _lr = _run_command(
+            [
+                "ip", "-6", "route", "del",
+                "local", f"{address}/128",
+                "dev", interface,
+                "table", "local",
+            ],
+            timeout=5, container=container,
+        )
+        _rc = getattr(_lr, "returncode", 0)
+        if _rc == 0:
+            logger.info(
+                "[DHCP] v0.5.352 removed v6 local-table entry for "
+                "%s dev %s",
+                address, interface,
+            )
+        else:
+            _err = (getattr(_lr, "stderr", "") or "").strip()
+            if "No such process" in _err or "No such file" in _err:
+                logger.debug(
+                    "[DHCP] v0.5.352 v6 local-table entry for %s dev "
+                    "%s already absent (kernel GC'd it)",
+                    address, interface,
+                )
+            else:
+                logger.debug(
+                    "[DHCP] v0.5.352 v6 local-table cleanup for %s "
+                    "dev %s returned rc=%s stderr=%r",
+                    address, interface, _rc, _err[:200],
+                )
+    except Exception as _lr_exc:
+        logger.debug(
+            "[DHCP] v0.5.352 v6 local-table cleanup for %s dev %s "
+            "raised: %s (non-fatal)",
+            address, interface, _lr_exc,
         )
 
 
@@ -5212,10 +5355,31 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                     "v6 anchor(s) %s off %s",
                     ", ".join(_v6_removed), interface,
                 )
+            # v0.5.352 (audit stop-server-v6-parent-nic-sweep): mirror
+            # v0.5.287 Fix B on the v4 side. A pre-v0.5.335 apply (or
+            # a hand-set anchor) may have landed the v6 pool-subnet
+            # address on the PARENT NIC (e.g. ens2f0np0) instead of
+            # the subif (vlan10). The v0.5.351 sweep above only
+            # touches the subif — leaving the parent-NIC ghost alive
+            # to break the next apply's DAD. Same intersection gate
+            # keeps this safe: only removes addresses that both match
+            # a candidate AND currently exist on the parent.
+            _parent6 = _iface_parent(interface, container=container)
+            if _parent6:
+                _parent6_removed = _remove_matching_ipv6_anchors(
+                    _parent6, _v6_candidates, container=container,
+                )
+                if _parent6_removed:
+                    logger.info(
+                        "[DHCP] v0.5.352 cleaned leaked v6 anchor(s) "
+                        "%s off parent NIC %s (subif was %s) — "
+                        "pre-v0.5.335 anchor drift",
+                        ", ".join(_parent6_removed), _parent6, interface,
+                    )
     except Exception as _v6_sweep_exc:
         logger.debug(
-            "[DHCP] v0.5.351 v6 anchor sweep raised for %s: %s "
-            "(non-fatal)", interface, _v6_sweep_exc,
+            "[DHCP] v0.5.351/v0.5.352 v6 anchor sweep raised for %s: "
+            "%s (non-fatal)", interface, _v6_sweep_exc,
         )
 
     # v0.5.235 (audit U1): remove the IPv4 anchor that

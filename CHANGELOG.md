@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.352] - 2026-09-16
+
+**v6 helper consolidation** — four fixes from a fresh post-v0.5.351
+paired-path drift audit. Every fix mirrors a guard the v4 side
+already carried; combined, they move v6 anchor healing from Apply-
+only into `_ensure_ipv6_address` itself so `arp_monitor`'s tick-
+time replay inherits it too.
+
+### D1 + D2 (shipped as one). `_ensure_ipv6_address` gains post-add plumbing
+
+v0.5.338 added two v6 kernel-race heals to `start_dhcp_server`:
+- **VRF connected-route check** (mirror of v0.5.275 v4) — `ip -6
+  addr add` on a VRF-slaved iface SHOULD auto-install the connected
+  route into the VRF's table; some kernel races skip it and dnsmasq
+  binds successfully while every egress packet gets no-route-dropped.
+- **Local-table host-route check** (mirror of v0.5.282/286 v4) — same
+  race, on the `local` table 255 side. Inbound packets get martian-
+  dropped when the kernel skips the auto-install of `local <ip>/128
+  dev <iface> table local`.
+
+Both lived inline in `start_dhcp_server` only. `arp_monitor`'s
+`_replay_dhcp_anchor_setup` calls `_ensure_ipv6_address` directly on
+a netgen-server restart — it re-attached the v6 address but SKIPPED
+both heals. Symptom: an operator restart of netgen-server on a
+device that had healthy v6 DHCP at Apply time could break egress
+routing indefinitely, with dnsmasq happily bound the whole time.
+
+**Fix:** new helper `_ensure_ipv6_post_add_plumbing` at
+`utils/dhcp.py:1720` extracts the two heals; `_ensure_ipv6_address`
+calls it on BOTH the already-present and freshly-added branches, so
+every caller (Apply, replay, drift recovery) inherits both guards.
+Marker `v0.5.352 (audit dhcpv6-helper-post-add-plumbing)`.
+
+### D3. `_remove_ipv6_address` gains paired local-table delete
+
+v0.5.290 shipped this for the v4 side but the v6 side never got the
+mirror. With D1/D2 above installing `local <ip>/128 dev <iface>
+table local` on every v6 anchor add, a rotation-without-delete would
+leak a `/128` local ghost. Kernel usually GCs when the last iface
+reference disappears, but VRF-slaved ifaces + secondary anchors
+defeat that GC — so a later v6 address on any iface hits the stale
+`local` and gets martian-dropped.
+
+**Fix:** append `ip -6 route del local <address>/128 dev <iface>
+table local` to `_remove_ipv6_address`, best-effort, swallowing
+"No such process"/"No such file" for the kernel-GC'd case. Marker
+`v0.5.352 (audit dhcpv6-local-table-cleanup)`.
+
+### D6. `stop_dhcp_server` v6 sweep also sweeps parent NIC
+
+Mirror of v0.5.287 Fix B on the v4 side. My v0.5.351 v6 sweep only
+touched the subif — a pre-v0.5.335 apply that landed the pool-
+subnet anchor on the parent NIC (`ens2f0np0`) instead of the subif
+(`vlan10`) survived. Same intersection gate as v4 keeps this safe:
+only removes addresses that both (a) match a candidate and (b)
+currently exist on the parent NIC. Marker
+`v0.5.352 (audit stop-server-v6-parent-nic-sweep)`.
+
+### Tests
+
+- `tests/test_v05352_v6_helper_consolidation.py` — 18 new tests for
+  D1/D2/D3/D6, helper structure, best-effort semantics, structural
+  pair between install (in the helper) and delete (in
+  `_remove_ipv6_address`), and regression guards on the v0.5.275,
+  v0.5.286, v0.5.290, v0.5.287 Fix B v4 mirrors that all four fixes
+  are patterned on.
+- `tests/test_v05351_stop_path_bundle.py` — one assertion widened
+  from 3000 → 5000-char body window; v0.5.352's parent-NIC sweep
+  inserted new code between the v0.5.351 sweep and its except.
+
 ## [0.5.351] - 2026-09-16
 
 **MED stop-path bundle** — three complementary Stop-side cleanups
