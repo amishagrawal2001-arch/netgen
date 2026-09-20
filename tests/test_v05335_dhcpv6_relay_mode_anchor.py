@@ -154,15 +154,31 @@ def test_direct_attached_still_derives_first_host_when_no_server_ip():
     relay_if = body.index("if _pool_is_l3_remote:")
     else_idx = body.index("else:", relay_if)
     direct_branch = body[else_idx:else_idx + 8000]
-    # v0.5.337: gateway-skip iterator over hosts of the pool net.
-    # `_hosts6` list must exist; `_hosts6[0]` is no longer used.
-    assert "_hosts6 = list(_v6_net.hosts())" in direct_branch, (
+    # v0.5.357 (audit v6-hosts-generator-explosion): `_hosts6 =
+    # list(_v6_net.hosts())` was replaced with direct arithmetic
+    # (`network_address + 1` / `+ 2`) because `list(hosts())` on a
+    # /64 tries to materialize 2^64-2 addresses and hangs the
+    # process. The `_hosts6` list still exists; assert its
+    # presence + the v0.5.337 iterator only.
+    assert "_hosts6 = " in direct_branch, (
         "v0.5.230 auto-derive (hosts of pool subnet) must still "
         "fire on the direct-attached branch"
     )
     assert "for _h6 in _hosts6" in direct_branch, (
         "v0.5.337 gateway-skip iterator must still fire on the "
         "direct-attached branch"
+    )
+    # Regression guard: the v0.5.357 fix must not have accidentally
+    # restored the exploding `list(_v6_net.hosts())` form. Strip
+    # comment lines so the v0.5.357 fix's own historical context
+    # (which mentions the buggy call by name) doesn't false-positive.
+    _code_only = "\n".join(
+        _l for _l in direct_branch.splitlines()
+        if not _l.lstrip().startswith("#")
+    )
+    assert "list(_v6_net.hosts())" not in _code_only, (
+        "v0.5.357: `list(_v6_net.hosts())` regressed — a /64 pool "
+        "would hang the process for practical eternity"
     )
 
 

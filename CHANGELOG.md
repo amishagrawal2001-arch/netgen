@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.357] - 2026-09-19
+
+**HOTFIX** — `list(ipv6_network.hosts())` explosion. **Regression
+caught on the srv06 v0.5.356 upgrade.**
+
+netgen-server started, background monitor threads spun up, but
+Flask never bound `:5050`. py-spy dump caught the main thread stuck
+at:
+
+```
+    hosts (ipaddress.py:2236)
+    _add_first_host (utils/dhcp.py:2232)
+    _collect_ipv6_anchor_candidates (utils/dhcp.py:2250)
+    _scan_parent_nic_drift_v6 (utils/arp_monitor.py:1147)
+    start (utils/arp_monitor.py:180)
+    main (run_tgen_server.py:28581)
+```
+
+**Root cause:** `ipaddress.IPv6Network.hosts()` yields a generator
+over every usable host in the network. For prefix ≤ 126 a
+`list(...)` on that generator tries to materialize up to 2^N
+addresses. A `/64` pool (device5's `2001:db8:30::100/64`) is
+2^64 − 2 items — the process wedges for practical eternity, and
+`arp_monitor.start()` never returns to `run_tgen_server.main` for
+`app.run()`.
+
+Three call sites had the same bug pattern; two were latent:
+
+1. **`_collect_ipv6_anchor_candidates::_add_first_host`** (dhcp.py) —
+   added in v0.5.354, called from `_scan_parent_nic_drift_v6` on
+   EVERY startup. **This is what hung srv06.**
+2. **`stop_dhcp_server`'s v6 anchor sweep** (dhcp.py) — added in
+   v0.5.351, only triggers when operator stops a v6 DHCP-server
+   device. Latent.
+3. **`start_dhcp_server`'s v6 auto-derive** (dhcp.py) — v0.5.230 +
+   v0.5.337. Only fires when operator leaves `ipv6_server_ip`
+   empty. Latent on srv06 because device5 sets it explicitly.
+
+**Fix:** replace `list(_net.hosts())` with direct arithmetic. For
+prefix ≤ 126 the first usable host is `network_address + 1`
+(matches what `hosts()` yields as its first item — the Subnet-
+Router Anycast at `network_address` is excluded). Prefixes 127 and
+128 use `network_address` directly per RFC 6164 and the `hosts()`
+docstring. All three sites carry the
+`v0.5.357 (audit v6-hosts-generator-explosion)` marker.
+
+**Ops:** srv06 was rolled back to v0.5.353 via
+`netgen-upgrade /tmp/ostg_trafficgen-0.5.353-py3-none-any.whl`
+while this fix was written. Re-upgrading to v0.5.357 after ship.
+
+### Tests
+
+- `tests/test_v05357_v6_hosts_explosion_hotfix.py` — 11 new tests
+  including RUNTIME proofs that the fixed collector returns in
+  under 0.5s on a `/64` pool (with and without an explicit
+  `ipv6_server_ip`), plus `/127` and `/128` special-case
+  handling, and regression guards on the v4 sister collector
+  (which never had the bug — a /24 → 254 hosts materialize fine).
+- Structural asserts strip comment lines before scanning, so the
+  fix's own historical-context comments (which mention the buggy
+  form by name) don't false-positive.
+- Two pre-existing tests widened / adjusted for the fix's larger
+  code footprint: `test_v05335 direct_attached_still_derives_
+  first_host_when_no_server_ip` (assertion switched from exact
+  `_hosts6 = list(_v6_net.hosts())` to `_hosts6 =` + iterator
+  presence + regression guard), and `test_v05354 collect_ipv6_
+  anchor_candidates_returns_first_host_of_pool` (allows either
+  post-v0.5.357 direct arithmetic or the legacy form, guards
+  against the buggy form in live code).
+
 ## [0.5.356] - 2026-09-19
 
 **MED bundle** — four correctness fixes spanning RDMA

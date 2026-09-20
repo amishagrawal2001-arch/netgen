@@ -89,7 +89,12 @@ def test_collect_ipv6_anchor_candidates_iterates_both_key_spellings():
     `pool6_start`/`prefix6`. Must iterate both."""
     src = _dhcp_src()
     idx = src.index("def _collect_ipv6_anchor_candidates(")
-    body = src[idx:idx + 3000]
+    # v0.5.357 (audit v6-hosts-generator-explosion): the helper body
+    # grew by ~700 chars when `list(_net.hosts())` was replaced with
+    # direct arithmetic + a long comment explaining why. Widen the
+    # window so downstream lookups (ipv6_gateway, first-host derive)
+    # still land in the slice.
+    body = src[idx:idx + 5000]
     assert '"ipv6_pool_start"' in body
     assert '"pool6_start"' in body
     assert '"ipv6_prefix"' in body
@@ -102,20 +107,53 @@ def test_collect_ipv6_anchor_candidates_includes_gateway():
     Must be a candidate for the parent-NIC scan to catch it."""
     src = _dhcp_src()
     idx = src.index("def _collect_ipv6_anchor_candidates(")
-    body = src[idx:idx + 3000]
+    # v0.5.357 (audit v6-hosts-generator-explosion): the helper body
+    # grew by ~700 chars when `list(_net.hosts())` was replaced with
+    # direct arithmetic + a long comment explaining why. Widen the
+    # window so downstream lookups (ipv6_gateway, first-host derive)
+    # still land in the slice.
+    body = src[idx:idx + 5000]
     assert '"ipv6_gateway"' in body
 
 
 def test_collect_ipv6_anchor_candidates_returns_first_host_of_pool():
     """v0.5.230 auto-derive picks the first host of the pool subnet.
-    Candidates must include that host for the sweep to match."""
+    Candidates must include that host for the sweep to match.
+
+    v0.5.357 (audit v6-hosts-generator-explosion): the collector
+    stopped calling `list(_net.hosts())` because that materializes
+    2^N addresses on a v6 /64 and hangs process startup. Now
+    computes the first host directly from `network_address + 1`
+    (with prefix-127/128 special cases). Assertion widened to
+    check for IPv6Network + one of the two possible derivations."""
     src = _dhcp_src()
     idx = src.index("def _collect_ipv6_anchor_candidates(")
-    body = src[idx:idx + 3000]
-    # Uses `list(_net.hosts())` + `_hosts[0]` — same shape as v4
-    # sister uses for its supernet derivation.
+    # v0.5.357 (audit v6-hosts-generator-explosion): the helper body
+    # grew by ~700 chars when `list(_net.hosts())` was replaced with
+    # direct arithmetic + a long comment explaining why. Widen the
+    # window so downstream lookups (ipv6_gateway, first-host derive)
+    # still land in the slice.
+    body = src[idx:idx + 5000]
     assert "IPv6Network(" in body
-    assert ".hosts()" in body
+    # Either the post-v0.5.357 direct arithmetic or the legacy
+    # (bugged) list-materialize form counts as "derives first
+    # host"; the regression guard below forbids the bugged form.
+    assert (
+        "network_address + 1" in body
+        or ".hosts()" in body
+    )
+    # Regression guard: the fix must not have been reverted. Strip
+    # comment lines so my own historical-context comment (which
+    # mentions the buggy `list(_net.hosts())` form by name) doesn't
+    # false-positive.
+    _code_only = "\n".join(
+        _l for _l in body.splitlines()
+        if not _l.lstrip().startswith("#")
+    )
+    assert "list(_net.hosts())" not in _code_only, (
+        "v0.5.357 regressed: `list(_net.hosts())` hangs the "
+        "process on a v6 /64 pool"
+    )
 
 
 # --- arp_monitor.py scanners ---

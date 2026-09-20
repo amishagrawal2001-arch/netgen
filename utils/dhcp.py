@@ -2225,13 +2225,31 @@ def _collect_ipv6_anchor_candidates(dhcp_cfg: Optional[Dict]) -> set:
     anchors: set = set()
 
     def _add_first_host(pool_start_str, prefix_str):
+        # v0.5.357 (audit v6-hosts-generator-explosion): NEVER call
+        # `list(_net.hosts())` on a v6 network — for prefix <= 126
+        # that materializes up to 2^N addresses (a /64 → 2^64-2
+        # entries) and hangs process startup. Regressed srv06 on
+        # v0.5.356 upgrade: `_scan_parent_nic_drift_v6` (v0.5.354)
+        # calls this collector on startup for every running DHCP-
+        # server device, and py-spy caught the main thread stuck
+        # inside `hosts()` before Flask could bind :5050.
+        # Fix: compute the first host directly:
+        #   * prefix <= 126 → network_address + 1 (matches what
+        #     `hosts()` yields as its first item — the Subnet-Router
+        #     Anycast at network_address is excluded).
+        #   * prefix 127 → network_address (both endpoints usable).
+        #   * prefix 128 → the address itself.
         try:
             _net = ipaddress.IPv6Network(
                 f"{pool_start_str}/{prefix_str}", strict=False,
             )
-            _hosts = list(_net.hosts())
-            if _hosts:
-                anchors.add((str(_hosts[0]), str(prefix_str)))
+            if _net.prefixlen >= 128:
+                _first = _net.network_address
+            elif _net.prefixlen == 127:
+                _first = _net.network_address
+            else:
+                _first = _net.network_address + 1
+            anchors.add((str(_first), str(prefix_str)))
         except (ipaddress.AddressValueError, ValueError):
             pass
 
@@ -4436,7 +4454,30 @@ def start_dhcp_server(
                     _v6_net = ipaddress.IPv6Network(
                         f"{ipv6_pool_start}/{ipv6_prefix}", strict=False,
                     )
-                    _hosts6 = list(_v6_net.hosts())
+                    # v0.5.357 (audit v6-hosts-generator-explosion):
+                    # NEVER `list(_v6_net.hosts())` on a v6 network
+                    # — a /64 materializes 2^64-2 addresses and
+                    # hangs the process. See the twin fix in
+                    # `_collect_ipv6_anchor_candidates::_add_first_host`.
+                    # v0.5.337's non-gateway iterator only needs to
+                    # peek at the first two candidates (the gateway
+                    # is at most one of them); compute them directly.
+                    if _v6_net.prefixlen >= 128:
+                        _hosts6 = [_v6_net.network_address]
+                    elif _v6_net.prefixlen == 127:
+                        _hosts6 = [
+                            _v6_net.network_address,
+                            _v6_net.network_address + 1,
+                        ]
+                    else:
+                        # prefix <= 126: first two usable hosts are
+                        # network_address + 1 and + 2 (the Subnet-
+                        # Router Anycast at network_address is
+                        # excluded).
+                        _hosts6 = [
+                            _v6_net.network_address + 1,
+                            _v6_net.network_address + 2,
+                        ]
                     if _hosts6:
                         # v0.5.337: iterate hosts and take the first
                         # non-gateway one. Preserves the ::1-first
@@ -5424,9 +5465,16 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                 _net = ipaddress.IPv6Network(
                     f"{_pool_start}/{_pool_pfx}", strict=False,
                 )
-                _hosts = list(_net.hosts())
-                if _hosts:
-                    _v6_candidates.add((str(_hosts[0]), _pool_pfx))
+                # v0.5.357 (audit v6-hosts-generator-explosion):
+                # replace `list(_net.hosts())` with direct arithmetic.
+                # A /64 pool hangs the process for practical
+                # eternity under `list(hosts())`. See the twin fix
+                # in `_collect_ipv6_anchor_candidates::_add_first_host`.
+                if _net.prefixlen >= 127:
+                    _first = _net.network_address
+                else:
+                    _first = _net.network_address + 1
+                _v6_candidates.add((str(_first), _pool_pfx))
             except (ipaddress.AddressValueError, ValueError):
                 continue
         if _v6_candidates:
