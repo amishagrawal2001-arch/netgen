@@ -201,18 +201,28 @@ def test_core_batch_still_separated_from_mlx_batch():
 
 
 def test_mlx_install_failure_is_non_fatal():
-    """The Mellanox batch must remain fail-tolerant. v0.5.28 doubles
-    the packages in it (libmlx4-dev + libmlx5-dev) — if EITHER
-    misses on a host without MOFED, the whole batch fails, and
-    the script must keep going."""
+    """The Mellanox batch must remain fault-tolerant. v0.5.28
+    doubles the packages in it (libmlx4-dev + libmlx5-dev) — if
+    EITHER misses on a host without MOFED, the whole batch fails,
+    and the script must keep going. v0.5.369 rewrapped the block
+    with `set +e ... set -e` around the eval so a non-zero return
+    doesn't abort the script under `pipefail`. Accept either form
+    as long as the failure branch is a log_warning, not exit."""
     src = _INSTALL_RDMA.read_text()
-    # The mlx install must be in an if/else that warns rather than
-    # exits on failure.
-    m = re.search(
+    # Legacy v0.5.28 form: `if eval "$mlx5_apt_cmd" ... else warn`.
+    _legacy = re.search(
         r'if\s+eval\s+"\$mlx5_apt_cmd"[\s\S]+?else[\s\S]+?log_warning',
         src,
     )
-    assert m, (
+    # v0.5.369 form: set +e, eval, capture rc, if [[ rc -eq 0 ]] ...
+    # else log_warning fi.
+    _v0_5_369 = re.search(
+        r'set \+e[\s\S]+?eval\s+"\$mlx5_apt_cmd"[\s\S]+?_mlx5_rc=\$\?[\s\S]+?'
+        r'set -e[\s\S]+?if\s+\[\[[^]]+_mlx5_rc[^]]+\]\][\s\S]+?'
+        r'else[\s\S]+?log_warning',
+        src,
+    )
+    assert _legacy or _v0_5_369, (
         "install_rdma.sh's Mellanox batch isn't fault-tolerant — "
         "a failure on libmlx4-dev would now abort the whole install "
         "even though it's optional."

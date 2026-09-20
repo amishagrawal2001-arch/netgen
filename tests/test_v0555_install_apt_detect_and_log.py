@@ -70,41 +70,45 @@ def test_dpdk_apt_update_uses_exit_code_via_pipeline_with_pipefail():
 
 def test_rdma_apt_install_tees_to_log_file():
     """install_rdma.sh must tee apt-get install output to a known
-    log file so the wizard can surface it on failure."""
+    log file so the wizard can surface it on failure. v0.5.369
+    rewrote the block to be tolerant (`set +e ... set -e` around
+    the eval + `--fix-missing`), but the tee-to-log semantic must
+    survive."""
     s = _RDMA.read_text()
-    # Find the apt-install branch.
-    block = re.search(
-        r"if\s+!\s+\([\s\S]+?eval\s+\"\$core_apt_cmd\"[\s\S]+?fi",
+    # v0.5.369 form: eval "$core_apt_cmd_fix" (the --fix-missing
+    # variant), still wrapped in tee → RDMA_APT_LOG.
+    assert re.search(
+        r"eval\s+\"\$core_apt_cmd(_fix)?\"[\s\S]{0,200}?tee\s+\"?\$RDMA_APT_LOG",
         s,
+    ), (
+        "install_rdma.sh apt install doesn't `tee` output to "
+        "$RDMA_APT_LOG — wizard has nothing to grep on failure."
     )
-    assert block, (
-        "install_rdma.sh apt install block not located. Did the "
-        "v0.5.55 edit preserve the if-block structure?"
-    )
-    body = block.group(0)
-    assert "tee" in body, (
-        "install_rdma.sh apt install doesn't `tee` output to a "
-        "log file — wizard has nothing to grep on failure."
-    )
-    assert "/tmp/" in body or "RDMA_APT_LOG" in body, (
-        "Log path isn't mentioned by name — operator can't find "
+    assert "RDMA_APT_LOG=/tmp/" in s, (
+        "Log path isn't defined as /tmp/... — operator can't find "
         "the file without source-diving."
     )
 
 
-def test_rdma_apt_failure_tails_log_into_log_error():
-    """On failure, install_rdma.sh must tail the log to stderr
-    so the wizard log captures the actual apt error, not just
-    `exit 2`."""
+def test_rdma_apt_failure_preserves_log_context():
+    """On apt failure the log path must remain grep-able. Pre-fix
+    (v0.5.55) this was `tail -30 $RDMA_APT_LOG | sed` into
+    log_error before `exit 2`. v0.5.369 removes the exit — it
+    falls back to per-package retry (`tee -a` appends) and
+    surfaces the log path in the recovery hint — so the tail-on-
+    failure step is gone but the log file itself is preserved
+    and mentioned to the operator."""
     s = _RDMA.read_text()
-    block = re.search(
-        r"if\s+!\s+\([\s\S]+?eval\s+\"\$core_apt_cmd\"[\s\S]+?fi",
+    # The log file is referenced in the failure path (either
+    # tail via v0.5.55 legacy, or recovery-hint via v0.5.369).
+    assert "$RDMA_APT_LOG" in s
+    # Per-package retry appends to the same log (tee -a).
+    assert re.search(
+        r"tee\s+-a\s+\"?\$RDMA_APT_LOG",
         s,
-    )
-    body = block.group(0)
-    assert "tail" in body, (
-        "install_rdma.sh failure path doesn't tail the log into "
-        "the error output."
+    ), (
+        "Per-package retry doesn't append to $RDMA_APT_LOG — "
+        "operator loses per-package failure context."
     )
 
 

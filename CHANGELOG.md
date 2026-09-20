@@ -2,6 +2,140 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.369] - 2026-09-20
+
+**`install_rdma.sh`: MUST NOT fail for any reason.** Operator
+directive after clicking "Install RDMA…" on `/admin` and hitting
+a stale external apt repo. Pre-fix the script's `set -euo
+pipefail` at L38 combined with a single `apt-get install` at
+Step 1 turned any package fetch 404 into `exit 2` — even when
+the essential `rdma-core` package (owner of `ib_uverbs`,
+`ib_umad`, `rdma_cm`, `rdma_ucm`, `iw_cm` kernel modules) was
+already installed and Step 2 modprobe would have succeeded.
+
+### Symptom operator hit today (svl-d-ai-srv04)
+
+- Host had Mellanox DOCA apt repo configured
+  (`linux.mellanox.com/public/repo/doca/latest/ubuntu24.04/x86_64`)
+- Signing key `DC726C5E41B9CC50` had been rotated →
+  `NO_PUBKEY` error on every `apt-get update`
+- Repo's `Release` file still advertised aux packages
+  (`ibverbs-utils`, `python3-pyverbs`, `mstflint`, `opensm`,
+  `libibmad-dev`, etc.) at version `2601.0.7-1` but the actual
+  `.deb` files 404'd
+- Operator clicked **Install RDMA…** → apt aborted at Step 1
+  with 10 `Failed to fetch` lines → script `exit 2` → admin
+  console showed failure → operator confused because `rdma-core
+  is already the newest version (2601.0.7-1)` was RIGHT THERE in
+  the log
+
+### Fix
+
+**Step 1 becomes three-tier + tolerant:**
+
+1. Full batched core install with `--fix-missing` — 404 fetches
+   get skipped instead of aborting the batch
+2. Per-package retry loop over the essentials only (rdma-core,
+   libibverbs-dev, librdmacm-dev, perftest, rdmacm-utils) with
+   `--fix-missing --no-install-recommends` — isolates any one
+   bad `.deb` so it can't block the rest
+3. Post-condition check via `dpkg-query -W -f='${Status}\n'
+   rdma-core` — the ONLY true essential. If rdma-core is
+   installed, Step 1 "succeeds" for the purpose of proceeding to
+   Step 2; aux-package failures become log_warnings
+
+**All tiers wrapped in `set +e ... set -e`** so bash's `pipefail`
+doesn't turn a 404 into an immediate exit. mlx5 install also
+wrapped for the same reason.
+
+**Step 4's `exit 3`** (when `ibv_devices` binary missing —
+`ibverbs-utils` 404) is downgraded to log_warning. The kernel
+modules Step 2 loaded ARE the RDMA plane; `ibv_devices` is a
+diagnostic tool, not the essential path.
+
+**Broken-repo detection**: apt-get update output is tee'd to
+`/tmp/rdma_apt_update.log` then grep'd for `NO_PUBKEY`,
+`404 Not Found`, and `no longer signed`. When any hit, the log
+stream surfaces the offending line + recovery hint:
+
+```
+  grep -rl <domain> /etc/apt/sources.list.d/
+  sudo mv <file>.list <file>.list.disabled
+  sudo apt-get update && retry Install RDMA
+```
+
+**Step 2 module-load summary**: reports `N/M modules loaded` at
+the end so the log stream matches the admin console RDMA card's
+shape. Final banner reports the same summary — operator sees
+plane state at a glance without scrolling back through 200 lines
+of apt output.
+
+### Only-remaining exit paths
+
+After this ship, the only non-zero exits are structural
+pre-flight checks:
+
+- L79 `exit 1` — non-root (can't `apt install` without root)
+- L88 `exit 1` — no `apt-get` (script is Debian/Ubuntu-only)
+
+Everything from Step 1 onward either completes or warns —
+**never aborts**.
+
+### Fix sites
+
+- `resources/dpdk/install_rdma.sh` — Step 1 tiered install
+  (L163–L226), broken-repo detection (L163–L226), mlx5 `set +e`
+  wrap (L285–L296), Step 2 module count (L323–L338), Step 4
+  ibv_devices downgrade (L397–L430), final summary (L440–L456)
+- All fix sites carry marker
+  `v0.5.369 (audit rdma-install-must-not-fail)`
+
+### Tests
+
+`tests/test_v05369_install_rdma_must_not_fail.py` (19 tests):
+
+- Bash syntax valid
+- No `exit 2` / `exit 3` outside comments — the critical property
+- Exactly 4 top-level exit statements (help, non-root, no-apt, EOF)
+- Tier 1 uses `--fix-missing`
+- Tier 2 per-package retry covers rdma-core, libibverbs-dev,
+  librdmacm-dev, perftest
+- Tier 3 dpkg-query post-check on rdma-core
+- ≥4 `set +e` blocks
+- Broken-repo grep pattern covers all 3 symptoms
+- Recovery hint includes `.list.disabled` rename step
+- Step 2 emits N/M module summary
+- Step 4 ibv_devices missing → warning, not exit
+- mlx5 install wrapped in `set +e`
+- Final banner reports module summary
+- Regression guards: v0.5.28 module set, v0.5.55 apt log capture,
+  v0.5.62 persistent modules-load file, v0.5.74 admin health
+  module probes
+- Version guard ≥ 0.5.369
+
+Also updated `tests/test_v0528_install_rdma_full_coverage.py`
+`test_mlx_install_failure_is_non_fatal` to accept either the
+legacy `if eval` form or the v0.5.369 `set +e; eval; set -e; if
+[[ rc -eq 0 ]]; else warn` form — both express the same
+fault-tolerance property.
+
+### Verification
+
+- `bash -n resources/dpdk/install_rdma.sh` → clean
+- Full RDMA test bundle: 71/71 pass (6 files)
+- srv04 verification: pending operator click on **Install RDMA…**
+  after upgrade
+
+### Downstream note
+
+The button on `/admin` doesn't change UX — same click, same log
+stream, same completion state. Only difference is that the log
+stream now surfaces broken-repo warnings + module-count summary
+instead of exiting 2 with an unexplained `apt-get install`
+tail. `loadHealth()` refresh at end already re-renders the RDMA
+card with actual `modules_loaded/total`, so the operator sees
+plane state without any client-side change.
+
 ## [0.5.368] - 2026-09-20
 
 **`/api/admin/upgrade_wheel`: schedule `systemctl restart` on the

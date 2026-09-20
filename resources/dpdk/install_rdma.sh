@@ -157,6 +157,7 @@ mlx5_apt_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y \
     -o Dpkg::Options::=--force-confdef \
     -o Dpkg::Options::=--force-confold \
     -o APT::Sandbox::User=root \
+    --fix-missing \
     libmlx5-dev \
     libmlx4-dev"
 
@@ -164,9 +165,35 @@ log_info "Updating apt index..."
 # v0.5.31: -o APT::Sandbox::User=root — see comment block above
 # core_apt_cmd. Required when invoked from netgen-server.service
 # (systemd RestrictSUIDSGID blocks apt's _apt-user privilege drop).
-apt-get update -o APT::Sandbox::User=root -o Acquire::http::Timeout=30 2>&1 | tail -3 || {
-    log_warning "apt-get update failed — continuing with cached index"
-}
+# v0.5.369 (audit rdma-install-must-not-fail): tee update output to
+# /tmp so we can detect broken external repos below (NO_PUBKEY,
+# 404, "no longer signed") and warn the operator specifically.
+APT_UPDATE_LOG=/tmp/rdma_apt_update.log
+set +e
+apt-get update -o APT::Sandbox::User=root -o Acquire::http::Timeout=30 2>&1 | tee "$APT_UPDATE_LOG" | tail -3
+_apt_update_rc=${PIPESTATUS[0]}
+set -e
+if [[ $_apt_update_rc -ne 0 ]]; then
+    log_warning "apt-get update failed (rc=$_apt_update_rc) — continuing with cached index"
+fi
+
+# v0.5.369 (audit rdma-install-must-not-fail): surface stale/
+# broken external apt repos. Operator on svl-d-ai-srv04 2026-09-20
+# hit the Mellanox DOCA repo with an expired GPG key + 404s on
+# aux package .debs; the pre-fix flow bailed at Step 1 with exit
+# 2 even though rdma-core (the only essential) was installed.
+if [[ -f "$APT_UPDATE_LOG" ]] && \
+       grep -qE 'NO_PUBKEY|no longer signed|404 +Not Found' "$APT_UPDATE_LOG" 2>/dev/null; then
+    log_warning "Detected broken external apt repo(s):"
+    grep -E 'NO_PUBKEY|no longer signed|404 +Not Found' "$APT_UPDATE_LOG" 2>/dev/null | \
+        head -5 | sed 's/^/  /' | while IFS= read -r _line; do
+            log_warning "$_line"
+        done
+    log_warning "Install will proceed with --fix-missing so 404 fetches are skipped."
+    log_warning "To silence future warnings, fix the repo's GPG key or disable it:"
+    log_warning "  grep -rl <domain> /etc/apt/sources.list.d/"
+    log_warning "  sudo mv <file>.list <file>.list.disabled"
+fi
 
 log_info "Installing core RDMA packages..."
 log_info "  libibverbs-dev   — InfiniBand verbs library"
@@ -189,14 +216,72 @@ log_info "  mstflint         — Mellanox firmware tools (mstflint, mstconfig)"
 # the operator saw "exit 2" with no log to dig in.
 RDMA_APT_LOG=/tmp/rdma_deps_install.log
 log_info "apt log will be saved to: $RDMA_APT_LOG"
-if ! (umask 077 && eval "$core_apt_cmd" 2>&1 | tee "$RDMA_APT_LOG"); then
-    log_error "Core RDMA package install failed."
-    log_error "Tail of install log ($RDMA_APT_LOG):"
-    tail -30 "$RDMA_APT_LOG" 2>/dev/null | sed 's/^/  /' || true
-    log_error "Run \`apt-get install -f\` to repair broken deps, then retry."
-    exit 2
+
+# v0.5.369 (audit rdma-install-must-not-fail): three-tier install
+# so a stale external repo (Mellanox DOCA on srv04, expired GPG
+# key + 404 aux .debs) cannot block the essential rdma-core
+# package. rdma-core is the ONLY hard requirement — it ships the
+# kernel modules Step 2 loads (ib_uverbs, ib_umad, rdma_cm,
+# rdma_ucm, iw_cm). Everything else is nice-to-have userspace
+# tooling.
+#
+#   Tier 1: full batch with --fix-missing (skips unfetchable pkgs)
+#   Tier 2: per-package retry for the essentials only
+#   Tier 3: dpkg-query post-check; if rdma-core is installed,
+#           declare Step 1 done regardless of aux package status.
+#
+# All three tiers run under `set +e` so a non-zero apt exit
+# doesn't abort the script (pre-fix `set -euo pipefail` at L38
+# turned any pkg fetch 404 into an immediate exit).
+core_apt_cmd_fix="${core_apt_cmd} --fix-missing"
+
+set +e
+(umask 077 && eval "$core_apt_cmd_fix" 2>&1 | tee "$RDMA_APT_LOG")
+_core_rc=${PIPESTATUS[0]}
+set -e
+
+if [[ $_core_rc -ne 0 ]]; then
+    log_warning "Batched core install returned rc=$_core_rc — retrying essentials individually"
+    # Per-package fallback so one bad .deb doesn't block the rest.
+    # Focused on the essentials the modprobe + module-persist steps
+    # depend on. If the operator loses ibverbs-utils / perftest to
+    # a broken repo they can still load kernel modules, still run
+    # any Mellanox in-kernel driver, and the admin console will
+    # still surface which utilities are missing.
+    for pkg in rdma-core libibverbs-dev librdmacm-dev perftest rdmacm-utils; do
+        set +e
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            -o APT::Sandbox::User=root \
+            --fix-missing --no-install-recommends \
+            "$pkg" 2>&1 | tee -a "$RDMA_APT_LOG"
+        _pkg_rc=${PIPESTATUS[0]}
+        set -e
+        if [[ $_pkg_rc -eq 0 ]]; then
+            log_success "$pkg installed (or already at latest)"
+        else
+            log_warning "$pkg install returned rc=$_pkg_rc (see $RDMA_APT_LOG)"
+        fi
+    done
 fi
-log_success "Core RDMA stack installed (log: $RDMA_APT_LOG)."
+
+# Post-condition: rdma-core is the only true essential. Any other
+# package (ibverbs-utils, infiniband-diags, python3-pyverbs,
+# mstflint, opensm) can be missing — Step 2 modprobe + kernel
+# functionality doesn't need them.
+if dpkg-query -W -f='${Status}\n' rdma-core 2>/dev/null | \
+       grep -q '^install ok installed'; then
+    log_success "Core RDMA stack installed (log: $RDMA_APT_LOG)."
+else
+    log_warning "rdma-core not installed after all fallbacks — Step 2 modprobe may fail."
+    log_warning "Broken external apt repo is the likely cause."
+    log_warning "Recovery:"
+    log_warning "  1) grep -rl <domain> /etc/apt/sources.list.d/"
+    log_warning "  2) sudo mv <file>.list <file>.list.disabled"
+    log_warning "  3) sudo apt-get update && retry Install RDMA"
+    log_warning "Continuing anyway — modules may already be present in kernel."
+fi
 
 # v0.5.28: opensm ships with an enabled-by-default service on some
 # distros. On RoCE-only / Soft-RoCE / no-RDMA-hardware hosts, an
@@ -214,8 +299,15 @@ if systemctl list-unit-files 2>/dev/null | grep -q '^opensm\.service'; then
 fi
 
 # Mellanox-specific
+# v0.5.369 (audit rdma-install-must-not-fail): also wrapped in
+# `set +e` — Mellanox userspace headers are optional; failure
+# here MUST not abort the script.
 log_info "Installing Mellanox-specific libmlx5-dev (optional)..."
-if eval "$mlx5_apt_cmd" 2>&1; then
+set +e
+eval "$mlx5_apt_cmd" 2>&1
+_mlx5_rc=$?
+set -e
+if [[ $_mlx5_rc -eq 0 ]]; then
     log_success "libmlx5-dev installed."
 else
     log_warning "libmlx5-dev install failed (likely no MOFED apt repo)."
@@ -239,15 +331,23 @@ log_step "Step 2: Load RDMA kernel modules"
 #                without iWARP hardware (Chelsio, Intel-some); load
 #                anyway so the userspace stack is universal.
 rdma_modules=("ib_uverbs" "rdma_cm" "rdma_ucm" "ib_umad" "iw_cm")
+# v0.5.369 (audit rdma-install-must-not-fail): track load count
+# so we can report "N/M modules loaded" at the end — matches the
+# summary shape the admin console's RDMA card renders.
+_mods_loaded=0
+_mods_total=${#rdma_modules[@]}
 for mod in "${rdma_modules[@]}"; do
     if lsmod | awk '{print $1}' | grep -qx "$mod"; then
         log_success "$mod already loaded"
+        _mods_loaded=$((_mods_loaded + 1))
     elif modprobe "$mod" 2>/dev/null; then
         log_success "$mod loaded"
+        _mods_loaded=$((_mods_loaded + 1))
     else
         log_warning "modprobe $mod failed (kernel may not have it)"
     fi
 done
+log_info "RDMA kernel modules: ${_mods_loaded}/${_mods_total} loaded"
 
 # Persist module loading across reboots.
 # v0.5.62 (audit M9): pre-fix the script skipped this write
@@ -298,26 +398,36 @@ fi
 # Step 4: verify
 log_step "Step 4: Verify RDMA stack"
 
+# v0.5.369 (audit rdma-install-must-not-fail): ibv_devices missing
+# is now a warning, not an exit. Pre-fix `exit 3` here bit any
+# operator whose external repo 404'd ibverbs-utils — script died
+# even though the kernel modules Step 2 loaded ARE the actual
+# RDMA plane. Downgrade + continue.
 if ! command -v ibv_devices >/dev/null 2>&1; then
-    log_error "ibv_devices not found despite ibverbs-utils install."
-    log_error "Something is wrong with the apt cache or package set."
-    exit 3
-fi
-
-log_info "Detected RDMA devices:"
-if ibv_devices 2>&1 | tee /tmp/netgen_ibv_devices.log; then
-    dev_count=$(ibv_devices 2>/dev/null | awk 'NR>2 && /[a-z_]/' | wc -l | tr -d ' ')
-    if [[ "$dev_count" -gt 0 ]]; then
-        log_success "Found $dev_count RDMA device(s). Stack is functional."
-    else
-        log_warning "No RDMA devices detected. This is expected if:"
-        log_warning "  - No RDMA-capable hardware is present"
-        log_warning "  - Mellanox NICs need MOFED + Mellanox firmware bound to interfaces"
-        log_warning "  - Soft RoCE (rxe) is not yet configured"
-        log_warning "Run \`lspci | grep -i mellanox\` to check for hardware."
-    fi
+    log_warning "ibv_devices not on PATH — ibverbs-utils probably 404'd during install."
+    log_warning "Kernel modules loaded above still provide the RDMA plane."
+    log_warning "Install ibverbs-utils separately to enable this diagnostic:"
+    log_warning "  sudo apt-get install -y --fix-missing ibverbs-utils"
 else
-    log_warning "ibv_devices returned nonzero — RDMA kernel state may be incomplete."
+    log_info "Detected RDMA devices:"
+    set +e
+    ibv_devices 2>&1 | tee /tmp/netgen_ibv_devices.log
+    _ibv_rc=${PIPESTATUS[0]}
+    set -e
+    if [[ $_ibv_rc -eq 0 ]]; then
+        dev_count=$(ibv_devices 2>/dev/null | awk 'NR>2 && /[a-z_]/' | wc -l | tr -d ' ')
+        if [[ "$dev_count" -gt 0 ]]; then
+            log_success "Found $dev_count RDMA device(s). Stack is functional."
+        else
+            log_warning "No RDMA devices detected. This is expected if:"
+            log_warning "  - No RDMA-capable hardware is present"
+            log_warning "  - Mellanox NICs need MOFED + Mellanox firmware bound to interfaces"
+            log_warning "  - Soft RoCE (rxe) is not yet configured"
+            log_warning "Run \`lspci | grep -i mellanox\` to check for hardware."
+        fi
+    else
+        log_warning "ibv_devices returned nonzero — RDMA kernel state may be incomplete."
+    fi
 fi
 
 if command -v perftest >/dev/null 2>&1 || command -v ib_send_bw >/dev/null 2>&1; then
@@ -327,6 +437,16 @@ else
 fi
 
 log_step "RDMA install complete"
+# v0.5.369 (audit rdma-install-must-not-fail): final summary so
+# the admin console's log stream renders "N/M modules loaded"
+# even when Step 1 hit --fix-missing skips. Operator can see at
+# a glance whether the essential plane is up.
+if [[ "${_mods_loaded:-0}" -eq "${_mods_total:-5}" ]]; then
+    log_success "Summary: ${_mods_loaded}/${_mods_total} RDMA kernel modules loaded — plane is up."
+else
+    log_warning "Summary: ${_mods_loaded:-0}/${_mods_total:-5} RDMA kernel modules loaded"
+    log_warning "         — some modules missing; check log above."
+fi
 log_success "Next: use the Tools → RDMA → Blast a RDMA Flow... wizard in netgen,"
 log_success "or run ibv_rc_pingpong / ib_send_bw manually to validate."
 log_info ""
