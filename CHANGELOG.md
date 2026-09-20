@@ -2,6 +2,127 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.372] - 2026-09-20
+
+**6-bug bundle from client + protocol audit.** One SEC + five
+correctness/UX. Triaged from 22 audit findings; bigger deferred
+findings (per-device VRF-table id collision, VXLAN interface
+name truncation dedup, DHCP restart async cancel, RFC 2544
+poll-timeout + swallowed exceptions, per-server auth-token
+routing pipeline) queued for v0.5.373+.
+
+### Fixes
+
+- **C1 SEC** — `run_tgen_client.py:78-92` auth-token monkey-patch
+  is URL-guarded. Pre-fix the wrapper injected
+  `Authorization: Bearer <netgen-token>` on EVERY `requests.*`
+  call — so any client code that later called out to a non-
+  Netgen endpoint (Ollama at `localhost:11434`, LM Studio,
+  GitHub, an external LLM API) leaked the Netgen bearer token to
+  that third party. New module-level `_NETGEN_ALLOWED_HOSTS` set
+  starts with loopback and grows via
+  `_netgen_register_server_host()` — called from Add Server
+  (`traffic_client/menu_actions.py:194+`) and
+  `load_server_interfaces` (same file, line 636+). Wrapper checks
+  `_netgen_url_allowed(url)` before injecting the header; non-
+  matching URLs get their original headers unchanged.
+  Marker: `v0.5.372 (audit client-auth-token-leak-monkey-patch)`.
+
+- **C2** — `utils/device_database.py:1439-1447` `remove_device`
+  used to `conn.commit()` → SELECT verify → `conn.rollback()` if
+  the row still exists → `return False`. But rollback after
+  commit is a no-op; the DELETE had already landed on disk, yet
+  the function returned "safe abort", confusing every caller.
+  Fix: verify BEFORE commit so the rollback is actually
+  meaningful, then commit only on verified-clean.
+  Marker: `v0.5.372 (audit device-db-rollback-after-commit)`.
+
+- **C3** — `traffic_client/stream_control.py:1456+`
+  `remove_selected_stream` gains a `QMessageBox.question` gate
+  with names + count. Pre-fix iterated selection and deleted in
+  place with only a post-hoc "Stream Removed" INFORMATION popup
+  — multi-select + accidental button click = silent bulk data
+  loss. Follows the `devices_tab.py:9286` confirm-first pattern.
+  Marker: `v0.5.372 (audit stream-delete-no-confirm)`.
+
+- **C4** — `widgets/devices_tab.py:9350-9358` device delete now
+  runs the server DELETE FIRST and only mutates the UI on
+  success. Pre-fix removed the row from the table before the
+  server call — network failure = UI desynced (device gone from
+  view, still on server; next Refresh restored it). `_server_ok
+  is False` branch keeps the row + surfaces the failure so the
+  next Refresh doesn't "restore" a stale device.
+  Marker: `v0.5.372 (audit device-delete-ui-first-server-later)`.
+
+- **C5** — `widgets/add_bgp_dialog.py:_validate` gains RFC 4271
+  §10 cross-field check: hold-time ≥ 3 × keepalive. Pre-fix
+  operator could save keepalive=60 / hold=3 and watch BGP churn
+  every 3 s. Error message names the exact recovery values
+  (`≥ 3 × keepalive` or `≤ hold / 3`).
+  Marker: `v0.5.372 (audit bgp-timer-cross-field-missing)`.
+
+- **C6** — `widgets/add_bgp_dialog.py:62,71` ASN widget
+  validators upgraded from `QIntValidator(1, 2147483647)` (Qt's
+  C++ int32 cap) to `QRegExpValidator(r'^[1-9][0-9]{0,9}$')`.
+  Pre-fix half the 4-byte AS space (RFC 6793: 1..4294967295) was
+  un-typable even though the server accepted it. Accept-time
+  check (`_validate`) enforces the actual 4-byte upper bound.
+  Marker: `v0.5.372 (audit bgp-asn-4byte-truncated)`.
+
+### Tests
+
+`tests/test_v05372_client_bug_bundle.py` — 24 tests, all pass:
+
+- AST-parse all 6 edited files
+- C1: URL-guard fn defined; loopback in default allowed set;
+  wrapper calls `_netgen_url_allowed(url)`; register-hook
+  exposed on requests module; Add Server + load_server_interfaces
+  both call the register hook
+- C2: SELECT verify appears BEFORE commit in `remove_device`
+- C3: `QMessageBox.question` gates the delete loop; No is default
+- C4: `_remove_device_from_server` called BEFORE `removeRow`;
+  `_server_ok is False` skips UI mutation with `continue`
+- C5: hold-time ≥ 3 × keepalive check with RFC 4271 citation
+- C6: no `QIntValidator` on either ASN input; `QRegExpValidator`
+  in place; Accept-time check bounds against 4294967295 with
+  RFC 6793 citation
+- Regression guards: v0.5.371 install_dpdk marker,
+  v0.5.370 `/api/health` running_version, v0.5.202 BGP
+  hold-time field intact
+
+### Verification
+
+- All 6 files AST-parse
+- 24/24 v0.5.372 tests pass
+- Full sweep: 5455 passed / 50 failed (all failures pre-existing,
+  none introduced by this ship)
+
+### Deferred to v0.5.373+
+
+Bigger findings from the same client + protocol audit that need
+proper scoping, not bundling:
+
+- **VRF-table id collision** — `utils/frr_docker.py:463-467`
+  uses `md5(device_id) % 1000` → birthday paradox: 37 devices ≈
+  50% collision, 100+ devices ≈ near-certain. Two devices
+  sharing a table id see each other's routes. Needs allocation-
+  tracking design (sequential id + freed-id reuse queue).
+- **Per-server auth-token routing** — full multi-server pipeline
+  so different servers can hold different bearer tokens. C1 SEC
+  closed the token-leak; C7+ will actually forward per-server
+  tokens.
+- **VXLAN interface name silent truncation** —
+  `utils/vxlan.py:333-334` truncates to 15 chars with no dedup.
+- **DHCP "Restart" freezes UI up to 60s** —
+  `utils/devices_tab_dhcp.py:1759-1775` blocks main thread on
+  `requests.post(timeout=60)`. Needs QThread + cancel button.
+- **RFC 2544 dialog poll swallows exceptions** —
+  `widgets/rfc2544_dialog.py:540-546` catches broad Exception →
+  timer keeps firing forever on server crash.
+- **String-vs-numeric sort** in stream statistics table.
+- **Client-side `requests.*` without timeout** in
+  `query_device_database.py` (9 sites) and elsewhere.
+
 ## [0.5.371] - 2026-09-20
 
 **`install_dpdk.sh` "must never fail" parity with v0.5.369 RDMA.**

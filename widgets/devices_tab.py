@@ -9347,6 +9347,29 @@ class DevicesTab(QWidget):
                 except Exception as exc:
                     logging.debug(f"[REMOVE] VXLAN cleanup failed for {device_name}: {exc}")
 
+            # v0.5.372 (audit device-delete-ui-first-server-later):
+            # pre-fix removed the row from the UI table FIRST, then
+            # called _remove_device_from_server. If the server DELETE
+            # failed (network drop, 500), the operator saw the row
+            # gone even though the device still existed server-side
+            # — next Refresh restored it, confusing everyone. Now:
+            # server call first, only mutate UI on success. If
+            # server fails, keep the row and surface the error.
+            _server_ok = self._remove_device_from_server(
+                device_info, device_id, device_name,
+            )
+            # Legacy callers of _remove_device_from_server may return
+            # None (best-effort logging path). Treat None as success
+            # to preserve back-compat with any subclass override, but
+            # skip the UI removal only on explicit False.
+            if _server_ok is False:
+                logging.warning(
+                    f"[REMOVE] server delete for {device_name} "
+                    f"returned False — keeping UI row so next "
+                    f"Refresh doesn't 'restore' a stale device"
+                )
+                continue
+
             self.devices_table.removeRow(row)
             self._remove_device_from_data_structure(device_info)
 
@@ -9354,8 +9377,6 @@ class DevicesTab(QWidget):
                 self.main_window.removed_devices.append(device_id)
             else:
                 self.main_window.removed_devices = [device_id]
-
-            self._remove_device_from_server(device_info, device_id, device_name)
 
             removed_devices.append(device_name)
 

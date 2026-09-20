@@ -1459,6 +1459,33 @@ class TrafficGenClientStreamControl:
             QMessageBox.warning(self, "No Selection", "Please select a stream to remove.")
             return
 
+        # v0.5.372 (audit stream-delete-no-confirm): pre-fix this
+        # method iterated selected_rows and deleted each in place
+        # with only a post-hoc "Stream Removed" INFORMATION popup
+        # — no chance for the operator to abort. Multi-select +
+        # accidental button click = silent bulk data loss. Add a
+        # QMessageBox.question gate that lists the names + count
+        # before doing any work. Follows the pattern of
+        # devices_tab.py's proper delete-device confirm.
+        _names = []
+        for _row in selected_rows:
+            _n_item = self.stream_table.item(_row.row(), 2)
+            _names.append(_n_item.text().strip() if _n_item else "?")
+        _count = len(_names)
+        _preview = "\n".join(f"  - {_n}" for _n in _names[:8])
+        if _count > 8:
+            _preview += f"\n  ... and {_count - 8} more"
+        if QMessageBox.question(
+            self,
+            "Remove Stream" if _count == 1 else f"Remove {_count} Streams",
+            f"Delete {_count} stream(s)?\n\n{_preview}\n\n"
+            f"This removes the stream from BOTH the desktop client "
+            f"AND the server. It cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
         try:
             for row in selected_rows:
                 r = row.row()

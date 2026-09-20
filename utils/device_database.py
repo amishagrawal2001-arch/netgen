@@ -1435,18 +1435,39 @@ class DeviceDatabase:
                     conn.close()
                     return False
                 
-                # Explicitly commit the transaction
-                conn.commit()
-                
-                # Verify deletion
-                cursor = conn.execute("SELECT device_id FROM devices WHERE device_id = ?", (device_id,))
+                # v0.5.372 (audit device-db-rollback-after-commit):
+                # verify BEFORE commit so a still-present row can
+                # actually be rolled back. Pre-fix the sequence was
+                # commit → verify → rollback-if-present, but rollback
+                # after commit is a no-op — the DELETE had already
+                # landed on disk. The function then returned False
+                # (looked like a safe abort) while data was gone,
+                # confusing every caller.
+                cursor = conn.execute(
+                    "SELECT device_id FROM devices WHERE device_id = ?",
+                    (device_id,),
+                )
                 if cursor.fetchone():
-                    logger.error(f"[DEVICE DB] Device {device_id} still exists after deletion attempt!")
+                    # DELETE didn't take effect within this txn —
+                    # e.g. FK constraint blocked cascade, or another
+                    # writer re-inserted concurrently. Rollback IS
+                    # meaningful here because we haven't committed.
+                    logger.error(
+                        f"[DEVICE DB] Device {device_id} still present "
+                        f"in verify — rolling back before commit"
+                    )
                     conn.rollback()
                     conn.close()
                     return False
-                
-                logger.info(f"[DEVICE DB] Successfully removed device {device_id} ({device_name}) - {rows_deleted} row(s) deleted")
+
+                # Verification passed → commit. Rollback path above
+                # already returned; from here the write IS durable.
+                conn.commit()
+
+                logger.info(
+                    f"[DEVICE DB] Successfully removed device "
+                    f"{device_id} ({device_name}) - {rows_deleted} row(s) deleted"
+                )
                 conn.close()
                 return True
                 

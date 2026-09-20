@@ -71,18 +71,61 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
     # Optional bearer-token auth — mirror of the server-side
     # NETGEN_AUTH_TOKEN gate in run_tgen_server.py. When set in the
     # client's environment, every `requests.{get,post,put,…}` call
-    # auto-injects an `Authorization: Bearer <token>` header so the
-    # 100+ HTTP sites scattered through traffic_client / widgets
-    # don't each need bespoke wiring. Override the per-call header
-    # by passing `headers={"Authorization": "Bearer …"}` explicitly.
+    # to a REGISTERED NETGEN SERVER auto-injects an
+    # `Authorization: Bearer <token>` header so the 100+ HTTP sites
+    # scattered through traffic_client / widgets don't each need
+    # bespoke wiring. Override the per-call header by passing
+    # `headers={"Authorization": "Bearer …"}` explicitly.
+    #
+    # v0.5.372 (audit client-auth-token-leak-monkey-patch): pre-fix
+    # the wrapper injected the header UNCONDITIONALLY on every
+    # requests.* call — so any client code that later called out
+    # to a non-Netgen endpoint (Ollama at localhost:11434, LM
+    # Studio, GitHub, an external LLM API) leaked the Netgen bearer
+    # token to that third party. This is a real token-disclosure
+    # bug: the token is scoped to the netgen-server auth boundary
+    # and is not meant to be sent anywhere else.
+    #
+    # Fix: URL-guard the wrapper. Only inject the header when the
+    # URL's host is in the registered-Netgen-servers set. The set
+    # starts with loopback (client always trusts self) and grows
+    # via _netgen_register_server_host(host) — called by Add
+    # Server + by session-load in traffic_client. Non-matching URLs
+    # get the ORIGINAL headers unchanged (no token forwarded).
+    import requests as _rq
+    try:
+        from urllib.parse import urlparse as _urlparse
+    except ImportError:  # py2-safety, though we're py3+
+        _urlparse = None
+
+    _NETGEN_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
+    _rq._netgen_allowed_hosts = _NETGEN_ALLOWED_HOSTS
+
+    def _netgen_register_server_host(host):
+        """Called from Add Server + load_server_interfaces to
+        register a host as trusted for auth-token forwarding."""
+        if not host:
+            return
+        _NETGEN_ALLOWED_HOSTS.add(str(host).strip().lower())
+    _rq._netgen_register_server_host = _netgen_register_server_host
+
+    def _netgen_url_allowed(url):
+        try:
+            if _urlparse is None:
+                return False
+            host = (_urlparse(str(url)).hostname or "").lower()
+        except Exception:
+            return False
+        return host in _NETGEN_ALLOWED_HOSTS
+
     _auth_token = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
     if _auth_token:
-        import requests as _rq
         def _wrap_request_fn(fn):
             def _patched(url, **kwargs):
-                headers = dict(kwargs.get("headers") or {})
-                headers.setdefault("Authorization", f"Bearer {_auth_token}")
-                kwargs["headers"] = headers
+                if _netgen_url_allowed(url):
+                    headers = dict(kwargs.get("headers") or {})
+                    headers.setdefault("Authorization", f"Bearer {_auth_token}")
+                    kwargs["headers"] = headers
                 return fn(url, **kwargs)
             return _patched
         for _m in ("get", "post", "put", "delete", "patch", "head", "options"):

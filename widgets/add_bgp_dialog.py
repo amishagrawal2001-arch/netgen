@@ -4,7 +4,8 @@ import logging
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QHBoxLayout,
                              QLineEdit, QComboBox, QGroupBox, QDialogButtonBox,
                              QWidget, QMessageBox, QCheckBox, QPushButton, QSpinBox, QLabel)
-from PyQt5.QtGui import QIntValidator
+from PyQt5.QtCore import QRegExp
+from PyQt5.QtGui import QIntValidator, QRegExpValidator
 from PyQt5.QtCore import Qt
 
 logger = logging.getLogger(__name__)
@@ -56,19 +57,29 @@ class AddBgpDialog(QDialog):
         layout.addWidget(bgp_mode_widget)
 
         # ASN Configuration
+        #
+        # v0.5.372 (audit bgp-asn-4byte-truncated): use
+        # QRegExpValidator so the widget accepts the full 4-byte
+        # unsigned range (1..4294967295) per RFC 6793. Pre-fix
+        # used QIntValidator(1, 2147483647) which is Qt's C++ int
+        # max (2^31-1), silently rejecting keystrokes past that
+        # ceiling — half the 4-byte AS space was un-typable even
+        # though the server accepts it. Accept-time check (line
+        # ~279) enforces the actual 4-byte upper bound.
+        _asn_regex = QRegExpValidator(QRegExp(r"^[1-9][0-9]{0,9}$"))
         local_asn_layout = QHBoxLayout()
         local_asn_layout.addWidget(QLabel("Local ASN:"))
         self.bgp_asn_input = QLineEdit("65000")
-        self.bgp_asn_input.setValidator(QIntValidator(1, 2147483647))  # Max 32-bit signed int
+        self.bgp_asn_input.setValidator(_asn_regex)
         local_asn_layout.addWidget(self.bgp_asn_input)
         local_asn_widget = QWidget()
         local_asn_widget.setLayout(local_asn_layout)
         layout.addWidget(local_asn_widget)
-        
+
         remote_asn_layout = QHBoxLayout()
         remote_asn_layout.addWidget(QLabel("Remote ASN:"))
         self.bgp_remote_asn_input = QLineEdit("65001")
-        self.bgp_remote_asn_input.setValidator(QIntValidator(1, 2147483647))  # Max 32-bit signed int
+        self.bgp_remote_asn_input.setValidator(_asn_regex)
         remote_asn_layout.addWidget(self.bgp_remote_asn_input)
         remote_asn_widget = QWidget()
         remote_asn_widget.setLayout(remote_asn_layout)
@@ -277,13 +288,46 @@ class AddBgpDialog(QDialog):
             return False
 
         try:
-            # Validate ASNs
+            # v0.5.372 (audit bgp-asn-4byte-truncated): validate ASN
+            # against the FULL 4-byte range per RFC 6793 (1 to
+            # 4,294,967,295). The QIntValidator on the widget still
+            # caps at int32 (2,147,483,647) as defense-in-depth,
+            # but the Accept-time check accepts the whole 4-byte
+            # space via string→int here.
             asn_local = int(self.bgp_asn_input.text())
             asn_remote = int(self.bgp_remote_asn_input.text())
             if asn_local <= 0 or asn_remote <= 0:
                 raise ValueError("ASN must be positive")
+            if asn_local > 4294967295 or asn_remote > 4294967295:
+                raise ValueError("ASN exceeds 4-byte range (RFC 6793)")
         except Exception:
-            QMessageBox.warning(self, "Invalid BGP ASN", "Local and Remote ASN must be positive integers.")
+            QMessageBox.warning(
+                self, "Invalid BGP ASN",
+                "Local and Remote ASN must be positive integers "
+                "in the range 1 to 4294967295 (RFC 6793).",
+            )
+            return False
+
+        # v0.5.372 (audit bgp-timer-cross-field-missing): RFC 4271
+        # §10 requires hold-time ≥ 3 × keepalive so that at least
+        # three keepalives can fit within the hold interval before
+        # the session tears down. Pre-fix nothing checked this, so
+        # an operator could save keepalive=60 / hold=3 and watch
+        # BGP churn every 3 s. The keepalive spin caps at 21845
+        # (65535/3) with this rule; the hold spin's existing 3
+        # minimum stays for full flexibility, but keepalive*3 is
+        # enforced at Accept.
+        _keepalive = int(self.bgp_keepalive_input.value())
+        _hold = int(self.bgp_hold_time_input.value())
+        if _hold < 3 * _keepalive:
+            _suggested = 3 * _keepalive
+            QMessageBox.warning(
+                self, "Invalid BGP Timers",
+                f"Hold-time ({_hold}s) must be at least 3× keepalive "
+                f"({_keepalive}s) — RFC 4271 §10.\n\n"
+                f"Set hold-time to at least {_suggested}s, or reduce "
+                f"keepalive to at most {_hold // 3}s.",
+            )
             return False
 
         # Validate IPv4 BGP fields if enabled

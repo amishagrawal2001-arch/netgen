@@ -197,6 +197,20 @@ class TrafficGenClientMenuAction():
                 server_entry["label"] = label
             self.server_interfaces.append(server_entry)
             existing.add(full_url)
+
+            # v0.5.372 (audit client-auth-token-leak-monkey-patch):
+            # register this server's host as trusted so the module-
+            # level requests wrapper injects the bearer token for
+            # its URLs. Non-registered hosts (Ollama, LLM, GitHub)
+            # continue to get NO token forwarded.
+            try:
+                import requests as _rq
+                from urllib.parse import urlparse as _urlparse
+                _host = (_urlparse(full_url).hostname or "").lower()
+                if _host and hasattr(_rq, "_netgen_register_server_host"):
+                    _rq._netgen_register_server_host(_host)
+            except Exception:
+                pass
             if connect_now:
                 added.append(full_url)
             else:
@@ -620,6 +634,20 @@ class TrafficGenClientMenuAction():
                 servers = [line.strip() for line in f.readlines()]
             self.server_interfaces = [{"tg_id": i, "address": server} for i, server in enumerate(servers)]
             logger.info(f"Loaded servers: {self.server_interfaces}")
+
+            # v0.5.372 (audit client-auth-token-leak-monkey-patch):
+            # register each loaded server host so the requests
+            # wrapper injects the bearer token for its URLs.
+            try:
+                import requests as _rq
+                from urllib.parse import urlparse as _urlparse
+                if hasattr(_rq, "_netgen_register_server_host"):
+                    for _s in self.server_interfaces:
+                        _host = (_urlparse(_s.get("address", "")).hostname or "").lower()
+                        if _host:
+                            _rq._netgen_register_server_host(_host)
+            except Exception:
+                pass
         except FileNotFoundError:
             logger.info("server_interfaces.txt not found. Starting with an empty server list.")
             self.server_interfaces = []
