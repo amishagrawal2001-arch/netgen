@@ -2,6 +2,80 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.368] - 2026-09-20
+
+**`/api/admin/upgrade_wheel`: schedule `systemctl restart` on the
+legacy (system-pip) path.** Fixes the upgrade flow silently
+leaving the running process stale on hosts that don't have the
+tarball layout.
+
+### Symptom operator hit today (svl-d-ai-srv04)
+
+Client POSTs `/api/admin/upgrade_wheel` with a v0.5.367 wheel.
+Server dispatches `systemd-run … -- python3 -m pip install …`.
+Pip installs the wheel cleanly. Client polls `/api/health`, sees
+`netgen_version: 0.5.367`, declares "upgrade verified".
+
+But the running process still has the pre-upgrade `_ADMIN_HTML`
+in memory — the RDMA install button (shipped in v0.5.367) never
+appears on `/admin`.
+
+### Root cause
+
+`api_admin_upgrade_wheel_log`'s completion branch keyed the
+restart decision off `systemd_unit`:
+
+```python
+if return_code == 0 and not systemd_unit:
+    <spawn detached `systemctl restart netgen-server`>
+elif return_code == 0 and systemd_unit:
+    <do nothing — assume the helper restarts>
+```
+
+That's only true for the **tarball path**
+(`upgrade_mode = "tarball:netgen-upgrade"`), which actually
+runs `/opt/netgen-server/bin/netgen-upgrade` and does its own
+restart + health verify. On the **legacy path**
+(`upgrade_mode = "legacy:system-pip+…"`), the same systemd-run
+wrap runs raw pip — pip installs and exits, no restart. The
+running process keeps the old code; `/api/health` reads the
+on-disk metadata pip just updated and lies about the version.
+
+### Fix
+
+- Persist `upgrade_mode` into `_ADMIN_UPGRADE_STATE` (already
+  computed higher in the handler; just never stored).
+- Completion branch keys off
+  `_upgrade_mode.startswith("tarball:")` instead of
+  `systemd_unit`. Only the tarball helper is trusted to
+  restart; every other mode (legacy today, plus any future
+  wrapper-less mode) gets a netgen-server-scheduled restart.
+
+Both fix sites carry the marker
+`v0.5.368 (audit upgrade-wheel-legacy-no-restart)`.
+
+### Tests
+
+- `tests/test_v05368_upgrade_wheel_legacy_restart.py` — 9 new
+  tests: marker presence, `upgrade_mode` persisted into state,
+  completion branch keys off mode (not `systemd_unit`),
+  legacy path triggers restart, tarball path still short-
+  circuits, no bare `not systemd_unit and` gate survives,
+  v0.5.23 systemd-run wrap still intact, v0.5.367 marker
+  still intact, AST parses.
+
+### Interim workaround for hosts already stuck
+
+If a host is running an older netgen-server that already
+uploaded a new wheel but didn't restart itself (like srv04 today),
+one manual restart fixes it:
+
+```bash
+ssh root@<host> 'systemctl restart netgen-server.service'
+```
+
+After that, `/admin` will serve the new HTML on next load.
+
 ## [0.5.367] - 2026-09-20
 
 **Admin console: one-click RDMA install.**

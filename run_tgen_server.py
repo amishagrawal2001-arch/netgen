@@ -23379,6 +23379,12 @@ def api_admin_upgrade_wheel():
             "return_code": None,
             "restart_scheduled": False,
             "systemd_unit": systemd_unit,
+            # v0.5.368 (audit upgrade-wheel-legacy-no-restart):
+            # persist upgrade_mode so the completion branch can
+            # tell tarball-path (helper does restart) from legacy-
+            # path (raw pip, no restart) — the pre-fix logic keyed
+            # off `systemd_unit` alone which conflated the two.
+            "upgrade_mode": upgrade_mode,
         })
         _admin_upgrade_persist()
 
@@ -23427,13 +23433,29 @@ def api_admin_upgrade_wheel_log():
             _ADMIN_UPGRADE_STATE["finished_at"] = _dt.datetime.now().isoformat()
             _ADMIN_UPGRADE_STATE["return_code"] = return_code
 
-            # v0.5.23: when systemd_unit is set, the detached
-            # netgen-upgrade script has already called
-            # `systemctl restart netgen-server` itself — don't
-            # double-restart. The legacy proc.poll() path keeps
-            # the inline restart trigger (no detached helper to
-            # do it for us).
-            if return_code == 0 and not systemd_unit and \
+            # v0.5.368 (audit upgrade-wheel-legacy-no-restart):
+            # pre-fix, the restart-decision keyed off `systemd_unit`:
+            # if set, we assumed "the netgen-upgrade helper script
+            # will restart the server itself" and did nothing. That's
+            # only true for the tarball path
+            # (`upgrade_mode = "tarball:netgen-upgrade"`, which
+            # actually runs `/opt/netgen-server/bin/netgen-upgrade`).
+            # For the legacy path (`upgrade_mode = "legacy:system-
+            # pip+…"`, which srv04's system-pip layout uses), the
+            # systemd-run wrap runs RAW pip — pip installs the wheel
+            # to disk and exits. NO restart. The running process
+            # keeps the old code in memory; `/api/health` LIES about
+            # the version because it reads on-disk metadata; the
+            # client polls health, sees the new version, declares
+            # "upgrade verified", and hands control back to a
+            # server still running the pre-upgrade code.
+            # Fix: schedule the restart whenever `upgrade_mode`
+            # starts with `legacy:` — the raw-pip path has no
+            # helper, so netgen-server must trigger its own restart.
+            # Skip only when the tarball helper is in charge.
+            _upgrade_mode = _ADMIN_UPGRADE_STATE.get("upgrade_mode") or ""
+            _helper_restarts = _upgrade_mode.startswith("tarball:")
+            if return_code == 0 and not _helper_restarts and \
                     not _ADMIN_UPGRADE_STATE.get("restart_scheduled"):
                 _ADMIN_UPGRADE_STATE["restart_scheduled"] = True
                 try:
@@ -23449,11 +23471,12 @@ def api_admin_upgrade_wheel_log():
                 except Exception as e:
                     with open(log_path, "ab") as lf:
                         lf.write(f"[upgrade] restart scheduling failed: {e}\n".encode())
-            elif return_code == 0 and systemd_unit:
-                # The netgen-upgrade script issues its own restart
-                # when pip + import-check + verify succeed. Flag
-                # restart_scheduled so the client knows to wait for
-                # /api/health instead of expecting more log output.
+            elif return_code == 0 and _helper_restarts:
+                # The netgen-upgrade tarball script issues its own
+                # restart when pip + import-check + verify succeed.
+                # Flag restart_scheduled so the client knows to
+                # wait for /api/health instead of expecting more
+                # log output.
                 _ADMIN_UPGRADE_STATE["restart_scheduled"] = True
             _admin_upgrade_persist()
 
