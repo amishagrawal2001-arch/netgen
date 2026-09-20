@@ -361,6 +361,24 @@ def _bgp_clear_prefix(device_id=None):
 _AUTH_TOKEN = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
 _AUTH_EXEMPT_PREFIXES = ("/admin", "/api/health")
 
+# v0.5.370 (audit health-version-drift-lie): snapshot the on-disk
+# package version at process-start time. importlib.metadata reads
+# from site-packages metadata, which pip UPDATES the moment
+# `pip install --upgrade …` completes — but this process still
+# holds the OLD bytecode in memory until systemctl restart. So a
+# post-pip / pre-restart /api/health poll would report the NEW
+# version even though the running code is stale. v0.5.368 fixed
+# the specific upgrade-completion detection off this same lie;
+# this captures the module-load-time version so /api/health can
+# emit BOTH `netgen_version` (still on-disk, back-compat) and
+# `running_version` (frozen at import — the truth). Client can
+# diff them to detect "pip finished, restart pending".
+try:
+    from importlib.metadata import version as _pkg_version_startup
+    _STARTUP_NETGEN_VERSION = _pkg_version_startup("ostg-trafficgen")
+except Exception:
+    _STARTUP_NETGEN_VERSION = "unknown"
+
 # ───────────────────────────────────────────────────────────────────
 # Per-role auth (opt-in extension of the bearer-token middleware)
 # ───────────────────────────────────────────────────────────────────
@@ -710,6 +728,13 @@ def api_health():
                          pip metadata isn't readable for any reason
                          (shouldn't happen on a real install).
     """
+    # v0.5.370 (audit health-version-drift-lie): report BOTH the
+    # on-disk version (`netgen_version` — back-compat; the historic
+    # field, matches what pip just installed) AND the running
+    # process's frozen-at-startup version (`running_version` —
+    # captured at module load). If they differ, pip finished but
+    # netgen-server has not restarted yet — the client can then
+    # decline to declare "upgrade verified" until they converge.
     netgen_version = "unknown"
     try:
         from importlib.metadata import version as _pkg_version
@@ -721,6 +746,8 @@ def api_health():
         "auth_required": bool(_AUTH_TOKEN),
         "version": 1,
         "netgen_version": netgen_version,
+        "running_version": _STARTUP_NETGEN_VERSION,
+        "restart_pending": netgen_version != _STARTUP_NETGEN_VERSION,
     }), 200
 
 
@@ -17996,9 +18023,12 @@ def dpdk_hugepages():
                     # succeeds regardless of our own cap state.
                     systemd_run = _systemd_run_available()
                     if systemd_run:
-                        import time as _t
+                        # v0.5.370 (audit systemd-run-unit-name-collision):
+                        # entropy-rich suffix; rapid retry of hugetlbfs
+                        # mount inside the same second would otherwise
+                        # collide on --collect'd unit.
                         mount_unit = (
-                            f"netgen-mount-hugetlbfs-{int(_t.time())}.service"
+                            f"netgen-mount-hugetlbfs-{_transient_unit_suffix()}.service"
                         )
                         _mount_cmd = [
                             systemd_run,
@@ -19675,11 +19705,14 @@ def dpdk_load_modules():
                     # or "Unknown error"` — both were empty.
                     # Without --quiet, the actual modprobe stderr
                     # reaches subprocess.run.
-                    import time as _t
+                    # v0.5.370 (audit systemd-run-unit-name-collision):
+                    # entropy-rich suffix so back-to-back modprobe calls
+                    # for the same module in the same second don't
+                    # collide on --collect'd unit.
                     modprobe_unit = (
                         f"netgen-modprobe-"
                         f"{module.replace('-', '_')}-"
-                        f"{int(_t.time())}.service"
+                        f"{_transient_unit_suffix()}.service"
                     )
                     modprobe_cmd = [
                         systemd_run,
@@ -22274,46 +22307,58 @@ def api_admin_install_dpdk():
     # SSH could recover. With `?force=1` we SIGTERM the previous
     # process, wait, then proceed. We also let DELETE on this
     # route do just the kill without restarting.
-    proc = _ADMIN_INSTALL_STATE.get("process")
+    #
+    # v0.5.370 (audit dpdk-install-toctou-parity): pre-fix the
+    # check-then-force-kill + RDMA mutex block was OUTSIDE
+    # `_ADMIN_INSTALL_LOCK`; only the final commit at the Popen
+    # site re-acquired. Two concurrent POSTs both passed the
+    # early check, both force-killed the same handle (harmless
+    # but wrong shape), both walked to the spawn. RDMA got this
+    # fix in v0.5.93; DPDK parity was never applied. Hoist the
+    # whole pre-flight into the lock, matching RDMA's shape.
     force = (
         request.args.get("force") == "1"
         or (request.get_json(silent=True) or {}).get("force") is True
     )
-    if proc and proc.poll() is None:
-        if force:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
+    with _ADMIN_INSTALL_LOCK:
+        proc = _ADMIN_INSTALL_STATE.get("process")
+        if proc and proc.poll() is None:
+            if force:
                 try:
-                    proc.kill()
+                    proc.terminate()
+                    proc.wait(timeout=5)
                 except Exception:
-                    pass
-            logging.warning(
-                "[ADMIN INSTALL DPDK] force-killed previous "
-                "install process (was wedged?)"
-            )
-        else:
-            return jsonify({
-                "error": "DPDK install is already running",
-                "log_path": _ADMIN_INSTALL_STATE.get("log_path"),
-                "hint": "pass ?force=1 to terminate the wedged install",
-            }), 409
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                logging.warning(
+                    "[ADMIN INSTALL DPDK] force-killed previous "
+                    "install process (was wedged?)"
+                )
+            else:
+                return jsonify({
+                    "error": "DPDK install is already running",
+                    "log_path": _ADMIN_INSTALL_STATE.get("log_path"),
+                    "hint": "pass ?force=1 to terminate the wedged install",
+                }), 409
 
-    # v0.5.71 (audit M3): mutual exclusion with install_rdma.
-    # Both invoke apt-get install which contends on dpkg lock;
-    # parallel runs block each other for minutes and the
-    # progress UI looks frozen.
-    rdma_proc = _ADMIN_INSTALL_RDMA_STATE.get("process")
-    if rdma_proc and rdma_proc.poll() is None:
-        return jsonify({
-            "error": (
-                "RDMA install is in progress; both install paths "
-                "contend on the dpkg lock. Wait for RDMA to "
-                "finish, then retry."
-            ),
-            "rdma_log_path": _ADMIN_INSTALL_RDMA_STATE.get("log_path"),
-        }), 409
+        # v0.5.71 (audit M3): mutual exclusion with install_rdma.
+        # Both invoke apt-get install which contends on dpkg lock;
+        # parallel runs block each other for minutes and the
+        # progress UI looks frozen. Now inside the same lock so
+        # the check is coherent with the RDMA spawn site (also
+        # gated by _ADMIN_INSTALL_LOCK in v0.5.93+).
+        rdma_proc = _ADMIN_INSTALL_RDMA_STATE.get("process")
+        if rdma_proc and rdma_proc.poll() is None:
+            return jsonify({
+                "error": (
+                    "RDMA install is in progress; both install paths "
+                    "contend on the dpkg lock. Wait for RDMA to "
+                    "finish, then retry."
+                ),
+                "rdma_log_path": _ADMIN_INSTALL_RDMA_STATE.get("log_path"),
+            }), 409
 
     # v0.5.71 (audit M5): prune /tmp install logs older than 7
     # days. Pre-fix one log file per install accumulated forever
@@ -22431,8 +22476,10 @@ def api_admin_install_dpdk():
         cmd = ["bash", script, "--auto"]
         systemd_run = _systemd_run_available()
         if systemd_run:
-            import time as _t
-            unit_name = f"netgen-install-dpdk-runner-{int(_t.time())}.service"
+            # v0.5.370 (audit systemd-run-unit-name-collision):
+            # entropy-rich suffix so a ?force=1 retry within the
+            # same second doesn't collide on the --collect'd unit.
+            unit_name = f"netgen-install-dpdk-runner-{_transient_unit_suffix()}.service"
             cmd = [
                 systemd_run,
                 "--wait",
@@ -22874,6 +22921,65 @@ def _systemd_run_available():
     return _SYSTEMD_RUN_PATH_DETECTED
 
 
+def _infer_upgrade_rc_from_log(log_path: str) -> Optional[int]:
+    """v0.5.370 (audit upgrade-wheel-legacy-detached-restart):
+    infer pip exit code from the log body when
+    `_systemd_unit_state(unit)` returns (False, None) — the case
+    where `systemd-run --collect` has already reaped the unit
+    and `ExecMainStatus` can't be retrieved.
+
+    Pre-fix: legacy-pip + `--no-block` + `--collect` path had
+    `systemd_unit` set → completion branch relied on
+    `_systemd_unit_state` for rc → post-reap that returns
+    (False, None) → rc stays None → the v0.5.368 restart-schedule
+    fires only when `return_code == 0`, so restart never happens
+    → same v0.5.368 lie re-emerges (running process holds stale
+    code even though pip on-disk is new). Operator on srv04 hit
+    this and had to manually restart via the chassis window.
+
+    Signals we look for, in order:
+      * pip success  → "Successfully installed ostg-trafficgen-…"
+      * netgen-upgrade success (tarball path)
+                     → "[upgrade] verify: ok"
+      * pip error    → "ERROR:" / "error: externally-managed-…"
+
+    Returns 0 on success, 1 on explicit failure, None when the
+    log doesn't yet contain a definitive signal (still installing,
+    or ambiguous)."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            _size = f.tell()
+            # Look at last 64 KiB — pip's success line is near the
+            # end and this bounds the read.
+            f.seek(max(0, _size - 64 * 1024))
+            _tail = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    if "Successfully installed ostg-trafficgen" in _tail or \
+       "Successfully installed ostg_trafficgen" in _tail or \
+       "[upgrade] verify: ok" in _tail:
+        return 0
+    if "ERROR: " in _tail or "error: externally-managed-environment" in _tail:
+        return 1
+    return None
+
+
+def _transient_unit_suffix() -> str:
+    """v0.5.370 (audit systemd-run-unit-name-collision): entropy
+    for transient unit names. Pre-fix all three call sites used
+    `int(time.time())` — 1-second resolution. Rapid retry within
+    the same second (e.g. `?force=1` then re-POST) collides on
+    the `--collect`'d unit name and `systemd-run` refuses with
+    "unit already exists" → entire install/upgrade dies at spawn.
+    Combines monotonic-ns (unique per process, monotonic) with
+    a 6-char uuid4 tail (unique across restarts) for a bounded
+    ~50-char suffix that never collides in practice."""
+    import time as _t
+    import uuid as _uuid
+    return f"{_t.monotonic_ns()}-{_uuid.uuid4().hex[:6]}"
+
+
 def _systemd_unit_state(unit: str):
     """Return (running: bool, return_code: Optional[int]) for a
     transient unit. `running` is True while is-active reports
@@ -23035,8 +23141,9 @@ def api_admin_install_rdma():
         cmd = ["bash", script, "--auto"]
         systemd_run = _systemd_run_available()
         if systemd_run:
-            import time as _t
-            unit_name = f"netgen-install-rdma-runner-{int(_t.time())}.service"
+            # v0.5.370 (audit systemd-run-unit-name-collision):
+            # entropy-rich suffix — see _transient_unit_suffix.
+            unit_name = f"netgen-install-rdma-runner-{_transient_unit_suffix()}.service"
             cmd = [
                 systemd_run,
                 "--wait",
@@ -23318,9 +23425,10 @@ def api_admin_upgrade_wheel():
     systemd_unit = None
     systemd_run = _systemd_run_available()
     if systemd_run:
-        import time as _t
-        ts = int(_t.time())
-        systemd_unit = f"netgen-upgrade-runner-{ts}.service"
+        # v0.5.370 (audit systemd-run-unit-name-collision): entropy-
+        # rich suffix so rapid re-upload within the same second
+        # doesn't collide on --collect'd unit.
+        systemd_unit = f"netgen-upgrade-runner-{_transient_unit_suffix()}.service"
         cmd = [
             systemd_run,
             "--no-block",
@@ -23399,9 +23507,18 @@ def api_admin_upgrade_wheel():
 
 
 @app.route("/api/admin/upgrade_wheel/log", methods=["GET"])
-@require_role("viewer")  # v0.5.92 (audit H1): leaks wheel paths +
-# pip output. Restart-trigger logic stays admin-only via internal
-# guards.
+# v0.5.370 (audit upgrade-wheel-log-viewer-role-elevation): pre-fix
+# this GET was `@require_role("viewer")` because the response body
+# leaks wheel paths / pip output that a viewer role documented for
+# observability could see. But the SAME handler ALSO schedules a
+# `systemctl restart netgen-server` when it detects pip
+# completion (v0.5.368 legacy-path fix). Viewer role → viewer can
+# trigger a service restart just by polling the log. Bump to
+# operator; viewer's read-only observability is best served by
+# /api/health which we now also emit `running_version` +
+# `restart_pending` on (v0.5.370 B8) so they can tell whether an
+# upgrade landed without needing the pip log at all.
+@require_role("operator")
 def api_admin_upgrade_wheel_log():
     """Tail the upgrade log + report status. Triggers restart when pip done."""
     log_path = _ADMIN_UPGRADE_STATE.get("log_path")
@@ -23417,6 +23534,19 @@ def api_admin_upgrade_wheel_log():
     proc = _ADMIN_UPGRADE_STATE.get("process")
     if systemd_unit:
         running, return_code = _systemd_unit_state(systemd_unit)
+        # v0.5.370 (audit upgrade-wheel-legacy-detached-restart):
+        # `systemd-run --no-block --collect` reaps the unit as
+        # soon as it exits, so ExecMainStatus is gone by the
+        # time we poll — `_systemd_unit_state` returns
+        # (False, None). Pre-fix the v0.5.368 restart branch then
+        # never fired (`return_code == 0` was False on None),
+        # and the legacy+detached path reproduced the exact
+        # v0.5.368 lie. Fall back to a log-body inspection —
+        # pip's "Successfully installed" line is definitive.
+        if not running and return_code is None:
+            _log_rc = _infer_upgrade_rc_from_log(log_path)
+            if _log_rc is not None:
+                return_code = _log_rc
     else:
         running = bool(proc and proc.poll() is None)
         return_code = None
@@ -24601,7 +24731,14 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           $('btn-install-rdma').disabled = false;
           // Refresh admin state so the RDMA card + button visibility
           // update to reflect the new module state.
-          if (typeof loadHealth === 'function') loadHealth();
+          // v0.5.370 (audit rdma-card-no-refresh-after-install):
+          // v0.5.367 called `loadHealth()` which does not exist;
+          // the actual function is `refreshHealth`. The typeof
+          // guard swallowed the ReferenceError, so the RDMA card
+          // silently stayed stale after Install completed — the
+          // "3/5 modules loaded" state didn't update to "5/5"
+          // until the operator hit Cmd+R.
+          if (typeof refreshHealth === 'function') refreshHealth();
         }
       } catch (e) {
         _stopRdmaPoll();
@@ -28456,6 +28593,12 @@ def interface_admin(iface):
 
 
 @app.route("/api/system/restart_service", methods=["POST"])
+@require_role("admin")  # v0.5.370 (audit system-endpoints-no-role-
+# gate): pre-fix any authenticated caller (viewer role even) could
+# restart the netgen-server unit. Global auth middleware requires
+# some token via NETGEN_AUTH_TOKENS_JSON but not a specific role.
+# `sudo systemctl restart` is not a viewer-tier action; gate to
+# admin (same tier that owns /api/admin/upgrade_wheel).
 def system_restart_service():
     """Restart the netgen-server systemd unit (or legacy ostg-server).
 
@@ -28524,6 +28667,10 @@ def system_restart_service():
 
 
 @app.route("/api/system/reboot", methods=["POST"])
+@require_role("admin")  # v0.5.370 (audit system-endpoints-no-role-
+# gate): pre-fix any authenticated caller could reboot the host.
+# Same rationale as /api/system/restart_service — physical reboot
+# is admin-tier, not viewer.
 def system_reboot():
     """Schedule a physical reboot of the host this server runs on.
 

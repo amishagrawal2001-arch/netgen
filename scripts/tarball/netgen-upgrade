@@ -304,14 +304,36 @@ def _rebuild_tx_worker(install_root: Path, venv_py: Path) -> None:
     # Build deps check — if libdpdk-dev / meson / ninja isn't
     # there, skip with a clear message rather than erroring out
     # the upgrade.
+    #
+    # v0.5.370 (audit netgen-upgrade-which-false-positive):
+    # pre-fix used `subprocess.run(["which", tool])`, but the
+    # `which` binary is not guaranteed on minimal Ubuntu images
+    # (it's from the `debianutils` package but stripped from
+    # some cloud/container images). When `/usr/bin/which` is
+    # missing, subprocess.run raises FileNotFoundError, but the
+    # code caught nothing — it fell into "returncode != 0" via
+    # exception, wrongly flagging meson/ninja/pkg-config as
+    # missing → skips tx_worker rebuild → operator gets stale
+    # binary reproducing exactly the v0.5.102 bug this rebuild
+    # was designed to prevent. Fix: use `shutil.which()` which
+    # is pure Python, always available, and returns None on
+    # missing rather than raising.
+    import shutil
     missing = []
     for tool in ("meson", "ninja"):
-        if subprocess.run(["which", tool], capture_output=True).returncode != 0:
+        if shutil.which(tool) is None:
             missing.append(tool)
-    if subprocess.run(
-        ["pkg-config", "--exists", "libdpdk"],
-        capture_output=True,
-    ).returncode != 0:
+    try:
+        _pkgcfg_rc = subprocess.run(
+            ["pkg-config", "--exists", "libdpdk"],
+            capture_output=True,
+        ).returncode
+    except FileNotFoundError:
+        # pkg-config itself missing — same failure mode as above,
+        # explicit catch instead of implicit.
+        _pkgcfg_rc = 1
+        missing.append("pkg-config (binary)")
+    if _pkgcfg_rc != 0 and "pkg-config (binary)" not in missing:
         missing.append("libdpdk-dev (pkg-config)")
     if missing:
         logger.warning(

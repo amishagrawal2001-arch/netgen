@@ -2,6 +2,143 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.370] - 2026-09-20
+
+**8-bug bundle from install-codebase + admin-console audit
+(triaged from ~47 audit findings).** Two SEC + six correctness.
+Ships after v0.5.369 (install_rdma tolerance). Feature/coverage-
+gap findings from the same audit are deferred to v0.5.371+ where
+they'll each get proper scoping — this bundle stays bug-only.
+
+### Fixes
+
+- **B1** — `_pollRdmaLog()` completion branch called `loadHealth()`
+  which doesn't exist (real name is `refreshHealth`). Guarded by
+  `typeof … === 'function'` so no ReferenceError, but the RDMA
+  card never refreshed after Install completed — operator had to
+  Cmd+R to see whether modules loaded. Silent v0.5.367 regression.
+  Marker: `v0.5.370 (audit rdma-card-no-refresh-after-install)`.
+
+- **B2 SEC** — `/api/system/restart_service` and
+  `/api/system/reboot` gain `@require_role("admin")`. Pre-fix the
+  global auth middleware gated on token presence via
+  `NETGEN_AUTH_TOKENS_JSON` but no role — any authenticated caller
+  (viewer role even) could restart the service or reboot the host.
+  Marker: `v0.5.370 (audit system-endpoints-no-role-gate)`.
+
+- **B3** — `api_admin_install_dpdk` hoists early check + force-kill
+  + RDMA mutex check into `_ADMIN_INSTALL_LOCK`. RDMA got this
+  fix in v0.5.93 (audit H3); DPDK parity was never applied — two
+  concurrent POSTs could both pass the early check and both walk
+  to the spawn. Now single-locked pre-flight, matching RDMA shape.
+  Marker: `v0.5.370 (audit dpdk-install-toctou-parity)`.
+
+- **B4** — new `_transient_unit_suffix()` helper returns
+  `monotonic_ns() + uuid4().hex[:6]`. Replaced `int(time.time())`
+  (1-second resolution) across 4 systemd-run unit-name sites
+  (hugetlbfs mount, modprobe, install_dpdk, install_rdma,
+  upgrade_wheel). Rapid retry within the same second used to
+  collide on the `--collect`'d unit name → `systemd-run` refused
+  with "unit exists" → entire install/upgrade died at spawn.
+  Marker: `v0.5.370 (audit systemd-run-unit-name-collision)`.
+
+- **B5** — new `_infer_upgrade_rc_from_log(log_path)` helper reads
+  the log tail for pip's `Successfully installed` line (and
+  netgen-upgrade's `[upgrade] verify: ok` marker). Wired into
+  `api_admin_upgrade_wheel_log` as fallback when
+  `_systemd_unit_state` returns `(False, None)` because
+  `systemd-run --no-block --collect` has reaped the unit and
+  `ExecMainStatus` is gone. Pre-fix v0.5.368's restart-schedule
+  branch never fired on the `legacy:system-pip+detached` combo →
+  same v0.5.368 lie re-emerged there. Confirms the srv04 workflow
+  where operator had to manually restart via the chassis window.
+  Marker: `v0.5.370 (audit upgrade-wheel-legacy-detached-restart)`.
+
+- **B6** — `netgen-upgrade` tx_worker build-dep check swapped
+  `subprocess.run(["which", tool])` for `shutil.which(tool)`. The
+  `which` binary isn't guaranteed on minimal Ubuntu images —
+  when it's missing, `subprocess.run` raised `FileNotFoundError`
+  → uncaught → false-positive as "meson missing" → tx_worker
+  rebuild skipped → operator got stale binary reproducing the
+  v0.5.102 bug this rebuild was designed to prevent. pkg-config
+  path also gained explicit `FileNotFoundError` catch. Synced
+  across both copies (`resources/tarball/netgen-upgrade` +
+  `scripts/tarball/netgen-upgrade` — v0.5.49 byte-identical
+  invariant preserved).
+  Marker: `v0.5.370 (audit netgen-upgrade-which-false-positive)`.
+
+- **B7 SEC** — `/api/admin/upgrade_wheel/log` bumped from
+  `@require_role("viewer")` to `@require_role("operator")`. Same
+  handler ALSO schedules `systemctl restart netgen-server` when
+  it detects pip completion (v0.5.368 fix) → viewer role → viewer
+  polling could trigger a service restart. Viewer's read-only
+  observability now flows through `/api/health` (which B8 gives
+  proper `running_version` + `restart_pending` fields).
+  Marker: `v0.5.370 (audit upgrade-wheel-log-viewer-role-elevation)`.
+
+- **B8** — `/api/health` now returns three version fields:
+  `netgen_version` (on-disk via importlib.metadata; back-compat),
+  `running_version` (frozen at module load via new
+  `_STARTUP_NETGEN_VERSION` constant), and `restart_pending`
+  (`netgen_version != _STARTUP_NETGEN_VERSION`). Same class of
+  drift-lie as v0.5.368 fixed for upgrade completion — but here
+  `/api/health` is the general-purpose probe that the desktop
+  client's "upgrade verified" heuristic keys off. Now clients
+  can detect "pip finished, restart pending" without needing to
+  parse the upgrade log.
+  Marker: `v0.5.370 (audit health-version-drift-lie)`.
+
+### Tests
+
+`tests/test_v05370_bug_bundle.py` — 30 tests, all pass:
+
+- AST-parse both files
+- B1: `loadHealth()` gone from non-comment code, `refreshHealth()` present
+- B2: both endpoints have `@require_role("admin")`
+- B3: force-kill + RDMA mutex check appear AFTER `with _ADMIN_INSTALL_LOCK:`
+- B4: `_transient_unit_suffix` helper exists w/ monotonic_ns + uuid4;
+  no bare `int(time())` in any unit-name f-string; every transient
+  unit uses the helper
+- B5: `_infer_upgrade_rc_from_log` helper exists, wired into
+  completion branch, gated on `return_code is None`
+- B6: no `subprocess.run(["which", ...])` in non-comment lines;
+  `shutil.which(tool)` present; `FileNotFoundError` catch around
+  pkg-config
+- B7: viewer role gone from the decorator (comment references OK)
+- B8: `_STARTUP_NETGEN_VERSION` at module scope (line < 500),
+  `/api/health` emits `running_version` + `restart_pending`,
+  `restart_pending` computed as version-diff not constant
+- Regression guards: v0.5.367 RDMA button click handler,
+  v0.5.368 upgrade-wheel-legacy-no-restart marker,
+  v0.5.369 install_rdma marker, v0.5.93 RDMA install TOCTOU fix
+
+### Verification
+
+- `bash -n` clean (no shell edits this ship)
+- Both Python files AST-parse
+- 30/30 v0.5.370 tests pass
+- Full sweep: 5409 passed / 48 failed (1 previous failure fixed:
+  v0549 byte-identical guard survived; 47 unrelated pre-existing
+  failures unchanged)
+
+### Deferred to v0.5.371+
+
+Coverage-gap / feature findings from the same audit — need
+scoping, not bundled with SEC + correctness:
+
+- Admin console UI wire-up for existing endpoints (Upgrade Wheel,
+  Restart, Cache Flush, Journal, LLDP Raw, Orphan Cleanup)
+- Missing cards: running streams, FRR container, device chassis,
+  BGP/OSPF/ISIS peers, DHCP leases
+- `install_dpdk.sh` "must never fail" parity with v0.5.369 RDMA
+  (no `--fix-missing`, `exit 1` on meson fail, `git clone` no
+  retry, hugepages sysfs unguarded)
+- `netgen-upgrade` `_rebuild_tx/rx_worker` timeouts
+- `netgen-install` atomic unit-file write
+- `setup_docker.py` `pkg_resources` deprecation
+- Log stream UX (timestamps, download, dedupe DPDK/RDMA `<pre>`)
+- Admin role indicator chrome
+
 ## [0.5.369] - 2026-09-20
 
 **`install_rdma.sh`: MUST NOT fail for any reason.** Operator
