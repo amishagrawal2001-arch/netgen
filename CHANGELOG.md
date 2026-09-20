@@ -2,6 +2,161 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.371] - 2026-09-20
+
+**`install_dpdk.sh` "must never fail" parity with v0.5.369 RDMA.**
+Same operator bar: script exits cleanly regardless of what the
+external environment throws at it (stale apt repos, broken GPG
+keys, DNS blips to dpdk.org, memory pressure at hugepages, sysfs
+perms under a stricter systemd unit), and the log stream reports
+exactly what worked and what didn't via a structured status
+array. The trap on Ctrl-C emits the same status so an
+interrupted install is diagnosable without SSH-diving into
+`/tmp/dpdk_deps_install.log`.
+
+### Fixes (all carry marker `v0.5.371 (audit install-dpdk-must-not-fail)`)
+
+- **Apt install tolerance** — `deps_install_cmd` gains
+  `--fix-missing` so a single 404 on a stale external repo can't
+  abort the whole batch. On failure, per-package retry loop over
+  the true essentials (`build-essential`, `meson`, `ninja-build`,
+  `pkg-config`, `libnuma-dev`, `libelf-dev`, `libpcap-dev`,
+  `python3-pyelftools`) with `--no-install-recommends`. Post-check
+  via `dpkg-query -W -f='${Status}\n'` on each essential; if any
+  is missing, `deps_ready=degraded` and the summary banner names
+  the shortfall — but the script keeps going.
+
+- **Broken-repo detection** — parses the earlier `apt-get update`
+  output for `NO_PUBKEY`, `404 Not Found`, `no longer signed` and
+  surfaces the offending line + recovery hint (`mv <file>.list
+  <file>.list.disabled`). Same shape as install_rdma.sh v0.5.369.
+
+- **Optional AF_XDP deps** — wrapped in `set +e` so a missing
+  `libxdp-dev` / `libbpf-dev` on a host with `universe` disabled
+  can't abort the script.
+
+- **pyelftools hard-gate softened** — v0.5.30 exited 1 when the
+  Python `elftools` module was still missing after apt-install.
+  Now flips `deps_ready=degraded` and lets Step 5 report the
+  actual meson error in context (matches the "no infra abort"
+  rule).
+
+- **git binary auto-install** — pre-fix Step 3 exited 1 if `git`
+  wasn't on PATH; audit found `git` was neither in
+  `_NETGEN_HOST_DEPS` nor apt-installed by any earlier bootstrap.
+  Now we try `apt-get install -y --fix-missing git` before
+  failing.
+
+- **git clone retry + shallow + mirror fallback** — three
+  attempts in sequence:
+  1. `git clone https://dpdk.org/git/dpdk` (canonical, full)
+  2. `git clone --depth 1 --branch v23.11 https://dpdk.org/git/dpdk`
+     (shallow when full clone times out)
+  3. `git clone --depth 1 --branch v23.11 https://github.com/DPDK/dpdk.git`
+     (GitHub mirror if dpdk.org firewalled)
+  5s sleep between attempts. On persistent failure, log a clear
+  "pre-stage the source manually via tarball" recovery hint and
+  `source_ready=blocked`.
+
+- **Step 5 build exits downgraded** — the four `exit 1` sites
+  (meson setup, meson reconfigure `--wipe`, ninja compile, ninja
+  install) become `return 1 + dpdk_built=<state>`. Return codes
+  are captured explicitly under `set +e` so `pipefail` doesn't
+  short-circuit the whole script; specific failure hints emit
+  (OOM, missing PMD, unwritable install target).
+
+- **Step 6 tx_worker exits downgraded** — three `exit 1` sites
+  (missing DPDK libs, missing binary, failed rebuild) become
+  `return 1 + tx_worker_built=<state>` matching the RDMA pattern.
+
+- **Hugepages sysfs guard** — `echo "$pages" > /sys/.../nr_hugepages`
+  wrapped in `set +e`; rc + partial-allocation state reported
+  (`ok` / `partial` / `failed`). Under memory pressure the kernel
+  can allocate fewer than requested — pre-fix the script just
+  reported the shortfall in a warning and moved on with a
+  misleading "success" banner; post-fix `hugepages_configured`
+  flips to `partial` and the summary reports both requested and
+  actual.
+
+- **IOMMU grep comment-aware** — pre-fix the GRUB idempotency
+  check matched a commented example line like
+  `#GRUB_CMDLINE_LINUX_DEFAULT="... intel_iommu=on"` (Ubuntu
+  default in some /etc/default/grub versions). Script flagged
+  "already configured" + reboot-required → IOMMU never actually
+  turned on. Post-fix filters `grep -v '^\s*#'` before the
+  `GRUB_CMDLINE_LINUX` regex.
+
+- **SIGINT/SIGTERM trap** — new `_netgen_dpdk_trap()` that
+  iterates `NETGEN_DPDK_STATUS` on interrupt and emits the state
+  of every step. Ctrl-C mid-Step-5 now leaves the operator with
+  a clear "install did NOT complete — status so far: …" banner
+  and a "re-run to resume" hint, not silence.
+
+- **Status array + summary banner** — new module-level
+  `NETGEN_DPDK_STATUS` array tracks each step's outcome
+  (`source_ready`, `deps_ready`, `dpdk_built`, `tx_worker_built`,
+  `rx_worker_built`, `hugepages_configured`, `iommu_configured`,
+  `vfio_ready`) as `ok`, `degraded`, `blocked`, `failed`,
+  `partial`, `pending_reboot`, `unknown`. `step_summary` iterates
+  and colors each with success/info/warning coloring, then
+  computes `_overall_ok` to decide whether the final banner says
+  "completed successfully" or "completed with warnings — see
+  summary". Pre-fix step_summary hardcoded a "success" line
+  regardless.
+
+### Remaining bare exits (structural pre-flight + user consent only)
+
+After this ship the only `exit N` statements in install_dpdk.sh
+that aren't in comments are:
+
+- root check (`exit 1` — can't install without root)
+- apt-based distro check (`exit 1` — script is Debian/Ubuntu-only)
+- three user-consent "Continue anyway? no" branches inside
+  interactive prompts (low disk space, cannot clone, missing
+  deps) — operator explicit consent, keep
+- unknown CLI arg (`exit 1` — structural)
+- `--help` (`exit 0` — expected)
+
+Everything past those either completes or warns — **never aborts
+on external-environment failures**.
+
+### Tests
+
+`tests/test_v05371_install_dpdk_must_not_fail.py` — 24 tests, all pass:
+
+- Bash syntax valid
+- `v0.5.371 (audit install-dpdk-must-not-fail)` marker on ≥8 sites
+- No `exit N` in `step_build_dpdk` / `step_build_tx_worker` /
+  `step_clone_dpdk` outside comments
+- 6–10 bare exits total (bounded so a future edit can't smuggle
+  in a new infra-failure exit)
+- `deps_install_cmd` includes `--fix-missing`
+- Per-package retry loop covers all 7 essentials
+- `dpkg-query` post-check with both `deps_ready=ok` and
+  `deps_ready=degraded` branches
+- pyelftools hard-gate has no exit
+- git clone has `_clone_attempts` array with `--depth 1` and
+  GitHub mirror
+- git binary auto-installed via apt if missing
+- Hugepages sysfs write wrapped in `set +e ... set -e`
+- Hugepages verify branches on ok/partial/failed
+- IOMMU grep filters comment lines via `grep -v '^\s*#'`
+- INT + TERM traps installed pointing at `_netgen_dpdk_trap`
+- Trap iterates `NETGEN_DPDK_STATUS`
+- `step_summary` iterates status array with `_overall_ok`
+- Status array covers all 6 key steps
+- Regression guards: v0.5.55 apt log, v0.5.30 pyelftools probe,
+  v0.5.51 reboot marker, v0.5.369 install_rdma marker
+
+### Verification
+
+- `bash -n resources/dpdk/install_dpdk.sh` → clean
+- 98/98 install-related tests pass across 6 files (v0.5.371 +
+  regression guards for v0.5.369 / v0.5.370 / v0.5.55 / v0.5.28 /
+  v0.5.49)
+- srv06 verification: pending operator click on **Install DPDK**
+  after upgrade
+
 ## [0.5.370] - 2026-09-20
 
 **8-bug bundle from install-codebase + admin-console audit

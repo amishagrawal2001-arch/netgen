@@ -15,6 +15,63 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# v0.5.371 (audit install-dpdk-must-not-fail): summary + trap.
+# Mirror v0.5.369 install_rdma.sh's "script never dies mid-flight
+# without an operator-visible reason" bar.
+#
+# Each step increments the appropriate counter so the final banner
+# can report exactly what did and didn't succeed — the admin
+# console's DPDK card is the source of truth for runtime state
+# (bound BDFs, hugepages, tx_worker), but the log stream is where
+# operators go when a Step failed and they need "why".
+NETGEN_DPDK_STATUS=(
+    "source_ready=unknown"
+    "deps_ready=unknown"
+    "dpdk_built=unknown"
+    "tx_worker_built=unknown"
+    "rx_worker_built=unknown"
+    "hugepages_configured=unknown"
+    "iommu_configured=unknown"
+    "vfio_ready=unknown"
+)
+_netgen_dpdk_set() {
+    local key="$1" val="$2"
+    local i
+    for i in "${!NETGEN_DPDK_STATUS[@]}"; do
+        if [[ "${NETGEN_DPDK_STATUS[$i]}" == "${key}="* ]]; then
+            NETGEN_DPDK_STATUS[$i]="${key}=${val}"
+            return
+        fi
+    done
+}
+
+# v0.5.371 (audit install-dpdk-must-not-fail): SIGINT / SIGTERM /
+# unexpected-exit trap. Pre-fix Ctrl-C mid-Step-5 left the operator
+# with a half-populated /opt/dpdk-build/build/, cached apt state,
+# a stale /tmp/dpdk_deps_install.log — and NO summary line telling
+# them "the install was interrupted at Step 5 of 8; run the script
+# again to resume, or `rm -rf /opt/dpdk-build` for a fresh start".
+# Now the trap always emits a status line the log stream can grep.
+_netgen_dpdk_trap() {
+    local rc=$?
+    local sig="${1:-EXIT}"
+    if [[ "$sig" != "EXIT" ]]; then
+        echo ""
+        log_warning "════════════════════════════════════════════════════════════"
+        log_warning "  install_dpdk.sh received $sig (rc=$rc)"
+        log_warning "  Install did NOT complete. Status so far:"
+        for kv in "${NETGEN_DPDK_STATUS[@]}"; do
+            log_warning "    $kv"
+        done
+        log_warning "  Recovery: re-run the script — completed steps are"
+        log_warning "  idempotent; interrupted steps will resume."
+        log_warning "  Full apt log: /tmp/dpdk_deps_install.log"
+        log_warning "════════════════════════════════════════════════════════════"
+    fi
+}
+trap '_netgen_dpdk_trap INT'  INT
+trap '_netgen_dpdk_trap TERM' TERM
+
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -359,9 +416,30 @@ step_clone_dpdk() {
 
     log_info "Cloning DPDK to: $DPDK_DIR"
 
+    # v0.5.371 (audit install-dpdk-must-not-fail): git binary is
+    # needed for the DPDK source clone but the audit found it's
+    # neither in _NETGEN_HOST_DEPS nor apt-installed by any earlier
+    # step. On a fresh Ubuntu 24.04 minimal image, this is a hard
+    # abort at Step 3 with no recovery hint. Auto-install it (best
+    # effort — apt has already been used above; if it fails now,
+    # fall back to a clear log_warning + set source_ready=blocked).
     if ! command -v git >/dev/null 2>&1; then
-        log_error "git not found. Please install git or provide DPDK source manually"
-        exit 1
+        log_warning "git not found on PATH — attempting auto-install..."
+        set +e
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            -o APT::Sandbox::User=root --fix-missing git 2>&1 | \
+                tee -a /tmp/dpdk_deps_install.log
+        _git_rc=${PIPESTATUS[0]}
+        set -e
+        if [[ $_git_rc -ne 0 ]] || ! command -v git >/dev/null 2>&1; then
+            log_error "Could not install git (rc=$_git_rc)."
+            log_error "Recovery:"
+            log_error "  sudo apt-get install -y git"
+            log_error "Then re-run this script."
+            _netgen_dpdk_set source_ready blocked
+            return 1
+        fi
+        log_success "git installed."
     fi
 
     # Make sure the parent dir exists before we cd into it. Default
@@ -374,14 +452,18 @@ step_clone_dpdk() {
     if [[ ! -d "$target_dir" ]]; then
         log_info "Parent directory $target_dir doesn't exist — creating it"
         if ! mkdir -p "$target_dir"; then
+            # v0.5.371: soften exit → warn + return so the summary
+            # banner reports "source_ready=blocked" with the reason.
             log_error "Failed to create $target_dir (permission denied?)"
-            exit 1
+            _netgen_dpdk_set source_ready blocked
+            return 1
         fi
     fi
 
     cd "$target_dir" || {
         log_error "cd $target_dir failed after mkdir — filesystem issue"
-        exit 1
+        _netgen_dpdk_set source_ready blocked
+        return 1
     }
 
     # If a partial clone is already there (previous attempt that died
@@ -400,27 +482,67 @@ step_clone_dpdk() {
         fi
     fi
 
-    git clone https://dpdk.org/git/dpdk "$dpdk_name" || {
-        log_error "Failed to clone DPDK from https://dpdk.org/git/dpdk"
-        log_error "If your lab firewalls dpdk.org, pre-stage the source manually:"
-        log_error "  git clone -b v23.11 --depth 1 https://dpdk.org/git/dpdk $DPDK_DIR"
-        log_error "Or set DPDK_DIR=/path/to/existing/dpdk before running this script."
-        exit 1
-    }
+    # v0.5.371 (audit install-dpdk-must-not-fail): retry the clone
+    # with backoff + shallow. Pre-fix any DNS blip / firewall
+    # transient / dpdk.org timeout blew away the whole install with
+    # no retry. Now we try 3 times (full clone → shallow → shallow-
+    # to-mirror) before surfacing the failure. Even then, downgrade
+    # `exit 1` to `return 1` + summary-status so the trap can
+    # explain what's missing.
+    local _clone_ok=0
+    local _clone_attempts=(
+        "git clone https://dpdk.org/git/dpdk $dpdk_name"
+        "git clone --depth 1 --branch v23.11 https://dpdk.org/git/dpdk $dpdk_name"
+        "git clone --depth 1 --branch v23.11 https://github.com/DPDK/dpdk.git $dpdk_name"
+    )
+    for _try in "${_clone_attempts[@]}"; do
+        log_info "clone: $_try"
+        set +e
+        eval "$_try"
+        _clone_rc=$?
+        set -e
+        if [[ $_clone_rc -eq 0 ]] && [[ -d "$dpdk_name/.git" ]]; then
+            _clone_ok=1
+            break
+        fi
+        log_warning "clone attempt failed (rc=$_clone_rc); retrying after 5s"
+        rm -rf "$dpdk_name" 2>/dev/null || true
+        sleep 5
+    done
+
+    if [[ $_clone_ok -ne 1 ]]; then
+        log_error "All DPDK clone attempts failed."
+        log_error "If your lab firewalls dpdk.org AND github.com, pre-stage the source:"
+        log_error "  1) Download DPDK 23.11 tarball on a network-reachable host:"
+        log_error "     curl -L -o dpdk-23.11.tar.xz https://fast.dpdk.org/rel/dpdk-23.11.tar.xz"
+        log_error "  2) scp to this host, extract into $DPDK_DIR"
+        log_error "  3) Set DPDK_DIR=$DPDK_DIR and re-run this script"
+        _netgen_dpdk_set source_ready blocked
+        return 1
+    fi
+
     cd "$dpdk_name"
-    git checkout v23.11 || git checkout main
+    # v0.5.371: only need checkout if the first clone (full, no
+    # branch) worked — the shallow clones already targeted v23.11.
+    set +e
+    git checkout v23.11 2>/dev/null || git checkout main 2>/dev/null
+    set -e
 
     # v0.3.2: fail-early sanity check on the clone. Pre-v0.3.2 a
     # corrupted clone (no meson.build) only surfaced ~60 s later
     # during the build step as a cryptic meson error. Confirm the
-    # tree looks like a DPDK source checkout RIGHT NOW so the
-    # operator gets an actionable message at the source step.
+    # tree looks like a DPDK source checkout RIGHT NOW.
+    #
+    # v0.5.371: downgrade exit 1 → return 1 + source_ready=blocked.
+    # The trap will surface the reason.
     if [[ ! -f meson.build ]] || [[ ! -d lib ]]; then
         log_error "DPDK source tree looks incomplete (missing meson.build or lib/)"
         log_error "The git clone may have been interrupted. Delete $DPDK_DIR and re-run."
-        exit 1
+        _netgen_dpdk_set source_ready blocked
+        return 1
     fi
     log_success "DPDK cloned successfully"
+    _netgen_dpdk_set source_ready ok
 }
 
 # Check if DPDK dependencies are installed
@@ -670,10 +792,32 @@ step_install_dependencies() {
     # blew away the whole install even though 99% of the packages
     # were fetchable. Operator hit this on san-ft-ai-srv01
     # 2026-07-19 (Ubuntu 22.04.5, universe not fully populated).
+    # v0.5.371 (audit install-dpdk-must-not-fail): mirror the
+    # install_rdma.sh v0.5.369 shape — add --fix-missing to the
+    # main install so a single 404 on a stale external repo can't
+    # abort the whole batch. Follow with a per-package retry on
+    # essentials + dpkg-query post-check. Broken-repo detection
+    # in the update log surfaces GPG / 404 / "no longer signed"
+    # so the operator knows which .list to disable.
     local apt_common="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Sandbox::User=root --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30"
     local deps_required="build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev python3-pyelftools libssl-dev libjansson-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev lldpd ${kernel_headers}"
     local deps_optional="libbpf-dev libxdp-dev"   # AF_XDP PMD
-    local deps_install_cmd="$apt_common $deps_required"
+    local deps_install_cmd="$apt_common --fix-missing $deps_required"
+
+    # v0.5.371: surface broken external repos before the install
+    # batch runs — same pattern as install_rdma.sh v0.5.369.
+    if [[ -f /tmp/dpdk_apt_update.log ]] && \
+           grep -qE 'NO_PUBKEY|no longer signed|404 +Not Found' /tmp/dpdk_apt_update.log 2>/dev/null; then
+        log_warning "Detected broken external apt repo(s):"
+        grep -E 'NO_PUBKEY|no longer signed|404 +Not Found' /tmp/dpdk_apt_update.log 2>/dev/null | \
+            head -5 | sed 's/^/  /' | while IFS= read -r _line; do
+                log_warning "$_line"
+            done
+        log_warning "Install will proceed with --fix-missing so 404 fetches are skipped."
+        log_warning "To silence, disable the offending repo:"
+        log_warning "  grep -rl <domain> /etc/apt/sources.list.d/"
+        log_warning "  sudo mv <file>.list <file>.list.disabled"
+    fi
 
     # v0.3.2: tighten umask around the temp-log tee so the file is
     # 0600 (owner-only) instead of the default 0644 (world-readable).
@@ -681,41 +825,85 @@ step_install_dependencies() {
     # to leak package names + error fragments to every user on the
     # host. The (subshell) keeps the umask change scoped — outer
     # process umask is untouched after the block exits.
-    # Try to install REQUIRED dependencies
-    if (umask 077 && eval "$deps_install_cmd" 2>&1 | tee /tmp/dpdk_deps_install.log); then
-        log_success "Required dependencies installed successfully"
+    #
+    # v0.5.371: wrap in `set +e ... set -e` so a non-zero return
+    # doesn't abort the script under `pipefail`, then handle the
+    # failure explicitly.
+    set +e
+    (umask 077 && eval "$deps_install_cmd" 2>&1 | tee /tmp/dpdk_deps_install.log)
+    _deps_rc=${PIPESTATUS[0]}
+    set -e
 
-        # v0.5.192: try the optional AF_XDP set separately, don't fail
-        # the whole install if it can't be found.
-        log_info "Installing optional AF_XDP deps ($deps_optional)..."
-        if (umask 077 && eval "$apt_common $deps_optional" 2>&1 | tee -a /tmp/dpdk_deps_install.log); then
-            log_success "Optional AF_XDP deps installed"
-        else
-            log_warning "Optional AF_XDP deps unavailable — AF_XDP PMD will be missing but DPDK builds fine without it."
-            log_warning "If AF_XDP is needed, enable Ubuntu 'universe' repo:"
-            log_warning "  sudo add-apt-repository universe && sudo apt-get update"
-        fi
+    if [[ $_deps_rc -eq 0 ]]; then
+        log_success "Required dependencies installed successfully"
     else
-        # Check if it's just unrelated package issues (like NVIDIA drivers)
-        if grep -q "nvidia\|unmet dependencies" /tmp/dpdk_deps_install.log 2>/dev/null; then
-            log_warning "Installation reported errors (possibly unrelated package issues)"
-            log_info "Checking if DPDK dependencies are actually installed..."
-            
-            if check_dpdk_dependencies; then
-                log_success "DPDK dependencies are installed (ignoring unrelated package errors)"
-                log_info "You may want to fix NVIDIA driver issues separately: apt --fix-broken install"
+        # v0.5.371: per-package retry loop for the essentials.
+        # Isolates any single bad .deb (stale external repo,
+        # broken sig, 404) so it can't block the rest. Followed
+        # by dpkg-query post-check on the true essentials — those
+        # are what determine whether Step 5 build can proceed.
+        log_warning "Batched deps install returned rc=$_deps_rc — retrying essentials individually"
+        for pkg in build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev python3-pyelftools; do
+            set +e
+            eval "$apt_common --fix-missing --no-install-recommends $pkg" 2>&1 | tee -a /tmp/dpdk_deps_install.log
+            _pkg_rc=${PIPESTATUS[0]}
+            set -e
+            if [[ $_pkg_rc -eq 0 ]]; then
+                log_success "$pkg installed (or already at latest)"
             else
-                log_error "DPDK dependencies are still missing"
-                if [[ $(prompt_yes_no "Continue anyway? (may fail during build)") != "y" ]]; then
-                    exit 1
-                fi
+                log_warning "$pkg install returned rc=$_pkg_rc (see /tmp/dpdk_deps_install.log)"
             fi
-        else
-            log_error "Dependency installation failed"
-            if [[ $(prompt_yes_no "Continue anyway?") != "y" ]]; then
-                exit 1
-            fi
+        done
+
+        # NVIDIA-unrelated-package detection (legacy signal kept
+        # for the ops log — some hosts really do have broken nvidia
+        # transactions holding the dpkg-lock queue).
+        if grep -q "nvidia\|unmet dependencies" /tmp/dpdk_deps_install.log 2>/dev/null; then
+            log_warning "Log shows nvidia / unmet-deps chatter — recovery:"
+            log_warning "  apt --fix-broken install"
         fi
+    fi
+
+    # v0.5.371: try the optional AF_XDP set separately. Always
+    # wrapped in set +e; missing on 'universe' is common on
+    # locked-down lab boxes and MUST not abort the script.
+    log_info "Installing optional AF_XDP deps ($deps_optional)..."
+    set +e
+    (umask 077 && eval "$apt_common --fix-missing $deps_optional" 2>&1 | tee -a /tmp/dpdk_deps_install.log)
+    _afxdp_rc=${PIPESTATUS[0]}
+    set -e
+    if [[ $_afxdp_rc -eq 0 ]]; then
+        log_success "Optional AF_XDP deps installed"
+    else
+        log_warning "Optional AF_XDP deps unavailable — AF_XDP PMD will be missing but DPDK builds fine without it."
+        log_warning "If AF_XDP is needed, enable Ubuntu 'universe' repo:"
+        log_warning "  sudo add-apt-repository universe && sudo apt-get update"
+    fi
+
+    # v0.5.371 (audit install-dpdk-must-not-fail): dpkg-query post-
+    # check on true essentials. If these are all present, Step 5
+    # build can proceed regardless of what else fell short. If ANY
+    # is missing, we set deps_ready=degraded and Step 5 will report
+    # the shortfall clearly — but the script keeps going, matching
+    # the RDMA v0.5.369 shape.
+    _deps_essential_missing=""
+    for pkg in build-essential meson ninja-build pkg-config libnuma-dev libelf-dev python3-pyelftools; do
+        if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | \
+                grep -q '^install ok installed'; then
+            _deps_essential_missing="${_deps_essential_missing}${pkg} "
+        fi
+    done
+    if [[ -z "$_deps_essential_missing" ]]; then
+        _netgen_dpdk_set deps_ready ok
+        log_success "All essential DPDK build deps installed."
+    else
+        _netgen_dpdk_set deps_ready degraded
+        log_warning "Essential deps missing after all fallbacks: ${_deps_essential_missing}"
+        log_warning "Step 5 build will likely fail. Broken external apt repo is the likely cause."
+        log_warning "Recovery:"
+        log_warning "  1) grep -rl <domain> /etc/apt/sources.list.d/"
+        log_warning "  2) sudo mv <file>.list <file>.list.disabled"
+        log_warning "  3) sudo apt-get update && re-run this script"
     fi
 
     # v0.5.30: HARD GATE on python3-pyelftools.
@@ -736,7 +924,15 @@ step_install_dependencies() {
     # This converts the failure mode from "silent continuation
     # → confusing meson error 100 lines later" to "loud,
     # actionable error in Step 4 with the apt log right there."
+    # v0.5.371 (audit install-dpdk-must-not-fail): pyelftools
+    # hard-gate softened to a LOUD warning that flips
+    # deps_ready=degraded. Step 5 build will still fail if
+    # elftools is missing but the script no longer exits — the
+    # final summary banner will name pyelftools as the specific
+    # blocker so the operator has an actionable message even if
+    # the terminal has already scrolled past the apt log.
     if ! python3 -c "import elftools" 2>/dev/null; then
+        _netgen_dpdk_set deps_ready degraded
         log_error ""
         log_error "════════════════════════════════════════════════════════════"
         log_error "  CRITICAL: python3-pyelftools is NOT installed."
@@ -754,20 +950,19 @@ step_install_dependencies() {
         log_error "  Then re-run Make DPDK Ready."
         log_error "════════════════════════════════════════════════════════════"
         log_error ""
-        # Print the last 30 lines of the apt log inline so the GUI
-        # log tail (also last 30 lines) surfaces them automatically.
         if [[ -r /tmp/dpdk_deps_install.log ]]; then
             log_error "Last 30 lines of apt install log:"
             tail -30 /tmp/dpdk_deps_install.log | while IFS= read -r line; do
                 log_error "  | $line"
             done
         fi
-        # Preserve the log — do NOT rm it.
-        exit 1
+        # v0.5.371: log preserved (was preserved on exit anyway);
+        # script continues to Step 5 which reports the failure
+        # cleanly in context. Removed `exit 1`.
+    else
+        log_success "python3-pyelftools verified (elftools module importable)"
+        rm -f /tmp/dpdk_deps_install.log
     fi
-    log_success "python3-pyelftools verified (elftools module importable)"
-
-    rm -f /tmp/dpdk_deps_install.log
 
     # v0.5.27: libmlx5-dev (Mellanox PMD dev headers) and the full
     # RDMA stack (libibverbs-dev, rdma-core, perftest) moved to
@@ -847,37 +1042,78 @@ step_build_dpdk() {
     meson_disable+=",raw/dpaa2_qdma,raw/dpaa2_cmdif"
     local meson_opts=("-Dexamples=all" "-Ddisable_drivers=${meson_disable}")
 
+    # v0.5.371 (audit install-dpdk-must-not-fail): downgrade the
+    # four `exit 1` sites (meson setup, meson reconfigure, ninja
+    # compile, ninja install) to `return 1` + dpdk_built=failed.
+    # Under `set -euo pipefail` the `|| { ... }` short-circuit
+    # still runs, but returning instead of exiting means Step 6
+    # (tx_worker) and Step 7 (hugepages) still get to run — the
+    # trap + summary banner reports precisely what failed.
     if [[ ! -d "build" ]]; then
         log_info "Configuring DPDK build (disabling: ${meson_disable})..."
-        meson setup build "${meson_opts[@]}" || {
-            log_error "DPDK meson setup failed"
-            exit 1
-        }
+        set +e
+        meson setup build "${meson_opts[@]}"
+        _meson_rc=$?
+        set -e
+        if [[ $_meson_rc -ne 0 ]]; then
+            log_error "DPDK meson setup failed (rc=$_meson_rc)."
+            log_error "Common causes:"
+            log_error "  - python3-pyelftools missing (see Step 4 log)"
+            log_error "  - libnuma / libpcap dev headers missing"
+            log_error "  - unwritable /opt/dpdk-build/build (disk full?)"
+            _netgen_dpdk_set dpdk_built failed
+            cd "$SCRIPT_DIR"
+            return 1
+        fi
     else
         log_info "DPDK build directory exists, wiping and reconfiguring..."
         # --wipe drops cached config from a previous failed run so the new
         # disable_drivers flag is actually applied (without --wipe meson
         # would honour the old options.txt and re-build the same broken set).
-        meson setup build --wipe "${meson_opts[@]}" || {
-            log_error "DPDK meson reconfigure failed"
-            exit 1
-        }
+        set +e
+        meson setup build --wipe "${meson_opts[@]}"
+        _meson_rc=$?
+        set -e
+        if [[ $_meson_rc -ne 0 ]]; then
+            log_error "DPDK meson reconfigure failed (rc=$_meson_rc)."
+            _netgen_dpdk_set dpdk_built failed
+            cd "$SCRIPT_DIR"
+            return 1
+        fi
     fi
-    
+
     log_info "Compiling DPDK (this may take 10-30 minutes)..."
-    ninja -C build || {
-        log_error "DPDK build failed"
-        exit 1
-    }
-    
+    set +e
+    ninja -C build
+    _ninja_rc=$?
+    set -e
+    if [[ $_ninja_rc -ne 0 ]]; then
+        log_error "DPDK ninja compile failed (rc=$_ninja_rc)."
+        log_error "Common causes:"
+        log_error "  - out of memory (need ~4 GB RAM for parallel compile)"
+        log_error "  - a specific PMD's build broke — check build/meson-logs/"
+        _netgen_dpdk_set dpdk_built failed
+        cd "$SCRIPT_DIR"
+        return 1
+    fi
+
     log_info "Installing DPDK to /usr/local..."
-    ninja -C build install || {
-        log_error "DPDK installation failed"
-        exit 1
-    }
-    
+    set +e
+    ninja -C build install
+    _install_rc=$?
+    set -e
+    if [[ $_install_rc -ne 0 ]]; then
+        log_error "DPDK install to /usr/local failed (rc=$_install_rc)."
+        log_error "Binaries built but not installed. Manual recovery:"
+        log_error "  cd $DPDK_DIR && sudo ninja -C build install"
+        _netgen_dpdk_set dpdk_built built_not_installed
+        cd "$SCRIPT_DIR"
+        return 1
+    fi
+
     cd "$SCRIPT_DIR"
     log_success "DPDK built and installed successfully"
+    _netgen_dpdk_set dpdk_built ok
 }
 
 # Step 6: Build tx_worker
@@ -902,8 +1138,12 @@ step_build_tx_worker() {
             log_success "Found DPDK libraries in /usr/local/lib/x86_64-linux-gnu"
             dpdk_libdir="/usr/local/lib/x86_64-linux-gnu"
         else
+            # v0.5.371 (audit install-dpdk-must-not-fail): downgrade
+            # exit 1 → warn + return so summary banner reports
+            # "tx_worker_built=blocked (no DPDK libs)".
             log_error "DPDK libraries not found. Make sure DPDK was installed correctly."
-            exit 1
+            _netgen_dpdk_set tx_worker_built blocked
+            return 1
         fi
     else
         log_info "Using DPDK libraries from: $dpdk_libdir"
@@ -954,16 +1194,20 @@ step_build_tx_worker() {
         echo "   PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig meson setup build"
         echo "   PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig ninja -C build"
         echo ""
-        exit 1
+        # v0.5.371: downgrade exit → return + status flag.
+        _netgen_dpdk_set tx_worker_built failed
+        return 1
     fi
-    
+
     # Step 6.1: Verify library compatibility and configure library paths
     log_info "Verifying library compatibility..."
-    
+
     local tx_worker_bin="$SCRIPT_DIR/tx_worker/build/tx_worker"
     if [[ ! -f "$tx_worker_bin" ]]; then
+        # v0.5.371: downgrade exit → return + status flag.
         log_error "tx_worker binary not found at $tx_worker_bin"
-        exit 1
+        _netgen_dpdk_set tx_worker_built failed
+        return 1
     fi
     
     # Check for missing libraries
@@ -1000,8 +1244,10 @@ step_build_tx_worker() {
                        ./dpdk_tx_worker.sh --dpdk-tree "$DPDK_DIR" --rewrite-src; then
                         log_success "tx_worker rebuilt successfully"
                     else
+                        # v0.5.371: downgrade exit → return + flag.
                         log_error "Failed to rebuild tx_worker"
-                        exit 1
+                        _netgen_dpdk_set tx_worker_built failed
+                        return 1
                     fi
                 fi
             fi
@@ -1198,14 +1444,40 @@ step_configure_hugepages() {
     done
     
     log_info "Setting $pages hugepages..."
+    # v0.5.371 (audit install-dpdk-must-not-fail): pre-fix the
+    # sysfs write was unguarded — under `set -euo pipefail` a
+    # failure (memory pressure, sandbox interaction, sysfs perms
+    # under a stricter systemd unit) silently aborted the whole
+    # script. Wrap in `set +e` + capture rc + log the failure so
+    # the operator knows partial allocation happened but the
+    # script keeps going.
+    set +e
     echo "$pages" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+    _huge_rc=$?
+    set -e
+    if [[ $_huge_rc -ne 0 ]]; then
+        log_warning "Failed to write nr_hugepages (rc=$_huge_rc)."
+        log_warning "Possible causes: insufficient memory, sysfs perms, or"
+        log_warning "systemd unit ProtectSystem=strict blocking /sys writes."
+        _netgen_dpdk_set hugepages_configured partial
+    fi
 
-    # Verify
+    # Verify — the running kernel's actual allocation, not our
+    # requested value. Under memory pressure the kernel may allocate
+    # fewer than requested (kswapd couldn't free enough contiguous
+    # 2 MB blocks). Report both numbers so the operator sees the
+    # gap.
     local new_total=$(grep HugePages_Total /proc/meminfo | awk '{print $2}')
     if [[ $new_total -ge $pages ]]; then
         log_success "Hugepages configured: $new_total pages"
+        _netgen_dpdk_set hugepages_configured ok
+    elif [[ $new_total -gt 0 ]]; then
+        log_warning "Partial allocation: requested $pages but got $new_total (memory fragmentation)"
+        log_warning "Reboot and retry, or free memory (drop caches, stop containers)."
+        _netgen_dpdk_set hugepages_configured partial
     else
-        log_warning "Requested $pages pages but got $new_total (may need more memory)"
+        log_warning "Zero hugepages allocated. Kernel likely has no free contiguous 2 MB blocks."
+        _netgen_dpdk_set hugepages_configured failed
     fi
 
     # Persist across reboots. Writing to /sys is volatile — reboot wipes
@@ -1312,10 +1584,22 @@ step_configure_iommu() {
     # Anchored idempotency check against the file — covers the
     # case where GRUB has the params but kernel hasn't been
     # rebooted yet.
-    if grep -qE "GRUB_CMDLINE_LINUX[A-Z_]*=.*${needed_param}" "$grub_file" \
-       && grep -qE "GRUB_CMDLINE_LINUX[A-Z_]*=.*iommu=pt" "$grub_file"; then
+    #
+    # v0.5.371 (audit install-dpdk-must-not-fail): comment-aware
+    # grep. Pre-fix `grep -qE "GRUB_CMDLINE_LINUX[A-Z_]*=..."`
+    # matched commented-out example lines like
+    # `#GRUB_CMDLINE_LINUX_DEFAULT="... intel_iommu=on"` (the
+    # Ubuntu default in some /etc/default/grub versions). The
+    # script then skipped the real edit + flagged reboot-required
+    # → IOMMU never turned on. Filter comment lines with `grep -v
+    # '^\s*#'` first.
+    if grep -v '^\s*#' "$grub_file" | \
+       grep -qE "GRUB_CMDLINE_LINUX[A-Z_]*=.*${needed_param}" \
+       && grep -v '^\s*#' "$grub_file" | \
+       grep -qE "GRUB_CMDLINE_LINUX[A-Z_]*=.*iommu=pt"; then
         log_warning "GRUB already has IOMMU params; reboot required to activate"
         netgen_mark_reboot_required "IOMMU enabled in GRUB but not yet active"
+        _netgen_dpdk_set iommu_configured pending_reboot
         return 0
     fi
 
@@ -1627,9 +1911,36 @@ step_verification() {
 # Step 11: Summary and next steps
 step_summary() {
     log_step "Installation Complete!"
-    
+
+    # v0.5.371 (audit install-dpdk-must-not-fail): status summary
+    # matching what the /admin console DPDK card renders. Pre-fix
+    # the "Installation completed successfully" line was hardcoded
+    # regardless of what actually worked — an install that failed
+    # at Step 5 but exited 0 (or was force-killed by the operator)
+    # left the operator with a misleading "success" banner and no
+    # per-step breakdown. Now each key step's true state comes out
+    # of NETGEN_DPDK_STATUS.
+    local _overall_ok=1
     echo ""
-    log_success "DPDK installation completed successfully"
+    log_info "═══════════════ Install summary ══════════════════════════════"
+    for kv in "${NETGEN_DPDK_STATUS[@]}"; do
+        local key="${kv%%=*}"
+        local val="${kv#*=}"
+        case "$val" in
+            ok)                log_success "  $key: ok" ;;
+            unknown|skipped)   log_info    "  $key: $val" ;;
+            *)                 log_warning "  $key: $val"; _overall_ok=0 ;;
+        esac
+    done
+    log_info "════════════════════════════════════════════════════════════"
+    echo ""
+    if [[ $_overall_ok -eq 1 ]]; then
+        log_success "DPDK installation completed successfully"
+    else
+        log_warning "DPDK installation completed with warnings. See summary above."
+        log_warning "Individual step statuses are also reflected in the /admin"
+        log_warning "console DPDK card. Re-run this script to retry failed steps."
+    fi
     echo ""
     
     echo "Next steps:"
