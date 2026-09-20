@@ -1817,7 +1817,65 @@ def generate_packets(stream_data, interface, stop_event):
 
     # ---- RoCEv2 + ibperf ----
     if l4_sel == "RoCEv2" and stream_data.get("use_ibperf", False):
-        start_ibperf_server(stream_data, stop_event)
+        # v0.5.355 (audit rdma-ibperf-tracker-leak): pre-fix, this
+        # branch called start_ibperf_server and returned WITHOUT
+        # touching the tracker, wiring stop_event, or reacting to
+        # the shim's returned status. Effects:
+        #   1. The tracker row added at the top of this function
+        #      stayed marked "running" forever; a subsequent Stop
+        #      couldn't reach the perftest job (nothing polled the
+        #      stop_event) and a restart of the same stream added a
+        #      duplicate row.
+        #   2. Any RX sniffer / flow tracker registered up-thread
+        #      leaked for the process lifetime.
+        #   3. A failed start (e.g. perftest binary missing, port
+        #      busy) was silently ignored — the tracker row said
+        #      "running" but no daemon existed.
+        # Fix: use the same `register_perftest_with_tracker` helper
+        # the RDMA-engine path uses (v0.5.141). It wires stop_event
+        # to `stop_perftest(job_id)` via a poll thread and clears
+        # the tracker row when the perftest job's `finished_at`
+        # populates. Also react to shim status so a start failure
+        # marks the stream stopped instead of leaking.
+        _shim_result = start_ibperf_server(stream_data, stop_event) or {}
+        if str(_shim_result.get("status", "")).lower() != "started":
+            logging.error(
+                f"[RoCEv2/ibperf] start_ibperf_server did not report "
+                f"status=started (got {_shim_result!r}). Marking stream "
+                f"stopped so the tracker row doesn't linger."
+            )
+            on_stream_stopped(interface, stream_id, reason="error")
+            return
+        try:
+            from utils.rdma_stream_engine import register_perftest_with_tracker
+            register_perftest_with_tracker(
+                tracker=stream_tracker,
+                stream_id=stream_id,
+                job_id=_shim_result["job_id"],
+                interface=interface,
+                stream_name=stream_data.get("name") or "rocev2-ibperf",
+                test="write_bw",
+                msg_size=32 * 1024,
+                stop_event=stop_event,
+                peer_addr=stream_data.get("dst_ip"),
+                rx_interface=stream_data.get("rx_interface"),
+                note="RoCEv2 + ibperf legacy shim",
+            )
+        except Exception as _reg_exc:
+            # If tracker wiring blows up we still don't want to
+            # leave the row lingering — mark stopped and let the
+            # operator retry.
+            logging.error(
+                f"[RoCEv2/ibperf] register_perftest_with_tracker "
+                f"failed: {_reg_exc}. Stopping the shim's job so it "
+                f"doesn't outlive the tracker row."
+            )
+            try:
+                from utils.rdma_perf import stop_perftest
+                stop_perftest(_shim_result["job_id"])
+            except Exception:
+                pass
+            on_stream_stopped(interface, stream_id, reason="error")
         return
 
     # ---- RoCEv2 ----

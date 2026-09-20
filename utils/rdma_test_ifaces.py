@@ -577,9 +577,22 @@ def cleanup_test_config(
         if state_id is not None and rec.get("state_id") != state_id:
             keep.append(rec)
             continue
+        # v0.5.355 (audit rdma-cleanup-drop-on-err): pre-fix, this
+        # loop never re-appended the record to `keep` — every
+        # matched record was silently dropped from state, whether or
+        # not any `ip addr del` succeeded. If a preflight ran while
+        # the iface was flapped/down, cleanup surfaced the error
+        # ONCE and then state had no memory of the orphan test IPs,
+        # so a retry couldn't find them. Now: track which entries
+        # actually got removed, keep the record with only the
+        # SURVIVING (error-still-orphaned) entries so a later
+        # cleanup pass can retry them, drop the record entirely
+        # only when every entry cleaned successfully.
+        _surviving: List[Dict[str, Any]] = []
         for entry in rec.get("applied", []):
             iface = entry.get("iface", "")
             cidr = entry.get("cidr", "")
+            _entry_ok = True
             if iface and cidr:
                 r = _run(["ip", "addr", "del", cidr, "dev", iface])
                 if r.returncode != 0 and "not assigned" not in (
@@ -589,8 +602,9 @@ def cleanup_test_config(
                         "message": r.stderr.strip()
                         or "ip addr del failed",
                     })
-                    continue
-                removed.append({"iface": iface, "cidr": cidr})
+                    _entry_ok = False
+                else:
+                    removed.append({"iface": iface, "cidr": cidr})
             if entry.get("rp_filter_changed"):
                 prev = entry.get("prev_rp_filter")
                 if isinstance(prev, int):
@@ -598,6 +612,15 @@ def cleanup_test_config(
                         "sysctl", "-w",
                         f"net.ipv4.conf.{iface}.rp_filter={prev}",
                     ])
+            if not _entry_ok:
+                _surviving.append(entry)
+        if _surviving:
+            # v0.5.355: retain the record with only the failed
+            # entries so a later cleanup pass can retry. Drop it
+            # entirely if every entry cleaned successfully.
+            _retained = dict(rec)
+            _retained["applied"] = _surviving
+            keep.append(_retained)
     data["records"] = keep
     _write_state(data)
     return {"ok": not errors, "removed": removed, "errors": errors}

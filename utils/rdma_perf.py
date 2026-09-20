@@ -1605,7 +1605,15 @@ def start_ibperf_server(stream_data, stop_event):
     perftest_mtu = 5 if mtu >= 4096 else 4 if mtu >= 2048 else 3 if mtu >= 1024 else 2
     opts = {
         "device": "mlx5_0",
-        "msg_size": "32K",
+        # v0.5.355 (audit rdma-ibperf-msg-size-string): pre-fix passed
+        # the string "32K" here. perftest's `-s` only accepts a decimal
+        # (strtol), so the server ran a 32-BYTE test — or on stricter
+        # builds the arg was rejected outright and start_perftest
+        # returned "error" (which the caller in
+        # multithreaded_traffic_gen.py ignored, making the failure
+        # invisible client-side). Ship as an integer byte count so
+        # historical intent (32 KiB messages) matches actual behavior.
+        "msg_size": 32 * 1024,
         "qp_count": 1,
         "iterations": iteration,
         "duration": 100,  # was -D 100 in the original stub

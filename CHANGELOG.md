@@ -2,6 +2,81 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.355] - 2026-09-19
+
+**RDMA / traffic HIGH bundle** — three correctness fixes from a
+fresh post-v0.5.354 audit across `multithreaded_traffic_gen.py` +
+`utils/rdma_*.py`. First real RDMA-side ship since v0.5.263.
+
+### A1. RoCEv2 + ibperf branch leaked the tracker row + orphaned Stop
+
+`multithreaded_traffic_gen.py::start_traffic` at the
+`l4_sel == "RoCEv2" and use_ibperf=True` branch called
+`start_ibperf_server` and `return`ed without touching the tracker,
+wiring `stop_event`, or reacting to the shim's returned status.
+Three side effects:
+
+1. Tracker row (added at the top of `start_traffic`) stayed marked
+   "running" forever; the daemon poll thread never saw stop_event
+   fire — a subsequent Stop couldn't reach the perftest job. Restart
+   of the same stream added a duplicate tracker row.
+2. Any RX sniffer / flow tracker registered up-thread leaked for
+   the process lifetime.
+3. Shim start failures (perftest binary missing, port busy) were
+   silently ignored — tracker said "running" but no daemon existed.
+
+**Fix:** capture the shim's result; on non-`started` status,
+`on_stream_stopped(reason="error")` so the row doesn't linger. On
+success, hand off to v0.5.141's `register_perftest_with_tracker`
+(the same helper the RDMA-engine path uses) — it wires
+`stop_event` → `stop_perftest(job_id)` via a poll thread and
+clears the tracker row when the perftest job's `finished_at`
+populates. If tracker wiring itself raises (import failure, etc.),
+call `stop_perftest` on the shim's job_id so the perftest daemon
+doesn't outlive the tracker row. Marker
+`v0.5.355 (audit rdma-ibperf-tracker-leak)`.
+
+### A2. `start_ibperf_server` passed msg_size as a string
+
+`utils/rdma_perf.py::start_ibperf_server` sent
+`"msg_size": "32K"` to perftest. perftest's `-s` accepts only a
+decimal via `strtol`, so the server ran a 32-BYTE test — or on
+stricter builds the arg was rejected outright and `start_perftest`
+returned `"error"`, which the (pre-A1) caller in
+`multithreaded_traffic_gen.py` ignored. Operator got nonsense
+throughput with no client-side error.
+
+**Fix:** pass `32 * 1024` (integer byte count) so historical intent
+matches actual behavior. Marker
+`v0.5.355 (audit rdma-ibperf-msg-size-string)`.
+
+### A3. `cleanup_test_config` dropped record from state on any-entry error
+
+`utils/rdma_test_ifaces.py::cleanup_test_config` iterated matching
+records + their `applied` entries, but the record itself was NEVER
+re-appended to `keep` — regardless of whether the entries
+succeeded or errored. Operator running cleanup while an iface was
+flapped/down saw the error surface once and then state had no
+memory of the still-live orphan test IPs → later cleanup passes
+couldn't find the record to retry.
+
+**Fix:** build a per-record `_surviving` list of entries whose
+`ip addr del` errored. If any entries survived, keep the record
+with `applied` replaced by `_surviving` so a later cleanup pass
+can retry. Drop the record entirely only when every entry cleaned
+successfully. Marker `v0.5.355 (audit rdma-cleanup-drop-on-err)`.
+
+### Tests
+
+- `tests/test_v05355_rdma_traffic_high_bundle.py` — 15 new tests:
+  A1 shim-result capture / on_stream_stopped on error / tracker
+  registration wiring / stop_event + job_id kwargs / stop_perftest
+  on tracker-wire failure; A2 no `"32K"` literal + integer value +
+  strtol reason in the marker; A3 `_surviving` tracking + record
+  retention with failed entries + fully-cleaned records still
+  dropped; AST-parse safety net; regression guards on v0.5.141's
+  `register_perftest_with_tracker` + `stop_perftest`.
+
 ## [0.5.354] - 2026-09-19
 
 **v6 monitor parity** — two `arp_monitor` sibling scanners that mirror
