@@ -2,6 +2,126 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.373] - 2026-09-20
+
+**5-fix bundle clearing v0.5.372's deferred queue** — one HIGH
+protocol-correctness fix plus four smaller ones. The remaining
+deferred item (DHCP-restart async QThread refactor) needs
+UI-plumbing design and is queued for v0.5.374.
+
+### Fixes
+
+- **D1 HIGH** — `utils/frr_docker.py` VRF routing-table id
+  collision. Pre-fix `1000 + md5(device_id) % 1000` gave a
+  1000-slot space with birthday-paradox collisions at ~37
+  devices (50% chance) and near-certainty past 100. Two devices
+  sharing a table id saw each other's routes in the same lookup
+  → silent-wrong forwarding.
+
+  Fix: hash-derived initial pick (preserves the id every
+  single-device install had before, minimal migration surprise)
+  → linear-probe over widened `1000..3999` (3000 slots, 100×
+  headroom) → persisted to
+  `/var/lib/netgen-server/vrf_table_map.json` (fallback:
+  `~/.netgen/vrf_table_map.json`, then `/tmp/`) so netgen-server
+  restart doesn't churn ids (kernel VRF state would mismatch a
+  fresh re-derivation). `_release_vrf_table(device_id)` frees
+  the slot on device removal so the pool doesn't grow monotone.
+  Both `_load_vrf_allocations` and `_persist_vrf_allocations`
+  are atomic + best-effort (state file is optimisation, not
+  source of truth). Guarded by `self._vrf_alloc_lock`.
+  Marker: `v0.5.373 (audit vrf-table-id-collision)`.
+
+- **D2** — `utils/vxlan.py` interface-name collision + silent
+  truncation. Pre-fix built `vx{vni}-{seed[:6]}` then truncated
+  to 15 chars — two devices with adjacent UUIDs produced the
+  same truncated name; `_interface_exists(iface)` returning
+  True was treated as "safe to reuse" (silent-wrong: we'd
+  manage a peer device's interface).
+
+  Fix: new `_pick_unique_vxlan_iface(vni, device_id, existing)`
+  helper. Priority: (1) explicit persisted name (state
+  convergence); (2) hash-derived 6-char seed (backward-compat);
+  (3) seed extended one char at a time on collision; (4) rotated
+  seed; (5) numeric-suffix last-resort. Every candidate is
+  checked against `_interface_exists` before it's returned.
+  Both the container-side + host-fallback code paths call the
+  helper.
+  Marker: `v0.5.373 (audit vxlan-iface-name-truncation-collision)`.
+
+- **D4** — `widgets/rfc2544_dialog.py` poll wedge. Pre-fix
+  `_poll_progress` had a broad `except Exception: return` that
+  silently swallowed every failure. If the server crashed
+  mid-test, the 2s timer kept firing forever, `data.get("running")`
+  never resolved, Start/Stop stayed disabled, operator was
+  stuck at "Test running…" with no signal.
+
+  Fix: track `self._poll_consecutive_fail`; after 5 consecutive
+  failures (10s), stop the timer, re-enable Start button,
+  disable Stop, set red status label "Poll lost — server
+  unreachable. Click Start to retry.", and raise a
+  `QMessageBox.warning` with the failure context. Successful
+  poll resets the counter to 0.
+  Marker: `v0.5.373 (audit rfc2544-poll-swallows-exceptions)`.
+
+- **D5** — `run_tgen_client.py` per-server auth-token routing,
+  completing v0.5.372 C1. C1 closed the leak (only Netgen
+  hosts get any token) but every registered host still got the
+  single env-var token. New `_NETGEN_HOST_TOKENS` map populated
+  from Add Server's captured `auth_token` field. Wrapper
+  consults per-host token first, then falls back to
+  `NETGEN_AUTH_TOKEN` env-var. Also: wrapper is now installed
+  unconditionally so a per-host token registered later works
+  even when the env-var wasn't set at process-start time.
+  `traffic_client/menu_actions.py add_server_interface` now
+  passes `token=entry.get("auth_token")` to the register call.
+  Marker: `v0.5.373 (audit client-multi-server-auth-token-routing)`.
+
+- **D6** — `query_device_database.py` — 9 diagnostic
+  `requests.get` calls gain `timeout=_GET_TIMEOUT = (5, 30)`.
+  Consistent with v0.5.361 capture_client pattern. Pre-fix an
+  unreachable server hung the CLI forever with no operator
+  signal.
+  Marker: `v0.5.373 (audit query-cli-missing-timeouts)`.
+
+### Tests
+
+`tests/test_v05373_deferred_bundle.py` — 28 tests, all pass:
+
+- AST-parse all 6 edited files
+- D1: allocator dict + lock; range widened to ≥3000; linear-
+  probe on collision; persist/load/state-path helpers;
+  `_release_vrf_table` present
+- D2: `_pick_unique_vxlan_iface` helper; checks
+  `_interface_exists`; container-side + host-side both call it
+- D4: `_poll_consecutive_fail` counter; timer stops + controls
+  re-enable after 5 fails
+- D5: `_NETGEN_HOST_TOKENS` map + `_netgen_token_for_url`
+  function; `_netgen_register_server_host(host, token=None)`
+  signature; Add Server passes `entry.get("auth_token")`
+- D6: `_GET_TIMEOUT` constant defined; every `requests.get` in
+  the file carries a `timeout` kwarg
+- Regression guards: v0.5.372 C1 URL-guard, v0.5.371
+  install_dpdk, v0.5.369 install_rdma; `_vrf_name` backward-
+  compat contract unchanged
+
+### Verification
+
+- All 6 files AST-parse
+- 28/28 v0.5.373 tests pass
+- srv06 verification pending
+
+### Deferred to v0.5.374+
+
+- **DHCP restart async** (`utils/devices_tab_dhcp.py:1759-1775`):
+  main thread blocks 60 s on `requests.post`. Needs QThread +
+  cancel button.
+- Admin console coverage-gap cards from the v0.5.370 audit
+  (Upgrade Wheel, Restart, Cache Flush, Journal viewer, streams,
+  FRR, chassis/peers)
+- String-vs-numeric sort in stream statistics table
+- Log-stream UX (timestamps, download, dedupe DPDK/RDMA `<pre>`)
+
 ## [0.5.372] - 2026-09-20
 
 **6-bug bundle from client + protocol audit.** One SEC + five

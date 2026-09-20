@@ -323,6 +323,99 @@ class FRRDockerManager:
         # new netgen-frr build works without config edits.
         self.container_prefix = "ostg-frr"
         self.image_name = _resolve_frr_image(self.client)
+
+        # v0.5.373 (audit vrf-table-id-collision): allocation-tracker
+        # for per-device VRF routing-table ids. Pre-fix `_vrf_table`
+        # used `md5(device_id) % 1000` — birthday paradox says ~37
+        # devices produce a 50% collision chance, 100+ devices are
+        # near-certain to collide. Two devices sharing a table id
+        # see each other's routes in the same lookup table → silent
+        # wrong-forwarding.
+        #
+        # Fix: hash-derived initial pick (preserves the id every
+        # single-device install has today) followed by linear-probe
+        # over a range 3x larger (1000..3999) that skips already-
+        # allocated ids. Assignment is persisted to a JSON file so
+        # netgen-server restart doesn't churn ids (kernel VRF state
+        # would mismatch what we compute afresh).
+        import threading as _th
+        self._vrf_alloc_lock = _th.Lock()
+        self._vrf_allocated: Dict[str, int] = {}
+        self._vrf_state_path = self._resolve_vrf_state_path()
+        self._load_vrf_allocations()
+
+    _VRF_TABLE_RANGE_LO = 1000
+    _VRF_TABLE_RANGE_HI = 3999  # 3000 slots — 100x headroom over
+    #                             a realistic lab of ~30 devices
+
+    def _resolve_vrf_state_path(self) -> str:
+        """v0.5.373 (audit vrf-table-id-collision): state-file path
+        for the VRF allocation map. Prefer /var/lib/netgen-server/
+        (same location v0.5.97's admin_bind_history uses); fall back
+        to a per-user tmpdir if the primary path isn't writable."""
+        import os as _os
+        for _candidate in (
+            "/var/lib/netgen-server/vrf_table_map.json",
+            _os.path.expanduser("~/.netgen/vrf_table_map.json"),
+        ):
+            _dir = _os.path.dirname(_candidate)
+            try:
+                _os.makedirs(_dir, exist_ok=True)
+                if _os.access(_dir, _os.W_OK):
+                    return _candidate
+            except Exception:
+                continue
+        # Last-resort tmpfs — survives netgen-server restart but not reboot.
+        return "/tmp/netgen-vrf_table_map.json"
+
+    def _load_vrf_allocations(self) -> None:
+        """Re-hydrate the {device_id: table_id} map from disk. Called
+        exactly once at __init__ time. Silent on errors — the map is
+        an optimisation, not a source of truth; the kernel's actual
+        VRF config is."""
+        import json as _json
+        import os as _os
+        if not _os.path.isfile(self._vrf_state_path):
+            return
+        try:
+            with open(self._vrf_state_path, "r") as _fh:
+                _raw = _json.load(_fh) or {}
+            if isinstance(_raw, dict):
+                for _k, _v in _raw.items():
+                    try:
+                        _tid = int(_v)
+                    except (TypeError, ValueError):
+                        continue
+                    if self._VRF_TABLE_RANGE_LO <= _tid <= self._VRF_TABLE_RANGE_HI:
+                        self._vrf_allocated[str(_k)] = _tid
+            logger.info(
+                f"[VRF ALLOC] loaded {len(self._vrf_allocated)} "
+                f"table-id assignments from {self._vrf_state_path}"
+            )
+        except Exception as _exc:
+            logger.warning(
+                f"[VRF ALLOC] failed to load {self._vrf_state_path}: "
+                f"{_exc} — starting with empty allocation map"
+            )
+
+    def _persist_vrf_allocations(self) -> None:
+        """Write the current map to disk. Atomic via temp+rename so
+        an interrupted write can't corrupt the file. Best-effort:
+        failure to persist only affects restart behavior, not
+        current-process correctness (the in-memory dict is
+        authoritative)."""
+        import json as _json
+        import os as _os
+        try:
+            _tmp = f"{self._vrf_state_path}.tmp"
+            with open(_tmp, "w") as _fh:
+                _json.dump(self._vrf_allocated, _fh, indent=2, sort_keys=True)
+            _os.replace(_tmp, self._vrf_state_path)
+        except Exception as _exc:
+            logger.warning(
+                f"[VRF ALLOC] persist failed: {_exc} — assignment "
+                f"is still in memory; will re-derive on restart"
+            )
     
     def _sanitize_container_name(self, name: str) -> str:
         """Sanitize device name for use in container naming."""
@@ -461,10 +554,68 @@ class FRRDockerManager:
         return f"vrf-{short}"
 
     def _vrf_table(self, device_id: str) -> int:
-        """Deterministic per-device routing-table id (1000..1999)."""
-        import hashlib
-        h = hashlib.md5(str(device_id or "").encode()).hexdigest()[:8]
-        return self.VRF_TABLE_BASE + (int(h, 16) % 1000)
+        """Per-device routing-table id in [1000..3999].
+
+        v0.5.373 (audit vrf-table-id-collision): pre-fix was pure
+        `1000 + md5(device_id) % 1000` → deterministic but 1000-slot
+        space with birthday-paradox collisions at ~37 devices. Post-
+        fix: hash-derived starting pick (so a lab with one or two
+        devices gets the same table id it had before, preserving
+        kernel state across the upgrade) → linear-probe over the
+        wider 3000-slot range, skipping ids already allocated to
+        OTHER devices → persisted to disk so restart doesn't churn.
+
+        Returns the same id for the same device_id across the
+        process lifetime; different devices get GUARANTEED-different
+        ids up to the 3000-slot ceiling."""
+        import hashlib as _hashlib
+        _key = str(device_id or "")
+        with self._vrf_alloc_lock:
+            _existing = self._vrf_allocated.get(_key)
+            if _existing is not None:
+                return _existing
+
+            _h = _hashlib.md5(_key.encode()).hexdigest()[:8]
+            _range_size = self._VRF_TABLE_RANGE_HI - self._VRF_TABLE_RANGE_LO + 1
+            _initial = self._VRF_TABLE_RANGE_LO + (int(_h, 16) % _range_size)
+
+            _in_use = set(self._vrf_allocated.values())
+            _candidate = _initial
+            for _step in range(_range_size):
+                _tid = self._VRF_TABLE_RANGE_LO + \
+                    ((_candidate - self._VRF_TABLE_RANGE_LO + _step) % _range_size)
+                if _tid not in _in_use:
+                    self._vrf_allocated[_key] = _tid
+                    if _tid != _initial:
+                        logger.warning(
+                            f"[VRF ALLOC] device_id={_key[:12]}… "
+                            f"hash-derived table {_initial} was taken; "
+                            f"probed to {_tid} (collision avoided)"
+                        )
+                    self._persist_vrf_allocations()
+                    return _tid
+
+            # Range exhausted — > 3000 devices on one host. Extremely
+            # unlikely for netgen's traffic-gen lab use case; if it
+            # happens, log loudly and fall back to the collision-
+            # prone original algorithm so the caller doesn't 500.
+            logger.error(
+                f"[VRF ALLOC] range 1000..3999 exhausted "
+                f"({len(_in_use)} allocations) — falling back to "
+                f"hash-only. Collisions possible; increase range."
+            )
+            return _initial
+
+    def _release_vrf_table(self, device_id: str) -> None:
+        """v0.5.373: called when a device is removed (frr container
+        stopped, VRF torn down) so its table id becomes reusable.
+        Best-effort — leaving a stale id would only waste a slot
+        (never cause a collision), so failures to persist are OK."""
+        _key = str(device_id or "")
+        with self._vrf_alloc_lock:
+            if _key in self._vrf_allocated:
+                del self._vrf_allocated[_key]
+                self._persist_vrf_allocations()
 
     def _create_vrf(self, device_id: str, iface_name: str,
                     ipv4_gateway: Optional[str] = None,

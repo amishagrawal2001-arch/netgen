@@ -142,6 +142,81 @@ def validate_config(config: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def _pick_unique_vxlan_iface(vni: Any, device_id: str,
+                             existing_name: Optional[str] = None) -> str:
+    """v0.5.373 (audit vxlan-iface-name-truncation-collision):
+    build a unique VXLAN interface name in the IFNAMSIZ (15-char)
+    limit, avoiding collisions with interfaces already on the
+    host. Pre-fix the name was `vx{vni}-{device_id[:6]}` then
+    silently truncated to 15 chars — two devices with adjacent
+    UUIDs could produce the same truncated name, and
+    `_interface_exists(iface)` returning True was treated as
+    "safe to reuse" (silent-wrong: we'd manage a peer device's
+    interface).
+
+    Priority:
+      1. Explicit `existing_name` (persisted from a prior
+         successful create) — return unchanged so we manage the
+         same interface we did before.
+      2. Hash-derived preferred name (matches pre-fix behavior
+         for one-device labs, minimal migration surprise).
+      3. On collision, extend seed / rotate first char / try
+         numeric suffix until we find a name that isn't taken.
+      4. Last-resort: incrementing numeric suffix `vx{vni}-N`.
+
+    Returns the first name found that is BOTH ≤ 15 chars AND
+    not currently present on the host as an interface."""
+    if existing_name and _interface_exists(existing_name):
+        return existing_name
+    if existing_name:
+        # Persisted name is not on the wire (fresh boot, cleanup
+        # removed it, etc.) — reuse it so state converges.
+        return existing_name
+
+    _seed = str(device_id or "").replace("-", "")
+    _vni = str(vni)
+    _base = f"vx{_vni}-"
+    _seed_len_max = 15 - len(_base)  # remaining chars for seed
+    if _seed_len_max < 1:
+        # Extremely wide VNI (>= 10 digits) leaves no room for
+        # a device-id seed; fall through to numeric-suffix path.
+        _candidates: List[str] = []
+    else:
+        _candidates = []
+        # 1. Original 6-char seed (backward-compat).
+        _candidates.append(_base + _seed[:min(6, _seed_len_max)])
+        # 2. Extend seed by one at a time (up to _seed_len_max)
+        #    so a 6-char collision resolves to 7, then 8, etc.
+        for _n in range(min(7, _seed_len_max),
+                        _seed_len_max + 1):
+            _candidates.append(_base + _seed[:_n])
+        # 3. Rotate the seed by half its length as a last hash-
+        #    style attempt (still deterministic per device).
+        if _seed_len_max >= 4 and len(_seed) > _seed_len_max:
+            _rot = (_seed[_seed_len_max // 2:] + _seed[:_seed_len_max // 2])
+            _candidates.append(_base + _rot[:_seed_len_max])
+
+    for _name in _candidates:
+        if len(_name) <= 15 and not _interface_exists(_name):
+            return _name
+
+    # Last-resort: numeric suffix. Try vxN, vxN-2, vxN-3, ... up
+    # to a bounded max so a truly saturated host doesn't spin
+    # forever.
+    for _i in range(2, 100):
+        _name = f"{_base}{_i}"
+        if len(_name) > 15:
+            _name = _name[:15]
+        if not _interface_exists(_name):
+            return _name
+
+    # If we get here we've tried ~100 candidates. Return the
+    # original 6-char form so the caller's error path (which
+    # already handles "A VXLAN device with the specified VNI
+    # already exists") kicks in — better than looping.
+    return (_base + _seed[:6])[:15]
+
+
 def _remote_in_local_subnet(local_ip: str, remote_ip: str, prefix_len: Any) -> bool:
     """Return True if remote_ip resides in the same subnet as local_ip/prefix."""
     try:
@@ -184,10 +259,12 @@ def ensure_vxlan_interface(
 
     if container_name and frr_manager:
         # Configure inside container using iproute2 (FRR 10 no longer exposes 'vxlan id' under interface)
-        ifname_seed = device_id.replace("-", "")
-        vxlan_iface = config.get("vxlan_interface") or f"vx{vni}-{ifname_seed[:6]}"
-        if len(vxlan_iface) > 15:
-            vxlan_iface = vxlan_iface[:15]
+        # v0.5.373 (audit vxlan-iface-name-truncation-collision):
+        # pick an actually-unique name — see _pick_unique_vxlan_iface.
+        vxlan_iface = _pick_unique_vxlan_iface(
+            vni, device_id,
+            existing_name=config.get("vxlan_interface"),
+        )
         config["vxlan_interface"] = vxlan_iface
         remote_ip = remote_peers[0]
         try:
@@ -219,12 +296,14 @@ def ensure_vxlan_interface(
                 return {"success": False, "error": msg}
 
     # Host-level fallback (legacy path)
-    ifname_seed = device_id.replace("-", "")
-    default_iface = f"vx{vni}-{ifname_seed[:6]}"
-    vxlan_iface = config.get("vxlan_interface") or default_iface
-    if len(vxlan_iface) > 15:
-        vxlan_iface = vxlan_iface[:15]
-        logger.debug("[VXLAN] Truncated interface name to %s (IFNAMSIZ limit)", vxlan_iface)
+    # v0.5.373 (audit vxlan-iface-name-truncation-collision): use
+    # the unique-name picker instead of the pre-fix static hash-
+    # then-truncate. The helper checks _interface_exists and
+    # rotates the seed until it finds a genuinely free name.
+    vxlan_iface = _pick_unique_vxlan_iface(
+        vni, device_id,
+        existing_name=config.get("vxlan_interface"),
+    )
     config["vxlan_interface"] = vxlan_iface
     remote_ip = remote_peers[0]
 

@@ -529,10 +529,18 @@ def print_protocol_summary(devices: List[Dict]):
     
     print(f"{'='*80}")
 
+# v0.5.373 (audit query-cli-missing-timeouts): shared (connect,
+# read) timeout for every diagnostic HTTP call. Matches the
+# v0.5.361 capture_client pattern. Pre-fix these 9 requests.get
+# calls had no timeout — an unreachable server would hang the
+# CLI forever with no operator signal.
+_GET_TIMEOUT = (5, 30)
+
+
 def get_database_info() -> Optional[Dict]:
     """Get database information"""
     try:
-        response = requests.get(f"{SERVER_URL}/api/device/database/info")
+        response = requests.get(f"{SERVER_URL}/api/device/database/info", timeout=_GET_TIMEOUT)
         if response.status_code == 200:
             return response.json()
         else:
@@ -545,7 +553,7 @@ def get_database_info() -> Optional[Dict]:
 def get_all_devices() -> Optional[List[Dict]]:
     """Get all devices from database"""
     try:
-        response = requests.get(f"{SERVER_URL}/api/device/database/devices")
+        response = requests.get(f"{SERVER_URL}/api/device/database/devices", timeout=_GET_TIMEOUT)
         if response.status_code == 200:
             devices_data = response.json()
             # Handle different response formats
@@ -565,7 +573,7 @@ def get_all_devices() -> Optional[List[Dict]]:
 def get_device_by_id(device_id: str) -> Optional[Dict]:
     """Get specific device by ID"""
     try:
-        response = requests.get(f"{SERVER_URL}/api/device/database/devices/{device_id}")
+        response = requests.get(f"{SERVER_URL}/api/device/database/devices/{device_id}", timeout=_GET_TIMEOUT)
         if response.status_code == 200:
             return response.json()
         else:
@@ -578,7 +586,7 @@ def get_device_by_id(device_id: str) -> Optional[Dict]:
 def get_device_events(device_id: str) -> Optional[List[Dict]]:
     """Get device events"""
     try:
-        response = requests.get(f"{SERVER_URL}/api/device/database/devices/{device_id}/events")
+        response = requests.get(f"{SERVER_URL}/api/device/database/devices/{device_id}/events", timeout=_GET_TIMEOUT)
         if response.status_code == 200:
             return response.json()
         else:
@@ -591,7 +599,7 @@ def get_device_events(device_id: str) -> Optional[List[Dict]]:
 def get_device_statistics(device_id: str) -> Optional[Dict]:
     """Get device statistics"""
     try:
-        response = requests.get(f"{SERVER_URL}/api/device/database/devices/{device_id}/statistics")
+        response = requests.get(f"{SERVER_URL}/api/device/database/devices/{device_id}/statistics", timeout=_GET_TIMEOUT)
         if response.status_code == 200:
             return response.json()
         else:
@@ -604,7 +612,7 @@ def get_device_statistics(device_id: str) -> Optional[Dict]:
 def get_all_route_pools() -> Optional[List[Dict]]:
     """Get all BGP route pools from database"""
     try:
-        response = requests.get(f"{SERVER_URL}/api/bgp/pools")
+        response = requests.get(f"{SERVER_URL}/api/bgp/pools", timeout=_GET_TIMEOUT)
         if response.status_code == 200:
             pools_data = response.json()
             return pools_data.get('pools', [])
@@ -618,7 +626,7 @@ def get_all_route_pools() -> Optional[List[Dict]]:
 def get_route_pool(pool_name: str) -> Optional[Dict]:
     """Get specific route pool by name"""
     try:
-        response = requests.get(f"{SERVER_URL}/api/bgp/pools/{pool_name}")
+        response = requests.get(f"{SERVER_URL}/api/bgp/pools/{pool_name}", timeout=_GET_TIMEOUT)
         if response.status_code == 200:
             return response.json().get('pool')
         else:
@@ -631,7 +639,7 @@ def get_route_pool(pool_name: str) -> Optional[Dict]:
 def get_device_route_pools(device_id: str) -> Optional[Dict]:
     """Get route pools attached to a specific device"""
     try:
-        response = requests.get(f"{SERVER_URL}/api/device/{device_id}/route-pools")
+        response = requests.get(f"{SERVER_URL}/api/device/{device_id}/route-pools", timeout=_GET_TIMEOUT)
         if response.status_code == 200:
             return response.json()
         else:
@@ -644,7 +652,7 @@ def get_device_route_pools(device_id: str) -> Optional[Dict]:
 def get_pool_usage(pool_name: str) -> Optional[Dict]:
     """Get usage information for a specific route pool"""
     try:
-        response = requests.get(f"{SERVER_URL}/api/bgp/pools/{pool_name}/usage")
+        response = requests.get(f"{SERVER_URL}/api/bgp/pools/{pool_name}/usage", timeout=_GET_TIMEOUT)
         if response.status_code == 200:
             return response.json()
         else:

@@ -101,12 +101,32 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
     _NETGEN_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
     _rq._netgen_allowed_hosts = _NETGEN_ALLOWED_HOSTS
 
-    def _netgen_register_server_host(host):
-        """Called from Add Server + load_server_interfaces to
-        register a host as trusted for auth-token forwarding."""
+    # v0.5.373 (audit client-multi-server-auth-token-routing):
+    # per-host token map so different servers in a multi-server lab
+    # can hold different bearer tokens. v0.5.372 C1 closed the leak
+    # (only Netgen hosts get ANY token) but every host still got
+    # the single env-var NETGEN_AUTH_TOKEN. The audit found Add
+    # Server captures a per-server `auth_token` into
+    # `self._server_auth_tokens` — but it was never consulted. Now
+    # the wrapper's lookup order is:
+    #   1. Explicit `Authorization` header on the call (unchanged)
+    #   2. Per-host registered token from _NETGEN_HOST_TOKENS
+    #   3. Env-var NETGEN_AUTH_TOKEN as default
+    #   4. No header (URL not registered)
+    _NETGEN_HOST_TOKENS = {}
+    _rq._netgen_host_tokens = _NETGEN_HOST_TOKENS
+
+    def _netgen_register_server_host(host, token=None):
+        """Register a host as trusted for auth-token forwarding.
+        When `token` is provided, that specific token is used for
+        this host; else the env-var default applies. Called from
+        Add Server + load_server_interfaces."""
         if not host:
             return
-        _NETGEN_ALLOWED_HOSTS.add(str(host).strip().lower())
+        _h = str(host).strip().lower()
+        _NETGEN_ALLOWED_HOSTS.add(_h)
+        if token:
+            _NETGEN_HOST_TOKENS[_h] = str(token).strip()
     _rq._netgen_register_server_host = _netgen_register_server_host
 
     def _netgen_url_allowed(url):
@@ -118,21 +138,38 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
             return False
         return host in _NETGEN_ALLOWED_HOSTS
 
-    _auth_token = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
-    if _auth_token:
-        def _wrap_request_fn(fn):
-            def _patched(url, **kwargs):
-                if _netgen_url_allowed(url):
+    def _netgen_token_for_url(url):
+        """v0.5.373: pick the right token for this URL. Per-host
+        token if registered, else env-var default, else None."""
+        try:
+            if _urlparse is None:
+                return None
+            host = (_urlparse(str(url)).hostname or "").lower()
+        except Exception:
+            return None
+        if host in _NETGEN_HOST_TOKENS:
+            return _NETGEN_HOST_TOKENS[host]
+        return os.environ.get("NETGEN_AUTH_TOKEN", "").strip() or None
+
+    _env_auth_token = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
+    # v0.5.373: install the wrapper unconditionally so per-host
+    # tokens registered later still work even when the env-var
+    # NETGEN_AUTH_TOKEN wasn't set at process-start time.
+    def _wrap_request_fn(fn):
+        def _patched(url, **kwargs):
+            if _netgen_url_allowed(url):
+                _tok = _netgen_token_for_url(url)
+                if _tok:
                     headers = dict(kwargs.get("headers") or {})
-                    headers.setdefault("Authorization", f"Bearer {_auth_token}")
+                    headers.setdefault("Authorization", f"Bearer {_tok}")
                     kwargs["headers"] = headers
-                return fn(url, **kwargs)
-            return _patched
-        for _m in ("get", "post", "put", "delete", "patch", "head", "options"):
-            try:
-                setattr(_rq, _m, _wrap_request_fn(getattr(_rq, _m)))
-            except Exception:
-                pass
+            return fn(url, **kwargs)
+        return _patched
+    for _m in ("get", "post", "put", "delete", "patch", "head", "options"):
+        try:
+            setattr(_rq, _m, _wrap_request_fn(getattr(_rq, _m)))
+        except Exception:
+            pass
 
     # v0.5.183: license gate. If the user has no cached license, or
     # the cached one has expired / been tampered with, show the

@@ -538,11 +538,58 @@ class Rfc2544Dialog(QDialog):
         self._poll_progress()
 
     def _poll_progress(self):
+        # v0.5.373 (audit rfc2544-poll-swallows-exceptions): pre-fix
+        # a broad `except Exception: return` silently swallowed every
+        # poll failure. If the server crashed mid-test the 2s timer
+        # kept firing forever, `data.get("running")` never resolved,
+        # Start/Stop stayed disabled, and the operator was stuck at
+        # "Test running..." with no signal that anything was wrong.
+        # Now: track consecutive failures; after N=5 (10s), stop the
+        # timer, re-enable controls, surface a status label + toast
+        # so the operator knows the poll wedged and can retry.
+        if not hasattr(self, "_poll_consecutive_fail"):
+            self._poll_consecutive_fail = 0
         try:
             r = requests.get(f"{self.server_url}/api/rfc2544/progress", timeout=5)
             data = r.json()
+            self._poll_consecutive_fail = 0
         except Exception as e:
-            logger.debug(f"[RFC 2544] poll failed: {e}")
+            self._poll_consecutive_fail += 1
+            logger.debug(
+                f"[RFC 2544] poll failed "
+                f"({self._poll_consecutive_fail}/5): {e}"
+            )
+            if self._poll_consecutive_fail >= 5:
+                logger.warning(
+                    "[RFC 2544] poll wedged after 5 consecutive "
+                    "failures — stopping timer + re-enabling controls"
+                )
+                try:
+                    if hasattr(self, "_poll_timer") and self._poll_timer:
+                        self._poll_timer.stop()
+                except Exception:
+                    pass
+                self.start_btn.setEnabled(True)
+                self.stop_btn.setEnabled(False)
+                self.export_btn.setEnabled(False)
+                self.status_label.setText(
+                    "Poll lost — server unreachable. Click Start to retry."
+                )
+                self.status_label.setStyleSheet(
+                    "color: #b91c1c; font-weight: 600;"
+                )
+                try:
+                    from PyQt5.QtWidgets import QMessageBox as _QMB
+                    _QMB.warning(
+                        self, "RFC 2544 poll lost",
+                        "Lost contact with the RFC 2544 server after "
+                        "5 consecutive failed polls (10 s).\n\n"
+                        "The test may have crashed, or the server may "
+                        "have restarted. Check server logs and click "
+                        "Start to retry.",
+                    )
+                except Exception:
+                    pass
             return
 
         # Update results table

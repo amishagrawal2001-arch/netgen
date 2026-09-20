@@ -203,12 +203,20 @@ class TrafficGenClientMenuAction():
             # level requests wrapper injects the bearer token for
             # its URLs. Non-registered hosts (Ollama, LLM, GitHub)
             # continue to get NO token forwarded.
+            #
+            # v0.5.373 (audit client-multi-server-auth-token-routing):
+            # also forward the per-server auth_token from the Add-
+            # Server dialog so multi-server labs with distinct
+            # bearers per server actually route correctly. Fallback
+            # to env-var NETGEN_AUTH_TOKEN when no per-server token
+            # was entered.
             try:
                 import requests as _rq
                 from urllib.parse import urlparse as _urlparse
                 _host = (_urlparse(full_url).hostname or "").lower()
+                _tok = entry.get("auth_token") or None
                 if _host and hasattr(_rq, "_netgen_register_server_host"):
-                    _rq._netgen_register_server_host(_host)
+                    _rq._netgen_register_server_host(_host, token=_tok)
             except Exception:
                 pass
             if connect_now:
