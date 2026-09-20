@@ -1984,22 +1984,46 @@ class AddDeviceDialog(QDialog):
                 # Default: use IPv6 gateway as neighbor IP
                 neighbor_ipv6 = ipv6_gateway
             
+            # v0.5.356 (audit bgp-empty-neighbor-on-v6-only): resolve
+            # both AF-enabled flags UP FRONT so we can conditionally
+            # emit the neighbor fields. Pre-fix, `bgp_neighbor_ipv4`
+            # + `peer_ip` were populated unconditionally — a v6-only
+            # device (ipv4_checkbox off) with BGP + `bgp_toggle_ipv4`
+            # left on (checkbox default) produced empty strings for
+            # both, and downstream FRR emitted a malformed IPv4 AF
+            # stanza with `neighbor  remote-as N` (missing peer IP).
+            _bgp_v4_on = (
+                self.bgp_toggle_ipv4.isChecked()
+                if hasattr(self, "bgp_toggle_ipv4") else True
+            )
+            _bgp_v6_on = (
+                self.bgp_toggle_ipv6.isChecked()
+                if hasattr(self, "bgp_toggle_ipv6") else True
+            )
             bgp_config = {
                 "bgp_asn": self.bgp_local_as_input.text().strip(),
                 "bgp_remote_asn": self.bgp_remote_as_input.text().strip(),
                 "mode": bgp_mode,
                 "bgp_keepalive": "30",
                 "bgp_hold_time": "90",
-                "ipv4_enabled": self.bgp_toggle_ipv4.isChecked() if hasattr(self, "bgp_toggle_ipv4") else True,
-                "ipv6_enabled": self.bgp_toggle_ipv6.isChecked() if hasattr(self, "bgp_toggle_ipv6") else True,
+                "ipv4_enabled": _bgp_v4_on,
+                "ipv6_enabled": _bgp_v6_on,
                 "local_ip": ipv4,  # Use device IP as local IP
-                "peer_ip": neighbor_ipv4,  # Use remote loopback IP or gateway IP based on checkbox
-                "bgp_neighbor_ipv4": neighbor_ipv4,  # Set neighbor IP for BGP configuration
-                "bgp_neighbor_ipv6": neighbor_ipv6,  # Set IPv6 neighbor IP for BGP configuration
                 "use_loopback_ip": use_loopback_ip,
                 "bgp_remote_loopback_ip": self.bgp_remote_loopback_ip_input.text().strip() if hasattr(self, "bgp_remote_loopback_ip_input") else "192.168.250.1",
                 "bgp_remote_loopback_ipv6": self.bgp_remote_loopback_ipv6_input.text().strip() if hasattr(self, "bgp_remote_loopback_ipv6_input") else "2001:ff00:250::1"
             }
+            # v0.5.356: only emit v4 neighbor fields when v4 is
+            # actually enabled AND we have a non-empty neighbor
+            # address. Otherwise leaving them absent is what the
+            # downstream FRR emitter treats as "no v4 AF configured
+            # for this neighbor" — pre-fix we wrote empty strings
+            # which produced malformed config.
+            if _bgp_v4_on and neighbor_ipv4:
+                bgp_config["peer_ip"] = neighbor_ipv4
+                bgp_config["bgp_neighbor_ipv4"] = neighbor_ipv4
+            if _bgp_v6_on and neighbor_ipv6:
+                bgp_config["bgp_neighbor_ipv6"] = neighbor_ipv6
         
         if self.ospf_enable_checkbox.isChecked():
             # Construct VLAN interface name for OSPF configuration

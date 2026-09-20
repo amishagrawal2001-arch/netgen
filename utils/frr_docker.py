@@ -1260,7 +1260,16 @@ class FRRDockerManager:
                 vtysh_commands.append(f" ipv6 address {ipv6_addr}/{ipv6_mask}")
             
             # Set MTU if provided
-            if mtu and mtu.isdigit():
+            # v0.5.356 (audit frr-mtu-int-coerce): pre-fix
+            # `mtu.isdigit()` assumed str. Some apply paths persist
+            # the mtu column as an integer (device_database
+            # normalization); the AttributeError from `int.isdigit`
+            # was swallowed by the surrounding except → the whole
+            # `_configure_interfaces` returned False and the
+            # container came up with NO ip mtu line, silently. Now:
+            # coerce to str before `.isdigit()` so both str and int
+            # DB shapes work.
+            if mtu and str(mtu).isdigit():
                 vtysh_commands.append(f" ip mtu {mtu}")
             
             vtysh_commands.extend([

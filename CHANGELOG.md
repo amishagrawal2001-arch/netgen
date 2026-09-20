@@ -2,6 +2,83 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.356] - 2026-09-19
+
+**MED bundle** — four correctness fixes spanning RDMA
+(`utils/rdma_perf.py`, `utils/rdma_stream_engine.py`), the
+Add-Device dialog (`widgets/add_device_dialog.py`), and FRR
+container plumbing (`utils/frr_docker.py`). Post-v0.5.355 audit
+tail; each carries its own `v0.5.356 (audit ...)` marker.
+
+### A4. `stop_perftest` pid/killpg race under `_jobs_lock`
+
+Pre-fix, `pid = job.pid` + the finished_at check were read OUTSIDE
+`_jobs_lock`, and `os.killpg(os.getpgid(pid), SIGTERM)` fired
+unlocked. Between the read and the signal, the reader thread could
+see the perftest process exit naturally (a short bandwidth test or
+1-iteration latency run completing), flip `finished_at`, and clear
+pid. The kernel then recycles the PID for an unrelated process, and
+our killpg lands on the wrong process group.
+
+**Fix:** hold `_jobs_lock` across both the pid/finished_at read
+AND the killpg call. Signal delivery is a syscall that returns
+instantly, so the brief lock hold is acceptable. Same discipline
+applied to the SIGKILL escalation path. Marker
+`v0.5.356 (audit rdma-stop-perftest-race)`.
+
+### A5. rdma_stream_engine poll thread had 2-4s stop lag
+
+`register_perftest_with_tracker._poll` did `time.sleep(2.0)` at the
+top of the loop, BEFORE the stop_event check. When the operator
+hit Stop, traffic kept flowing until the sleep expired (~2s) plus
+another ~2s in the outer stopper drain — 2-4s of ghost packets.
+
+**Fix:** replace with `stop_event.wait(2.0)` and break on truthy
+return. `wait()` returns immediately when the event is set, so Stop
+is now instant up to scheduling latency. Marker
+`v0.5.356 (audit rdma-stream-stop-lag)`.
+
+### A6. v6-only device with BGP wrote empty `bgp_neighbor_ipv4=""`
+
+`add_device_dialog.get_values` populated `peer_ip` and
+`bgp_neighbor_ipv4` unconditionally from `ipv4_gateway`. Adding
+a v6-only device (ipv4_checkbox off) with BGP enabled and
+`bgp_toggle_ipv4` left on (the default checkbox state) produced
+`ipv4_gateway=""`, and the empty string flowed into
+`bgp_config["peer_ip"]` / `["bgp_neighbor_ipv4"]`. Downstream FRR
+emitted a malformed `neighbor  remote-as N` (missing peer IP).
+
+**Fix:** hoist `_bgp_v4_on` / `_bgp_v6_on` above the config dict
+as a single source of truth. Only emit the per-AF neighbor fields
+when BOTH the AF is enabled AND the resolved neighbor address is
+truthy. Downstream FRR treats absent fields as "no AF configured
+for this neighbor" — the correct semantics. Marker
+`v0.5.356 (audit bgp-empty-neighbor-on-v6-only)`.
+
+### A7. `mtu.isdigit()` assumed str → silent MTU drop on int mtu
+
+`utils/frr_docker.py::_configure_interfaces` at the interface
+vtysh-config block. Some apply paths persist the mtu column as an
+int (device_database normalization); `int.isdigit()` raises
+`AttributeError`, the outer `except Exception` swallows it, the
+whole `_configure_interfaces` returns False, and the FRR container
+comes up with NO `ip mtu` line at all — silently.
+
+**Fix:** `str(mtu).isdigit()` so both str and int DB shapes work.
+Marker `v0.5.356 (audit frr-mtu-int-coerce)`.
+
+### Tests
+
+- `tests/test_v05356_med_bundle.py` — 14 new tests: A4 lock
+  discipline across pid+killpg + SIGKILL escalation + unknown-
+  job_id early-return; A5 `stop_event.wait` swap-in + break on
+  set (with comment-line stripping so the marker's own historical-
+  context text doesn't false-positive); A6 flag hoist + gated
+  emit + no-longer-in-dict regression guard; A7 str-coerce landed;
+  AST-parse safety net across all four touched files; regression
+  guards on `stop_perftest`, `register_perftest_with_tracker`, and
+  v0.5.355's ibperf tracker wiring.
+
 ## [0.5.355] - 2026-09-19
 
 **RDMA / traffic HIGH bundle** — three correctness fixes from a

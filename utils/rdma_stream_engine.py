@@ -155,7 +155,16 @@ def register_perftest_with_tracker(
     def _poll():
         last_bytes = 0
         while not stop_event.is_set():
-            time.sleep(2.0)
+            # v0.5.356 (audit rdma-stream-stop-lag): pre-fix, this
+            # was `time.sleep(2.0)` — an unconditional wall-clock
+            # sleep BEFORE the stop_event check. An operator's Stop
+            # click had to wait ~2s for the sleep to expire plus
+            # another ~2s in the outer stopper drain, so traffic
+            # kept flowing 2-4s after Stop. `stop_event.wait(2.0)`
+            # returns True immediately on set — Stop is now instant
+            # up to scheduling latency.
+            if stop_event.wait(2.0):
+                break
             job = get_perftest_job(job_id)
             if job is None:
                 break

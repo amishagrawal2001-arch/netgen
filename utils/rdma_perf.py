@@ -1532,32 +1532,54 @@ def stop_perftest(job_id: str) -> Dict[str, Any]:
         job = _jobs.get(job_id)
     if job is None:
         return {"status": "error", "error": f"unknown job_id {job_id}"}
-    if job.finished_at is not None:
-        return {"status": "noop", "note": "job already finished",
-                "job": job.to_public_dict()}
-    pid = job.pid
-    if pid is None:
-        return {"status": "noop", "note": "no pid recorded",
-                "job": job.to_public_dict()}
-    try:
-        # killpg because we used start_new_session.
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError) as exc:
-        logger.debug(f"[rdma] SIGTERM job {job_id[:8]} pid={pid}: {exc}")
+    # v0.5.356 (audit rdma-stop-perftest-race): pre-fix, `pid =
+    # job.pid` + the finished_at check were read OUTSIDE the lock,
+    # and then killpg fired unlocked. Between the read and the
+    # signal, the reader thread could see the process exit
+    # naturally (short perftest completing, or a single-iteration
+    # latency run), flip finished_at and clear pid. The kernel then
+    # recycles the PID for an unrelated process, and our killpg
+    # lands on the wrong process group. Now: hold `_jobs_lock`
+    # across both the pid/finished_at read AND the killpg call, so
+    # the reader thread can't slip a finished_at update between
+    # them. Signal delivery is a syscall that returns instantly;
+    # brief lock hold is acceptable.
+    with _jobs_lock:
+        if job.finished_at is not None:
+            return {"status": "noop", "note": "job already finished",
+                    "job": job.to_public_dict()}
+        pid = job.pid
+        if pid is None:
+            return {"status": "noop", "note": "no pid recorded",
+                    "job": job.to_public_dict()}
+        try:
+            # killpg because we used start_new_session.
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError) as exc:
+            logger.debug(
+                f"[rdma] SIGTERM job {job_id[:8]} pid={pid}: {exc}"
+            )
     # Give the reader thread a moment to wait() and update the job.
     for _ in range(30):
         with _jobs_lock:
             if job.finished_at is not None:
                 break
         time.sleep(0.1)
-    # Escalate if still alive.
+    # v0.5.356: same lock discipline for the SIGKILL escalation —
+    # re-verify pid + finished_at under the lock before signaling.
     with _jobs_lock:
         still = job.finished_at is None
-    if still:
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        _pid_now = job.pid if still else None
+    if still and _pid_now is not None:
+        with _jobs_lock:
+            # Second-look re-check under the lock (the timer above
+            # sleeps unlocked; the reader thread may have caught
+            # up just now).
+            if job.finished_at is None:
+                try:
+                    os.killpg(os.getpgid(_pid_now), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
         # Wait one more beat.
         for _ in range(20):
             with _jobs_lock:
