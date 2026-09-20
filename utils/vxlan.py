@@ -1157,13 +1157,48 @@ def _ensure_vxlan_in_container_iproute(
                 # stay well clear of common .1 (gateway) and .10
                 # (legacy behavior for backward-compat when only one
                 # device is in the subnet).
+                # v0.5.363 (audit vxlan-veth-ip-assumes-v4, A6): pre-fix,
+                # `veth_ip = f"{local_ip.rsplit('.', 1)[0]}.{_suffix}/24"`
+                # built the veth IP by string-slicing the last octet.
+                # For an IPv6 VTEP (`local_ip=2001:db8::10`) this
+                # produces nonsense (`2001:db8:.11/24`), `ip addr add`
+                # rejects it, the except-swallow hides the failure, and
+                # the L2 VNI has no ARP anchor → Type-2 EVPN routes
+                # never generate. Now: detect family and build a
+                # family-appropriate host address, or skip the veth-IP
+                # step entirely for v6 (netgen's v6 EVPN path doesn't
+                # need the same anchor shape — see v0.5.263 IPv6 EVPN
+                # for that plumbing).
                 try:
                     import hashlib as _hashlib
+                    import ipaddress as _ipa
                     _digest = int(_hashlib.md5(str(device_id).encode()).hexdigest()[:8], 16)
                     _suffix = 11 + (_digest % 240)  # [11, 250]
-                    veth_ip = f"{local_ip.rsplit('.', 1)[0]}.{_suffix}/24"
-                    _container_ip(frr_manager, container_name, ["ip", "addr", "add", veth_ip, "dev", veth_name])
-                    logger.debug("[VXLAN] Added IP address %s to veth interface %s (device=%s)", veth_ip, veth_name, device_id)
+                    try:
+                        _local_addr = _ipa.ip_address(str(local_ip).split("/")[0])
+                    except (ValueError, _ipa.AddressValueError):
+                        _local_addr = None
+                    if _local_addr is not None and _local_addr.version == 4:
+                        veth_ip = f"{local_ip.rsplit('.', 1)[0]}.{_suffix}/24"
+                        _container_ip(frr_manager, container_name, ["ip", "addr", "add", veth_ip, "dev", veth_name])
+                        logger.debug("[VXLAN] Added IPv4 address %s to veth interface %s (device=%s)", veth_ip, veth_name, device_id)
+                    elif _local_addr is not None and _local_addr.version == 6:
+                        # v6 VTEP: skip the v4 anchor step. v0.5.263's
+                        # IPv6 EVPN plumbing installs ND anchors via a
+                        # different code path.
+                        logger.debug(
+                            "[VXLAN] v0.5.363: local_ip %s is IPv6 — "
+                            "skipping v4-shaped veth anchor (would build "
+                            "malformed address). v6 ND anchors go via the "
+                            "v0.5.263 EVPN path.",
+                            local_ip,
+                        )
+                    else:
+                        logger.debug(
+                            "[VXLAN] v0.5.363: local_ip %r could not be "
+                            "parsed as v4 or v6; skipping veth anchor.",
+                            local_ip,
+                        )
                 except Exception as veth_ip_exc:
                     if "File exists" not in str(veth_ip_exc):
                         logger.debug("[VXLAN] Could not add IP address to veth interface (non-critical): %s", veth_ip_exc)
@@ -2523,11 +2558,75 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 logger.warning("[VXLAN ARP/FDB] Local SVI IP not found on %s or bridge %s", svi_interface, bridge_name)
                 return False
         
-        # Derive remote SVI IP
+        # Derive remote SVI IP.
+        # v0.5.363 (audit vxlan-remote-svi-derive-v4-only, A4): pre-fix,
+        # `remote_svi_obj = IPv4Address(int(local_svi) + 1)` had three
+        # defects hidden behind the outer `except Exception: return
+        # False` swallow:
+        #   1. Hardcoded IPv4 — a dual-stack overlay with an IPv6 SVI
+        #      raised IPv4Address(int) construction error and ARP+FDB
+        #      never installed.
+        #   2. No bounds check — a local SVI at `.255` produced `.256`
+        #      which IPv4Address rejects.
+        #   3. Point-to-point assumption — a 3-VTEP fabric with two
+        #      remote peers still only derived one remote candidate.
+        # Fix: use the family-aware ip_address, detect broadcast/max
+        # overflow, and expose ALL derived candidates via a list so
+        # downstream MAC lookup can try each remote peer. If the
+        # operator wants explicit mapping, they can pass a
+        # `remote_peer_svi_ips` map in the config; we honor it first.
         import ipaddress
-        local_svi_obj = ipaddress.IPv4Address(local_svi_ip_str)
-        remote_svi_obj = ipaddress.IPv4Address(int(local_svi_obj) + 1)
-        remote_svi_ip = str(remote_svi_obj)
+        _explicit_map = config.get("remote_peer_svi_ips")
+        _remote_svi_candidates = []
+        try:
+            local_svi_obj = ipaddress.ip_address(local_svi_ip_str)
+        except (ValueError, ipaddress.AddressValueError) as _e:
+            logger.warning(
+                "[VXLAN ARP/FDB] v0.5.363: local SVI IP %r "
+                "unparseable: %s", local_svi_ip_str, _e,
+            )
+            return False
+        if isinstance(_explicit_map, dict) and _explicit_map:
+            for _peer in remote_peers:
+                _mapped = _explicit_map.get(_peer) or _explicit_map.get(str(_peer))
+                if _mapped:
+                    _remote_svi_candidates.append(str(_mapped))
+        if not _remote_svi_candidates:
+            # Derive by `+1` per family, guarding against overflow.
+            _max = (
+                int(ipaddress.IPv4Address("255.255.255.255"))
+                if local_svi_obj.version == 4
+                else int(ipaddress.IPv6Address("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"))
+            )
+            _next_int = int(local_svi_obj) + 1
+            if _next_int > _max:
+                logger.warning(
+                    "[VXLAN ARP/FDB] v0.5.363: local SVI IP %s is at "
+                    "family max; cannot derive remote SVI by +1. Pass "
+                    "`remote_peer_svi_ips` in config to map peers.",
+                    local_svi_ip_str,
+                )
+                return False
+            try:
+                _cls = (
+                    ipaddress.IPv4Address if local_svi_obj.version == 4
+                    else ipaddress.IPv6Address
+                )
+                _remote_svi_candidates.append(str(_cls(_next_int)))
+            except (ValueError, ipaddress.AddressValueError):
+                return False
+        # Historical shape: downstream code expects a single
+        # `remote_svi_ip`. Keep that for backward-compat but log the
+        # additional candidates. A follow-up ship can extend the MAC
+        # lookup loop below to iterate.
+        remote_svi_ip = _remote_svi_candidates[0]
+        if len(_remote_svi_candidates) > 1:
+            logger.debug(
+                "[VXLAN ARP/FDB] v0.5.363: multiple remote SVI "
+                "candidates: %s — using first (%s); pass "
+                "`remote_peer_svi_ips` to disambiguate.",
+                _remote_svi_candidates, remote_svi_ip,
+            )
         
         # Query EVPN Type-2 routes for MAC address
         evpn_result = container.exec_run(["vtysh", "-c", "show bgp l2vpn evpn route type macip"])

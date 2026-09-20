@@ -2,6 +2,51 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.363] - 2026-09-19
+
+**VXLAN v6 parity** — two family-blind paths in `utils/vxlan.py`
+that silently failed on IPv6 VTEPs or overflowed on `.255`.
+
+### A4. `configure_vxlan_arp_fdb_from_evpn` remote SVI derivation
+Pre-fix, `remote_svi_obj = IPv4Address(int(local_svi) + 1)`. Three
+defects hidden behind the outer `except Exception: return False`
+swallow:
+1. **Hardcoded IPv4** — dual-stack overlay with a v6 SVI raised
+   `IPv4Address(int)` construction error → silent False → ARP+FDB
+   never installed.
+2. **No bounds check** — local SVI at `.255` produced `.256` which
+   IPv4Address rejects.
+3. **Point-to-point assumption** — 3-VTEP fabric with two remote
+   peers still only derived one candidate.
+
+**Fix:** `ipaddress.ip_address` (family-aware) + explicit
+overflow check against the family max + optional
+`remote_peer_svi_ips` config map for explicit peer → SVI mapping.
+Multi-candidate list is logged (`_remote_svi_candidates`); current
+shape returns the first candidate to preserve backward-compat, a
+follow-up ship can extend the MAC lookup to iterate.
+
+### A6. veth IP derivation assumed IPv4 dotted-quad
+Pre-fix, `veth_ip = f"{local_ip.rsplit('.', 1)[0]}.{suffix}/24"`.
+IPv6 VTEP (`local_ip=2001:db8::10`) → nonsense address
+(`2001:db8:.11/24`) → `ip addr add` rejects → outer except
+swallows → L2 VNI has no ARP anchor → Type-2 EVPN routes never
+generate.
+
+**Fix:** detect family via `ipaddress.ip_address(...)`; v4 keeps
+the historical shape; v6 skips the v4-shaped anchor step
+(v0.5.263's IPv6 EVPN plumbing installs ND anchors via a
+different code path).
+
+### Tests
+
+- `tests/test_v05363_vxlan_v6_parity.py` — 10 new tests: A4
+  family-aware `ip_address` use, explicit peer-SVI map honored
+  first, overflow-bounded per-family, no bare
+  `IPv4Address(int+1)` in live code; A6 family branch present,
+  v6 skip log references v0.5.263, rsplit is inside the v4
+  branch only.
+
 ## [0.5.362] - 2026-09-19
 
 **ISIS MED bundle** — four fixes across `utils/isis.py` and
