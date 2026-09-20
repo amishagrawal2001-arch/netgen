@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.360] - 2026-09-19
+
+**D10: Apply-path v6 wait-loop was too short and broke on
+link-local-only iface.**
+
+Runtime evidence caught on srv06 v0.5.359 verification: after
+Stop→Apply on device7, the wire had `2001:db8:30::13a/128` within
+~15s but the DB stamped `state=Failed` /
+`dhcp_last_error="IPv6: no global IPv6 observed (only link-local)"`.
+
+Three defects in `start_dhcp_client`'s v6 path:
+
+1. **Wait deadline too short.** `lease_deadline = time.time() +
+   lease_timeout`, default `lease_timeout=20`. v6 SOLICIT / ADVERTISE
+   / REQUEST / REPLY through a relay agent regularly takes 20-30s
+   on srv06's Juniper setup.
+2. **Wait-loop broke on link-local.** The `dhclient -6` fallback
+   branch's polling loop broke as soon as `_parse_ipv6` returned
+   anything, but `_parse_ipv6` includes link-local (`fe80::…`)
+   which is always present after iface-up. First poll broke with
+   only link-local, downstream `_pick_global_ipv6` returned None,
+   and we stamped "no global IPv6 observed" seconds after Apply
+   — long before dhclient completed SOLICIT.
+3. **`dhcp6c` branch had NO polling loop at all.** It parsed
+   once immediately after spawn. dhcp6c returns from spawn BEFORE
+   SOLICIT completes, so `addr6` was always empty for that branch.
+
+**Fix — three parts, one marker
+`v0.5.360 (audit D10 apply-v6-wait-too-short)`:**
+
+- `lease_deadline = time.time() + max(lease_timeout, 30)` — floor
+  at 30s.
+- Both polling loops (dhcp6c and dhclient-6) require a global
+  address (`_pick_global_ipv6(parsed)` truthy) before breaking.
+- The dhcp6c branch gains the same polling loop the dhclient-6
+  branch has.
+
+Operators who explicitly want longer than 30s still get it via
+`dhcp_config["timeout"]`.
+
+### Tests
+
+- `tests/test_v05360_apply_v6_wait_and_global_only.py` — 9 new
+  tests: deadline floored at 30s, both branches gate on
+  `_pick_global_ipv6`, dhcp6c branch gained the polling loop
+  (bounded via the fallback log line so nested if/else inside
+  the config-writer doesn't confuse the branch boundary),
+  regression guards on `_pick_global_ipv6`, v0.5.346 sysctl
+  lockdown, v0.5.350 dual-stack partial state, and v0.5.359
+  D7/D8 stop-path clears.
+
 ## [0.5.359] - 2026-09-19
 
 **Stop-path lease-field + last-error clear** (D7 + D8 from the

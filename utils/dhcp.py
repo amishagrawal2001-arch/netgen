@@ -3579,7 +3579,17 @@ def start_dhcp_client(
                     _sysctl_key, _sysctl_val, interface, _sysctl_exc,
                 )
 
-        lease_deadline = time.time() + lease_timeout
+        # v0.5.360 (audit D10 apply-v6-wait-too-short): v6 SOLICIT/
+        # ADVERTISE/REQUEST/REPLY is slower than v4 DISCOVER/OFFER,
+        # especially through a relay agent. Operator-observed on
+        # srv06 2026-09-19: default lease_timeout=20s expired while
+        # dhcp6c was still mid-SOLICIT, start_dhcp_client stamped
+        # state=Failed + dhcp_last_error="no global IPv6 observed",
+        # and no code path reconciled it back to Leased once dhclient
+        # completed asynchronously. Floor the v6 deadline at 30s to
+        # give SOLICIT enough headroom in the common case. Operators
+        # who NEED longer via `timeout` in dhcp_config still get it.
+        lease_deadline = time.time() + max(lease_timeout, 30)
         addr6 = None
 
         if _command_exists("dhcp6c", container=container):
@@ -3628,7 +3638,22 @@ def start_dhcp_client(
             if dhcp6_exec.returncode != 0:
                 ipv6_result = {"success": False, "error": dhcp6_exec.stderr.strip()}
             else:
-                addr6 = _parse_ipv6(interface, container=container)
+                # v0.5.360 (audit D10 apply-v6-wait-too-short):
+                # pre-fix, the dhcp6c branch called `_parse_ipv6`
+                # ONCE immediately after spawn — but dhcp6c returns
+                # from spawn before SOLICIT completes, so the parse
+                # ran against link-local-only state and reported
+                # "no global IPv6 observed". Poll the same way the
+                # dhclient-6 fallback branch below does, up to
+                # lease_deadline (v0.5.360 also floors that at 30s).
+                # Prefer a global address; keep polling if only
+                # link-local is present so far.
+                while time.time() < lease_deadline:
+                    parsed = _parse_ipv6(interface, container=container)
+                    if parsed and _pick_global_ipv6(parsed):
+                        addr6 = parsed
+                        break
+                    time.sleep(1)
         else:
             logger.info("[DHCP] dhcp6c not found; falling back to dhclient -6 for %s", interface)
             try:
@@ -3649,9 +3674,19 @@ def start_dhcp_client(
             if dhcp6_exec.returncode != 0:
                 ipv6_result = {"success": False, "error": dhcp6_exec.stderr.strip()}
             else:
+                # v0.5.360 (audit D10 apply-v6-wait-too-short):
+                # pre-fix, the break condition was `if parsed:` —
+                # but `_parse_ipv6` returns link-local too, which
+                # is always present after iface-up. First poll
+                # would break with only link-local, downstream
+                # `_pick_global_ipv6` would fail, and we'd stamp
+                # "no global IPv6 observed" seconds after Apply
+                # — before dhclient completed SOLICIT. Now: require
+                # a GLOBAL address before breaking, so the loop
+                # keeps polling until dhclient's REPLY lands.
                 while time.time() < lease_deadline:
                     parsed = _parse_ipv6(interface, container=container)
-                    if parsed:
+                    if parsed and _pick_global_ipv6(parsed):
                         addr6 = parsed
                         break
                     time.sleep(1)
