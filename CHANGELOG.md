@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.359] - 2026-09-19
+
+**Stop-path lease-field + last-error clear** (D7 + D8 from the
+post-v0.5.354 audit backlog).
+
+Runtime evidence caught on srv06 v0.5.358 verification: after
+Stop→Apply on device7, the wire had a live v6 lease
+`2001:db8:30::197/128` within seconds but the DB kept reading
+`state=Failed, lease=""`. Root cause: `stop_dhcp_server`'s Stopped
+DB write only touched three fields (state / running /
+`lease_subnet`) and never cleared `dhcp_last_error` from a prior
+cycle's failure. The stale error made every subsequent Apply's
+status readout look Failed even when the wire was healthy.
+
+Twin issue on `stop_dhcp_client`: cleared every lease field
+(v0.5.218 + v0.5.302) but left `dhcp_last_error` intact.
+
+### D7. `stop_dhcp_server` extends lease-field clear
+
+Post-fix the Stopped DB write blanks every v4 and v6 lease field
+that `stop_dhcp_client` clears — `dhcp_lease_ip / _mask /
+_gateway / _server / _expires / _subnet` on the v4 side and
+`dhcp_lease_ip6 / _prefix6 / _gateway6` on the v6 side. Mode-flip
+server → client also no longer inherits a stale v6 gateway/ip
+from the previous v6 server role.
+
+### D8. Both stop paths clear `dhcp_last_error`
+
+- `stop_dhcp_client`: unconditional clear on the Stopped DB
+  write (client's stop path always reaches this line on success;
+  any hard failure earlier raises).
+- `stop_dhcp_server`: conditional. On success (empty failures
+  list) → clear the field. On partial failure → SET the field to
+  the aggregated failure summary so operators still see WHY the
+  stop wasn't clean.
+
+Structural pattern: the fix builds `_stop_payload` as a local
+dict then makes ONE `_update_device_db` call so a future refactor
+can't split the write into two calls (which would race the
+monitor's next tick).
+
+Both fixes carry the marker `v0.5.359 (audit stop-server-lease-
+field-clear, D7 + D8)`; the client-side D8 also carries a
+`v0.5.359 D8` reference so a grep finds both call sites.
+
+### Tests
+
+- `tests/test_v05359_stop_lease_and_last_error_clear.py` — 10
+  new tests: D7 field-parity with `stop_dhcp_client`, D7's
+  `_stop_payload` dict pattern, D8 success-vs-failure branch on
+  the server side, D8 unconditional clear on the client side,
+  regression guards that `stop_dhcp_client` still clears every
+  lease field (baseline that D7's parity argument stays true),
+  that `stop_dhcp_server` still returns the v0.5.217 fix-D
+  failures shape, and that the v0.5.357 hotfix's `list(hosts())`
+  fix wasn't accidentally reverted (both edits touch the same
+  function).
+
 ## [0.5.358] - 2026-09-19
 
 **Post-hotfix sweep + lint guard** for the class of bug that hung

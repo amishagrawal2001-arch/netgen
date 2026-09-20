@@ -3892,6 +3892,13 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
         {
             "dhcp_state": "Stopped",
             "dhcp_running": False,
+            # v0.5.359 D8: clear dhcp_last_error on Stop so a stale
+            # failure message from a prior cycle doesn't stick and
+            # confuse the next Apply's status readout. Same reasoning
+            # as the twin fix in stop_dhcp_server. stop_dhcp_client
+            # always reaches this line on success (any hard failure
+            # earlier raises), so unconditional clear is safe.
+            "dhcp_last_error": "",
             "dhcp_lease_ip": "",
             "dhcp_lease_mask": "",
             "dhcp_lease_gateway": "",
@@ -5575,16 +5582,42 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
             device_id, _cleanup_exc,
         )
 
-    _update_device_db(
-        device_db,
-        device_id,
-        {
-            "dhcp_state": "Stopped",
-            "dhcp_running": False,
-            "dhcp_lease_subnet": "",
-            "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    # v0.5.359 (audit stop-server-lease-field-clear, D7 + D8):
+    # extend the Stopped DB write to blank ALL v4 and v6 lease
+    # fields (parity with stop_dhcp_client at :3893) AND clear
+    # dhcp_last_error on success. Pre-fix, only three fields were
+    # written; a subsequent Apply that succeeded on the wire but
+    # left a stale dhcp_last_error from a prior failed cycle read
+    # as "Failed" in the UI even though the live lease was present
+    # — observed on srv06 device7 2026-09-19 after v0.5.358 verify.
+    # Mode-flip server → client also inherited stale v6 lease
+    # fields from the previous v6 server role.
+    _stop_payload = {
+        "dhcp_state": "Stopped",
+        "dhcp_running": False,
+        # v4 lease fields (parity with stop_dhcp_client).
+        "dhcp_lease_ip": "",
+        "dhcp_lease_mask": "",
+        "dhcp_lease_gateway": "",
+        "dhcp_lease_server": "",
+        "dhcp_lease_expires": None,
+        "dhcp_lease_subnet": "",
+        # v6 lease fields (parity with stop_dhcp_client + v0.5.302).
+        "dhcp_lease_ip6": "",
+        "dhcp_lease_prefix6": "",
+        "dhcp_lease_gateway6": "",
+        "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+    }
+    # v0.5.359 D8: on success, clear dhcp_last_error so a
+    # subsequent Apply doesn't inherit a stale failure message. On
+    # partial failure, SET it to the aggregated failure summary so
+    # the operator sees why the stop wasn't clean — that message is
+    # what the caller writes below via the `failures` return.
+    if not failures:
+        _stop_payload["dhcp_last_error"] = ""
+    else:
+        _stop_payload["dhcp_last_error"] = "; ".join(failures)
+    _update_device_db(device_db, device_id, _stop_payload)
     # v0.5.217 (audit fix D): surface aggregated failures instead of
     # blanket success. Callers previously had no way to know that
     # dnsmasq is still running or that a route is still installed.
