@@ -1122,7 +1122,15 @@ def _maybe_stop_dpdk_rx_for_stream(*, stream_id: str) -> None:
 
 
 @app.route("/api/streams/save", methods=["GET"])
+@require_role("operator")
 def save_session():
+    # v0.5.366 (audit route-auth-sweep, MP1): pre-fix, this GET
+    # endpoint wrote `stream_session.json` on disk with no role
+    # gate — a `<img src="…streams/save">` in a viewer's browser
+    # (or any CSRF vector) overwrote the session file. Operator-
+    # role gate closes the CSRF class of attack because the
+    # bearer token isn't automatically included on cross-site
+    # requests.
     import json
     from utils.path_utils import get_ostg_data_directory
     
@@ -15211,6 +15219,7 @@ def get_ospf_route_pools():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/ospf/pools", methods=["POST"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep)
 def create_ospf_route_pool():
     """Create a new OSPF route pool."""
     try:
@@ -15271,6 +15280,7 @@ def create_ospf_route_pool():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/ospf/pools/<pool_name>", methods=["PUT"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep)
 def update_ospf_route_pool(pool_name):
     """Update an existing OSPF route pool."""
     try:
@@ -15331,6 +15341,7 @@ def update_ospf_route_pool(pool_name):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/ospf/pools/<pool_name>", methods=["DELETE"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep)
 def delete_ospf_route_pool(pool_name):
     """Delete an OSPF route pool."""
     try:
@@ -16156,6 +16167,7 @@ def get_bgp_route_pools():
 
 
 @app.route("/api/bgp/pools", methods=["POST"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep)
 def create_bgp_route_pool():
     """Create a new BGP route pool in the database."""
     try:
@@ -16230,6 +16242,7 @@ def get_bgp_route_pool(pool_name):
 
 
 @app.route("/api/bgp/pools/<pool_name>", methods=["PUT"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep)
 def update_bgp_route_pool(pool_name):
     """Update an existing BGP route pool."""
     try:
@@ -16277,6 +16290,7 @@ def update_bgp_route_pool(pool_name):
 
 
 @app.route("/api/bgp/pools/<pool_name>", methods=["DELETE"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep)
 def delete_bgp_route_pool(pool_name):
     """Delete a BGP route pool from the database."""
     try:
@@ -16295,6 +16309,7 @@ def delete_bgp_route_pool(pool_name):
 
 
 @app.route("/api/bgp/pools/batch", methods=["POST"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep)
 def save_bgp_route_pools_batch():
     """Save multiple BGP route pools in a batch operation."""
     try:
@@ -16569,6 +16584,7 @@ def get_device_route_pools(device_id):
 
 
 @app.route("/api/device/<device_id>/route-pools", methods=["POST"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep)
 def attach_route_pools_to_device(device_id):
     """Attach route pools to a device for a specific neighbor."""
     try:
@@ -16610,6 +16626,7 @@ def attach_route_pools_to_device(device_id):
 
 
 @app.route("/api/device/<device_id>/route-pools", methods=["DELETE"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep)
 def remove_device_route_pools(device_id):
     """Remove route pool attachments from a device."""
     try:
@@ -27692,6 +27709,7 @@ def _rfc2544_thread(params):
 
 
 @app.route("/api/rfc2544/start", methods=["POST"])
+@require_role("operator")  # v0.5.366 (audit route-auth-sweep, S5)
 def rfc2544_start():
     """Kick off an RFC 2544 throughput test in the background.
 
@@ -29259,10 +29277,17 @@ def main(argv=None):
     
     # AI Device Discovery
     @app.route("/api/ai/device/discover", methods=["POST"])
+    @require_role("operator")
     def ai_discover_devices():
         """AI-powered device discovery on network"""
+        # v0.5.366 (audit route-auth-sweep + get_json-safety): pre-fix
+        # this used `request.get_json()` without `silent=True` — an
+        # empty or non-JSON body raised, which `data.get(...)` below
+        # then hit as AttributeError → 500. Now: silent parse to
+        # {} + operator role gate (discovery scans the network,
+        # not a viewer-tier action).
         try:
-            data = request.get_json()
+            data = request.get_json(silent=True) or {}
             subnet = data.get("subnet", "192.168.1.0/24")
             
             # Simple network scan (can be enhanced with nmap, etc.)

@@ -2,6 +2,37 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.366] - 2026-09-20
+
+**Route authorization sweep** — 11 MED-tier state-changing
+endpoints gain `@require_role("operator")`. Post-v0.5.365 hotfix
+follow-through; no logic change, no API break for callers that
+already send an operator-role bearer token.
+
+### Endpoints gated
+
+- `/api/streams/save` (GET, MP1) — writes disk; role gate closes
+  the CSRF vector because the bearer token isn't included on
+  cross-origin requests.
+- `/api/ospf/pools` POST + PUT + DELETE, `/api/bgp/pools` POST +
+  PUT + DELETE, `/api/bgp/pools/batch` POST,
+  `/api/device/<id>/route-pools` POST + DELETE (MP2 × 9) — all
+  mutate `device_db`.
+- `/api/rfc2544/start` POST (MP3, also S5 in the audit) — spawns
+  long-running tx_worker/tcpdump; other tests get 409 while it runs.
+- `/api/ai/device/discover` POST (MP4) — operator role +
+  `get_json(silent=True)` (empty body was raising 500).
+
+All 11 carry `v0.5.366 (audit route-auth-sweep)`. Sibling GET
+routes (list/read pools) stay ungated by design.
+
+### Tests
+
+- `tests/test_v05366_route_auth_sweep.py` — 16 new tests, one
+  per route + a sanity check that read-only GET siblings stayed
+  ungated + regression guard that v0.5.365's markers didn't
+  revert.
+
 ## [0.5.365] - 2026-09-20 — SECURITY HOTFIX
 
 **Nine attacker-controlled input paths closed.** Post-v0.5.364
