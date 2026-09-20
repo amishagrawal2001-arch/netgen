@@ -2,6 +2,40 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.361] - 2026-09-19
+
+**`capture_client` timeouts + streaming download cleanup.** Post-
+v0.5.360 audit A1 + A10.
+
+Pre-fix, `PacketCaptureClient.start_capture` / `stop_capture` /
+`download_capture` all called `requests.post` or `requests.get`
+with NO `timeout=` — a wedged capture server (deadlocked sniffer,
+slow disk, network partition) hung the Qt slot / worker thread
+indefinitely. Same file also opened the streaming download
+response without a `with` context, so the TCP connection leaked
+on any exception in `iter_content`.
+
+### Fixes
+
+- Every `requests.*` call gets `timeout=(connect, read)`. Connect
+  fixed at 5s (LAN, immediate ACK); read at 30s for the quick
+  start/stop routes and 60s for the streaming download.
+- `download_capture` wraps the `requests.get(..., stream=True)` in
+  a `with` block so the underlying connection is released even
+  when `iter_content` raises (server drops mid-transfer, disk
+  full, etc.).
+
+Markers: `v0.5.361 (audit capture-client-no-timeout)` +
+`v0.5.361 (audit capture-client-stream-not-closed)`.
+
+### Tests
+
+9 new tests including AST checks that every `requests.*` call
+carries `timeout=`, structural check that `download_capture` uses
+a `with` block, runtime proofs via monkeypatched `requests` module
+(no server required), and regression guard that the
+`{"error": str}` return contract on RequestException is preserved.
+
 ## [0.5.360] - 2026-09-19
 
 **D10: Apply-path v6 wait-loop was too short and broke on
