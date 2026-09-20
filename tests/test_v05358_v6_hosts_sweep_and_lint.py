@@ -228,9 +228,11 @@ _KNOWN_SAFE_LIVE_SITES = {
 # Files we know are dead (not imported by anything). Left for
 # separate cleanup ship — the lint below flags them but ignores
 # them here so this test can be green while the cleanup lands.
-_KNOWN_DEAD_FILES = {
-    "add_bgp_route_dialog_updated.py",
-}
+# v0.5.364: `add_bgp_route_dialog_updated.py` was deleted (the
+# audit's "cleanup ship" — see git log). The set is empty for
+# now; keep the mechanism so a future dead file can be flagged
+# without hunting for the pattern again.
+_KNOWN_DEAD_FILES: set = set()
 
 
 def _iter_production_py_files():

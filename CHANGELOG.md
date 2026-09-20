@@ -2,6 +2,20 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.364] - 2026-09-19
+
+**Housekeeping: delete dead legacy dialog file.**
+
+`add_bgp_route_dialog_updated.py` has been flagged by v0.5.358's
+repo-wide lint as carrying a `list(network.hosts())` explosion
+pattern in dead code (not imported anywhere). Since no live code
+references it, deleting it removes the flag entirely rather than
+carrying an allowlist entry forever.
+
+`_KNOWN_DEAD_FILES` in `tests/test_v05358_v6_hosts_sweep_and_lint.py`
+is now empty; the mechanism stays in place so a future dead file
+can be flagged without hunting for the pattern again.
+
 ## [0.5.363] - 2026-09-19
 
 **VXLAN v6 parity** — two family-blind paths in `utils/vxlan.py`
