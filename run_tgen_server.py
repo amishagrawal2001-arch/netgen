@@ -1591,6 +1591,7 @@ def api_streams_orphans():
 
 
 @app.route("/api/streams/orphans/reap", methods=["POST"])
+@require_role("admin")
 def api_streams_orphans_reap():
     """SIGTERM the specified PIDs, wait 1 s, SIGKILL anything
     still alive. Body: `{"pids": [3194868, 3194724]}`.
@@ -1607,7 +1608,14 @@ def api_streams_orphans_reap():
 
     Without an explicit pids list the endpoint refuses (400) — we
     never reap silently. The GUI must build the list from the
-    `/api/streams/orphans` response first."""
+    `/api/streams/orphans` response first.
+
+    v0.5.365 (audit orphans-reap-arbitrary-pid, S7): pre-fix, ANY
+    caller (viewer or unauth) could POST `{"pids": [1]}` and
+    SIGKILL init — or netgen-server's own PID. Now: admin role
+    required AND the requested PIDs are intersected with
+    `find_dpdk_workers()` so an admin can only reap actual tx/rx
+    worker processes, never unrelated system PIDs."""
     body = request.get_json(force=True, silent=True) or {}
     pids = body.get("pids")
     if not isinstance(pids, list) or not pids:
@@ -1619,8 +1627,30 @@ def api_streams_orphans_reap():
         return jsonify({
             "error": f"invalid pids in request: {bad_pids}",
         }), 400
+    # v0.5.365 (audit orphans-reap-arbitrary-pid, S7): membership
+    # check — only allow reaping PIDs that `find_dpdk_workers`
+    # currently reports as tx/rx workers. An admin who fat-fingers
+    # a bad PID (their own shell, the server itself, init) is
+    # rejected rather than executed.
     try:
-        from utils.dpdk_orphans import reap_workers
+        from utils.dpdk_orphans import find_dpdk_workers, reap_workers
+    except Exception as _imp_exc:
+        logging.exception("[orphans] cannot import dpdk_orphans")
+        return jsonify({"error": str(_imp_exc)}), 500
+    try:
+        _worker_pids = {int(w.get("pid")) for w in (find_dpdk_workers() or []) if w.get("pid")}
+    except Exception:
+        _worker_pids = set()
+    _out_of_scope = [p for p in pids if p not in _worker_pids]
+    if _out_of_scope:
+        return jsonify({
+            "error": (
+                "one or more pids are not netgen worker processes; "
+                "refusing to signal"
+            ),
+            "out_of_scope": _out_of_scope,
+        }), 400
+    try:
         result = reap_workers(pids)
         logging.warning(
             f"[orphans] reap requested pids={pids} "
@@ -14402,18 +14432,79 @@ def get_interface_rx_engine_advice(iface_name):
 
 
 ## Packet Capture CODE
+# v0.5.365 (audit capture-routes-hardening, S1-S4): the capture
+# routes below all took filepath / filename / interface straight
+# from unauthenticated request input. Post-fix, every route
+# requires operator role AND every filesystem path is confined
+# to the process's captures/ or uploads/pcaps/ directory via
+# realpath + commonpath check. Filenames go through
+# werkzeug.utils.secure_filename to strip path separators. iface
+# names go through a strict `[A-Za-z0-9._@:-]+` allowlist so a
+# malicious `interface=eth0; rm -rf /` can't reach tcpdump's argv.
+
+_CAPTURE_IFACE_RE = re.compile(r"^[A-Za-z0-9._@:-]{1,64}$")
+
+
+def _capture_root() -> str:
+    """v0.5.365: canonical captures/ root. Files are written /
+    read only from here; realpath resolves symlinks so a rogue
+    symlink INSIDE captures/ can't escape."""
+    _root = os.path.realpath(os.path.join(os.getcwd(), "captures"))
+    os.makedirs(_root, exist_ok=True)
+    return _root
+
+
+def _pcap_upload_root() -> str:
+    """v0.5.365: canonical uploads/pcaps/ root, same shape."""
+    _root = os.path.realpath(os.path.join(os.getcwd(), "uploads", "pcaps"))
+    os.makedirs(_root, exist_ok=True)
+    return _root
+
+
+def _safe_within(base: str, candidate: str) -> Optional[str]:
+    """v0.5.365 (audit capture-routes-hardening): return the
+    realpath of `candidate` iff it resolves within `base`. None
+    means the operator-supplied path escapes the allowed root —
+    caller must reject (never touch the file). Handles absolute
+    inputs, `..` traversal, and symlinks pointing outside `base`.
+    """
+    try:
+        _abs = os.path.realpath(candidate)
+        _base_abs = os.path.realpath(base)
+        if os.path.commonpath([_abs, _base_abs]) != _base_abs:
+            return None
+        return _abs
+    except (ValueError, OSError):
+        return None
+
 
 @app.route("/api/capture/start", methods=["POST"])
+@require_role("operator")
 def start_capture():
-    data = request.json
-    interface = data.get("interface", "eth0")
-    filename = data.get("filename", f"{interface}_{int(time.time())}.pcap")
+    # v0.5.365 (audit capture-routes-hardening, S2): input JSON
+    # can be malformed or absent — `request.json` raises 500;
+    # `get_json(silent=True) or {}` is the pattern already used
+    # elsewhere in this file for user-provided bodies. iface goes
+    # through a strict regex and filename through
+    # `werkzeug.utils.secure_filename` before being joined into
+    # the captures/ root; the final path is then checked with
+    # `_safe_within` in case secure_filename lets something
+    # ambiguous through.
+    from werkzeug.utils import secure_filename
+    data = request.get_json(silent=True) or {}
+    interface = str(data.get("interface", "eth0")).strip()
+    if not _CAPTURE_IFACE_RE.match(interface):
+        return jsonify({"error": "invalid interface name"}), 400
+    _default_name = f"{interface}_{int(time.time())}.pcap"
+    _raw_name = str(data.get("filename") or _default_name)
+    filename = secure_filename(_raw_name) or _default_name
+    if not filename.endswith(".pcap"):
+        filename = filename + ".pcap"
 
-    # Create 'captures' directory if it doesn't exist
-    capture_dir = os.path.join(os.getcwd(), "captures")
-    os.makedirs(capture_dir, exist_ok=True)
-
+    capture_dir = _capture_root()
     filepath = os.path.join(capture_dir, filename)
+    if _safe_within(capture_dir, filepath) is None:
+        return jsonify({"error": "filename escapes captures/ root"}), 400
 
     if interface in capture_processes:
         return jsonify({"error": "Capture already running"}), 400
@@ -14424,9 +14515,17 @@ def start_capture():
     return jsonify({"message": "Capture started", "filepath": filepath})
 
 @app.route("/api/capture/stop", methods=["POST"])
+@require_role("operator")
 def stop_capture():
-    data = request.json
-    interface = data.get("interface")
+    # v0.5.365 (audit capture-routes-hardening, S2 companion):
+    # role gate + get_json(silent=True). Interface only used as
+    # a key into `capture_processes` (never reaches the OS
+    # directly here) so the iface regex isn't strictly needed —
+    # but validate anyway for consistency with start.
+    data = request.get_json(silent=True) or {}
+    interface = str(data.get("interface") or "").strip()
+    if not interface:
+        return jsonify({"error": "interface required"}), 400
 
     entry = capture_processes.pop(interface, None)
     if not entry:
@@ -14437,20 +14536,34 @@ def stop_capture():
 
 
 @app.route("/api/capture/download", methods=["GET"])
+@require_role("operator")
 def download_capture():
-    filepath = request.args.get("filepath")
-    if not os.path.isfile(filepath):
+    # v0.5.365 (audit capture-routes-hardening, S1): pre-fix
+    # returned any host-readable file — `?filepath=/etc/shadow`
+    # worked. Now confined to `captures/` via realpath +
+    # commonpath. Operator role required (viewer isn't enough —
+    # a pcap can contain credentials / DHCP handshakes / clear-
+    # text HTTP that isn't fit for a read-only role).
+    filepath = request.args.get("filepath") or ""
+    _safe = _safe_within(_capture_root(), filepath)
+    if not _safe or not os.path.isfile(_safe):
         return jsonify({"error": "Capture file not found"}), 404
-    return send_file(filepath, as_attachment=True)
+    return send_file(_safe, as_attachment=True)
 
 @app.route("/api/capture/summary", methods=["GET"])
+@require_role("operator")
 def capture_summary():
-    filepath = request.args.get("filepath")
-    if not filepath or not os.path.isfile(filepath):
+    # v0.5.365 (audit capture-routes-hardening, S4): same arbitrary-
+    # filepath read as S1, additionally `scapy.rdpcap` loads the
+    # whole file into RAM — `?filepath=/var/log/syslog` on a
+    # 10 GB log OOM-kills netgen-server. Same allowlist as S1.
+    filepath = request.args.get("filepath") or ""
+    _safe = _safe_within(_capture_root(), filepath)
+    if not _safe or not os.path.isfile(_safe):
         return jsonify({"error": "Capture file not found"}), 404
 
     try:
-        packets = rdpcap(filepath)
+        packets = rdpcap(_safe)
         total = len(packets)
 
         protocol_counter = Counter()
@@ -14484,23 +14597,37 @@ def capture_summary():
 
 
 @app.route("/api/pcap/upload", methods=["POST"])
+@require_role("operator")
 def upload_pcap():
+    # v0.5.365 (audit capture-routes-hardening, S3): pre-fix,
+    # `file.filename` was written straight into path — a
+    # multipart upload with `filename="../../etc/cron.d/pwn"`
+    # placed attacker-controlled bytes wherever the netgen
+    # process could write. Now: secure_filename strips path
+    # separators + traversal; final path is re-checked with
+    # `_safe_within` as defense in depth.
+    from werkzeug.utils import secure_filename
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
 
     file = request.files['file']
-    if file.filename == '':
+    _raw = file.filename or ""
+    if _raw == '':
         return jsonify({"error": "No selected file"}), 400
 
-    pcap_dir = os.path.join(os.getcwd(), "uploads", "pcaps")
-    os.makedirs(pcap_dir, exist_ok=True)
+    filename = secure_filename(_raw)
+    if not filename:
+        return jsonify({"error": "invalid filename"}), 400
 
-    filepath = os.path.join(pcap_dir, file.filename)
+    pcap_dir = _pcap_upload_root()
+    filepath = os.path.join(pcap_dir, filename)
+    if _safe_within(pcap_dir, filepath) is None:
+        return jsonify({"error": "filename escapes uploads/pcaps/ root"}), 400
     file.save(filepath)
 
     return jsonify({
         "message": "PCAP uploaded",
-        "filepath": f"uploads/pcaps/{file.filename}"
+        "filepath": f"uploads/pcaps/{filename}"
     })
 
 
@@ -28079,7 +28206,16 @@ def latency_stop():
 
 
 @app.route("/api/interfaces/<iface>/admin", methods=["POST"])
+@require_role("admin")
 def interface_admin(iface):
+    # v0.5.365 (audit iface-admin-no-role, S9): pre-fix, this
+    # endpoint POST'd `ip link set <iface> up/down` with NO role
+    # gate — a viewer-role token could down the management NIC
+    # (`ens10f0` on srv06) and lock everyone out of the server.
+    # Sibling `/api/admin/iface/<iface>/up|down|reset|flash` are
+    # already `@require_role("admin")` (v0.5.4+); this route was
+    # missed. Same rank for parity — any op that can silently
+    # blackhole traffic is admin-tier.
     """Set a network interface admin state to up or down.
 
     v0.5.4: GUI server tree gained a right-click context menu on
@@ -29067,12 +29203,23 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/device/external/execute", methods=["POST"])
+    @require_role("operator")
     def execute_external_device_command():
-        """Execute command on external device"""
+        """Execute command on external device.
+
+        v0.5.365 (audit device-external-execute-no-role, S8): pre-
+        fix, ANY caller (viewer or unauth) could POST a `command`
+        string that SSHed into the registered external device (a
+        Juniper switch, Cisco router, etc.) and executed it as
+        whatever principal the operator saved in the device's
+        credentials. `reboot`, `configure`, arbitrary CLI — all
+        one HTTP call away. Now: operator-role gate matches the
+        rest of the state-changing external-device routes."""
         try:
             from utils.external_device_manager import ExternalDeviceManager
-            
-            data = request.get_json()
+
+            # v0.5.365: guard against malformed / missing body too.
+            data = request.get_json(silent=True) or {}
             device_id = data.get("device_id")
             command = data.get("command")
             connection_method = data.get("connection_method")

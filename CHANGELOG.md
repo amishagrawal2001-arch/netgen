@@ -2,6 +2,87 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.365] - 2026-09-20 — SECURITY HOTFIX
+
+**Nine attacker-controlled input paths closed.** Post-v0.5.364
+route audit surfaced multiple missing `@require_role` decorators
+plus unsanitized filesystem paths and shell-string interpolations
+that let ANY caller (viewer or unauth, depending on deployment)
+read arbitrary host files, write attacker-controlled bytes
+anywhere the netgen process could write, SIGKILL init, or
+SSH-exec into managed external switches.
+
+**Any deployment running v0.5.348–v0.5.364 should upgrade
+immediately.** If auth is off (the default `NETGEN_AUTH_TOKEN`
+unset), unauthenticated attackers on the same network could
+trigger each of these.
+
+### S1 — `/api/capture/download` — arbitrary file read
+Pre-fix: `send_file(request.args["filepath"])` returned any
+host-readable file (`/etc/shadow`, private keys, etc.). Now:
+`@require_role("operator")` + `_safe_within(_capture_root(),
+filepath)` confines reads to the `captures/` root via realpath
++ commonpath.
+
+### S2 — `/api/capture/start` — path traversal to tcpdump + iface arg injection
+Pre-fix: `filename` from JSON joined into path without
+`secure_filename`; `interface` piped straight to `tcpdump -i`
+without validation. Now: operator role +
+`werkzeug.utils.secure_filename` on filename + strict
+`[A-Za-z0-9._@:-]+` regex on iface + `get_json(silent=True)` for
+malformed-body safety.
+
+### S3 — `/api/pcap/upload` — path traversal on multipart upload
+Pre-fix: `file.save(os.path.join(pcap_dir, file.filename))` —
+`filename="../../etc/cron.d/pwn"` wrote there. Now: operator
+role + `secure_filename` + `_safe_within` re-check.
+
+### S4 — `/api/capture/summary` — arbitrary file read + OOM DoS
+Pre-fix: same arbitrary-`filepath` read as S1 + `scapy.rdpcap`
+loaded whole file into RAM (`?filepath=/var/log/syslog` → 10 GB
+spike → OOM-kill). Now: same allowlist as S1.
+
+### S6 — `frr_docker` loopback shell-string injection
+Pre-fix: `f"ip addr add {loopback_ipv4}/32 dev lo"` interpolated
+into `bash -c` INSIDE a privileged container with `cap_add=ALL`
+and host `/var/log/frr` mounted rw. Import a device record with
+`loopback_ipv4: "1.1.1.1; ip link del ens2f0"` and the second
+command ran as root inside the container. Now:
+`ipaddress.IPv{4,6}Address(str(v).split("/")[0].strip())`
+validates the value; malformed input skips the anchor with a
+warning log. `bash -c` removed entirely — argv-list form.
+
+### S7 — `/api/streams/orphans/reap` — SIGKILL arbitrary PIDs
+Pre-fix: ANY caller could POST `{"pids": [1]}` and SIGKILL init,
+or netgen-server itself. Now: `@require_role("admin")` +
+membership check against `find_dpdk_workers()` — admin can only
+reap actual worker processes, never unrelated system PIDs.
+
+### S8 — `/api/device/external/execute` — SSH RCE on managed devices
+Pre-fix: no role gate. `POST {"device_id":"…","command":"reboot"}`
+with a viewer token → SSH-exec runs on the switch as whatever
+principal the operator saved in the device's credentials. Now:
+operator role + `get_json(silent=True)`.
+
+### S9 — `/api/interfaces/<iface>/admin` — down the mgmt NIC
+Pre-fix: no role gate on `ip link set <iface> up/down`. Sibling
+`/api/admin/iface/<iface>/up|down` has been `@require_role("admin")`
+since v0.5.4; this route was missed. Now: admin role for parity.
+
+### Tests
+
+- `tests/test_v05365_security_hotfix.py` — 16 new tests via AST
+  walk over `run_tgen_server.py` route decorators + structural
+  checks on the capture helpers (`_safe_within`, `_capture_root`,
+  `_pcap_upload_root`, `_CAPTURE_IFACE_RE`) + the S6 shell-
+  interpolation removal + S7 membership check.
+
+### Follow-up
+
+v0.5.366 will close the remaining MED authorization gaps (~10
+BGP/OSPF/pools POST/DELETE routes, plus `/api/rfc2544/start`
+and `/api/streams/save`).
+
 ## [0.5.364] - 2026-09-19
 
 **Housekeeping: delete dead legacy dialog file.**

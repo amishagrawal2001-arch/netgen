@@ -1438,23 +1438,71 @@ class FRRDockerManager:
                 # CRITICAL: Also configure loopback IP directly using ip command as a fallback
                 # Sometimes FRR's vtysh doesn't immediately apply the IP to the kernel
                 # This ensures the IP is actually configured on the interface
+                # v0.5.365 (audit frr-loopback-shell-injection, S6):
+                # pre-fix, `loopback_ipv4` / `loopback_ipv6` were
+                # interpolated straight into a `bash -c` string. A
+                # device record with `loopback_ipv4: "1.1.1.1;
+                # ip link del ens2f0"` executed as root INSIDE a
+                # privileged container that mounts host paths
+                # (`/var/log/frr` rw) with cap_add=ALL. Now: strip
+                # the address through `ipaddress.ip_address(...)` —
+                # any shell metachar makes construction raise and
+                # we skip the anchor with a clear log line. Also
+                # switch to argv-list form (`ip addr add …` +
+                # `ip addr replace …` as separate exec_run calls)
+                # so no `bash -c` at all.
+                import ipaddress as _ipa
                 if loopback_ipv4:
-                    ip_cmd = f"ip addr add {loopback_ipv4}/32 dev lo 2>&1 || ip addr replace {loopback_ipv4}/32 dev lo 2>&1"
-                    ip_result = container.exec_run(["bash", "-c", ip_cmd])
-                    ip_output = ip_result.output.decode('utf-8') if isinstance(ip_result.output, bytes) else str(ip_result.output)
-                    if ip_result.exit_code == 0:
-                        logger.info(f"[FRR] Successfully configured loopback IPv4 {loopback_ipv4}/32 directly via ip command")
-                    else:
-                        logger.warning(f"[FRR] Failed to configure loopback IPv4 via ip command (may already exist): {ip_output}")
-                
+                    try:
+                        _v4 = str(_ipa.IPv4Address(str(loopback_ipv4).split("/")[0].strip()))
+                    except (ValueError, _ipa.AddressValueError):
+                        logger.warning(
+                            f"[FRR] v0.5.365: refusing to configure loopback "
+                            f"IPv4 — value {loopback_ipv4!r} is not a valid "
+                            f"IPv4 address (shell-injection guard)"
+                        )
+                        _v4 = None
+                    if _v4:
+                        _add = container.exec_run(
+                            ["ip", "addr", "add", f"{_v4}/32", "dev", "lo"]
+                        )
+                        if _add.exit_code != 0:
+                            _rep = container.exec_run(
+                                ["ip", "addr", "replace", f"{_v4}/32", "dev", "lo"]
+                            )
+                            _out = _rep.output.decode('utf-8') if isinstance(_rep.output, bytes) else str(_rep.output)
+                            if _rep.exit_code == 0:
+                                logger.info(f"[FRR] Successfully replaced loopback IPv4 {_v4}/32")
+                            else:
+                                logger.warning(f"[FRR] Failed to configure loopback IPv4 (may already exist): {_out}")
+                        else:
+                            logger.info(f"[FRR] Successfully added loopback IPv4 {_v4}/32")
+
                 if loopback_ipv6:
-                    ip6_cmd = f"ip -6 addr add {loopback_ipv6}/128 dev lo 2>&1 || ip -6 addr replace {loopback_ipv6}/128 dev lo 2>&1"
-                    ip6_result = container.exec_run(["bash", "-c", ip6_cmd])
-                    ip6_output = ip6_result.output.decode('utf-8') if isinstance(ip6_result.output, bytes) else str(ip6_result.output)
-                    if ip6_result.exit_code == 0:
-                        logger.info(f"[FRR] Successfully configured loopback IPv6 {loopback_ipv6}/128 directly via ip command")
-                    else:
-                        logger.warning(f"[FRR] Failed to configure loopback IPv6 via ip command (may already exist): {ip6_output}")
+                    try:
+                        _v6 = str(_ipa.IPv6Address(str(loopback_ipv6).split("/")[0].strip()))
+                    except (ValueError, _ipa.AddressValueError):
+                        logger.warning(
+                            f"[FRR] v0.5.365: refusing to configure loopback "
+                            f"IPv6 — value {loopback_ipv6!r} is not a valid "
+                            f"IPv6 address (shell-injection guard)"
+                        )
+                        _v6 = None
+                    if _v6:
+                        _add6 = container.exec_run(
+                            ["ip", "-6", "addr", "add", f"{_v6}/128", "dev", "lo"]
+                        )
+                        if _add6.exit_code != 0:
+                            _rep6 = container.exec_run(
+                                ["ip", "-6", "addr", "replace", f"{_v6}/128", "dev", "lo"]
+                            )
+                            _out6 = _rep6.output.decode('utf-8') if isinstance(_rep6.output, bytes) else str(_rep6.output)
+                            if _rep6.exit_code == 0:
+                                logger.info(f"[FRR] Successfully replaced loopback IPv6 {_v6}/128")
+                            else:
+                                logger.warning(f"[FRR] Failed to configure loopback IPv6 (may already exist): {_out6}")
+                        else:
+                            logger.info(f"[FRR] Successfully added loopback IPv6 {_v6}/128")
             
             # Verify loopback was configured by checking both running config and saved config
             verify_cmd = "echo '=== Running Config ===' && vtysh -c 'show running-config' | grep -A 5 'interface lo' || echo 'Loopback not found in running config'; echo '=== Saved Config ===' && cat /etc/frr/frr.conf | grep -A 5 'interface lo' || echo 'Loopback not found in saved config'"
