@@ -9366,31 +9366,36 @@ def device_arp():
 
 
 def generate_host_routes_from_pool(network, count):
-    """Generate individual host routes from a network pool."""
+    """Generate individual host routes from a network pool.
+
+    v0.5.358 (audit v6-hosts-generator-explosion, sweep): pre-fix
+    called `list(network.hosts())` unconditionally. On an IPv6 /64
+    that materializes 2^64-2 entries and hangs the request thread
+    for practical eternity. Same class as the v0.5.357 hotfix — the
+    caller passes `ipaddress.ip_network(subnet)` which auto-detects
+    v4/v6, so an operator creating a BGP route pool with an IPv6
+    subnet reached this path. Now: use `itertools.islice` on the
+    generator so we materialize at most `count` addresses.
+    """
+    import itertools
     try:
-        # Get all host addresses from the network
-        hosts = list(network.hosts())
-        
-        if network.version == 6:
-            # For IPv6, use all addresses (no broadcast)
-            hosts = list(network)
-            # Remove the network address (first address)
-            if len(hosts) > 1:
-                hosts = hosts[1:]
-        
-        if len(hosts) < count:
+        # v0.5.358: bounded iteration via islice — never materialize
+        # the full generator. For v6 the extra `hosts = list(network)`
+        # branch is also gone; the Subnet-Router Anycast at
+        # network_address is what `hosts()` already skips, so the
+        # branch was redundant AND buggy.
+        selected_hosts = list(itertools.islice(network.hosts(), count))
+
+        if len(selected_hosts) < count:
             raise ValueError(f"Not enough host addresses in network {network}")
-        
-        # Take the first 'count' host addresses and format as /32 or /128 routes
-        selected_hosts = hosts[:count]
-        
+
         if network.version == 4:
             # IPv4: use /32 for individual host routes
             return [f"{host}/32" for host in selected_hosts]
         else:
             # IPv6: use /128 for individual host routes
             return [f"{host}/128" for host in selected_hosts]
-            
+
     except Exception as e:
         logging.error(f"[BGP ROUTE ADV] Error generating host routes: {e}")
         return []
@@ -29122,14 +29127,30 @@ def main(argv=None):
             # Parse subnet
             try:
                 network = ipaddress.ip_network(subnet, strict=False)
-                # Limit to /24 for safety
-                if network.prefixlen < 24:
+                # v0.5.358 (audit v6-hosts-generator-explosion, sweep):
+                # the pre-fix `prefixlen < 24` guard was v4-shaped.
+                # For a v6 subnet (auto-detected by ip_network), a /64
+                # trivially passes `< 24` → then `list(hosts())` tries
+                # to materialize 2^64-2 addresses and the request
+                # thread hangs. Family-aware guard + bounded iteration
+                # via itertools.islice below.
+                if network.version == 4 and network.prefixlen < 24:
                     return jsonify({
                         "error": "Subnet too large. Please use /24 or smaller."
                     }), 400
-                
-                # Scan first 10 hosts (for demo - use nmap for production)
-                hosts = list(network.hosts())[:10]
+                if network.version == 6 and network.prefixlen < 120:
+                    return jsonify({
+                        "error": (
+                            "IPv6 subnet too large. Please use /120 "
+                            "or smaller (256 addresses max)."
+                        )
+                    }), 400
+
+                # Scan first 10 hosts (for demo — use nmap for
+                # production). v0.5.358: bounded via itertools.islice
+                # so the generator is never fully materialized.
+                import itertools as _it
+                hosts = list(_it.islice(network.hosts(), 10))
                 
                 for host in hosts:
                     # Ping test

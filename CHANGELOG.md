@@ -2,6 +2,70 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.358] - 2026-09-19
+
+**Post-hotfix sweep + lint guard** for the class of bug that hung
+srv06 on the v0.5.356 upgrade (`list(network.hosts())` on an
+IPv6 network materializes 2^N addresses).
+
+Grep across the codebase after v0.5.357 surfaced two more live
+call sites the hotfix hadn't touched, plus a dead legacy file
+that carries the pattern. All fixes preserve original semantics by
+switching to `itertools.islice(generator, N)` — at most N items
+materialize regardless of subnet size.
+
+### A. `run_tgen_server.py::generate_host_routes_from_pool`
+
+Called from the BGP route-advertisement path with a subnet the
+operator supplies via API. `ipaddress.ip_network(subnet)` auto-
+detects family, so a v6 pool (e.g. `2001:db8::/64` in a BGP route
+pool) reached `list(network.hosts())` and hung the request thread.
+The v6 branch ALSO did `hosts = list(network)` which is even worse
+— iterates every address including the network base.
+
+**Fix:** single `list(itertools.islice(network.hosts(), count))`
+call. The v6 branch is removed (it was buggy AND redundant — the
+generator already skips Subnet-Router Anycast).
+
+### B. `run_tgen_server.py` AI-discovery scan (:29132)
+
+Pre-fix `prefixlen < 24` size guard was v4-shaped. A v6 subnet
+passed it trivially (a `/64` clears `< 24` easily), then
+`list(network.hosts())[:10]` materialized the full generator
+BEFORE slicing.
+
+**Fix:** family-aware size guard (v4 keeps `< 24`; v6 requires
+`< 120` — 256-address cap matching the v4 limit) + bounded scan
+via `itertools.islice(network.hosts(), 10)`.
+
+### C. Lint guard — `tests/test_v05358_v6_hosts_sweep_and_lint.py`
+
+Repo-wide AST walk that fails the suite if any `list(...hosts())`
+call expression appears in production code outside the
+`_KNOWN_SAFE_LIVE_SITES` allowlist. Uses AST (not regex) so
+docstrings, comments, and string literals that MENTION the pattern
+don't false-positive — only real call expressions do. The
+allowlist enumerates the four v4-only call sites verified safe
+(v4 /24 → 254 hosts materialize fine).
+
+`add_bgp_route_dialog_updated.py` still carries the buggy pattern
+but isn't imported anywhere — flagged as a dead file
+(`_KNOWN_DEAD_FILES`) with a companion regression test that fails
+if anything ever imports it. Cleanup deferred.
+
+### Tests
+
+- `tests/test_v05358_v6_hosts_sweep_and_lint.py` — 12 new tests.
+  Structural (islice call landed, v6 branch removed, v4 /32 +
+  v6 /128 emit preserved), RUNTIME (bounded on v6 /64 in <0.5s,
+  v4 /24 still returns correct hosts), family-aware size guard on
+  the AI-discovery scan, and the repo-wide AST lint that catches
+  future occurrences.
+- The runtime probe extracts `generate_host_routes_from_pool` via
+  `ast.unparse` + `exec` into an isolated throwaway module so the
+  test doesn't need to import `run_tgen_server` (which triggers
+  `/opt/netgen` startup side effects on real hosts).
+
 ## [0.5.357] - 2026-09-19
 
 **HOTFIX** — `list(ipv6_network.hosts())` explosion. **Regression
