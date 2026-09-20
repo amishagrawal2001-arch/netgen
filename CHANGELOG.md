@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.367] - 2026-09-20
+
+**Admin console: one-click RDMA install.**
+
+Operator on `svl-d-ai-srv04` 2026-09-20: the /admin console's
+RDMA Stack card showed missing kernel modules with a footnote
+pointing at the desktop client's "Setup RDMA…" wizard or
+manually running `install_rdma.sh` on the host — but there was
+no one-click Install action in the console itself, unlike the
+sibling System Dependencies card and DPDK Runtime cards which
+both carry per-item Install buttons.
+
+The endpoint has existed since v0.5.27 (`POST /api/admin/install_rdma`
++ `GET /api/admin/install_rdma/log`); this ship just wires a UI
+button to it.
+
+### Fix
+
+- `<button id="btn-install-rdma">` next to the RDMA Stack card
+  heading, matching the System Dependencies card's Refresh button
+  placement.
+- `loadHealth` reveals the button only when RDMA is unhealthy
+  (perftest CLI missing OR any required module unloaded). On a
+  fully-installed host the button stays hidden.
+- Click handler POSTs `/api/admin/install_rdma`, disables itself,
+  then polls `/api/admin/install_rdma/log` at 2s intervals and
+  streams the log into the same `<pre id="log">` element the
+  DPDK installer uses (one Install Log card, not two). On
+  completion the poll stops, `install-status` reflects the
+  outcome, and `loadHealth()` re-renders so the RDMA card and
+  its own Install button update automatically.
+
+Marker: `v0.5.367 (audit admin-rdma-install-button)`.
+
+### Tests
+
+- `tests/test_v05367_admin_rdma_install_button.py` — 13 new
+  tests: HTML button present + hidden by default, JS reveal
+  gated on `perftest_installed AND every module`, POST/polling/
+  stop-on-complete wiring, log pane shared with DPDK installer,
+  regression guards on the v0.5.27 endpoints and v0.5.74 state
+  render.
+- `tests/test_v0574_rdma_status_admin.py` — 1 assertion widened
+  to accept the new `<h2 style="margin: 0;">RDMA Stack</h2>`
+  flex-container form alongside the pre-fix bare tag.
+
 ## [0.5.366] - 2026-09-20
 
 **Route authorization sweep** — 11 MED-tier state-changing

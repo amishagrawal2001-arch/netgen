@@ -165,10 +165,15 @@ def test_health_issues_list_flags_zero_active_ports():
 
 def test_admin_html_includes_rdma_card():
     src = _src()
-    # The card has a heading "RDMA Stack".
-    assert "<h2>RDMA Stack</h2>" in src, (
-        "Admin HTML doesn't include an RDMA Stack card"
-    )
+    # The card has a heading "RDMA Stack". v0.5.367 (audit
+    # admin-rdma-install-button) moved the heading into a flex
+    # container with an Install button — the tag now has a
+    # `style="margin: 0;"` attribute for alignment. Accept either
+    # the bare v0.5.74 form or the v0.5.367 flex form.
+    assert (
+        "<h2>RDMA Stack</h2>" in src
+        or '<h2 style="margin: 0;">RDMA Stack</h2>' in src
+    ), "Admin HTML doesn't include an RDMA Stack card"
     # And surfaces the four state elements.
     for elem_id in ("p-rdma-perftest", "p-rdma-mods",
                      "p-rdma-hca-count", "p-rdma-ports"):

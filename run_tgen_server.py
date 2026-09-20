@@ -23729,14 +23729,27 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       <div class="row"><span class="label">Disk free (/tmp)</span><span id="p-disk-tmp">…</span></div>
     </div>
 
+    <!-- v0.5.367 (audit admin-rdma-install-button): pre-fix, the
+         RDMA card showed missing modules with a footnote that said
+         "Run 'Setup RDMA…' from the desktop client or set up
+         manually with install_rdma.sh" — but there was no
+         one-click Install action in the admin console itself.
+         `POST /api/admin/install_rdma` already existed (v0.5.27);
+         this ship just wires a button to it and pipes the log
+         into the shared Install Log card below. Button is hidden
+         until we know something is actually missing, so a
+         healthy host isn't tempted by a re-run. -->
     <div class="card">
-      <h2>RDMA Stack</h2>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">RDMA Stack</h2>
+        <button id="btn-install-rdma" hidden>Install RDMA…</button>
+      </div>
       <div class="row"><span class="label">perftest CLI</span><span class="pill" id="p-rdma-perftest">…</span></div>
       <div class="row"><span class="label">Kernel modules</span><span class="pill" id="p-rdma-mods">…</span></div>
       <div class="row"><span class="label">HCA devices</span><span id="p-rdma-hca-count">…</span></div>
       <div class="row"><span class="label">Active ports</span><span id="p-rdma-ports">…</span></div>
       <p style="color: var(--muted); font-size: 11px; margin: 8px 0 0;">
-        Required modules: ib_uverbs, rdma_cm, rdma_ucm, ib_umad, iw_cm. Run "Setup RDMA…" from the desktop client or set up manually with install_rdma.sh.
+        Required modules: ib_uverbs, rdma_cm, rdma_ucm, ib_umad, iw_cm. The Install button above runs install_rdma.sh (apt packages + modprobe + rdma-core service); a full install takes 1–3 minutes and the log streams into the Install Log card below.
       </p>
     </div>
 
@@ -24056,6 +24069,20 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           p.textContent = `Missing: ${missing.join(', ')}`;
           p.className = 'pill bad';
           p.setAttribute('aria-label', `RDMA modules missing: ${missing.join(', ')}`);
+        }
+        // v0.5.367 (audit admin-rdma-install-button): reveal the
+        // Install button only when something is actually missing —
+        // perftest CLI absent, module list Unknown, or any required
+        // module unloaded. On a healthy host the button stays
+        // hidden so operators aren't tempted to re-run.
+        const _btnRdmaInstall = $('btn-install-rdma');
+        if (_btnRdmaInstall) {
+          const _rdmaHealthy = (
+            !!rdma.perftest_installed
+            && modKeys.length > 0
+            && modKeys.every(k => mods[k])
+          );
+          _btnRdmaInstall.hidden = _rdmaHealthy;
         }
         $('p-rdma-hca-count').textContent = String(rdma.hca_count ?? 0);
         const portsTotal = rdma.ports_total ?? 0;
@@ -24513,6 +24540,82 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         $('btn-install-dpdk').disabled = false;
       }
     });
+
+    // v0.5.367 (audit admin-rdma-install-button): wire the new
+    // RDMA install button. Runs install_rdma.sh --auto via the
+    // existing POST /api/admin/install_rdma endpoint, then polls
+    // /api/admin/install_rdma/log every 2s until `running` flips
+    // false. Log is streamed into the same <pre id="log"> element
+    // the DPDK installer uses so the operator sees output in the
+    // existing Install Log card without a second scroll target.
+    // On completion, refresh the health cards so the RDMA Stack
+    // card re-renders and hides its own Install button when
+    // everything is now installed.
+    let _rdmaPollTimer = null;
+    function _stopRdmaPoll() {
+      if (_rdmaPollTimer) { clearInterval(_rdmaPollTimer); _rdmaPollTimer = null; }
+    }
+    async function _pollRdmaLog() {
+      try {
+        const r = await fetch('/api/admin/install_rdma/log');
+        const d = await r.json();
+        const log = $('log');
+        if (d.log !== undefined) {
+          log.textContent = d.log || '(no output yet)';
+          if ($('log-autoscroll').checked && isNearBottom(log)) {
+            log.scrollTop = log.scrollHeight;
+          }
+        }
+        if (!d.running) {
+          _stopRdmaPoll();
+          const _rc = d.return_code;
+          if (_rc === 0) {
+            $('install-status').textContent = 'RDMA install complete (rc=0).';
+          } else if (_rc !== null && _rc !== undefined) {
+            $('install-status').textContent = `RDMA install failed (rc=${_rc}). See log.`;
+            toast(`install_rdma.sh exited rc=${_rc}. See log below.`);
+          }
+          $('btn-install-rdma').disabled = false;
+          // Refresh admin state so the RDMA card + button visibility
+          // update to reflect the new module state.
+          if (typeof loadHealth === 'function') loadHealth();
+        }
+      } catch (e) {
+        _stopRdmaPoll();
+        toast('RDMA log poll failed: ' + e);
+        $('btn-install-rdma').disabled = false;
+      }
+    }
+    if ($('btn-install-rdma')) {
+      $('btn-install-rdma').addEventListener('click', async () => {
+        if (!confirm(
+          'Run install_rdma.sh on this server?\n\n' +
+          'apt installs libibverbs-dev, rdma-core, perftest, ibverbs-utils, ' +
+          'infiniband-diags; modprobes ib_uverbs / rdma_cm / ib_umad and ' +
+          'persists in /etc/modules-load.d/. Typically 1–3 minutes.'
+        )) return;
+        $('btn-install-rdma').disabled = true;
+        $('install-status').textContent = 'Starting RDMA install…';
+        $('log').textContent = 'Starting install_rdma.sh…';
+        try {
+          const r = await fetch('/api/admin/install_rdma', { method: 'POST' });
+          const d = await r.json();
+          if (!r.ok) {
+            toast('RDMA install failed to start: ' + (d.error || r.status));
+            $('btn-install-rdma').disabled = false;
+            $('install-status').textContent = 'RDMA install could not start.';
+            return;
+          }
+          $('install-status').textContent = `RDMA install started (pid ${d.pid}). Log: ${d.log_path}`;
+          _stopRdmaPoll();
+          _pollRdmaLog();
+          _rdmaPollTimer = setInterval(_pollRdmaLog, 2000);
+        } catch (e) {
+          toast('Request failed: ' + e);
+          $('btn-install-rdma').disabled = false;
+        }
+      });
+    }
 
     // v0.5.64 (audit M14 + M15): error toast that includes the
     // full server-reported text — message/error/output/stderr —
