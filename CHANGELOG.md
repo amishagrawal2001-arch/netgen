@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.354] - 2026-09-19
+
+**v6 monitor parity** — two `arp_monitor` sibling scanners that mirror
+the long-standing v4 originals. Both build on v0.5.352's v6 helper
+consolidation: the parent-NIC scan now has a matching remediation
+(v0.5.352 D6's sweep), and the local-table scan can auto-delete
+because v0.5.352 D3 proved the paired install/remove on the /128
+side.
+
+### D4. `_scan_local_table_drift_v6`
+
+Mirror of v0.5.290+v0.5.293. v0.5.352 D1/D2 installs `local
+<ip>/128 dev <iface> table local` on every v6 anchor. A manual
+`ip -6 addr del`, or any pre-v0.5.352 `_remove_ipv6_address` call
+that lacked the paired cleanup, leaves the local `/128` ghost. The
+kernel then treats the address as netgen's own → drops any inbound
+packet with `src=<ip>` as martian on ANY interface → silently
+breaks DHCPv6 relay or any v6 protocol whose peer owns that IP.
+
+**AUTO-DELETE + WARN** (matches v0.5.293's v4 auto-cleanup policy —
+an application-installed local host route whose IP isn't on the
+interface is by definition broken kernel state with no legitimate
+use case). Safety guards mirror v0.5.293's v4 shape: skip `lo`
+(kernel-managed for v6, `::1/128` etc.), skip anything but `/128`
+host routes (subnet-shaped `local` entries are rare admin-installed
+NDP-proxy configs and MUST NOT be auto-deleted), skip link-local
+(`fe80::/10`).
+
+### D5. `_scan_parent_nic_drift_v6`
+
+Mirror of v0.5.287 Fix C. A pre-v0.5.335 apply (or a hand-set
+anchor) may have landed a v6 pool-subnet address on the parent NIC
+(`ens2f0np0`) instead of the vlan subif (`vlan10`). Same symptom
+class as the v4 sister — kernel installs a connected /64 in the
+default VRF via the parent, NDP replies for sibling anchors on the
+vlan subif route out UNTAGGED, switch trunk drops them, operator
+sees NDP-timeout / no DHCPv6 transactions with no netgen-side
+error.
+
+**WARN-only** (same conservatism as v4 sister — v6 addresses may
+be intentional management-plane. Remediation: stop→start on the
+DHCP-server device triggers v0.5.352 D6's parent-NIC sweep.)
+
+### Two new helpers in `utils/dhcp.py`
+
+- `_iface_ipv6_addresses(interface, container=None)` — v6 mirror
+  of v0.5.239's `_iface_ipv4_addresses`. Excludes link-local so
+  the parent-NIC scan doesn't false-positive every direct-attached
+  iface.
+- `_collect_ipv6_anchor_candidates(dhcp_cfg)` — v6 mirror of
+  v0.5.239's `_collect_ipv4_anchor_candidates`. Iterates BOTH key
+  spellings (`ipv6_pool_start`/`ipv6_prefix` AND legacy
+  `pool6_start`/`prefix6`), includes v0.5.230's auto-derive first
+  host, and includes `ipv6_gateway` when the operator declared a
+  distinct v6 gateway.
+
+Both scanners wired into `arp_monitor`'s startup block alongside
+their v4 siblings, each guarded by its own try/except so a failing
+scan doesn't prevent the monitor loop from starting.
+
+### Tests
+
+- `tests/test_v05354_v6_monitor_parity.py` — 23 new tests: helper
+  definitions, key-spelling coverage in the v6 candidate collector,
+  scanner WARN-only vs AUTO-DELETE policy, safety guards
+  (link-local, `lo`, /128-only), scanner-to-startup wiring,
+  regression guards on v4 siblings + v0.5.352 helpers this depends
+  on.
+
 ## [0.5.353] - 2026-09-16
 
 **UI cramp bundle** — six dialogs get roomier minimum widths.

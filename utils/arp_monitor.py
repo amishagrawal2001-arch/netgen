@@ -166,6 +166,20 @@ class ARPStatusMonitor:
                 f"[ARP MONITOR] parent-NIC drift scan raised: {_exc}"
             )
 
+        # v0.5.354 (audit dhcpv6-scanner-parity): v6 mirror. A pre-
+        # v0.5.335 v6 anchor that landed on the parent NIC produces
+        # the same symptom class the v4 scanner catches (NDP replies
+        # routed via the parent's default-VRF connected route land
+        # UNTAGGED on the switch trunk). WARN-only, same as the v4
+        # sibling — deleting v6 addresses is destructive; stop→start
+        # triggers v0.5.352 D6 parent-NIC sweep.
+        try:
+            self._scan_parent_nic_drift_v6()
+        except Exception as _exc:
+            logger.warning(
+                f"[ARP MONITOR] v6 parent-NIC drift scan raised: {_exc}"
+            )
+
         # v0.5.290 (audit anchor-DAD, part 3): scan the local
         # routing table for stale `local <ip> dev <iface>` entries
         # whose <ip> is no longer on <iface>. v0.5.286 (ARP-J6)
@@ -183,6 +197,21 @@ class ARPStatusMonitor:
         except Exception as _exc:
             logger.warning(
                 f"[ARP MONITOR] local-table drift scan raised: {_exc}"
+            )
+
+        # v0.5.354 (audit dhcpv6-scanner-parity): v6 mirror. v0.5.352
+        # D1/D2 installs `local <ip>/128 dev <iface> table local` on
+        # every v6 anchor; a manual `ip -6 addr del` (or a pre-v0.5.352
+        # `_remove_ipv6_address`) leaves the local `/128` orphan and
+        # the kernel martian-drops packets from that address on ANY
+        # iface. AUTO-DELETE matches v0.5.293's v4 auto-cleanup — an
+        # application-installed v6 local host route whose IP isn't on
+        # the interface is by definition broken state.
+        try:
+            self._scan_local_table_drift_v6()
+        except Exception as _exc:
+            logger.warning(
+                f"[ARP MONITOR] v6 local-table drift scan raised: {_exc}"
             )
 
         self.is_running = True
@@ -1035,6 +1064,240 @@ class ARPStatusMonitor:
                     f"{_iface} table local`. Kernel drops packets "
                     f"with src={_ip} as martian until cleaned."
                 )
+
+    def _scan_parent_nic_drift_v6(self) -> None:
+        """v0.5.354 (audit dhcpv6-scanner-parity): v6 mirror of
+        `_scan_parent_nic_drift`. A pre-v0.5.335 apply (or a hand-
+        set anchor) may have landed a v6 pool-subnet address on the
+        parent NIC (e.g. `ens2f0np0`) instead of the vlan subif.
+
+        The v6 symptom class mirrors the v4 one — the kernel installs
+        a connected route for the /64 in the default VRF via the
+        parent NIC. NDP replies for sibling anchors on the vlan subif
+        get sent out UNTAGGED via the parent's route, and the switch
+        trunk drops them. Operator sees NDP-timeout / no DHCPv6
+        transactions with no netgen-side error.
+
+        WARN-only (never auto-delete). Same rationale as the v4
+        sister: v6 addresses may have been placed intentionally
+        (management, mgmt-plane, etc.). Stop→start on the affected
+        DHCP-server device triggers v0.5.352 D6's parent-NIC sweep.
+        """
+        try:
+            devices = self.device_db.get_all_devices()
+        except Exception as _exc:
+            logger.warning(
+                f"[ARP MONITOR] v6 drift scan: get_all_devices "
+                f"failed: {_exc}"
+            )
+            return
+        _dhcp_servers = [
+            d for d in (devices or [])
+            if (d.get("status") == "Running"
+                and str(d.get("dhcp_mode") or "").lower() == "server")
+        ]
+        if not _dhcp_servers:
+            logger.debug(
+                "[ARP MONITOR] v6 drift scan: no Running DHCP-server "
+                "devices; nothing to scan"
+            )
+            return
+        try:
+            from utils.dhcp import (
+                _collect_ipv6_anchor_candidates,
+                _iface_ipv6_addresses,
+                _iface_parent,
+            )
+        except Exception as _imp_exc:
+            logger.warning(
+                f"[ARP MONITOR] v6 drift scan: cannot import DHCP "
+                f"helpers: {_imp_exc}"
+            )
+            return
+        _warned_ifaces: set = set()
+        for _dev in _dhcp_servers:
+            _dev_id = _dev.get("device_id") or "?"
+            _iface = (
+                _dev.get("interface")
+                or _dev.get("server_interface")
+                or ""
+            )
+            _vlan = str(_dev.get("vlan") or "0").strip()
+            if _vlan and _vlan != "0":
+                _iface = f"vlan{_vlan}"
+            _iface = (_iface or "").split("@", 1)[0]
+            if not _iface:
+                continue
+            _parent = _iface_parent(_iface, container=None)
+            if not _parent:
+                continue
+            if _parent in _warned_ifaces:
+                continue
+            _dhcp_cfg = _dev.get("dhcp_config")
+            if isinstance(_dhcp_cfg, str):
+                try:
+                    import json as _json
+                    _dhcp_cfg = _json.loads(_dhcp_cfg)
+                except Exception:
+                    _dhcp_cfg = {}
+            if not isinstance(_dhcp_cfg, dict):
+                _dhcp_cfg = {}
+            try:
+                _candidates = _collect_ipv6_anchor_candidates(_dhcp_cfg)
+            except Exception:
+                _candidates = set()
+            if not _candidates:
+                continue
+            try:
+                _parent_ips = _iface_ipv6_addresses(_parent, container=None)
+            except Exception:
+                _parent_ips = []
+            _candidate_ips = {ip for ip, _pfx in _candidates}
+            _orphans = [
+                (ip, pfx) for ip, pfx in _parent_ips
+                if ip in _candidate_ips
+            ]
+            if _orphans:
+                _orphan_str = ", ".join(f"{ip}/{pfx}" for ip, pfx in _orphans)
+                logger.warning(
+                    f"[ARP MONITOR] v0.5.354 v6 DRIFT: parent NIC "
+                    f"{_parent} carries v6 anchor IP(s) that belong "
+                    f"on subif {_iface} (device {_dev_id}): "
+                    f"{_orphan_str}. NDP replies for sibling v6 "
+                    f"anchors route via the parent's connected /64 "
+                    f"and the switch trunk drops them UNTAGGED. Fix: "
+                    f"stop→start the DHCP-server device (triggers "
+                    f"v0.5.352 D6 parent-NIC sweep). Manual: "
+                    f"'sudo ip -6 addr del <ip>/<pfx> dev {_parent}'."
+                )
+                _warned_ifaces.add(_parent)
+
+    def _scan_local_table_drift_v6(self) -> None:
+        """v0.5.354 (audit dhcpv6-scanner-parity): v6 mirror of
+        `_scan_local_table_drift`. v0.5.352 D1/D2 installs
+        ``local <ip>/128 dev <iface> table local`` on every v6
+        anchor. When the address is later removed (manual
+        `ip -6 addr del`, or a pre-v0.5.352 `_remove_ipv6_address`
+        that lacked the paired cleanup), the kernel does NOT auto-
+        remove the application-installed local host route. The
+        ghost `/128` persists — kernel treats the IP as netgen's
+        own → drops any inbound packet with src=<ip> as martian
+        → silently breaks DHCPv6 relay or any protocol whose peer
+        owns that IP.
+
+        AUTO-DELETE + WARN (matches v0.5.293 v4 policy). An
+        application-installed v6 local host route whose IP isn't on
+        the interface is by definition broken kernel state with no
+        legitimate use case.
+
+        Safety guards mirror v0.5.293's v4 shape:
+        - `lo` is kernel-managed for v6 (`::1/128` etc.) — skip.
+        - Skip CIDR-notation `local` entries (subnet-shaped v6
+          `local` routes are rare admin-installed NDP-proxy shapes
+          and MUST NOT be auto-deleted).
+        - Only touch `/128` host routes (or bare host `local` lines
+          without an explicit prefix).
+        """
+        try:
+            _res = subprocess.run(
+                ["ip", "-6", "route", "show", "table", "local"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception as _exc:
+            logger.debug(
+                f"[ARP MONITOR] v6 local-table drift scan: "
+                f"ip -6 route show failed: {_exc}"
+            )
+            return
+        _out = (_res.stdout or "")
+        # Parse `local <ip>[/128] dev <iface> ...`
+        _ghosts = []
+        for _line in _out.splitlines():
+            _tokens = _line.strip().split()
+            if len(_tokens) < 4 or _tokens[0] != "local":
+                continue
+            try:
+                _dev_idx = _tokens.index("dev")
+            except ValueError:
+                continue
+            if _dev_idx + 1 >= len(_tokens):
+                continue
+            _ip_field = _tokens[1]
+            _iface = _tokens[_dev_idx + 1]
+            if _iface == "lo":
+                continue
+            # Accept only bare host or explicit /128 form. Anything
+            # with a different prefix is a subnet-shaped `local`
+            # entry that must not be auto-deleted.
+            if "/" in _ip_field:
+                _ip, _, _pfx = _ip_field.partition("/")
+                if _pfx != "128":
+                    continue
+            else:
+                _ip = _ip_field
+            # Skip link-local addresses (`fe80::/10`) — kernel
+            # manages those; auto-deleting is destructive.
+            import ipaddress as _ipa
+            try:
+                if _ipa.IPv6Address(_ip).is_link_local:
+                    continue
+            except (ValueError, _ipa.AddressValueError):
+                continue
+            # Check whether _ip is currently on _iface.
+            try:
+                _addr = subprocess.run(
+                    ["ip", "-6", "-o", "addr", "show", "dev", _iface],
+                    capture_output=True, text=True, timeout=3,
+                )
+                _addr_out = (_addr.stdout or "")
+            except Exception:
+                continue
+            # `inet6 <ip>/<pfx>` — grep for the ip followed by /
+            if f" {_ip}/" not in _addr_out:
+                _ghosts.append((_ip, _iface))
+        if not _ghosts:
+            logger.debug(
+                "[ARP MONITOR] v6 local-table drift scan: no ghosts"
+            )
+            return
+        for _ip, _iface in _ghosts:
+            _rm_ok = False
+            _rm_err = ""
+            _rm_rc = -1
+            try:
+                _rm = subprocess.run(
+                    [
+                        "ip", "-6", "route", "del", "local", f"{_ip}/128",
+                        "dev", _iface, "table", "local",
+                    ],
+                    capture_output=True, text=True, timeout=5,
+                )
+                _rm_ok = (_rm.returncode == 0)
+                _rm_rc = _rm.returncode
+                _rm_err = (_rm.stderr or "").strip()
+            except Exception as _rm_exc:
+                _rm_err = str(_rm_exc)
+            if _rm_ok:
+                logger.warning(
+                    f"[ARP MONITOR] v0.5.354 V6 LOCAL-TABLE GHOST "
+                    f"auto-cleaned: `local {_ip}/128 dev {_iface}` "
+                    f"was in v6 table local but {_ip} is NOT on "
+                    f"{_iface}. Kernel would drop packets with "
+                    f"src={_ip} as martian, silently breaking DHCPv6 "
+                    f"relay or any v6 protocol whose peer owns that "
+                    f"IP. Removed."
+                )
+            else:
+                logger.warning(
+                    f"[ARP MONITOR] v0.5.354 V6 LOCAL-TABLE GHOST "
+                    f"detected but auto-cleanup FAILED: `local "
+                    f"{_ip}/128 dev {_iface}` (rc={_rm_rc}, "
+                    f"err={_rm_err[:200]!r}). Run manually: `sudo "
+                    f"ip -6 route del local {_ip}/128 dev {_iface} "
+                    f"table local`. Kernel drops packets with "
+                    f"src={_ip} as martian until cleaned."
+                )
+
     def _monitor_loop(self):
         """Main monitoring loop."""
         logger.info("[ARP MONITOR] Monitoring loop started")

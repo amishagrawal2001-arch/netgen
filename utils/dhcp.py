@@ -2199,6 +2199,63 @@ def _collect_ipv4_anchor_candidates(dhcp_cfg: Optional[Dict]) -> set:
     return anchors
 
 
+def _collect_ipv6_anchor_candidates(dhcp_cfg: Optional[Dict]) -> set:
+    """v0.5.354 (audit dhcpv6-scanner-parity): v6 mirror of
+    `_collect_ipv4_anchor_candidates`. Returns the set of
+    ``{(ip_str, prefix_len_str), ...}`` tuples that
+    `_ensure_ipv6_address` COULD have added on behalf of this DHCP
+    config, across every v6 metadata source we track. Used by
+    `arp_monitor._scan_parent_nic_drift_v6` (v0.5.354) to detect
+    v6 pool-subnet anchors that landed on the parent NIC.
+
+    Sources scanned (both key spellings; mirrors the v0.5.351
+    stop_dhcp_server sweep):
+    - ``ipv6_server_ip`` + ``ipv6_prefix`` — the operator-set
+      anchor when explicit.
+    - First host of ``ipv6_pool_start``/``ipv6_prefix`` — the
+      v0.5.230 auto-derive.
+    - First host of legacy ``pool6_start``/``prefix6``.
+    - ``ipv6_gateway`` — operator may have declared a distinct v6
+      gateway that `_ensure_ipv6_address` honored via
+      `server_ip = gateway`. Included with its declared prefix so
+      the parent-NIC scan matches.
+    """
+    if not dhcp_cfg:
+        return set()
+    anchors: set = set()
+
+    def _add_first_host(pool_start_str, prefix_str):
+        try:
+            _net = ipaddress.IPv6Network(
+                f"{pool_start_str}/{prefix_str}", strict=False,
+            )
+            _hosts = list(_net.hosts())
+            if _hosts:
+                anchors.add((str(_hosts[0]), str(prefix_str)))
+        except (ipaddress.AddressValueError, ValueError):
+            pass
+
+    _v6_ip = str(dhcp_cfg.get("ipv6_server_ip") or "").strip()
+    _v6_pfx_top = str(dhcp_cfg.get("ipv6_prefix") or dhcp_cfg.get("prefix6") or "").strip()
+    if _v6_ip and _v6_pfx_top:
+        anchors.add((_v6_ip, _v6_pfx_top))
+
+    for _start_key, _pfx_key in (
+        ("ipv6_pool_start", "ipv6_prefix"),
+        ("pool6_start", "prefix6"),
+    ):
+        _ps = str(dhcp_cfg.get(_start_key) or "").strip()
+        _pp = str(dhcp_cfg.get(_pfx_key) or "").strip()
+        if _ps and _pp:
+            _add_first_host(_ps, _pp)
+
+    _v6_gw = str(dhcp_cfg.get("ipv6_gateway") or "").strip()
+    if _v6_gw and _v6_pfx_top:
+        anchors.add((_v6_gw, _v6_pfx_top))
+
+    return anchors
+
+
 def _iface_ipv4_addresses(interface: str, container=None) -> List[tuple]:
     """v0.5.239: enumerate ``[(ip, prefix), ...]`` currently assigned
     to `interface` (IPv4 only). Used by the anchor sweep so we only
@@ -2222,6 +2279,33 @@ def _iface_ipv4_addresses(interface: str, container=None) -> List[tuple]:
         ip, _, pfx = cidr.partition("/")
         if ip and pfx:
             out.append((ip, pfx))
+    return out
+
+
+def _iface_ipv6_addresses(interface: str, container=None) -> List[tuple]:
+    """v0.5.354 (audit dhcpv6-scanner-parity): v6 mirror of
+    `_iface_ipv4_addresses`. Enumerate ``[(ip, prefix), ...]``
+    currently assigned to `interface` (IPv6 only). Excludes link-
+    local (`fe80::/10`) — those are kernel-managed and never a
+    DHCPv6 anchor; including them would false-positive every
+    healthy interface in the parent-NIC drift scan.
+
+    Used by `arp_monitor._scan_parent_nic_drift_v6` (v0.5.354).
+    """
+    if not interface:
+        return []
+    out = []
+    for entry in (_parse_ipv6(interface, container=container) or []):
+        _ip = entry.get("ip") or ""
+        _pfx = entry.get("prefix")
+        if not _ip or _pfx in (None, ""):
+            continue
+        try:
+            if ipaddress.IPv6Address(_ip).is_link_local:
+                continue
+        except (ipaddress.AddressValueError, ValueError):
+            continue
+        out.append((_ip, str(_pfx)))
     return out
 
 
