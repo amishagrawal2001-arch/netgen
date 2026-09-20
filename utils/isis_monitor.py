@@ -146,7 +146,19 @@ class ISISMonitor:
                     # 100 devices at ~2s per exec_run, one pass took 3+
                     # minutes, far past the 10s check_interval. Mirror
                     # BGP/OSPF's ThreadPoolExecutor pattern.
-                    with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    # v0.5.362 (audit isis-monitor-shutdown-hang, A5):
+                    # pre-fix `with ThreadPoolExecutor(...) as ex:` block
+                    # exit waited for every in-flight future to finish.
+                    # In-flight futures are docker exec_run calls with
+                    # no timeout — an operator hitting Stop Monitor with
+                    # ~100 devices could block shutdown 10s+ while
+                    # pending exec_runs drained. Now: create executor
+                    # manually, then on stop_event flip call
+                    # `executor.shutdown(wait=False, cancel_futures=True)`
+                    # so queued (not-yet-started) futures cancel and
+                    # running ones don't block the shutdown path.
+                    executor = ThreadPoolExecutor(max_workers=self.max_workers)
+                    try:
                         futures = {}
                         for device in isis_devices:
                             if self.stop_event.is_set():
@@ -157,11 +169,27 @@ class ISISMonitor:
                                 continue
                             futures[executor.submit(self._check_device_isis_status, device_id, device_name)] = device_id
                         for fut in as_completed(futures):
+                            # v0.5.362: bail out of the results loop as
+                            # soon as stop_event fires. Pending futures
+                            # will be cancelled below.
+                            if self.stop_event.is_set():
+                                break
                             _did = futures[fut]
                             try:
                                 fut.result()
                             except Exception as _fe:
                                 logger.error(f"[ISIS MONITOR] Check failed for {_did}: {_fe}")
+                    finally:
+                        # v0.5.362: fire-and-forget shutdown on stop
+                        # (cancel pending futures, don't wait). On
+                        # normal iteration end, still shut down cleanly
+                        # but with cancel_futures so we're consistent.
+                        try:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                        except TypeError:
+                            # cancel_futures added in Python 3.9; fall
+                            # back for older interpreters.
+                            executor.shutdown(wait=False)
                 
                 logger.info(f"[ISIS MONITOR] Periodic ISIS status check completed for {len(isis_devices)} devices")
                 

@@ -2,6 +2,54 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.362] - 2026-09-19
+
+**ISIS MED bundle** — four fixes across `utils/isis.py` and
+`utils/isis_monitor.py`.
+
+### A2. DB-fallback default enabled BOTH AFs
+Pre-fix, on ANY exception the fallback in `start_isis_neighbor`
+set `enable_ipv4=True; enable_ipv6=True`. A transient sqlite
+lock during Start ISIS on a v4-only device pushed
+`ipv6 router isis CORE` onto an interface with no v6 address;
+adjacency never came up over v6, `isis_state` stuck at Starting.
+Fix: prefer isis_config's `ipv4_enabled` / `ipv6_enabled` (v0.5.205
+populates them from the operator's per-AF checkboxes); final
+fallback is v4-only, not both.
+
+### A3. 20s sync sleep in Flask worker
+`configure_isis_neighbor` had `max_retries=10 × retry_delay=2s =
+20s` of blocking `time.sleep`. Fix: cap at 5 × 1s = 5s so the
+Flask worker doesn't wedge; slower container startups fail the
+readiness check and fall through with the pre-fix
+"proceeding anyway" log.
+
+### A5. Monitor shutdown blocked on in-flight docker exec_runs
+`ThreadPoolExecutor(...) as ex:` block-exit waits for every
+submitted future. Docker `exec_run` calls have no timeout —
+operator hitting Stop Monitor with ~100 devices blocked shutdown
+10s+. Fix: create executor manually, on stop_event flip the
+`as_completed` loop breaks and the `finally:` calls
+`executor.shutdown(wait=False, cancel_futures=True)` (with a
+Python 3.8 fallback that drops the `cancel_futures` kwarg).
+
+### A7. shell=True with interpolated container_id
+`get_isis_status`'s two `docker exec … vtysh` calls used
+`subprocess.run(f"docker exec {container_id} …", shell=True)`.
+`container_id` is currently a UUID so no exploit path today, but
+a future refactor letting user text through would open a shell-
+injection. Fix: switch to argv-list form (`shell=False` default).
+
+### Tests
+
+- `tests/test_v05362_isis_med_bundle.py` — 11 new tests: A2
+  isis_config fallback preference + no bare `enable_ipv6=True`,
+  A3 retry budget cap, A5 `cancel_futures` + `stop_event` break
+  in results loop + no more `with ThreadPoolExecutor`, A7 AST
+  check that no `shell=True` remains in `get_isis_status` and
+  that `neighbor_cmd`/`summary_cmd` assign to `["docker", ...]`
+  argv lists.
+
 ## [0.5.361] - 2026-09-19
 
 **`capture_client` timeouts + streaming download cleanup.** Post-

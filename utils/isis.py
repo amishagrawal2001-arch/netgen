@@ -73,13 +73,30 @@ def get_isis_status(device_id: str, device_name: str, container_id: str) -> Dict
         _scope = _isis_vrf_suffix(device_id).strip()  # "vrf <name>" or ""
         _scope_suffix = f" {_scope}" if _scope else ""
 
-        # Get ISIS neighbor details
-        neighbor_cmd = f"docker exec {container_id} vtysh -c 'sh isis{_scope_suffix} nei det json'"
-        neighbor_result = subprocess.run(neighbor_cmd, shell=True, capture_output=True, text=True, timeout=10)
+        # v0.5.362 (audit isis-shell-true-interpolation, A7): switch
+        # from `shell=True` with an interpolated `container_id` /
+        # `_scope_suffix` to argv-list form. `container_id` is
+        # currently always a UUID and `_scope_suffix` comes from a
+        # derived VRF name, but nothing in this file enforces that
+        # — a future refactor that passes user-provided text through
+        # would open a shell-injection path. Argv form eliminates
+        # that class of bug entirely.
+        _scope_argv = (f" {_scope}" if _scope else "")
+        neighbor_cmd = [
+            "docker", "exec", container_id, "vtysh",
+            "-c", f"sh isis{_scope_argv} nei det json",
+        ]
+        neighbor_result = subprocess.run(
+            neighbor_cmd, shell=False, capture_output=True, text=True, timeout=10,
+        )
 
-        # Get ISIS summary
-        summary_cmd = f"docker exec {container_id} vtysh -c 'sh isis{_scope_suffix} summary json'"
-        summary_result = subprocess.run(summary_cmd, shell=True, capture_output=True, text=True, timeout=10)
+        summary_cmd = [
+            "docker", "exec", container_id, "vtysh",
+            "-c", f"sh isis{_scope_argv} summary json",
+        ]
+        summary_result = subprocess.run(
+            summary_cmd, shell=False, capture_output=True, text=True, timeout=10,
+        )
         
         isis_status = {
             "isis_running": False,
@@ -249,9 +266,17 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         
         # Wait for container to be ready and daemons to start
         # Optimized to match BGP performance: fewer retries, faster timeout
+        # v0.5.362 (audit isis-configure-blocks-flask-20s, A3): pre-fix
+        # max_retries=10 × retry_delay=2s = 20s of sync `time.sleep`
+        # inside a Flask HTTP worker. UI spinner appeared frozen; a
+        # concurrent Apply on a second device queued 20s behind. Cap
+        # total wait at ~5s (retries × delay + exec_run timeouts)
+        # which is enough headroom for the common "container just
+        # started" case; slower startups will fail the check and log
+        # "not ready … proceeding anyway", same recovery as before.
         import time
-        max_retries = 10  # Allow additional retries to ensure isisd fully starts after container restart
-        retry_delay = 2  # Increased from 1 to 2 to match BGP (fewer retries needed)
+        max_retries = 5
+        retry_delay = 1
         
         def exec_run_with_timeout(cmd, timeout_sec=3):
             """Execute container.exec_run with a timeout using threading.
@@ -614,7 +639,19 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
         level_map = {"Level-1": "level-1-only", "Level-2": "level-2-only", "Level-1-2": "level-1-2"}
         frr_level = level_map.get(level, "level-2-only")
 
-        # Determine address families based on device IP configuration
+        # Determine address families based on device IP configuration.
+        # v0.5.362 (audit isis-db-fallback-double-af, A2): pre-fix, on
+        # ANY exception the fallback set both `enable_ipv4=True` and
+        # `enable_ipv6=True` — so a transient sqlite lock during
+        # Start ISIS on a v4-only device pushed `ipv6 router isis
+        # CORE` onto an interface that had no v6 address, adjacency
+        # never came up over v6, and `isis_state` stuck at Starting.
+        # Now: prefer isis_config's `ipv4_enabled` / `ipv6_enabled`
+        # flags (v0.5.205 populates these from the operator's per-AF
+        # checkboxes) — that's the operator's stated intent, safe to
+        # trust even when the DB read fails. Fall back to v4-only if
+        # even the config lacks the flags, matching the historical
+        # v4-default and avoiding false-v6 adjacency attempts.
         try:
             from utils.device_database import DeviceDatabase
             device_db = DeviceDatabase()
@@ -626,10 +663,23 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
             enable_ipv6 = bool(device_data and device_data.get('ipv6_address'))
             if dhcp_mode == "client":
                 enable_ipv4 = True
-        except Exception:
-            # Fallback: enable both if unable to determine
-            enable_ipv4 = True
-            enable_ipv6 = True
+        except Exception as _db_exc:
+            logger.warning(
+                "[ISIS START] v0.5.362 device_db read failed for %s: %s "
+                "— falling back to isis_config's per-AF flags "
+                "(operator intent) instead of enabling both", device_id, _db_exc,
+            )
+            # v0.5.205 stores ipv4_enabled / ipv6_enabled in the
+            # per-protocol config dict. Trust that when the DB is
+            # unavailable. Final fallback is v4-only, NOT both.
+            _cfg_v4 = isis_config.get("ipv4_enabled")
+            _cfg_v6 = isis_config.get("ipv6_enabled")
+            if _cfg_v4 is not None or _cfg_v6 is not None:
+                enable_ipv4 = bool(_cfg_v4) if _cfg_v4 is not None else False
+                enable_ipv6 = bool(_cfg_v6) if _cfg_v6 is not None else False
+            else:
+                enable_ipv4 = True
+                enable_ipv6 = False
 
         # Ensure router process first, then enable interface (some FRR builds require router before interface attach)
         # Note: Global router-id is configured in frr_docker.py when container is created
