@@ -1469,11 +1469,50 @@ class TrafficGenClientServerSection():
                     # TG (server) selected
                     server_address = item.text(1)
                     current_selection.append(("server", server_address, None))
-        
+
+        # v0.5.388 (audit devices-tab D5): capture scroll position
+        # + expanded-item set + current selection BEFORE clear.
+        # Pre-fix, this method unconditionally cleared the tree
+        # every refresh — scroll snapped to top, every expanded
+        # chassis re-collapsed, the operator lost their place.
+        # Auto-select tail code (below at ~:1729) then hijacked
+        # the current selection to the first checked TG, blowing
+        # away whatever the operator had chosen. Fix: snapshot
+        # (scroll, expanded server_addrs, currently-selected key)
+        # and restore after rebuild; auto-select tail code is
+        # gated behind should_preserve/_first_populate flag so it
+        # fires ONLY on the initial population.
+        _scroll_pos = 0
+        _expanded_addrs = set()
+        _sel_key = None  # (kind, server_addr, iface_name_or_None)
+        try:
+            _vs = self.server_tree.verticalScrollBar()
+            if _vs is not None:
+                _scroll_pos = _vs.value()
+        except Exception:
+            _scroll_pos = 0
+        try:
+            for _i in range(self.server_tree.topLevelItemCount()):
+                _it = self.server_tree.topLevelItem(_i)
+                if _it is not None and _it.isExpanded():
+                    _expanded_addrs.add(_it.text(1))
+        except Exception:
+            _expanded_addrs = set()
+        try:
+            _cur = self.server_tree.currentItem()
+            if _cur is not None:
+                _p = _cur.parent()
+                if _p is None:
+                    _sel_key = ("server", _cur.text(1), None)
+                else:
+                    _sel_key = ("interface", _p.text(1), _cur.text(0).strip())
+        except Exception:
+            _sel_key = None
+
         # Block signals during tree update to prevent cascading selection change events
         # This is safer than disconnect/connect and automatically restores signals
         self.server_tree.blockSignals(True)
-        
+
         self.server_tree.clear()  # Clear the tree before updating
 
         if not self.server_interfaces:
@@ -1724,9 +1763,51 @@ class TrafficGenClientServerSection():
         self.server_tree.setColumnWidth(1, 200)
         self.server_tree.setColumnWidth(2, 75)
         
-        # If servers are selected (checkboxes checked), select the first TG in the tree
-        # This ensures the stream table is populated on startup
-        if hasattr(self, "selected_servers") and self.selected_servers:
+        # v0.5.388 (audit devices-tab D5): restore expanded chassis
+        # + selection + scroll position captured above. Restore
+        # order matters: expand first (changes item heights), then
+        # set selection, then restore scroll.
+        try:
+            for _i in range(self.server_tree.topLevelItemCount()):
+                _it = self.server_tree.topLevelItem(_i)
+                if _it is not None and _it.text(1) in _expanded_addrs:
+                    _it.setExpanded(True)
+        except Exception:
+            pass
+        # v0.5.388 (D5): re-select the previously-selected item if
+        # it still exists. Preserves the operator's current
+        # selection through routine refreshes.
+        _restored_sel = False
+        if _sel_key is not None:
+            try:
+                _kind, _addr, _iface = _sel_key
+                for _i in range(self.server_tree.topLevelItemCount()):
+                    _it = self.server_tree.topLevelItem(_i)
+                    if _it is None or _it.text(1) != _addr:
+                        continue
+                    if _kind == "server":
+                        self.server_tree.setCurrentItem(_it)
+                        _restored_sel = True
+                    else:
+                        for _c in range(_it.childCount()):
+                            _ch = _it.child(_c)
+                            if _ch is not None and _ch.text(0).strip() == _iface:
+                                self.server_tree.setCurrentItem(_ch)
+                                _restored_sel = True
+                                break
+                    break
+            except Exception:
+                _restored_sel = False
+
+        # v0.5.388 (D5): auto-select first checked TG ONLY on
+        # first population (or when should_preserve is False AND
+        # we didn't already restore a prior selection). Pre-fix,
+        # this hijacked the operator's current selection on
+        # EVERY refresh — an SSE reload while they were viewing a
+        # non-primary TG would jump them back to the first one.
+        _first_populate = not getattr(self, "_server_tree_populated_once", False)
+        self._server_tree_populated_once = True
+        if _first_populate and not _restored_sel and hasattr(self, "selected_servers") and self.selected_servers:
             # Select the first selected server's TG item in the tree
             first_selected = self.selected_servers[0]
             selected_address = first_selected.get("address")
@@ -1741,14 +1822,23 @@ class TrafficGenClientServerSection():
                         self._on_server_selection_changed_combined()
                     QTimer.singleShot(50, trigger_selection_change)
                     break
-        
+
+        # v0.5.388 (D5): restore scroll position AFTER expand +
+        # selection (both change item layout).
+        try:
+            _vs = self.server_tree.verticalScrollBar()
+            if _vs is not None and _scroll_pos > 0:
+                _vs.setValue(_scroll_pos)
+        except Exception:
+            pass
+
         # Clear the update flag
         self._updating_server_tree = False
-        
+
         # Clear preserve_selection flag if it was set
         if hasattr(self, "_preserve_selection"):
             self._preserve_selection = False
-        
+
         logger.debug(f"Tree widget updated with {len(self.server_interfaces)} servers")
     '''def update_server_status_icon(self, server, is_online):
         """Helper to update status icon based on online state."""

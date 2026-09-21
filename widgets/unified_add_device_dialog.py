@@ -223,13 +223,39 @@ class UnifiedAddDeviceDialog(QDialog):
         if not ok or not subnet:
             return
         
+        # v0.5.388 (audit devices-tab D2): if a previous discovery
+        # is still running, abort it before starting a fresh one.
+        # Pre-fix, re-clicking Discover while the first worker was
+        # still running overwrote `self.discovery_worker`, dropping
+        # the ONLY Python reference to the previous QThread; the
+        # first thread became an unreachable zombie (its signals
+        # kept firing into a dead progress dialog). closeEvent
+        # only tore down the LAST worker.
+        _prev_worker = getattr(self, "discovery_worker", None)
+        if _prev_worker is not None:
+            try:
+                if _prev_worker.isRunning():
+                    _prev_worker.requestInterruption()
+                    _prev_worker.wait(500)
+            except Exception:
+                pass
+
         # Show progress
         progress = QProgressDialog("Discovering devices...", "Cancel", 0, 0, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
-        
+
         # Start discovery worker
         self.discovery_worker = DeviceDiscoveryWorker(subnet, self.server_url)
+        # v0.5.388 (audit devices-tab D2): wire the progress dialog's
+        # Cancel button (progress.canceled) to actually terminate
+        # the worker. Pre-fix, Cancel just closed the dialog while
+        # the worker kept running to completion — completion then
+        # fired `progress.close()` on an already-destroyed dialog.
+        try:
+            progress.canceled.connect(self._cancel_discovery_worker)
+        except Exception:
+            pass
         self.discovery_worker.device_found.connect(self.on_device_discovered)
         self.discovery_worker.discovery_complete.connect(
             lambda devices: self.on_discovery_complete(devices, progress)
@@ -238,14 +264,40 @@ class UnifiedAddDeviceDialog(QDialog):
             lambda error: self.on_discovery_error(error, progress)
         )
         self.discovery_worker.start()
-    
+
+    def _cancel_discovery_worker(self):
+        """v0.5.388 (audit devices-tab D2): stop the running
+        discovery worker cleanly when the operator hits Cancel on
+        the progress dialog. Best-effort — QThread.terminate() is
+        a last resort, but requestInterruption + short wait is
+        the polite version."""
+        _worker = getattr(self, "discovery_worker", None)
+        if _worker is None:
+            return
+        try:
+            if _worker.isRunning():
+                _worker.requestInterruption()
+                _worker.wait(500)
+        except Exception:
+            pass
+
     def on_device_discovered(self, device_info):
         """Handle discovered device"""
         self.discovered_devices.append(device_info)
-    
+
     def on_discovery_complete(self, devices, progress):
         """Handle discovery completion"""
-        progress.close()
+        # v0.5.388 (audit devices-tab D2): guard against a
+        # destroyed progress dialog. On operator-Cancel, the
+        # dialog is closed by the code path above; if the worker
+        # then completes late (subnet scan raced the click), this
+        # slot fires with `progress` referencing a deleted C++
+        # object → RuntimeError on `progress.close()`. `sip.isdeleted`
+        # would be the Qt-friendly check but adds a dep — wrap.
+        try:
+            progress.close()
+        except (RuntimeError, Exception) as _pc_exc:
+            logger.debug(f"[AI DISCOVERY] progress.close skipped: {_pc_exc}")
         
         if not devices:
             QMessageBox.information(
@@ -290,7 +342,12 @@ class UnifiedAddDeviceDialog(QDialog):
     
     def on_discovery_error(self, error, progress):
         """Handle discovery error"""
-        progress.close()
+        # v0.5.388 (audit devices-tab D2): same destroyed-dialog
+        # guard as on_discovery_complete.
+        try:
+            progress.close()
+        except (RuntimeError, Exception) as _pc_exc:
+            logger.debug(f"[AI DISCOVERY] progress.close skipped: {_pc_exc}")
         QMessageBox.warning(self, "Discovery Error", f"Failed to discover devices:\n{error}")
     
     def fill_form_from_discovery(self, device_info):
@@ -321,15 +378,36 @@ class UnifiedAddDeviceDialog(QDialog):
                 self.external_dialog.connection_method_combo.setCurrentIndex(index)
     
     def add_device(self):
-        """Add device based on selected type"""
+        """Add device based on selected type.
+
+        v0.5.388 (audit devices-tab D3): rebuild `frr_dialog` /
+        `external_dialog` on every open. Pre-fix, both were
+        cached on first construction. Two consequences:
+          1. `_existing_devices` (the collision peer list) was
+             passed to AddDeviceDialog once; devices added later
+             in the same session weren't in the peer list, so the
+             collision check missed real collisions.
+          2. Cancelled inputs persisted — the dialog kept whatever
+             text the operator had typed on the previous open,
+             even after Cancel. The intent of Cancel is "discard".
+        Fix: always instantiate a fresh dialog per open. Refresh
+        `_existing_devices` from a helper if the outer widget
+        supplies one; otherwise use whatever was passed to __init__.
+        """
         if self.device_type == "frr_container":
-            # Use existing FRR dialog
-            if not self.frr_dialog:
-                self.frr_dialog = AddDeviceDialog(
-                    self, default_iface=self.default_iface,
-                    existing_devices=self._existing_devices,
-                )
-            
+            # v0.5.388 D3: fresh dialog each open + fresh peer list.
+            _peers = self._existing_devices
+            _refresher = getattr(self, "_existing_devices_refresh", None)
+            if callable(_refresher):
+                try:
+                    _peers = _refresher() or _peers
+                except Exception as _r_exc:
+                    logger.debug(f"[UNIFIED ADD] peer refresh skipped: {_r_exc}")
+            self.frr_dialog = AddDeviceDialog(
+                self, default_iface=self.default_iface,
+                existing_devices=_peers,
+            )
+
             if self.frr_dialog.exec_() == QDialog.Accepted:
                 self.device_data = {
                     "device_type": "frr_container",
@@ -337,10 +415,10 @@ class UnifiedAddDeviceDialog(QDialog):
                 }
                 self.accept()
         else:
-            # Use existing external dialog
-            if not self.external_dialog:
-                self.external_dialog = AddExternalDeviceDialog(self)
-            
+            # v0.5.388 D3: fresh external dialog each open — same
+            # rationale.
+            self.external_dialog = AddExternalDeviceDialog(self)
+
             if self.external_dialog.exec_() == QDialog.Accepted:
                 self.device_data = {
                     "device_type": "external",

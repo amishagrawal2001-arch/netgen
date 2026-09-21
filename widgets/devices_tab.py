@@ -9516,12 +9516,65 @@ class DevicesTab(QWidget):
             QMessageBox.warning(self, "No Selection", "Select one or more devices to remove.")
             return
 
+        # v0.5.388 (audit devices-tab D1): snapshot the selection to
+        # (device_id, device_name, device_info) tuples up-front,
+        # BEFORE any blocking work. Pre-fix, this loop iterated
+        # `sorted(unique_rows, reverse=True)` and called
+        # `_remove_device_from_server` (up to 60s per device) with
+        # the row index for each step. During those blocking
+        # subprocess/HTTP calls, SSE-driven rebuild or the 30s
+        # status poll could rebuild the table; the NEXT iteration's
+        # `item(row, ...)` then read a DIFFERENT device. Also, the
+        # confirmation prompt listed no device names or count. Fix:
+        # capture (device_id, name, info) once, show a listing in
+        # the confirm dialog, and delete by device_id lookup so
+        # table rebuilds don't misdirect the delete.
         unique_rows = sorted({item.row() for item in selected_items}, reverse=True)
+        from PyQt5.QtCore import Qt as _Qt
+        _targets = []  # [(device_id, device_name, device_info)]
+        for row in unique_rows:
+            name_item = self.devices_table.item(row, self.COL.get("Device Name"))
+            if not name_item:
+                continue
+            device_name = name_item.text()
+            # Prefer device_id from the row's UserRole stash
+            # (canonical); fall back to name lookup.
+            _row_id = name_item.data(_Qt.UserRole)
+            device_info = None
+            if _row_id:
+                try:
+                    for _d in getattr(self.main_window, "all_devices", []) or []:
+                        if isinstance(_d, dict) and (
+                                _d.get("device_id") == _row_id
+                                or _d.get("Device ID") == _row_id):
+                            device_info = _d
+                            break
+                except Exception:
+                    device_info = None
+            if device_info is None:
+                device_info = self.get_device_info_by_name(device_name)
+            if not device_info:
+                logging.warning(f"[REMOVE] Device '{device_name}' not found in data model")
+                continue
+            _did = device_info.get("device_id") or _row_id
+            _targets.append((_did, device_name, device_info))
+
+        if not _targets:
+            QMessageBox.warning(self, "No Devices Found", "Selected rows don't map to any known devices.")
+            return
+
+        # Confirmation lists names + count so the operator knows
+        # exactly what they're about to destroy.
+        _name_lines = "\n  • ".join(t[1] for t in _targets[:20])
+        _more = ""
+        if len(_targets) > 20:
+            _more = f"\n  … and {len(_targets) - 20} more"
         confirm = QMessageBox.question(
             self,
             "Confirm Device Removal",
-            "Are you sure you want to remove the selected device(s)?\n\n"
-            "This will stop protocols, remove containers, and delete the devices from the UI.",
+            f"Remove {len(_targets)} device(s)?\n\n  • {_name_lines}{_more}"
+            f"\n\nThis will stop protocols, remove containers, and "
+            f"delete the devices from the UI.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -9529,36 +9582,33 @@ class DevicesTab(QWidget):
             return
 
         # Check if any device has VXLAN before removal (to determine if interface refresh is needed)
-        # Do this before removing rows from the table, as row indices become invalid after removal
         needs_interface_refresh = False
-        for row in unique_rows:
-            name_item = self.devices_table.item(row, self.COL.get("Device Name"))
-            if not name_item:
-                continue
-            device_name = name_item.text()
-            device_info = self.get_device_info_by_name(device_name)
-            if device_info:
-                vxlan_config = device_info.get("vxlan_config", {})
-                vxlan_interface = device_info.get("vxlan_interface", "")
-                # Check if device had VXLAN configuration or interface
-                if (vxlan_config and isinstance(vxlan_config, dict) and 
-                    (vxlan_config.get("tunnels") or vxlan_config.get("vni") or vxlan_interface)):
-                    needs_interface_refresh = True
-                    break
+        for _did, device_name, device_info in _targets:
+            vxlan_config = device_info.get("vxlan_config", {})
+            vxlan_interface = device_info.get("vxlan_interface", "")
+            # Check if device had VXLAN configuration or interface
+            if (vxlan_config and isinstance(vxlan_config, dict) and
+                (vxlan_config.get("tunnels") or vxlan_config.get("vni") or vxlan_interface)):
+                needs_interface_refresh = True
+                break
+
+        # v0.5.388 D1: re-lookup the current row by device_id at
+        # each removeRow. Any table rebuild during the previous
+        # iteration's blocking call is safe.
+        def _row_for_device_id(_did):
+            if not _did:
+                return None
+            for _r in range(self.devices_table.rowCount()):
+                _it = self.devices_table.item(_r, self.COL.get("Device Name"))
+                if _it is None:
+                    continue
+                if str(_it.data(_Qt.UserRole) or "") == str(_did):
+                    return _r
+            return None
 
         removed_devices = []
-        # Process rows in reverse order to avoid index shifting issues when removing
-        for row in sorted(unique_rows, reverse=True):
-            name_item = self.devices_table.item(row, self.COL.get("Device Name"))
-            if not name_item:
-                continue
-            device_name = name_item.text()
-            device_info = self.get_device_info_by_name(device_name)
-            if not device_info:
-                logging.warning(f"[REMOVE] Device '{device_name}' not found in data model")
-                continue
-
-            device_id = device_info.get("device_id")
+        # Iterate captured targets — NOT stale row indices.
+        for device_id, device_name, device_info in _targets:
 
             if hasattr(self, "bgp_handler") and self.bgp_handler:
                 try:
@@ -9604,7 +9654,20 @@ class DevicesTab(QWidget):
                 )
                 continue
 
-            self.devices_table.removeRow(row)
+            # v0.5.388 (audit devices-tab D1): re-lookup the row by
+            # device_id RIGHT before removeRow. Any table rebuild
+            # during the previous iteration's blocking server
+            # DELETE is safe — if the row is gone (SSE already
+            # removed it), just skip the UI removal step.
+            _cur_row = _row_for_device_id(device_id)
+            if _cur_row is None:
+                logging.debug(
+                    f"[REMOVE] row for device_id={device_id!r} "
+                    f"already gone (SSE removal) — skipping "
+                    f"removeRow, still cleaning data structure"
+                )
+            else:
+                self.devices_table.removeRow(_cur_row)
             self._remove_device_from_data_structure(device_info)
 
             if hasattr(self.main_window, "removed_devices"):

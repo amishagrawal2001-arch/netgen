@@ -787,6 +787,19 @@ class TrafficGeneratorClient(
         effect because the layout system hasn't run yet.
         """
         super().showEvent(event)
+        # v0.5.388 (audit devices-tab D4): restore persisted window
+        # layout on first show. Pre-fix, `statistics_dock.setObjectName
+        # ("trafficStatisticsDock")` at line ~:360 was explicitly
+        # tagged "Required for saveState/restoreState" but the
+        # methods were never called. Dock float/size, splitter
+        # positions, main-window geometry, and the tab widget's
+        # current index all reset every launch — operators
+        # re-arranged the UI every session. Restore on the first
+        # showEvent (deferred one tick so the initial layout runs
+        # first, then our restore overrides it).
+        if not getattr(self, "_layout_restored", False):
+            self._layout_restored = True
+            QTimer.singleShot(0, self._restore_window_layout)
         # Defer one event-loop tick so geometry is settled. QTimer.singleShot(0)
         # runs after the show is complete.
         QTimer.singleShot(0, self._balance_stats_dock)
@@ -794,6 +807,65 @@ class TrafficGeneratorClient(
         # (idempotent), then prime the title-bar readout.
         QTimer.singleShot(0, self._install_section_size_filter)
         QTimer.singleShot(0, self._update_section_size_readout)
+
+    # v0.5.388 (audit devices-tab D4): QSettings-backed layout
+    # persistence. Uses a stable organization + app name so the
+    # values land in ~/.config/netgen/client.conf (Linux) or the
+    # macOS preferences plist. Called from showEvent (restore) and
+    # closeEvent (save) so the operator's dock/geometry/splitter
+    # arrangement survives across launches.
+    _LAYOUT_SETTINGS_ORG = "netgen"
+    _LAYOUT_SETTINGS_APP = "netgen-client"
+    _LAYOUT_GEOMETRY_KEY = "mainwindow/geometry"
+    _LAYOUT_STATE_KEY = "mainwindow/state"
+
+    def _layout_settings(self):
+        """Lazy-init the shared QSettings handle."""
+        from PyQt5.QtCore import QSettings
+        return QSettings(self._LAYOUT_SETTINGS_ORG, self._LAYOUT_SETTINGS_APP)
+
+    def _restore_window_layout(self):
+        """Restore main-window geometry + dock/splitter state from
+        QSettings. Best-effort: any failure just means the
+        default layout applies."""
+        try:
+            _s = self._layout_settings()
+            _geo = _s.value(self._LAYOUT_GEOMETRY_KEY)
+            _state = _s.value(self._LAYOUT_STATE_KEY)
+            if _geo is not None:
+                try:
+                    self.restoreGeometry(_geo)
+                    logger.debug("[LAYOUT] restored geometry from QSettings")
+                except Exception as _ge:
+                    logger.debug(f"[LAYOUT] restoreGeometry failed: {_ge}")
+            if _state is not None:
+                try:
+                    self.restoreState(_state)
+                    logger.debug("[LAYOUT] restored dock state from QSettings")
+                except Exception as _se:
+                    logger.debug(f"[LAYOUT] restoreState failed: {_se}")
+        except Exception as _outer:
+            logger.debug(f"[LAYOUT] restore skipped: {_outer}")
+
+    def _save_window_layout(self):
+        """Write current main-window geometry + dock/splitter state
+        to QSettings. Called on closeEvent."""
+        try:
+            _s = self._layout_settings()
+            try:
+                _s.setValue(self._LAYOUT_GEOMETRY_KEY, self.saveGeometry())
+            except Exception as _ge:
+                logger.debug(f"[LAYOUT] saveGeometry failed: {_ge}")
+            try:
+                _s.setValue(self._LAYOUT_STATE_KEY, self.saveState())
+            except Exception as _se:
+                logger.debug(f"[LAYOUT] saveState failed: {_se}")
+            try:
+                _s.sync()
+            except Exception:
+                pass
+        except Exception as _outer:
+            logger.debug(f"[LAYOUT] save skipped: {_outer}")
 
     def resizeEvent(self, event):
         """Update the title-bar dimension readout on window resize.
@@ -874,6 +946,14 @@ class TrafficGeneratorClient(
                     )
             # Discard / Save (success or failed) → fall through to
             # the normal close path.
+
+        # v0.5.388 (audit devices-tab D4): persist window layout
+        # BEFORE the shutdown teardown starts destroying widgets.
+        # Best-effort — teardown continues even if save fails.
+        try:
+            self._save_window_layout()
+        except Exception as _lo:
+            logger.debug(f"[LAYOUT] closeEvent save skipped: {_lo}")
 
         self._is_closing = True
 

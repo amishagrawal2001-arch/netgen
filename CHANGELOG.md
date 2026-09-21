@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.388] - 2026-09-21
+
+### Fixed — Device tab audit MEDs (5 items)
+
+**D1: Multi-delete confirmation + row-shift protection**
+(`widgets/devices_tab.py:9512-9700`) — Pre-fix, the multi-delete
+handler iterated `sorted(unique_rows, reverse=True)` and called
+`_remove_device_from_server` (up to 60s per device) between
+row-index accesses. During those blocking calls, an SSE reload
+or 30s status poll could rebuild the table, and the NEXT
+iteration's `item(row, ...)` read a DIFFERENT device — silent
+misdirected deletes. Also, the confirm listed no names or count.
+Fix: snapshot the selection to `(device_id, device_name,
+device_info)` tuples up-front; show a confirmation listing the
+names + count; re-lookup the row by `device_id` at each
+`removeRow` (skip cleanly if the row is already gone).
+
+**D2: AI discovery Cancel wiring + worker leak**
+(`widgets/unified_add_device_dialog.py:225-355`) — Pre-fix,
+`ai_discover_devices` never connected `progress.canceled` to the
+worker — Cancel just closed the dialog while the QThread kept
+running to completion, then fired `progress.close()` on a
+destroyed dialog (RuntimeError). Re-clicks overwrote
+`self.discovery_worker` dropping the ONLY Python reference to
+the previous thread. Fix: `progress.canceled` → new
+`_cancel_discovery_worker`; interrupt any previous worker before
+starting a new one; guard `progress.close()` in both completion
+and error handlers.
+
+**D3: Frozen dialog helpers rebuild on each open**
+(`widgets/unified_add_device_dialog.py:380-430`) — Pre-fix,
+`frr_dialog` / `external_dialog` were cached on first
+construction. Two effects: (a) `_existing_devices` collision peer
+list was frozen at first-open — devices added later in the
+session weren't in the peer list, so real collisions passed
+through; (b) cancelled inputs persisted on next open (violating
+Cancel's discard intent). Fix: always instantiate a fresh dialog
+per open; call `_existing_devices_refresh` when the outer widget
+supplies it to get a live peer list.
+
+**D4: Chassis window saveState/restoreState via QSettings**
+(`traffic_client/main.py:782-880, 895-905`) — Pre-fix,
+`statistics_dock.setObjectName("trafficStatisticsDock")` at
+line ~:360 was explicitly tagged "Required for saveState/
+restoreState" but the methods were never called. Dock float/
+size, splitter positions, main-window geometry, and the tab
+widget's current index all reset every launch. Fix: new
+`_restore_window_layout()` and `_save_window_layout()` backed by
+`QSettings("netgen", "netgen-client")`; restore on the first
+`showEvent`, save on `closeEvent`.
+
+**D5: `update_server_tree` preserves scroll + expansion + selection**
+(`traffic_client/server_section.py:1448-1810`) — Pre-fix,
+`update_server_tree` unconditionally cleared the tree every
+refresh — scroll snapped to top, every expanded chassis
+re-collapsed, and the auto-select tail code (~:1729)
+hijacked the current selection to the first checked TG on
+EVERY refresh (an SSE reload while the operator was viewing
+a non-primary TG jumped them back to the first one). Fix:
+capture (scroll position, expanded chassis addresses, current
+selection) BEFORE clear; restore after rebuild in the correct
+order (expand → select → scroll); gate the auto-select tail
+code behind a `_server_tree_populated_once` flag so it fires
+only on the initial population, not on every refresh.
+
+### Tests
+
+New: `tests/test_v05388_devices_tab_meds.py`. AST + structural +
+regression coverage.
+
 ## [0.5.387] - 2026-09-21
 
 ### Fixed — Device tab audit HIGHs + MEDs (5 items)
