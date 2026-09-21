@@ -2,6 +2,49 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.390] - 2026-09-21
+
+### Added — /admin Containers card (selective FRR container + interface cleanup)
+
+Operator-requested feature: enumerate every FRR / DHCP
+container this server manages, and allow selective removal
+with full interface + VRF cleanup — all from the /admin
+console without needing the desktop client.
+
+**F1: `GET /api/admin/containers`** (`run_tgen_server.py:19736-19825`)
+Viewer-role endpoint. Returns `{"containers": [{"name",
+"device_id", "status", "image", "vrf", "interface",
+"has_db_row"}, ...], "count"}` where `has_db_row=false`
+flags orphans (containers whose device_id no longer has a
+matching row in the devices DB — typically left from a
+crash or stale CLI remove).
+
+**F2: `POST /api/admin/containers/remove`** (`run_tgen_server.py:19827-19910`)
+Admin-role endpoint. Accepts `{"names": [...]}`, calls
+`stop_frr_container(remove=True)` per name. That helper (via
+v0.5.382 W1+W2+W3) already does the FULL teardown chain
+regardless of prefix (`ostg-frr-` vs `dhcp-frr-`):
+container stop → container remove → VRF detach → interface
+nomaster → VRF-table id release. Whitelists both prefixes
+so a stray POST can't touch unrelated containers. Returns
+per-container success/error for partial-failure rendering.
+
+**F3: /admin Containers card UI** (`run_tgen_server.py:24817-24860, 26105-26260`)
+New card with a checkbox table showing container, device_id,
+status (green for running), image, VRF, enslaved interface,
+and an "orphan" tag when `has_db_row=false`. Select-all
+checkbox. "Remove Selected" button is disabled until at
+least one row is checked; on click, shows a `window.confirm`
+listing the container names + a clear description of the
+teardown steps, then POSTs to the F2 endpoint and re-renders
+with the success/failure count. Auto-loads on DOM-ready
+(deferred 2.5s so it doesn't block the initial paint).
+
+### Tests
+
+New: `tests/test_v05390_admin_containers.py`. AST + structural +
+regression coverage.
+
 ## [0.5.389] - 2026-09-21
 
 ### Fixed — Devices tab audit tail: session-load state, column persistence, name-collision warn, MAC validator

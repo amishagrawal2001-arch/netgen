@@ -19733,6 +19733,165 @@ _DPDK_ACCELERATOR_CLASSES = {
 }
 
 
+# v0.5.390 (audit /admin containers-card F1): enumerate every
+# managed FRR container (both `ostg-frr-*` and `dhcp-frr-*`
+# prefixes) with the metadata the /admin Containers card needs
+# for a selective-remove UI:
+#   - name             — the container name (also the row key)
+#   - device_id        — parsed suffix; may or may not still have
+#                        a matching row in the device DB
+#   - status           — running / exited / created / ...
+#   - image            — image tag (or "" if untagged)
+#   - vrf              — the per-device VRF name (v0.5.198+ arch)
+#                        so the operator sees what will get torn
+#                        down when they remove
+#   - interface        — the enslaved interface (if any) so the
+#                        operator sees which iface will come free
+#   - has_db_row       — whether the device_id still exists in
+#                        the devices table; false = orphan (rows
+#                        that `cleanup_all_containers` would sweep)
+#
+# Runs at viewer role — read-only enumeration. Any per-container
+# metadata failure is best-effort: the row still returns with the
+# fields we could resolve; missing fields become "".
+@app.route("/api/admin/containers", methods=["GET"])
+@require_role("viewer")
+def admin_list_containers():
+    try:
+        from utils.frr_docker import (
+            list_all_containers as _list_all,
+            frr_manager as _fm,
+        )
+        _raw = _list_all()
+        # Build a set of device_ids known to the DB so we can flag
+        # orphans in one lookup instead of N.
+        _db_ids = set()
+        try:
+            for _d in device_db.get_all_devices():
+                if isinstance(_d, dict):
+                    _did = _d.get("device_id") or _d.get("Device ID")
+                    if _did:
+                        _db_ids.add(str(_did))
+        except Exception as _db_exc:
+            logging.debug(f"[ADMIN CONTAINERS] DB device-id fetch: {_db_exc}")
+
+        _out = []
+        for _row in _raw:
+            _did = _row.get("device_id", "")
+            _vrf = ""
+            _iface = ""
+            try:
+                _vrf = _fm.vrf_name_for_device(_did) or ""
+            except Exception as _v_exc:
+                logging.debug(
+                    f"[ADMIN CONTAINERS] vrf lookup for {_did}: {_v_exc}"
+                )
+            # Best-effort interface lookup from the device DB row.
+            try:
+                if _did in _db_ids:
+                    _rec = device_db.get_device(_did) or {}
+                    _stored = str(_rec.get("interface") or "").strip()
+                    # Strip vlanN@base display suffix (kernel iface
+                    # name only). Same shape v0.5.382 W1 uses.
+                    _iface = _stored.split("@", 1)[0] if _stored else ""
+            except Exception as _if_exc:
+                logging.debug(
+                    f"[ADMIN CONTAINERS] iface lookup for {_did}: {_if_exc}"
+                )
+            _out.append({
+                **_row,
+                "vrf": _vrf,
+                "interface": _iface,
+                "has_db_row": _did in _db_ids,
+            })
+        return jsonify({
+            "containers": _out,
+            "count": len(_out),
+        }), 200
+    except Exception as _e:
+        logging.error(f"[ADMIN CONTAINERS] list failed: {_e}")
+        return jsonify({"error": str(_e), "containers": []}), 500
+
+
+# v0.5.390 (audit /admin containers-card F2): selective remove.
+# Accepts JSON body `{"names": ["ostg-frr-<uuid>", ...]}` and
+# calls `stop_frr_container(remove=True)` for each. That helper
+# (v0.5.382 W1+W2+W3) handles the FULL teardown chain even when
+# the container was created under the alt prefix (dhcp-frr- vs
+# ostg-frr-), and always runs the VRF detach + VRF-table release
+# in a finally-shaped block. Returns per-container status so the
+# UI can render partial success.
+#
+# Admin role only — destructive.
+@app.route("/api/admin/containers/remove", methods=["POST"])
+@require_role("admin")
+def admin_remove_containers():
+    try:
+        _data = request.get_json(silent=True) or {}
+        _names = _data.get("names") or []
+        if not isinstance(_names, list) or not _names:
+            return jsonify({
+                "error": "Provide non-empty `names` list of container names"
+            }), 400
+        from utils.frr_docker import frr_manager as _fm
+        _MANAGED_PREFIXES = ("ostg-frr-", "dhcp-frr-")
+        _results = []
+        for _name in _names:
+            _name_str = str(_name or "").strip()
+            if not _name_str:
+                _results.append({"name": "", "ok": False,
+                                 "error": "empty name"})
+                continue
+            # Whitelist prefix — refuse to touch anything outside
+            # netgen's managed namespace (defense against a stray
+            # POST that names a legit unrelated container).
+            if not any(_name_str.startswith(_p)
+                       for _p in _MANAGED_PREFIXES):
+                _results.append({
+                    "name": _name_str, "ok": False,
+                    "error": (
+                        f"refusing to remove {_name_str!r} — not a "
+                        f"netgen-managed container name (prefix "
+                        f"must be one of {_MANAGED_PREFIXES})"
+                    ),
+                })
+                continue
+            # Derive device_id from either prefix.
+            _did = None
+            for _p in _MANAGED_PREFIXES:
+                if _name_str.startswith(_p):
+                    _did = _name_str[len(_p):]
+                    break
+            try:
+                _ok = _fm.stop_frr_container(_did, None, remove=True)
+                _results.append({
+                    "name": _name_str,
+                    "device_id": _did,
+                    "ok": bool(_ok),
+                })
+            except Exception as _stop_exc:
+                logging.warning(
+                    f"[ADMIN CONTAINERS] stop failed for "
+                    f"{_name_str}: {_stop_exc}"
+                )
+                _results.append({
+                    "name": _name_str,
+                    "device_id": _did,
+                    "ok": False,
+                    "error": str(_stop_exc),
+                })
+        _succ = sum(1 for r in _results if r.get("ok"))
+        _fail = len(_results) - _succ
+        return jsonify({
+            "results": _results,
+            "success_count": _succ,
+            "failure_count": _fail,
+        }), 200
+    except Exception as _e:
+        logging.error(f"[ADMIN CONTAINERS] remove failed: {_e}")
+        return jsonify({"error": str(_e)}), 500
+
+
 @app.route("/api/admin/lldp_raw", methods=["GET"])
 @require_role("viewer")
 def admin_lldp_raw():
@@ -24655,6 +24814,42 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       <div id="streams-table-wrap"><div class="iface-empty">Click Refresh to load…</div></div>
     </div>
 
+    <!-- v0.5.390 (audit admin-containers-card): FRR + DHCP
+         container listing with selective remove. Backed by
+         /api/admin/containers (GET, viewer) and
+         /api/admin/containers/remove (POST, admin). Each row
+         shows the container name, device_id, status, VRF and
+         iface it enslaves, and whether a DB device row still
+         exists (has_db_row=false → orphan). Operator picks a
+         subset via checkboxes; Remove Selected calls the
+         admin endpoint which delegates to
+         stop_frr_container(remove=True) — that helper (via
+         v0.5.382 W1+W2+W3) does the full teardown chain:
+         container stop + remove + VRF detach + interface
+         nomaster + VRF-table release, safely for both
+         `ostg-frr-*` and `dhcp-frr-*` prefixes. -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">Containers</h2>
+        <div>
+          <span id="containers-count" style="font-size: 12px; color: var(--muted); margin-right: 12px;">—</span>
+          <button class="secondary" id="btn-refresh-containers">Refresh</button>
+          <button class="danger" id="btn-remove-containers" disabled>Remove Selected</button>
+        </div>
+      </div>
+      <p style="color: var(--muted); font-size: 12px; margin: 4px 0 8px;">
+        Every FRR / DHCP container this server manages. Select
+        rows and click Remove Selected to stop the container,
+        detach its interface from the per-device VRF, delete
+        the VRF, and release the VRF table id. Rows tagged
+        "orphan" have no matching device in the DB (typically
+        left over from a crash or a stale CLI removal) and are
+        safe to sweep.
+      </p>
+      <div id="containers-remove-result" style="font-size: 12px; color: var(--muted); margin-bottom: 6px;"></div>
+      <div id="containers-table-wrap"><div class="iface-empty">Click Refresh to load…</div></div>
+    </div>
+
     <div class="card" style="grid-column: 1 / -1;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
         <h2 style="margin: 0;">Install Log</h2>
@@ -25905,6 +26100,160 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     document.addEventListener('DOMContentLoaded', () => {
       if ($('streams-table-wrap')) {
         setTimeout(_refreshStreams, 2000);
+      }
+    });
+
+    // v0.5.390 (audit admin-containers-card): FRR + DHCP
+    // container listing + selective remove. Fetch, render with
+    // per-row checkboxes, and POST the selected names to
+    // /api/admin/containers/remove on confirm.
+    async function _refreshContainers() {
+      const _wrap = $('containers-table-wrap');
+      const _count = $('containers-count');
+      const _btn = $('btn-remove-containers');
+      const _result = $('containers-remove-result');
+      if (_result) _result.textContent = '';
+      if (!_wrap) return;
+      try {
+        const r = await fetch('/api/admin/containers', {cache: 'no-store'});
+        const d = await r.json();
+        if (!r.ok) {
+          _wrap.innerHTML = `<div class="iface-empty">error: ${d.error || r.status}</div>`;
+          if (_btn) _btn.disabled = true;
+          return;
+        }
+        const _list = Array.isArray(d.containers) ? d.containers : [];
+        if (_count) _count.textContent = _list.length + ' container(s)';
+        if (_list.length === 0) {
+          _wrap.innerHTML = '<div class="iface-empty">No FRR / DHCP containers found.</div>';
+          if (_btn) _btn.disabled = true;
+          return;
+        }
+        // Row shape:
+        //   [ ] name  device_id  status  image  vrf  iface  [orphan?]
+        const _rows = _list.slice(0, 500).map(c => {
+          const _name = c.name || '';
+          const _did = c.device_id || '';
+          const _status = c.status || '';
+          const _image = c.image || '';
+          const _vrf = c.vrf || '—';
+          const _iface = c.interface || '—';
+          const _orphan = c.has_db_row === false
+            ? '<span style="color: #b45309; font-weight: 600;">orphan</span>'
+            : '';
+          const _statusHtml = _status === 'running'
+            ? '<span style="color: #059669;">' + _escapeHtml(_status) + '</span>'
+            : '<span style="color: var(--muted);">' + _escapeHtml(_status) + '</span>';
+          return (
+            '<tr>' +
+              '<td><input type="checkbox" class="container-select" data-name="' + _escapeHtml(_name) + '"></td>' +
+              '<td style="font-family: monospace; font-size: 11px;">' + _escapeHtml(_name) + '</td>' +
+              '<td style="font-family: monospace; font-size: 11px;">' + _escapeHtml(_did) + '</td>' +
+              '<td>' + _statusHtml + '</td>' +
+              '<td style="font-size: 11px; color: var(--muted);">' + _escapeHtml(_image) + '</td>' +
+              '<td style="font-family: monospace; font-size: 11px;">' + _escapeHtml(_vrf) + '</td>' +
+              '<td style="font-family: monospace; font-size: 11px;">' + _escapeHtml(_iface) + '</td>' +
+              '<td>' + _orphan + '</td>' +
+            '</tr>'
+          );
+        }).join('');
+        _wrap.innerHTML =
+          '<table style="width: 100%; font-size: 12px; border-collapse: collapse;">' +
+            '<thead><tr style="border-bottom: 1px solid var(--muted);">' +
+              '<th style="text-align: left; width: 30px;"><input type="checkbox" id="container-select-all"></th>' +
+              '<th style="text-align: left;">Container</th>' +
+              '<th style="text-align: left;">device_id</th>' +
+              '<th style="text-align: left;">Status</th>' +
+              '<th style="text-align: left;">Image</th>' +
+              '<th style="text-align: left;">VRF</th>' +
+              '<th style="text-align: left;">Interface</th>' +
+              '<th style="text-align: left;"></th>' +
+            '</tr></thead>' +
+            '<tbody>' + _rows + '</tbody>' +
+          '</table>';
+        // Wire the select-all checkbox
+        const _all = $('container-select-all');
+        if (_all) {
+          _all.addEventListener('change', () => {
+            document.querySelectorAll('.container-select').forEach(_cb => {
+              _cb.checked = _all.checked;
+            });
+            _updateRemoveButtonState();
+          });
+        }
+        document.querySelectorAll('.container-select').forEach(_cb => {
+          _cb.addEventListener('change', _updateRemoveButtonState);
+        });
+        _updateRemoveButtonState();
+      } catch (e) {
+        _wrap.innerHTML = '<div class="iface-empty">request failed: ' + _escapeHtml(String(e)) + '</div>';
+        if (_btn) _btn.disabled = true;
+      }
+    }
+
+    function _updateRemoveButtonState() {
+      const _btn = $('btn-remove-containers');
+      if (!_btn) return;
+      const _any = document.querySelectorAll('.container-select:checked').length > 0;
+      _btn.disabled = !_any;
+    }
+
+    async function _removeSelectedContainers() {
+      const _names = Array.from(
+        document.querySelectorAll('.container-select:checked')
+      ).map(_cb => _cb.getAttribute('data-name')).filter(Boolean);
+      if (_names.length === 0) return;
+      const _lines = _names.slice(0, 20).join('\n  • ');
+      const _more = _names.length > 20 ? '\n  … and ' + (_names.length - 20) + ' more' : '';
+      const _confirm = window.confirm(
+        'Remove ' + _names.length + ' container(s)?\n\n  • ' + _lines + _more +
+        '\n\nEach will be stopped + removed; its VRF will be torn down; ' +
+        'the enslaved interface will be freed; the VRF table id will be ' +
+        'released. This is not reversible from /admin — the operator ' +
+        'must re-Apply the device from the desktop client to bring it back.'
+      );
+      if (!_confirm) return;
+      const _result = $('containers-remove-result');
+      if (_result) _result.textContent = 'Removing ' + _names.length + '…';
+      try {
+        const r = await fetch('/api/admin/containers/remove', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({names: _names}),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+          if (_result) _result.textContent = 'error: ' + (d.error || r.status);
+          return;
+        }
+        const _succ = d.success_count || 0;
+        const _fail = d.failure_count || 0;
+        let _msg = 'Removed ' + _succ + ' / ' + _names.length + '.';
+        if (_fail > 0) {
+          const _failed = (d.results || []).filter(x => !x.ok)
+            .map(x => x.name + (x.error ? ' (' + x.error + ')' : '')).slice(0, 3);
+          _msg += ' Failed: ' + _failed.join(', ');
+          if (_fail > 3) _msg += ' + ' + (_fail - 3) + ' more';
+        }
+        if (_result) _result.textContent = _msg;
+        // Refresh the table
+        setTimeout(_refreshContainers, 500);
+      } catch (e) {
+        if (_result) _result.textContent = 'request failed: ' + e;
+      }
+    }
+
+    if ($('btn-refresh-containers')) {
+      $('btn-refresh-containers').addEventListener('click', _refreshContainers);
+    }
+    if ($('btn-remove-containers')) {
+      $('btn-remove-containers').addEventListener('click', _removeSelectedContainers);
+    }
+    // Kick a first load once the DOM is ready (deferred so it
+    // doesn't block the initial /admin paint).
+    document.addEventListener('DOMContentLoaded', () => {
+      if ($('containers-table-wrap')) {
+        setTimeout(_refreshContainers, 2500);
       }
     });
 
