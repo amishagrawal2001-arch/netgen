@@ -1683,7 +1683,30 @@ class TrafficGenClientStatisticsSection():
         # print(f"[DEBUG] update_per_stream_statistics() called with {len(stream_stats)} entries")
 
         stat_map = {entry.get("stream_id"): entry for entry in stream_stats if entry.get("stream_id")}
-        
+
+        # v0.5.386 (audit stats-B5): pre-compute a stream_id →
+        # (port_key, stream_dict) reverse index once per call.
+        # Pre-fix, the loop at ~:1717 did a nested scan
+        # `for p, lst in self.streams.items(): if any(s.get(
+        # "stream_id") == stream_id_from_table for s in lst)` for
+        # EVERY row × EVERY port × EVERY stream/port — O(rows ×
+        # ports × streams). At 100 streams / port × 8 ports × N
+        # rows = ~N × 800 comparisons per 2s tick. Reverse index
+        # makes it O(rows) with O(1) lookup per row.
+        _stream_id_index = {}  # {stream_id: (port_key, stream_dict)}
+        try:
+            for _p, _lst in self.streams.items():
+                for _s in _lst:
+                    _sid = _s.get("stream_id")
+                    if _sid:
+                        _stream_id_index[_sid] = (_p, _s)
+        except Exception as _idx_exc:
+            # If index build fails for any reason, fall back to the
+            # legacy nested-scan path (unchanged below); the index
+            # stays empty and lookups return None.
+            logger.debug(f"[STATS B5] index build skipped: {_idx_exc}")
+            _stream_id_index = {}
+
         # Track if any stream status changed
         status_changed = False
 
@@ -1714,10 +1737,18 @@ class TrafficGenClientStatisticsSection():
             #   3. Header row → match the visible text.
             matched_iface = None
             if stream_id_from_table:
-                for p, lst in self.streams.items():
-                    if any(s.get("stream_id") == stream_id_from_table for s in lst):
-                        matched_iface = p
-                        break
+                # v0.5.386 (audit stats-B5): O(1) lookup via
+                # pre-built reverse index; fall through to the
+                # nested-scan path only when the index is empty
+                # (e.g. build-exception fallback).
+                _hit = _stream_id_index.get(stream_id_from_table)
+                if _hit is not None:
+                    matched_iface = _hit[0]
+                elif not _stream_id_index:
+                    for p, lst in self.streams.items():
+                        if any(s.get("stream_id") == stream_id_from_table for s in lst):
+                            matched_iface = p
+                            break
 
             if not matched_iface:
                 # Continuation rows hide the iface in the tooltip.

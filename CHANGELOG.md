@@ -2,6 +2,71 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.386] - 2026-09-21
+
+### Fixed — Backlog sweep: OSPF multi-area, FK integrity, VRF clears, docker reconnect, stats perf (5 items)
+
+**B1: Multi-area OSPF pools collapsed to one area**
+(`run_tgen_server.py:6810-6910`) — Pre-fix, when the payload
+carried `route_pools_per_area` with multiple areas, the handler
+picked `"default"` (or first-in-dict) and applied every area's
+pools to the flat `area_id` field. Multi-area topologies silently
+had all pools retargeted to one area. Fix: normalise the payload
+into `{area_id: pools}` and iterate; per-area threads honor the
+correct area on both configure and cleanup paths. Legacy flat
+`route_pools` still uses the flat `area_id`.
+
+**B2: `attach_route_pools_to_device` — FK-enforcing connection**
+(`utils/device_database.py:2910-2960`) — Pre-fix, plain
+`sqlite3.connect` (no `PRAGMA foreign_keys = ON`) let attach
+succeed for a nonexistent pool name. The FK on
+`device_route_pools(pool_name)` was defined but never fired; the
+mismatch surfaced later as a v0.5.197 "unknown pool" warning at
+apply time. Fix: use `self._connect_fk_on()`; catch
+`sqlite3.IntegrityError` and log an actionable error naming the
+missing pool so the operator saves it first.
+
+**B3: BGP cleanup `clear` — VRF-scoped + canonical IPv6 form**
+(`run_tgen_server.py:10536-10600`) — Two coupled defects:
+- The IPv6 branch used non-standard `clear ipv6 bgp <n>`; the
+  canonical FRR command is `clear bgp ipv6 unicast <n>`. Old
+  form no-ops on some FRR versions.
+- Neither v4 nor v6 branch included `vrf <name>`. On VRF-scoped
+  sessions (v0.5.198+ default arch), the clear ran in the default
+  VRF and never touched the per-device instance — new route-maps
+  weren't pushed to the peer, operator saw stale prefixes for
+  minutes. Fix: append the already-computed `_vrf_route_suffix`
+  to both v4 + v6 clears; use canonical `clear bgp ipv6 unicast`
+  shape; add ` soft out` to force outbound re-push.
+
+**B4: FRR docker client reconnect on daemon restart**
+(`utils/frr_docker.py:318-395`) — Pre-fix, `FRRDockerManager`
+bound `docker.from_env()` once in `__init__` and reused it
+forever. If dockerd was restarted while netgen-server was
+running, every `self.client.*` call raised connection errors
+and the whole start/stop/list surface stayed broken until the
+operator restarted netgen-server. Fix: new `_ensure_client()`
+method pings the daemon at most every 30s; on failure it
+recreates `self.client` via `docker.from_env()` and re-resolves
+the image. Wired into `start_frr_container` +
+`stop_frr_container` (the highest-value entry points).
+
+**B5: `update_per_stream_statistics` O(N²) → O(N)**
+(`traffic_client/statistics_section.py:1682-1745`) — Pre-fix,
+the per-row iface-resolution loop did `for p, lst in
+self.streams.items(): if any(s.get("stream_id") ==
+stream_id_from_table for s in lst)` — for EVERY table row ×
+EVERY port × EVERY stream per port. At 100 streams/port × 8
+ports × N rows = ~N × 800 comparisons per 2s tick. Fix: build
+a `_stream_id_index` dict once per call for O(1) lookup;
+nested-scan fallback preserved for the (rare) index-build
+failure path.
+
+### Tests
+
+New: `tests/test_v05386_bgp_stats_backlog.py`. AST + structural
++ behavioral (FK IntegrityError raise, index build).
+
 ## [0.5.385] - 2026-09-21
 
 ### Fixed — BGP audit MED backlog (5 items)

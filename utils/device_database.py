@@ -2920,24 +2920,46 @@ class DeviceDatabase:
             bool: True if successful, False otherwise
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            # v0.5.386 (audit BGP-B2): use _connect_fk_on so the
+            # `FOREIGN KEY (pool_name) REFERENCES route_pools(pool_name)`
+            # constraint on `device_route_pools` (see schema line ~480)
+            # actually fires. Pre-fix, `sqlite3.connect` (no
+            # `PRAGMA foreign_keys = ON`) allowed attaching a
+            # NONEXISTENT pool name silently — the mismatch only
+            # surfaced later as the v0.5.197 unknown-pool warning
+            # at apply time, so the operator got a very late signal.
+            # Now the INSERT raises `IntegrityError` at attach time
+            # and the caller sees the failure immediately.
+            with self._connect_fk_on() as conn:
                 # First, remove existing attachments for this device and neighbor
                 conn.execute("""
-                    DELETE FROM device_route_pools 
+                    DELETE FROM device_route_pools
                     WHERE device_id = ? AND neighbor_ip = ?
                 """, (device_id, neighbor_ip))
-                
+
                 # Add new attachments
                 for pool_name in pool_names:
                     conn.execute("""
                         INSERT INTO device_route_pools (device_id, pool_name, neighbor_ip, created_at)
                         VALUES (?, ?, ?, ?)
                     """, (device_id, pool_name, neighbor_ip, datetime.now(timezone.utc).isoformat()))
-                
+
                 conn.commit()
                 logger.info(f"[DEVICE DB] Attached {len(pool_names)} route pools to device {device_id} for neighbor {neighbor_ip}")
                 return True
-                
+
+        except sqlite3.IntegrityError as _fk_exc:
+            # v0.5.386 (BGP-B2): the FK guard fired. Log the
+            # actionable message so the operator understands.
+            logger.error(
+                f"[DEVICE DB] Refusing to attach route pools to "
+                f"device {device_id} (neighbor {neighbor_ip}): "
+                f"FK violation — one or more pool names "
+                f"{pool_names} do not exist in route_pools. "
+                f"Save the pool first (Tools → BGP → Manage Route "
+                f"Pools), then re-attach. ({_fk_exc})"
+            )
+            return False
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to attach route pools to device {device_id}: {e}")
             return False

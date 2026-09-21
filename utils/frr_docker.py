@@ -317,12 +317,68 @@ class FRRDockerManager:
 
     def __init__(self):
         self.client = docker.from_env()
+        # v0.5.386 (audit FRR-B4): remember when we last confirmed
+        # the docker client is healthy. Used by `_ensure_client()`
+        # to reconnect on a broken socket (e.g. dockerd restarted
+        # under the running server) instead of failing every call
+        # until the netgen-server process itself restarts.
+        try:
+            import time as _time_mod
+            self._client_last_ok = _time_mod.monotonic()
+        except Exception:
+            self._client_last_ok = 0
+        self._client_ping_interval = 30.0  # seconds between forced pings
         # Container prefix kept at ostg-frr for backwards compatibility
         # with already-running deployments (renaming would orphan
         # in-flight containers); the image name auto-resolves so the
         # new netgen-frr build works without config edits.
         self.container_prefix = "ostg-frr"
         self.image_name = _resolve_frr_image(self.client)
+
+    # v0.5.386 (audit FRR-B4): docker client reconnect wrapper.
+    # Pre-fix, FRRDockerManager bound `docker.from_env()` once in
+    # `__init__` and reused it forever. If dockerd was restarted
+    # while netgen-server was running, every subsequent
+    # `self.client.*` call raised `docker.errors.APIError` /
+    # `requests.exceptions.ConnectionError` and the whole
+    # start/stop/list surface stayed broken until the operator
+    # restarted netgen-server. Fix: `_ensure_client()` pings the
+    # daemon at most every `_client_ping_interval` seconds; on
+    # failure it recreates `self.client` from `docker.from_env()`
+    # and re-resolves the image. Called from every
+    # container-touching entry point (start/stop/list). Cheap
+    # in the healthy case (single HTTP ping every 30s).
+    def _ensure_client(self):
+        try:
+            import time as _time_mod
+            _now = _time_mod.monotonic()
+            if (_now - getattr(self, "_client_last_ok", 0)
+                    < getattr(self, "_client_ping_interval", 30.0)):
+                # Ping recently confirmed healthy; skip.
+                return self.client
+            # Try a cheap ping. If it works, refresh the timestamp.
+            try:
+                self.client.ping()
+                self._client_last_ok = _now
+                return self.client
+            except Exception as _ping_exc:
+                logger.warning(
+                    f"[FRR] docker client ping failed ({_ping_exc}); "
+                    f"reconnecting (v0.5.386 audit FRR-B4)"
+                )
+                self.client = docker.from_env()
+                try:
+                    self.image_name = _resolve_frr_image(self.client)
+                except Exception as _img_exc:
+                    logger.debug(
+                        f"[FRR] image re-resolve after reconnect: {_img_exc}"
+                    )
+                self._client_last_ok = _now
+                return self.client
+        except Exception as _outer:
+            # Never let ensure_client itself crash the caller.
+            logger.debug(f"[FRR] _ensure_client best-effort skip: {_outer}")
+            return self.client
 
         # v0.5.373 (audit vrf-table-id-collision): allocation-tracker
         # for per-device VRF routing-table ids. Pre-fix `_vrf_table`
@@ -947,6 +1003,9 @@ class FRRDockerManager:
         _start_lock = self._start_lock_for(device_id)
         _start_lock.acquire()
         try:
+            # v0.5.386 (audit FRR-B4): reconnect docker client if
+            # dockerd was restarted since our last successful call.
+            self._ensure_client()
             device_name = device_config.get('device_name', f'device_{device_id}')
             dhcp_mode = (device_config.get('dhcp_mode') or '').lower()
             container_name = self._get_container_name(device_id, device_name, dhcp_mode=dhcp_mode)
@@ -1872,6 +1931,9 @@ class FRRDockerManager:
           but-never-called helper.
         """
         try:
+            # v0.5.386 (audit FRR-B4): reconnect docker client if
+            # dockerd was restarted since our last successful call.
+            self._ensure_client()
             container, container_name = self._find_existing_container(
                 device_id, device_name)
 

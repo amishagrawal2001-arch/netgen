@@ -6808,21 +6808,39 @@ def configure_ospf():
                 try:
                     # Check for route pools in ospf_config first, then in route_pools_per_area payload
                     route_pools_data = ospf_config.get("route_pools", [])
-                    
-                    # If route_pools_per_area is provided in payload, use it (allows per-area assignment)
+
+                    # v0.5.386 (audit OSPF-B1): multi-area route
+                    # pools. Pre-fix, the handler collapsed
+                    # `route_pools_per_area` down to a SINGLE area
+                    # ("default" if present, else first-in-dict)
+                    # and used the flat `area_id` field for the
+                    # apply call. Payloads with per-area
+                    # assignments silently retargeted every area's
+                    # pools onto that one flat area.
+                    #
+                    # Fix: normalise the payload into a dict
+                    # {area_id → pools} and iterate. When the
+                    # legacy `route_pools` flat list is present,
+                    # keep the old behavior for backward compat.
                     route_pools_per_area = data.get("route_pools_per_area", {})
-                    if route_pools_per_area and not route_pools_data:
-                        # Extract route pools from route_pools_per_area
-                        # For now, use "default" area or first area found
-                        if "default" in route_pools_per_area:
-                            route_pools_data = route_pools_per_area["default"]
-                        elif route_pools_per_area:
-                            # Use first area's pools
-                            first_area = list(route_pools_per_area.keys())[0]
-                            route_pools_data = route_pools_per_area[first_area]
-                    
-                    area_id = ospf_config.get("area_id", "0.0.0.0")
-                    
+                    _flat_area_id = ospf_config.get("area_id", "0.0.0.0")
+                    # Normalised {area_id: pools_value} — pools_value
+                    # may be a list (v4 back-compat) or dict
+                    # ({neighbor_type: [...]}) matching the existing
+                    # per-neighbor-type format.
+                    _per_area = {}
+                    if route_pools_per_area:
+                        # Preserve per-area keys verbatim; only fall
+                        # back to flat area_id when the caller sent
+                        # the sentinel "default".
+                        for _k, _v in route_pools_per_area.items():
+                            _target_area = _flat_area_id if _k == "default" else _k
+                            _per_area[_target_area] = _v
+                    elif route_pools_data:
+                        # Legacy: caller sent flat `route_pools`
+                        # under the flat `area_id`.
+                        _per_area[_flat_area_id] = route_pools_data
+
                     # Get all available route pools
                     all_pools_db = device_db.get_all_route_pools()
                     all_pools = []
@@ -6835,43 +6853,55 @@ def configure_ospf():
                             "last_host": pool["last_host_ip"],
                             "increment_type": pool.get("increment_type", "host")
                         })
-                    
-                    # Handle both old list format and new dict format (per neighbor type)
-                    if isinstance(route_pools_data, dict):
-                        # New format: apply route pools per neighbor type
-                        for neighbor_type, route_pools in route_pools_data.items():
-                            if route_pools and len(route_pools) > 0:
-                                logging.info(f"[OSPF CONFIGURE] Applying route pools for area {area_id}, type {neighbor_type}: {route_pools}")
+
+                    if not _per_area:
+                        # No route pools configured for any area -
+                        # clean up existing routes for the flat
+                        # (or only) area.
+                        logging.info(f"[OSPF CONFIGURE] No route pools configured - cleaning up existing routes for area {_flat_area_id}")
+                        import threading
+                        def _cleanup_routes():
+                            cleanup_ospf_route_advertisement(device_id, device_name, _flat_area_id)
+                        threading.Thread(target=_cleanup_routes, daemon=True).start()
+                    else:
+                        for _apply_area, _apply_pools in _per_area.items():
+                            # Handle both old list format and new
+                            # dict format (per neighbor type).
+                            if isinstance(_apply_pools, dict):
+                                for neighbor_type, route_pools in _apply_pools.items():
+                                    if route_pools and len(route_pools) > 0:
+                                        logging.info(f"[OSPF CONFIGURE] Applying route pools for area {_apply_area}, type {neighbor_type}: {route_pools}")
+                                        import threading
+                                        def _apply_routes(af_type=neighbor_type, pools=route_pools, area=_apply_area):
+                                            configure_ospf_route_advertisement(
+                                                device_id, device_name, area,
+                                                pools, all_pools, af_type=af_type
+                                            )
+                                        threading.Thread(target=_apply_routes, daemon=True).start()
+                                    else:
+                                        logging.info(f"[OSPF CONFIGURE] No route pools for area {_apply_area}, type {neighbor_type} - cleaning up existing routes")
+                                        import threading
+                                        def _cleanup_routes(af_type=neighbor_type, area=_apply_area):
+                                            cleanup_ospf_route_advertisement(device_id, device_name, area, af_type=af_type)
+                                        threading.Thread(target=_cleanup_routes, daemon=True).start()
+                            elif isinstance(_apply_pools, list) and len(_apply_pools) > 0:
+                                # Legacy list format: apply as IPv4
+                                # (backward compatibility).
+                                logging.info(f"[OSPF CONFIGURE] Applying route pools for area {_apply_area}: {_apply_pools} (old format)")
                                 import threading
-                                def _apply_routes(af_type=neighbor_type, pools=route_pools):
+                                def _apply_routes(pools=_apply_pools, area=_apply_area):
                                     configure_ospf_route_advertisement(
-                                        device_id, device_name, area_id, 
-                                        pools, all_pools, af_type=af_type
+                                        device_id, device_name, area,
+                                        pools, all_pools, af_type="IPv4"
                                     )
                                 threading.Thread(target=_apply_routes, daemon=True).start()
                             else:
-                                logging.info(f"[OSPF CONFIGURE] No route pools for area {area_id}, type {neighbor_type} - cleaning up existing routes")
+                                # Empty pools for this area - clean up.
+                                logging.info(f"[OSPF CONFIGURE] No route pools for area {_apply_area} - cleaning up existing routes")
                                 import threading
-                                def _cleanup_routes(af_type=neighbor_type):
-                                    cleanup_ospf_route_advertisement(device_id, device_name, area_id, af_type=af_type)
+                                def _cleanup_routes(area=_apply_area):
+                                    cleanup_ospf_route_advertisement(device_id, device_name, area)
                                 threading.Thread(target=_cleanup_routes, daemon=True).start()
-                    elif isinstance(route_pools_data, list) and len(route_pools_data) > 0:
-                        # Old format: apply as IPv4 (backward compatibility)
-                        logging.info(f"[OSPF CONFIGURE] Applying route pools for area {area_id}: {route_pools_data} (old format)")
-                        import threading
-                        def _apply_routes():
-                            configure_ospf_route_advertisement(
-                                device_id, device_name, area_id, 
-                                route_pools_data, all_pools, af_type="IPv4"
-                            )
-                        threading.Thread(target=_apply_routes, daemon=True).start()
-                    else:
-                        # No route pools configured - clean up existing routes
-                        logging.info(f"[OSPF CONFIGURE] No route pools configured - cleaning up existing routes for area {area_id}")
-                        import threading
-                        def _cleanup_routes():
-                            cleanup_ospf_route_advertisement(device_id, device_name, area_id)
-                        threading.Thread(target=_cleanup_routes, daemon=True).start()
                 except Exception as e:
                     logging.warning(f"[OSPF CONFIGURE] Failed to apply route pool configurations: {e}")
                 
@@ -10503,22 +10533,54 @@ def cleanup_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip
             logging.warning(f"[BGP ROUTE CLEANUP] Command exit code: {result.exit_code}")
             logging.warning(f"[BGP ROUTE CLEANUP] output: {result.output.decode(errors='replace')[:1500]}")
         
-        # Clear BGP session to force route withdrawal (only for the specified AF)
+        # Clear BGP session to force route withdrawal.
+        #
+        # v0.5.386 (audit BGP-B3): VRF-scoped clear + canonical
+        # command shape. Pre-fix:
+        #   1. IPv6 branch used the non-standard `clear ipv6 bgp
+        #      <n>` — the canonical FRR command is `clear bgp ipv6
+        #      unicast <n>` (matches the configure path at
+        #      configure_bgp_route_advertisement's route-map
+        #      binding). Old form silently no-ops on some FRR
+        #      versions.
+        #   2. Neither v4 nor v6 branch included `vrf <name>`. On
+        #      the default VRF-scoped architecture (v0.5.198+),
+        #      the session lives inside `router bgp <asn> vrf
+        #      <name>` and a default-VRF `clear` doesn't reach
+        #      it → new route-maps never pushed to peer → operator
+        #      sees stale advertised prefixes for several minutes
+        #      until the peer's own scan expires them.
+        # `_vrf_route_suffix` was already computed above for the
+        # static-route cleanup; reuse it here (may be empty for
+        # legacy single-device deployments).
         try:
+            # _vrf_route_suffix is either "" or " vrf <name>".
+            # Same suffix works verbatim in the clear command.
             if not is_ipv6_only:
                 clear_cmd = [
-                    "docker", "exec", container_name, "vtysh", 
-                    "-c", f"clear ip bgp {neighbor_ip}"
+                    "docker", "exec", container_name, "vtysh",
+                    "-c", f"clear ip bgp{_vrf_route_suffix} {neighbor_ip} soft out"
                 ]
                 subprocess.run(clear_cmd, capture_output=True, text=True, timeout=10)
-                logging.info(f"[BGP ROUTE CLEANUP] Clearing IPv4 BGP session with {neighbor_ip}")
+                logging.info(
+                    f"[BGP ROUTE CLEANUP] Clearing IPv4 BGP session with "
+                    f"{neighbor_ip}{_vrf_route_suffix}"
+                )
             if not is_ipv4_only:
+                # Canonical FRR IPv6 clear command shape (matches
+                # configure_bgp's `neighbor <n> route-map ... out`
+                # under `address-family ipv6 unicast`). The old
+                # `clear ipv6 bgp <n>` form no-ops on some
+                # versions.
                 clear_cmd = [
-                    "docker", "exec", container_name, "vtysh", 
-                    "-c", f"clear ipv6 bgp {neighbor_ip}"
+                    "docker", "exec", container_name, "vtysh",
+                    "-c", f"clear bgp{_vrf_route_suffix} ipv6 unicast {neighbor_ip} soft out"
                 ]
                 subprocess.run(clear_cmd, capture_output=True, text=True, timeout=10)
-                logging.info(f"[BGP ROUTE CLEANUP] Clearing IPv6 BGP session with {neighbor_ip}")
+                logging.info(
+                    f"[BGP ROUTE CLEANUP] Clearing IPv6 BGP session with "
+                    f"{neighbor_ip}{_vrf_route_suffix}"
+                )
         except Exception as e:
             logging.warning(f"[BGP ROUTE CLEANUP] Failed to clear BGP session: {e}")
         
