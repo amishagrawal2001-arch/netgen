@@ -15584,6 +15584,101 @@ def get_device_arp_status(device_id):
         ipv4_gateway = _strip_mask(device.get('ipv4_gateway'))
         ipv6_gateway = _strip_mask(device.get('ipv6_gateway'))
 
+        # v0.5.376 (audit arp-gateway-fallback-to-own-ip): when the
+        # DB row has an empty ipv4_gateway/ipv6_gateway (client Add/
+        # Edit dialog persistence gap — the UI cross-references
+        # OSPF/ISIS neighbor tables to DISPLAY a gateway, but the
+        # column is never written back), fall back to the OSPF /
+        # ISIS / BGP peer address the protocol monitors have already
+        # resolved. This restores the v0.5.311 semantic ("ARP is
+        # for REMOTE peers") without the flawed own-IP stopgap that
+        # was silently failing from within per-device VRFs (local
+        # table 1000+ has no route for the device's own /32).
+        #
+        # Trust order (first non-empty wins):
+        #   1. DB ipv4_gateway   (operator-set, authoritative)
+        #   2. ospf_neighbors[0].address / .neighbor_id peer IP
+        #   3. isis_neighbors[0].ipv4_address peer IP
+        #   4. bgp_neighbors[0].remote_ip peer IP
+        #
+        # Same order for v6, using .ipv6_link_local / .ipv6_global /
+        # bgp v6 neighbor.
+        def _first_peer_ip(field_json_str, keys, family="ipv4"):
+            """Extract the first peer IP from a JSON-serialized
+            neighbors list. field_json_str is the raw string from
+            the DB (ospf_neighbors etc); keys is a tuple of
+            candidate field names to try, in preference order."""
+            if not field_json_str:
+                return ""
+            try:
+                _peers = json.loads(field_json_str) \
+                    if isinstance(field_json_str, str) \
+                    else field_json_str
+                if not isinstance(_peers, list):
+                    return ""
+                for _p in _peers:
+                    if not isinstance(_p, dict):
+                        continue
+                    # v6 branch: only accept a global v6 address,
+                    # not link-local (link-local can't be pinged as
+                    # a gateway target — needs %iface suffix).
+                    if family == "ipv6":
+                        for _k in keys:
+                            _v = _p.get(_k) or ""
+                            if _v and ":" in _v \
+                                    and not _v.lower().startswith("fe80"):
+                                return _v
+                    else:
+                        for _k in keys:
+                            _v = _p.get(_k) or ""
+                            if _v and "." in _v and ":" not in _v:
+                                return _v
+            except (json.JSONDecodeError, TypeError, ValueError) as _exc:
+                logging.debug(
+                    f"[ARP STATUS] peer-fallback parse for "
+                    f"{device_id}: {_exc}"
+                )
+            return ""
+
+        if not ipv4_gateway:
+            _fallback4 = ""
+            for _field, _keys in (
+                (device.get("ospf_neighbors"), ("address", "neighbor_id")),
+                (device.get("isis_neighbors"), ("ipv4_address",)),
+                (device.get("bgp_neighbors"),
+                 ("remote_ip", "peer_ip", "neighbor_ip")),
+            ):
+                _fallback4 = _first_peer_ip(_field, _keys, "ipv4")
+                if _fallback4:
+                    break
+            if _fallback4:
+                logging.info(
+                    f"[ARP STATUS] device {device_id}: DB "
+                    f"ipv4_gateway empty; using peer-derived "
+                    f"{_fallback4!r} as ARP target"
+                )
+                ipv4_gateway = _fallback4
+        if not ipv6_gateway:
+            _fallback6 = ""
+            for _field, _keys in (
+                (device.get("ospf_neighbors"),
+                 ("ipv6_global", "ipv6_link_local", "address")),
+                (device.get("isis_neighbors"),
+                 ("ipv6_global", "ipv6_link_local")),
+                (device.get("bgp_neighbors"),
+                 ("remote_ip", "peer_ip", "neighbor_ip")),
+            ):
+                _fallback6 = _first_peer_ip(_field, _keys, "ipv6")
+                if _fallback6:
+                    break
+            if _fallback6:
+                logging.info(
+                    f"[ARP STATUS] device {device_id}: DB "
+                    f"ipv6_gateway empty; using peer-derived "
+                    f"{_fallback6!r} as ARP target"
+                )
+                ipv6_gateway = _fallback6
+
         # v0.5.254: ping is a poor proxy for "ARP resolved". Many
         # devices (notably Juniper QFX IRB interfaces in the srv06
         # lab, and any router with an ICMP-rate-limit / firewall
@@ -15713,9 +15808,20 @@ def get_device_arp_status(device_id):
                 # Stash the IPs we ACTUALLY pinged so the client can
                 # see what the server resolved to, separately from
                 # what's in the device dict.
+                #
+                # v0.5.376 (audit arp-gateway-fallback-to-own-ip):
+                # `gateway_target` now reflects the peer-derived
+                # fallback when the DB row's ipv4_gateway was empty.
+                # Pre-fix it was always the empty DB field and the
+                # UI had no signal that we'd fallen back to own-IP.
                 "ipv4_target": ipv4_address or "",
                 "ipv6_target": ipv6_address or ipv6_gateway or "",
                 "gateway_target": ipv4_gateway or "",
+                "gateway_target_v6": ipv6_gateway or "",
+                "gateway_target_source": (
+                    "db" if _strip_mask(device.get("ipv4_gateway"))
+                    else ("peer" if ipv4_gateway else "none")
+                ),
                 "vrf": ping_prefix[3] if ping_prefix else "",
             },
         }

@@ -974,6 +974,126 @@ class DeviceDatabase:
                     conn.execute(f"ALTER TABLE devices ADD COLUMN {_v6_col} TEXT")
                     conn.commit()
 
+            # v0.5.376 (audit arp-gateway-fallback-to-own-ip):
+            # one-time backfill of empty ipv4_gateway / ipv6_gateway
+            # rows from the protocol-monitor peer address. Devices
+            # created before v0.5.376's client-side dialog fix have
+            # an empty gateway in the DB (dialog captured the value
+            # but never persisted it) — the UI hid this by cross-
+            # referencing ospf_neighbors[0].address to DISPLAY a
+            # gateway, but the server's ARP check trusted the DB
+            # and fell back to the flawed own-IP ping → amber pill.
+            # This backfill heals existing installs in one shot;
+            # idempotent (only touches rows where gateway=='').
+            try:
+                import json as _json
+                _rows_to_heal = conn.execute(
+                    "SELECT device_id, device_name, ipv4_gateway, "
+                    "ipv6_gateway, ospf_neighbors, isis_neighbors, "
+                    "bgp_neighbors FROM devices "
+                    "WHERE (ipv4_gateway IS NULL OR ipv4_gateway = '') "
+                    "   OR (ipv6_gateway IS NULL OR ipv6_gateway = '')"
+                ).fetchall()
+                _healed_v4 = 0
+                _healed_v6 = 0
+
+                def _first_v4(_field):
+                    if not _field:
+                        return ""
+                    try:
+                        _peers = _json.loads(_field) if isinstance(_field, str) else _field
+                        if not isinstance(_peers, list):
+                            return ""
+                        for _p in _peers:
+                            if not isinstance(_p, dict):
+                                continue
+                            for _k in ("address", "neighbor_id",
+                                       "ipv4_address", "remote_ip",
+                                       "peer_ip", "neighbor_ip"):
+                                _v = _p.get(_k) or ""
+                                if _v and "." in _v and ":" not in _v:
+                                    return _v
+                    except Exception:
+                        pass
+                    return ""
+
+                def _first_v6(_field):
+                    if not _field:
+                        return ""
+                    try:
+                        _peers = _json.loads(_field) if isinstance(_field, str) else _field
+                        if not isinstance(_peers, list):
+                            return ""
+                        for _p in _peers:
+                            if not isinstance(_p, dict):
+                                continue
+                            for _k in ("ipv6_global", "ipv6_link_local",
+                                       "remote_ip", "peer_ip",
+                                       "neighbor_ip", "address"):
+                                _v = _p.get(_k) or ""
+                                if _v and ":" in _v \
+                                        and not _v.lower().startswith("fe80"):
+                                    return _v
+                    except Exception:
+                        pass
+                    return ""
+
+                for _row in _rows_to_heal:
+                    _did, _dname, _gw4, _gw6, _ospf, _isis, _bgp = _row
+                    _new_v4 = _gw4 or ""
+                    _new_v6 = _gw6 or ""
+                    if not _new_v4:
+                        for _n in (_ospf, _isis, _bgp):
+                            _c = _first_v4(_n)
+                            if _c:
+                                _new_v4 = _c
+                                break
+                    if not _new_v6:
+                        for _n in (_ospf, _isis, _bgp):
+                            _c = _first_v6(_n)
+                            if _c:
+                                _new_v6 = _c
+                                break
+                    _updated = False
+                    if _new_v4 and _new_v4 != (_gw4 or ""):
+                        conn.execute(
+                            "UPDATE devices SET ipv4_gateway = ? "
+                            "WHERE device_id = ?",
+                            (_new_v4, _did),
+                        )
+                        _healed_v4 += 1
+                        _updated = True
+                    if _new_v6 and _new_v6 != (_gw6 or ""):
+                        conn.execute(
+                            "UPDATE devices SET ipv6_gateway = ? "
+                            "WHERE device_id = ?",
+                            (_new_v6, _did),
+                        )
+                        _healed_v6 += 1
+                        _updated = True
+                    if _updated:
+                        logger.info(
+                            f"[DEVICE DB] v0.5.376 backfill: "
+                            f"device {_dname!r} ({_did[:12]}...) "
+                            f"gw4={_new_v4!r} gw6={_new_v6!r}"
+                        )
+                if _healed_v4 or _healed_v6:
+                    conn.commit()
+                    logger.info(
+                        f"[DEVICE DB] v0.5.376 gateway backfill: "
+                        f"{_healed_v4} v4, {_healed_v6} v6 rows healed "
+                        f"from protocol-monitor peer addresses"
+                    )
+            except Exception as _backfill_exc:
+                # Non-fatal: falls through to the outer except which
+                # discards the migration mark so a retry can rerun.
+                # ARP-check fallback still works even without the
+                # backfill — this just persists it.
+                logger.warning(
+                    f"[DEVICE DB] v0.5.376 gateway backfill skipped: "
+                    f"{_backfill_exc}"
+                )
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Migration failed: {e}")
             # v0.5.375 (audit db-migrations-mark-before-run): un-

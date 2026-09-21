@@ -2,6 +2,101 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.376] - 2026-09-20
+
+**ARP gateway status false-negative for devices with empty
+ipv4_gateway/ipv6_gateway in DB.** Operator on srv06 reported
+device1 stuck amber ⚠ in the Devices tab even though the switch
+could ping the device and the device's VRF could ping the
+gateway — both v4 and v6.
+
+### Symptom operator hit
+
+- `switch → ping 192.168.0.2` — 0.4ms, works
+- `vrf-fdde6b42126 → ping 192.168.0.1` — 0.34ms, works
+- `vrf-fdde6b42126 → ping6 2001:db8::1` — 0.37ms, works
+- Devices tab: device1 amber ⚠, IPv4 columns orange, IPv6 white
+- `/api/device/arp/<id>` returned:
+  - `ipv4_target: "192.168.0.2"` (device's OWN IP, not gateway)
+  - `gateway_target: ""` (empty in DB)
+  - `ipv4_ping: "failed"` — own-IP ping via VRF is 100% loss
+  - `arp_ipv4_resolved: false`
+  - `arp_status: "Failed"`
+
+### Root cause chain
+
+1. Add/Edit Device dialog captured `192.168.0.1` in the UI but
+   never persisted it to the DB (client-side persistence gap —
+   deferred as F2 to v0.5.377).
+2. Devices tab hides the DB miss by cross-referencing
+   `ospf_neighbors[0].address` to DISPLAY a gateway — operator
+   sees `192.168.0.1` and thinks it's saved.
+3. Server-side `/api/device/arp/<id>` reads `ipv4_gateway=""` →
+   falls back to `ipv4_target = ipv4_gateway or ipv4_address` →
+   pings the device's own IP `192.168.0.2` from within the
+   device's VRF.
+4. Per-VRF local table (1000–3999) doesn't have a route to the
+   own /32 — that lives in the default netns's local table 255.
+   Ping is instantly "Destination unreachable".
+5. `arp_ipv4_resolved=False` → amber pill.
+
+### Fixes
+
+- **F1** — `run_tgen_server.py` ARP endpoint gains peer-derived
+  fallback for empty gateway. When `device.ipv4_gateway` is
+  empty, try in order:
+  1. `ospf_neighbors[0].address` / `.neighbor_id`
+  2. `isis_neighbors[0].ipv4_address`
+  3. `bgp_neighbors[0].remote_ip` / `.peer_ip` / `.neighbor_ip`
+  Same for IPv6 — prefer `ipv6_global` over `ipv6_link_local`
+  (link-local can't be pinged as gateway target without `%iface`).
+  Emits INFO log when fallback fires so operators see the
+  substitution in server logs. Details block also gains
+  `gateway_target_source` (`"db"` / `"peer"` / `"none"`) so UI
+  clients can render the state.
+
+- **F3** — `utils/device_database.py _run_migrations` gains a
+  one-time backfill pass. On DB init, any row where
+  `ipv4_gateway=''` or `ipv6_gateway=''` gets the empty column
+  filled from `ospf_neighbors` / `isis_neighbors` /
+  `bgp_neighbors` — same preference order as F1. Idempotent
+  (only touches empty rows). Per-device INFO log + summary log
+  ("N v4, M v6 rows healed"). Wrapped in its own try/except so
+  a parse error can't abort the outer migration.
+
+### Deferred to v0.5.377
+
+- **F2** — Add/Edit Device dialog persistence gap. F1+F3
+  restore correctness without an operator fix (existing devices
+  heal on next server restart; new devices work via the
+  runtime fallback), so F2 becomes a cleanup for future device
+  additions, not a blocker. Investigation deferred.
+
+### Tests
+
+`tests/test_v05376_arp_gateway_fallback.py` — 19 tests, all
+pass:
+
+- AST-parse both files
+- v0.5.376 marker present in server (≥2 sites) + migration
+- F1: `_first_peer_ip` helper defined; fallback covers OSPF +
+  ISIS + BGP; both v4 and v6 paths; v6 excludes fe80:: link-
+  local; INFO log when fallback fires; response details expose
+  `gateway_target_source` + `gateway_target_v6`
+- F3: backfill SELECT filters to empty rows only; uses UPDATE
+  not INSERT; per-device + summary logs; wrapped in own try/
+  except with warning fallback
+- Regression guards: v0.5.311 semantic comment, v0.5.254 neigh-
+  cache fallback, v0.5.375 SEC decorators, v0.5.288 migration
+  lock, v0.5.375 `_connect_fk_on` helper
+
+### Verification
+
+- Both files AST-parse
+- 19/19 v0.5.376 tests pass
+- Operator runtime verification: device1 amber → green expected
+  on next ARP poll (30s) after wheel upload + restart
+
 ## [0.5.375] - 2026-09-20 — **⚠️ SECURITY HOTFIX**
 
 **Fixes 8 HIGH-severity SEC findings in the AI subsystem + 3 HIGH
