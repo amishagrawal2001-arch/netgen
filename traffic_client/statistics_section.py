@@ -1812,30 +1812,100 @@ class TrafficGenClientStatisticsSection():
                     stream["tx_rate"] = stat_entry.get("tx_rate", 0.0)
                     stream["rx_rate"] = stat_entry.get("rx_rate", 0.0)
                 
-                # Determine status based on server's status field (not just presence in stat_map)
+                # v0.5.393 (audit streams J2 + J3): counter-advance override
+                # + row-race safe status painting.
+                #
+                # J2 — trust advancing counters over the server's label:
+                # If server_status says "stopped" but the tx_count or
+                # rx_count we just received is HIGHER than the last one we
+                # remembered for this sid, then packets are still flowing
+                # and the stopped label is a lie (typically caused by the
+                # server-side tracker drift the J1 fix guards against, or
+                # by an in-flight poll landing between a real stop and the
+                # DB catching up — either way, the counters don't lie).
+                # Log the drift so we can trace it, then paint green.
+                #
+                # J3 — always pass stream_id= to update_stream_status so
+                # v0.5.392 H1's row re-resolution kicks in. Bare row-index
+                # calls survive fine when the table is still, but they
+                # write the WRONG row's status when a rebuild has shifted
+                # the row between capture and paint.
+                sid_for_history = stream_id or stream_id_from_table
+                prev = getattr(self, "_stream_counter_history", None)
+                if prev is None:
+                    prev = {}
+                    self._stream_counter_history = prev
+                _tx_now = int(stream.get("tx_count", 0) or 0)
+                _rx_now = int(stream.get("rx_count", 0) or 0)
+                _prev_tx, _prev_rx = prev.get(sid_for_history, (0, 0)) if sid_for_history else (0, 0)
+                _counters_advanced = (
+                    sid_for_history is not None
+                    and (_tx_now > _prev_tx or _rx_now > _prev_rx)
+                )
+                # Update history for next poll (only when we saw a valid sid)
+                if sid_for_history:
+                    prev[sid_for_history] = (_tx_now, _rx_now)
+
                 if server_status == "running":
                     new_status = "running"
                     stream["status"] = new_status
-                    self.update_stream_status(row, "green")
+                    self.update_stream_status(row, "green", stream_id=sid_for_history)
                 elif server_status == "stopped":
-                    new_status = "stopped"
-                    stream["status"] = new_status
-                    # Zero out rates for stopped streams
-                    stream["tx_rate"] = 0.0
-                    stream["rx_rate"] = 0.0
-                    self.update_stream_status(row, "red")
+                    if _counters_advanced:
+                        # Counter-advance override: packets are flowing
+                        # right now, so the server's "stopped" is stale.
+                        try:
+                            logger.warning(
+                                f"[STATUS] Server says stopped but "
+                                f"tx_count {_prev_tx}→{_tx_now}, "
+                                f"rx_count {_prev_rx}→{_rx_now} for "
+                                f"sid={sid_for_history} — trusting "
+                                f"counters, painting green"
+                            )
+                        except Exception:
+                            pass
+                        new_status = "running"
+                        stream["status"] = new_status
+                        self.update_stream_status(row, "green", stream_id=sid_for_history)
+                    else:
+                        new_status = "stopped"
+                        stream["status"] = new_status
+                        # Zero out rates for stopped streams
+                        stream["tx_rate"] = 0.0
+                        stream["rx_rate"] = 0.0
+                        self.update_stream_status(row, "red", stream_id=sid_for_history)
                 elif (stream_id and stream_id in stat_map) or (stream_id_from_table and stream_id_from_table in stat_map):
                     # Fallback: if status not provided but stream is in stats, assume running
                     new_status = "running"
                     stream["status"] = new_status
-                    self.update_stream_status(row, "green")
+                    self.update_stream_status(row, "green", stream_id=sid_for_history)
                 else:
-                    # Stream not in stats at all - definitely stopped
-                    new_status = "stopped"
-                    stream["status"] = new_status
-                    stream["tx_rate"] = 0.0
-                    stream["rx_rate"] = 0.0
-                    self.update_stream_status(row, "red")
+                    # Stream not in stats at all — but J2 counter-advance
+                    # override applies here too: if the last poll for this
+                    # sid pushed higher counts than the one before, the
+                    # stream WAS running and this absence is a transient
+                    # (server bounce, poll landed between DB writes, etc).
+                    # Don't repaint red on the strength of one absent poll.
+                    if _counters_advanced:
+                        try:
+                            logger.warning(
+                                f"[STATUS] Stream sid={sid_for_history} "
+                                f"absent from stat_map but counters "
+                                f"advanced tx {_prev_tx}→{_tx_now}, "
+                                f"rx {_prev_rx}→{_rx_now} — keeping "
+                                f"green (transient absence)"
+                            )
+                        except Exception:
+                            pass
+                        new_status = "running"
+                        stream["status"] = new_status
+                        self.update_stream_status(row, "green", stream_id=sid_for_history)
+                    else:
+                        new_status = "stopped"
+                        stream["status"] = new_status
+                        stream["tx_rate"] = 0.0
+                        stream["rx_rate"] = 0.0
+                        self.update_stream_status(row, "red", stream_id=sid_for_history)
                 
                 if old_status != new_status:
                     status_changed = True

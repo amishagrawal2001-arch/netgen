@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.393] - 2026-09-21
+
+### Fixed — Stream status shows red while traffic actively flowing (user-reported)
+
+Direct user report: **"clicked start stream, status shows red however
+traffic stats updating in traffic statistics"** — i.e. the stream row's
+status indicator is painted red in the Streams tab, but the Traffic
+Statistics tab is simultaneously showing the same stream's tx/rx
+counters climbing. The stream is provably running; the status color
+is lying. Traced to a server-side downgrade + a client-side lock-in
+that reinforced each other.
+
+**J1: server `/api/streams/stats` verifier trusts non-zero counters over
+tracker-index miss**
+(`run_tgen_server.py:1315-1360`) — Pre-fix, the verifier at
+`:1326-1331` downgraded any DB-`Running` row to `Stopped` whenever
+`(interface, stream_id)` wasn't in `stream_tracker`. But
+`stream_tracker` is an in-process index of stop_events + Futures we
+know about — the tx_worker is a separate subprocess that keeps
+sending frames whether or not we still hold its Future. Tracker drift
+happens legitimately on server-restart repopulate windows and on
+transient RX-drain races. When drift hits, the DB row was written by
+the poll thread with real, advancing tx/rx counts — those counts are
+authoritative proof the subprocess is alive. Fix: before downgrading,
+check `tx_count > 0 or rx_count > 0`. If yes, keep `Running` and log
+the drift as a WARNING so root cause stays traceable. If both counts
+are zero, downgrade as before (real dead stream).
+
+**J2: client trusts advancing counters over server's stopped label**
+(`traffic_client/statistics_section.py:1815-1900`) — Pre-fix, the
+per-poll paint logic at `:1820-1826/:1832-1838` painted red whenever
+the server sent `status="stopped"` OR whenever the sid was absent
+from `stat_map`, no matter what the counters said. If the server-side
+J1 bug fired (or fires again in a new form), or if a single poll landed
+in a brief absence window, the client mutated `stream["status"]="stopped"`
+and painted red. Fix: track per-sid `(tx_count, rx_count)` history in
+`self._stream_counter_history`. On each poll, if the current counts
+are HIGHER than the last-remembered pair (advancing → packets still
+flowing right now), override the server's "stopped" or absent label
+to green and log the drift. Real stops plateau, so the next poll
+sees `tx_now == tx_prev` → override doesn't fire → red paints
+correctly.
+
+**J3: `statistics_section.py` update_stream_status calls pass stream_id=**
+(`traffic_client/statistics_section.py:1815-1900`) — Four bare
+`update_stream_status(row, "green"/"red")` sites lacked the
+`stream_id=` kwarg added in v0.5.392 H1. When a stats-driven table
+rebuild shifts rows mid-poll, the row index captured at the top of
+the per-stream loop no longer points at the same sid by the time
+the paint lands — so the color was written to the wrong row. Fix:
+pass `stream_id=sid_for_history` on all four paths so H1's re-
+resolution kicks in.
+
+Tests: 12 new (`tests/test_v05393_status_vs_counters.py`), all pass.
+Regressions on v0.5.389–v0.5.392: intact.
+
+---
+
 ## [0.5.392] - 2026-09-21
 
 ### Fixed — Streams tab audit tail (5 items)

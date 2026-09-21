@@ -1323,12 +1323,42 @@ def stream_stats():
                 is_actually_running = (interface, stream_id) in tracker_stream_keys
             
             # If database says "Running" but stream_tracker doesn't have it, mark as "Stopped"
+            # v0.5.393 (audit streams J1): before downgrading Running→Stopped
+            # solely because the in-process tracker index is missing this
+            # (interface, stream_id) pair, look at the packet counters. The
+            # tracker is a hint about which stop_events / Futures we know
+            # about; the tx_worker subprocess is what actually puts frames
+            # on the wire. If tx_count or rx_count is > 0 (i.e. tx_worker
+            # is provably alive and pushing packets), the correct label is
+            # "Running" — the tracker entry has drifted (server restart
+            # repopulate window, or race between register_stream landing in
+            # DB and add_stream landing in tracker). Downgrading to Stopped
+            # in that window paints a live stream red in the client, which
+            # the operator then sees while Traffic Statistics is showing
+            # advancing counters (this exact bug: user reported "clicked
+            # start stream, status shows red however traffic stats
+            # updating"). Log the drift so we can trace root cause without
+            # lying to the UI.
+            tx_count_now = int(stream.get("tx_count", 0) or 0)
+            rx_count_now = int(stream.get("rx_count", 0) or 0)
             if db_status == "Running" and not is_actually_running:
-                logging.warning(f"[STATS] Stream '{stream.get('stream_name')}' (id={stream_id}) on {interface} marked as 'Running' in database but not in stream_tracker - correcting to 'Stopped'")
-                actual_status = "Stopped"
-                # Also zero out rates since stream is not actually running
-                tx_rate = 0.0
-                rx_rate = 0.0
+                if tx_count_now > 0 or rx_count_now > 0:
+                    logging.warning(
+                        f"[STATS] Stream '{stream.get('stream_name')}' "
+                        f"(id={stream_id}) on {interface} missing from "
+                        f"stream_tracker but tx_count={tx_count_now}, "
+                        f"rx_count={rx_count_now} — trusting counters "
+                        f"and keeping status='Running' (tracker drift)"
+                    )
+                    actual_status = "Running"
+                    tx_rate = stream.get("tx_rate", 0.0)
+                    rx_rate = stream.get("rx_rate", 0.0)
+                else:
+                    logging.warning(f"[STATS] Stream '{stream.get('stream_name')}' (id={stream_id}) on {interface} marked as 'Running' in database but not in stream_tracker - correcting to 'Stopped'")
+                    actual_status = "Stopped"
+                    # Also zero out rates since stream is not actually running
+                    tx_rate = 0.0
+                    rx_rate = 0.0
             elif db_status == "Running" and is_actually_running:
                 # Stream is actually running - use database rates (they're updated by background thread)
                 actual_status = "Running"
