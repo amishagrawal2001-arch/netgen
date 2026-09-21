@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.383] - 2026-09-20
+
+### Fixed — FRR + stats MED backlog (5 items)
+
+**X1: `start_frr_container` — per-device start lock**
+(`utils/frr_docker.py:345-357, 927-1287`) — Pre-fix, two
+concurrent applies for the same `device_id` both passed the
+`containers.get() → NotFound` check at ~:927 and both raced
+into `containers.run(name=…)` at ~:1217. The loser hit a 409
+Conflict, `except Exception` swallowed it, and the caller
+marked the device failed while the container was actually up.
+Fix: per-device `_start_locks` dict (defaultdict) + metalock,
+`_start_lock_for(device_id)` helper; `start_frr_container`
+acquires at function top and releases in `finally` so every
+early-return + every raise still unlocks.
+
+**X2: `device_manager.py` — use `frr_manager` singleton**
+(`utils/device_manager.py:195, 271, 357, 481`) — Four sites
+opened `FRRDockerManager()` per call, thrashing docker
+connections and racing the persisted VRF map (each instance's
+`_persist_vrf_allocations` could clobber a peer's write — no
+file lock). Same parity fix as v0.5.380 M2 (ISIS monitor) and
+v0.5.382 W1/W2/W3 shape. Now uses `frr_manager` module singleton.
+
+**X3: `remove_device_protocols` — call `stop_frr_container`**
+(`utils/device_manager.py:505-527`) — Pre-fix, protocol-removal
+cleaned OSPF/BGP/VXLAN config + iface IPs but NEVER called
+`stop_frr_container`. Container + its VRF stayed alive until
+`cleanup_all_containers` swept it 5 min later — and that sweep
+only fires when the DB row is also gone. Depending on caller
+order (delete-config-first vs delete-row-first), the container
+could linger indefinitely, holding the interface as a VRF slave
+and blocking every subsequent re-apply for that interface. Fix:
+call `frr_manager.stop_frr_container(device_id, device_name,
+remove=True)` at the end of `remove_device_protocols`, which
+also triggers the v0.5.382 W1 `_release_vrf_table` and
+v0.5.382 W3 always-run `_remove_vrf` block.
+
+**X4: `StreamTracker.add_stream` — O(n²) list rebuild → O(1) set + targeted pop**
+(`multithreaded_traffic_gen.py:75-135, 267-295`) — Pre-fix,
+every add rebuilt `active_streams` via list comprehension for
+dedup, holding `self.lock` for O(n) — starting N streams in a
+batch was O(N²), and concurrent readers via
+`get_stream_stats` blocked for the full rebuild each time.
+Fix: new `_stream_keys: set[(iface, sid)]` sidecar for O(1)
+membership; add/remove use targeted single `del` on the list.
+Lock-held window is now O(1) for the common no-dup case,
+O(n) worst case for the collision (tail shift), never O(n²).
+
+**X5: Ghost row flicker after Delete Stream**
+(`traffic_client/statistics_section.py:1635-1685`) — Pre-fix,
+the worker's `stream_stats_fetched` signal extended
+`_pending_poll_stream_stats` from a worker thread on one
+poll cycle. If the operator removed a stream between that
+fetch and `_on_poll_finished`, the deleted stream's row
+briefly reappeared in the 13-col statistics table until the
+next 2s tick cleaned it out — visible as a "ghost row"
+flicker right after Delete Stream. Fix: build a set of
+`stream_ids` still present in `stream_table` (the client's
+authoritative "known streams" view) and filter the pending
+list before calling `update_stream_statistics_table`.
+Fail-safe: if the scan can't complete, pass through unchanged
+so no legitimate rows are hidden.
+
+### Tests
+
+New: `tests/test_v05383_frr_stats_med.py`. AST + structural +
+regression coverage.
+
 ## [0.5.382] - 2026-09-20
 
 ### Fixed — FRR docker + stats polling bundle (6 HIGH items)

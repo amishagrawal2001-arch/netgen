@@ -79,6 +79,17 @@ class StreamTracker:
         self.lock = threading.Lock()
         self._sniffers = set()      # {(rx_interface, stream_id)}
         self.streams = {}           # quick RX lookups
+        # v0.5.383 (audit stats-X4): O(1) membership sidecar. Pre-
+        # fix, `add_stream` did a full list-comprehension rebuild
+        # of `active_streams` on every add to dedup; starting N
+        # streams in a batch was O(N²) under `self.lock`, and
+        # concurrent readers (`get_stream_stats` at line ~179)
+        # blocked on the lock for the whole rebuild. The set gives
+        # O(1) dup-check so add_stream now uses a targeted single
+        # `pop(idx)` on collision (still O(n) tail-shift, but no
+        # full allocation) — measurably cheaper AND holds the
+        # lock for shorter windows.
+        self._stream_keys = set()   # {(interface, stream_id)}
 
     # ---- sniffer registry ----
     def register_sniffer(self, rx_interface, stream_id):
@@ -98,10 +109,20 @@ class StreamTracker:
         with self.lock:
             sid = stream.get("stream_id")
             iface = stream.get("interface")
-            self.active_streams = [
-                s for s in self.active_streams
-                if not (s.get("interface") == iface and s.get("stream_id") == sid)
-            ]
+            # v0.5.383 (audit stats-X4): O(1) dup check via set,
+            # O(n) targeted pop only on collision (was O(n) list
+            # rebuild UNCONDITIONALLY per add — even the common
+            # no-dup path allocated a fresh list).
+            _key = (iface, sid)
+            if _key in self._stream_keys:
+                for _i, _s in enumerate(self.active_streams):
+                    if _s.get("interface") == iface and _s.get("stream_id") == sid:
+                        del self.active_streams[_i]
+                        break
+                # _stream_keys.discard happens in the .add below
+                # via the set's idempotence — no need to remove
+                # then re-add.
+            self._stream_keys.add(_key)
             self.active_streams.append({
                 "stream_id": sid,
                 "interface": iface,
@@ -250,22 +271,24 @@ class StreamTracker:
         with self.lock:
             # Find the stream to get rx_interface for sniffer unregistration
             stream_to_remove = None
-            for s in self.active_streams:
+            for _i, s in enumerate(self.active_streams):
                 if s["interface"] == interface and s["stream_id"] == stream_id:
                     stream_to_remove = s
+                    _idx_to_pop = _i
                     break
-            
+
             # Unregister sniffer if flow tracking was enabled
             if stream_to_remove and stream_to_remove.get("flow_tracking_enabled"):
                 rx_interface = stream_to_remove.get("rx_interface")
                 if rx_interface:
                     self._sniffers.discard((rx_interface, stream_id))
-            
-            # Remove from active_streams
-            self.active_streams = [
-                s for s in self.active_streams
-                if not (s["interface"] == interface and s["stream_id"] == stream_id)
-            ]
+
+            # v0.5.383 (audit stats-X4): targeted pop + set discard
+            # (was O(n) list-comp rebuild even for the common case
+            # where the row IS present exactly once).
+            if stream_to_remove is not None:
+                del self.active_streams[_idx_to_pop]
+                self._stream_keys.discard((interface, stream_id))
 
 
 

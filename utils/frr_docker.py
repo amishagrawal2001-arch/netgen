@@ -344,6 +344,19 @@ class FRRDockerManager:
         self._vrf_state_path = self._resolve_vrf_state_path()
         self._load_vrf_allocations()
 
+        # v0.5.383 (audit FRR-X1): per-device start lock. Pre-fix,
+        # two concurrent apply/start calls for the same device_id
+        # both passed the `containers.get() → NotFound` check at
+        # line ~927 and both raced into `containers.run(name=…)`
+        # at ~1217. The loser hit a 409 Conflict, `except Exception`
+        # swallowed it, and the caller marked the device failed
+        # while the container was actually up. Serialises the
+        # check-then-create window per device_id. Distinct from
+        # `_vrf_alloc_lock` (which only guards the VRF table map).
+        from collections import defaultdict as _dd
+        self._start_locks: Dict[str, _th.Lock] = _dd(_th.Lock)
+        self._start_locks_meta = _th.Lock()
+
     _VRF_TABLE_RANGE_LO = 1000
     _VRF_TABLE_RANGE_HI = 3999  # 3000 slots — 100x headroom over
     #                             a realistic lab of ~30 devices
@@ -915,8 +928,24 @@ class FRRDockerManager:
         the naming convention."""
         return self._vrf_name(device_id)
 
+    def _start_lock_for(self, device_id: str):
+        """v0.5.383 (audit FRR-X1): return the per-device start
+        lock, creating it on first access. Metalock protects the
+        allocation; identical shape to the sibling monitors' write-
+        lock helpers (v0.5.262 ARP, v0.5.264 BGP/OSPF/ISIS)."""
+        with self._start_locks_meta:
+            return self._start_locks[device_id]
+
     def start_frr_container(self, device_id: str, device_config: Dict) -> Optional[str]:
-        """Start FRR container on host networking"""
+        """Start FRR container on host networking.
+
+        v0.5.383 (audit FRR-X1): per-device start lock guards the
+        check-then-create window against concurrent applies for
+        the same device_id (was a 409 Conflict → silent stream-
+        failed-while-container-running race).
+        """
+        _start_lock = self._start_lock_for(device_id)
+        _start_lock.acquire()
         try:
             device_name = device_config.get('device_name', f'device_{device_id}')
             dhcp_mode = (device_config.get('dhcp_mode') or '').lower()
@@ -1242,11 +1271,20 @@ class FRRDockerManager:
             # Container is ready for protocol configuration
             
             return container_name
-            
+
         except Exception as e:
             logger.error(f"[FRR] Failed to start FRR container for device {device_id}: {e}")
             return None
-    
+        finally:
+            # v0.5.383 (audit FRR-X1): always release the per-device
+            # start lock so a subsequent apply on this same device
+            # can proceed. Applies to every early-return and every
+            # raise inside the try.
+            try:
+                _start_lock.release()
+            except Exception:
+                pass
+
     def _configure_interfaces(self, container_name: str, device_id: str, device_config: Dict = None) -> bool:
         """
         Configure interface IP addresses and loopback in FRR container.

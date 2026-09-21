@@ -1634,9 +1634,51 @@ class TrafficGenClientStatisticsSection():
     
     def _on_poll_finished(self):
         """Process polled stream stats and update UI when worker finishes."""
+        # v0.5.383 (audit stats-X5): filter the poll response
+        # against the client's currently-known streams before
+        # rendering. Pre-fix, the worker's `stream_stats_fetched`
+        # signal extended `_pending_poll_stream_stats` from a
+        # worker thread on ONE cycle; if the operator removed a
+        # stream between that fetch and this `_on_poll_finished`
+        # rebuild, the deleted stream's row briefly reappeared
+        # in the 13-col statistics table until the next 2s tick
+        # cleaned it out — visible as a "ghost row" flicker
+        # right after Delete Stream.
+        #
+        # Fix: build a set of stream_ids still present in
+        # `stream_table` (the client's authoritative "known
+        # streams" view) and filter the pending list. A stream
+        # the server still knows about but the client just
+        # removed no longer paints a stats row.
+        _known_ids = set()
+        try:
+            from PyQt5.QtCore import Qt
+            if hasattr(self, "stream_table") and self.stream_table is not None:
+                for _row in range(self.stream_table.rowCount()):
+                    _name_item = self.stream_table.item(_row, 2)
+                    if _name_item is not None:
+                        _sid = _name_item.data(Qt.UserRole)
+                        if _sid:
+                            _known_ids.add(_sid)
+        except Exception as _known_exc:
+            logger.debug(f"[STATS] X5 known-ids scan skipped: {_known_exc}")
+            _known_ids = None
+        # None means "couldn't determine — pass through unchanged"
+        # so we never accidentally hide legitimate rows.
+        if _known_ids is not None and _known_ids:
+            _filtered = [s for s in self._pending_poll_stream_stats
+                         if s.get("stream_id") in _known_ids]
+            if len(_filtered) < len(self._pending_poll_stream_stats):
+                logger.debug(
+                    f"[STATS] X5 dropped "
+                    f"{len(self._pending_poll_stream_stats) - len(_filtered)} "
+                    f"ghost row(s) for removed streams"
+                )
+        else:
+            _filtered = self._pending_poll_stream_stats
         # Update stream statistics table
-        logger.debug(f"[DEBUG STREAM STATS POLL] Calling update_stream_statistics_table with {len(self._pending_poll_stream_stats)} stream(s)")
-        self.update_stream_statistics_table(self._pending_poll_stream_stats)
+        logger.debug(f"[DEBUG STREAM STATS POLL] Calling update_stream_statistics_table with {len(_filtered)} stream(s)")
+        self.update_stream_statistics_table(_filtered)
     def update_per_stream_statistics(self, stream_stats):
         # print(f"[DEBUG] update_per_stream_statistics() called with {len(stream_stats)} entries")
 

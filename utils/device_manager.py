@@ -187,12 +187,20 @@ class DeviceManager:
         }
 
         vxlan_config = vxlan_utils.normalize_config(device_data.get("vxlan_config"))
+        # v0.5.383 (audit FRR-X2): use the module-level frr_manager
+        # singleton instead of instantiating FRRDockerManager() per
+        # call. Pre-fix, this site + 3 others in this file opened a
+        # fresh docker.from_env() client on every start/stop/remove
+        # AND re-read the VRF state file — on DHCP-heavy churn each
+        # instance's _persist_vrf_allocations could clobber a
+        # peer's write (no file lock). Same parity fix as v0.5.380
+        # M2 (ISIS monitor).
         frr_manager = None
         container_name = None
         if device_id:
             try:
-                from utils.frr_docker import FRRDockerManager
-                frr_manager = FRRDockerManager()
+                from utils.frr_docker import frr_manager as _fm
+                frr_manager = _fm
                 container_name = frr_manager._get_container_name(device_id, device_name or "")
             except Exception:
                 frr_manager = None
@@ -266,10 +274,9 @@ class DeviceManager:
         # BGP stop (neighbor shutdown)
         if "BGP" in protocols:
             try:
-                # Use Docker-based BGP neighbor shutdown
-                from utils.frr_docker import FRRDockerManager
-                frr_manager = FRRDockerManager()
-                
+                # v0.5.383 (audit FRR-X2): singleton, not per-call.
+                from utils.frr_docker import frr_manager
+
                 # Get BGP status first to check if container is running
                 bgp_status = frr_manager.get_bgp_status(device_id, device_name)
                 logging.info(f"[BGP STOP DEBUG] bgp_status type: {type(bgp_status)}, value: {bgp_status}")
@@ -349,12 +356,13 @@ class DeviceManager:
 
         vxlan_config = vxlan_utils.normalize_config(device_data.get("vxlan_config"))
         if "VXLAN" in protocols and vxlan_config:
+            # v0.5.383 (audit FRR-X2): singleton, not per-call.
             frr_manager = None
             container_name = None
             if device_id:
                 try:
-                    from utils.frr_docker import FRRDockerManager
-                    frr_manager = FRRDockerManager()
+                    from utils.frr_docker import frr_manager as _fm
+                    frr_manager = _fm
                     container_name = frr_manager._get_container_name(device_id, device_name or "")
                 except Exception:
                     frr_manager = None
@@ -473,12 +481,13 @@ class DeviceManager:
 
         vxlan_config = vxlan_utils.normalize_config(device_data.get("vxlan_config"))
         if "VXLAN" in protocols and vxlan_config:
+            # v0.5.383 (audit FRR-X2): singleton, not per-call.
             frr_manager = None
             container_name = None
             if device_id:
                 try:
-                    from utils.frr_docker import FRRDockerManager
-                    frr_manager = FRRDockerManager()
+                    from utils.frr_docker import frr_manager as _fm
+                    frr_manager = _fm
                     container_name = frr_manager._get_container_name(device_id, device_name or "")
                 except Exception:
                     frr_manager = None
@@ -492,5 +501,30 @@ class DeviceManager:
                 )
             except Exception as exc:
                 logging.debug(f"[VXLAN REMOVE] Failed to tear down VXLAN for {device_id}: {exc}")
+
+        # v0.5.383 (audit FRR-X3): stop + remove the FRR container
+        # + tear down its VRF + release the VRF table id. Pre-fix,
+        # `remove_device_protocols` cleaned OSPF/BGP/VXLAN config +
+        # iface IPs but NEVER called `stop_frr_container`. The
+        # container + its VRF stayed alive until `cleanup_all_
+        # containers` swept it 5 min later — and that sweep only
+        # fires when the DB row is also gone. Depending on caller
+        # order (delete-config-first vs delete-row-first), the
+        # container could linger indefinitely, holding onto the
+        # interface as a VRF slave and blocking every subsequent
+        # re-apply for that interface.
+        if device_id:
+            try:
+                from utils.frr_docker import frr_manager as _fm
+                _fm.stop_frr_container(
+                    device_id, device_name or None, remove=True
+                )
+                result.setdefault("cleanup", {})["frr_container"] = "removed"
+            except Exception as _stop_exc:
+                logging.warning(
+                    f"[FRR] stop_frr_container on protocol-remove "
+                    f"for {device_id} raised: {_stop_exc}"
+                )
+                result.setdefault("cleanup", {})["frr_container"] = "error"
 
         return result
