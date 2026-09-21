@@ -237,7 +237,22 @@ class AddDeviceDialog(QDialog):
         _default_mac = self._generate_unique_lab_mac() if self.mode == "add" else ""
         self.mac_input = QLineEdit(_default_mac)
         self.mac_input.setPlaceholderText("AA:BB:CC:DD:EE:FF")
-        mac_re = QRegExp(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+        # v0.5.389 (audit devices-tab E4): tighten the MAC validator
+        # to reject broadcast + multicast source MACs. Pre-fix, the
+        # regex `^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$` accepted:
+        #   - Broadcast FF:FF:FF:FF:FF:FF — the server (and any
+        #     downstream switch) silently drops frames with that
+        #     src MAC; TX-generated traffic never leaves the wire.
+        #   - Any multicast source MAC (first-octet LSB set, e.g.
+        #     01:00:5E:*, 33:33:*) — same silent drop.
+        # Regex now: first octet must have LSB=0 (unicast bit)
+        # AND the address must not be all-Fs. The character class
+        # `[02468ACEace]` covers all hex digits with LSB=0.
+        mac_re = QRegExp(
+            r"^(?!FF:FF:FF:FF:FF:FF$)"
+            r"[0-9A-Fa-f][02468ACEace]"
+            r"(:[0-9A-Fa-f]{2}){5}$"
+        )
         self.mac_input.setValidator(QRegExpValidator(mac_re, self))
         self.mac_input.setMinimumWidth(150)
         self.mac_input.setToolTip(

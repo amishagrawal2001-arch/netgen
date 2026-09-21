@@ -1811,6 +1811,25 @@ class DevicesTab(QWidget):
             if col >= len(self.device_headers):
                 self.devices_table.setColumnHidden(col, True)
 
+        # v0.5.389 (audit devices-tab E2): restore persisted column
+        # widths + visibility from QSettings, overriding the
+        # hardcoded defaults above. Pre-fix, EVERY startup reset
+        # widths to the code's opinion + re-hid columns 12..15 so
+        # operators who resized/reordered/unhid columns had to
+        # redo it every session. Mirrors v0.5.388 D4 (window
+        # layout persistence).
+        try:
+            self._restore_devices_table_columns()
+        except Exception as _cs_exc:
+            logger.debug(f"[COLUMNS] restore skipped: {_cs_exc}")
+        # Connect column resize + visibility signals so any user
+        # change is persisted immediately.
+        try:
+            _hdr = self.devices_table.horizontalHeader()
+            _hdr.sectionResized.connect(self._on_devices_column_resized)
+        except Exception as _con_exc:
+            logger.debug(f"[COLUMNS] resize signal connect skipped: {_con_exc}")
+
         # ---- icons via shared loader ----
         def load_icon(filename: str) -> QIcon:
             return qicon("resources", f"icons/{filename}")
@@ -4689,15 +4708,60 @@ class DevicesTab(QWidget):
         Sets the populate-guard flag so add_device's per-cell setItem
         writes don't trigger on_cell_changed and falsely mark devices
         as _needs_apply=True. Same guard as update_device_table.
+
+        v0.5.389 (audit devices-tab E1): capture + restore sort +
+        selection across the rebuild. Pre-fix, this called
+        `setRowCount(0)` and rebuilt via `add_device` with NO sort/
+        selection capture — session load (Open Session, or first
+        server-connect) reset the sort back to insertion order and
+        cleared the operator's selection, both of which the
+        `update_device_table` sibling already preserved via
+        `capture_sort_state` / `restore_sort_state`. Mirror that
+        pattern so the two entry points behave the same.
         """
+        # v0.5.389 E1: capture state BEFORE the rebuild.
+        _sort_state = None
+        _selected_ids = set()
+        try:
+            from utils.table_sort_state import capture_sort_state
+            _sort_state = capture_sort_state(self.devices_table)
+        except Exception as _sort_exc:
+            logger.debug(f"[POPULATE] sort capture skipped: {_sort_exc}")
+        try:
+            from PyQt5.QtCore import Qt as _Qt
+            for _it in self.devices_table.selectedItems():
+                if _it is None:
+                    continue
+                _row = _it.row()
+                _name_item = self.devices_table.item(
+                    _row, self.COL.get("Device Name"))
+                if _name_item is None:
+                    continue
+                _sid = _name_item.data(_Qt.UserRole)
+                if _sid:
+                    _selected_ids.add(str(_sid))
+        except Exception as _sel_exc:
+            logger.debug(f"[POPULATE] selection capture skipped: {_sel_exc}")
+
         self._populating_devices_table = True
         try:
+            # Sorting must be OFF during the rebuild — setItem
+            # writes trigger re-sort on each call and scramble
+            # the table (v0.2.92 fix pattern from update_device_
+            # table).
+            _was_sorting = self.devices_table.isSortingEnabled()
+            self.devices_table.setSortingEnabled(False)
+
             # Clear existing table
             self.devices_table.setRowCount(0)
-            
+
             # Get all devices from all interfaces
             all_devices = getattr(self.main_window, 'all_devices', {})
             if not all_devices:
+                # v0.5.389 E1: still restore sort-enabled state
+                # on early-return so the empty table isn't stuck
+                # in sortable=False.
+                self.devices_table.setSortingEnabled(_was_sorting)
                 return
             
             # Add devices from all interfaces to the table
@@ -4853,6 +4917,33 @@ class DevicesTab(QWidget):
             # Restore signal flow so genuine user inline-edits are
             # caught by on_cell_changed (audit HIGH #2 handler).
             self._populating_devices_table = False
+            # v0.5.389 E1: re-enable sorting + restore captured
+            # sort state + previously-selected device rows.
+            try:
+                self.devices_table.setSortingEnabled(_was_sorting)
+            except Exception:
+                pass
+            if _sort_state is not None:
+                try:
+                    from utils.table_sort_state import restore_sort_state
+                    restore_sort_state(self.devices_table, _sort_state)
+                except Exception as _rs_exc:
+                    logger.debug(f"[POPULATE] sort restore skipped: {_rs_exc}")
+            if _selected_ids:
+                try:
+                    from PyQt5.QtCore import Qt as _Qt
+                    # Re-select rows whose device_id was previously
+                    # selected. Uses UserRole stash so the match
+                    # survives sort re-ordering.
+                    for _r in range(self.devices_table.rowCount()):
+                        _name_item = self.devices_table.item(
+                            _r, self.COL.get("Device Name"))
+                        if _name_item is None:
+                            continue
+                        if str(_name_item.data(_Qt.UserRole) or "") in _selected_ids:
+                            self.devices_table.selectRow(_r)
+                except Exception as _rr_exc:
+                    logger.debug(f"[POPULATE] selection restore skipped: {_rr_exc}")
 
     # ---------- Dialogs / actions ----------
     def apply_selected_device(self):
@@ -6722,6 +6813,80 @@ class DevicesTab(QWidget):
     def _apply_isis_to_server_sync(self, server_url, device_info):
         """Apply ISIS configuration synchronously (for use in background workers)."""
         return self.isis_handler._apply_isis_to_server_sync(server_url, device_info)
+    # v0.5.389 (audit devices-tab E2): column layout persistence.
+    # Pre-fix, this table's column widths + visibility were reset
+    # to hardcoded defaults on EVERY startup — operators who
+    # widened columns, hid unused ones, or reordered had to redo
+    # it every session. Now: QSettings-backed save on any
+    # per-column resize + restore on init.
+    _DEVICES_COLS_SETTINGS_ORG = "netgen"
+    _DEVICES_COLS_SETTINGS_APP = "netgen-client"
+    _DEVICES_COLS_WIDTHS_KEY = "devices_table/widths"
+    _DEVICES_COLS_HIDDEN_KEY = "devices_table/hidden"
+
+    def _devices_cols_settings(self):
+        from PyQt5.QtCore import QSettings
+        return QSettings(
+            self._DEVICES_COLS_SETTINGS_ORG,
+            self._DEVICES_COLS_SETTINGS_APP,
+        )
+
+    def _restore_devices_table_columns(self):
+        """Restore per-column widths + visibility from QSettings.
+        Silently returns when nothing has been persisted yet, so
+        first-run keeps the hardcoded defaults."""
+        try:
+            _s = self._devices_cols_settings()
+            _widths = _s.value(self._DEVICES_COLS_WIDTHS_KEY)
+            _hidden = _s.value(self._DEVICES_COLS_HIDDEN_KEY)
+            if isinstance(_widths, dict):
+                for _k, _v in _widths.items():
+                    try:
+                        _col = int(_k)
+                        _w = int(_v)
+                        if _col >= 0 and _col < self.devices_table.columnCount() and _w > 20:
+                            self.devices_table.setColumnWidth(_col, _w)
+                    except (ValueError, TypeError):
+                        continue
+            if isinstance(_hidden, (list, tuple)):
+                _hidden_set = set()
+                for _k in _hidden:
+                    try:
+                        _hidden_set.add(int(_k))
+                    except (ValueError, TypeError):
+                        continue
+                for _col in range(self.devices_table.columnCount()):
+                    self.devices_table.setColumnHidden(
+                        _col, _col in _hidden_set,
+                    )
+        except Exception as _r_exc:
+            logger.debug(f"[COLUMNS] restore skipped: {_r_exc}")
+
+    def _save_devices_table_columns(self):
+        """Persist current widths + hidden set. Called from the
+        resize signal (below); safe to call on demand too."""
+        try:
+            _s = self._devices_cols_settings()
+            _widths = {}
+            _hidden = []
+            for _col in range(self.devices_table.columnCount()):
+                _widths[str(_col)] = int(self.devices_table.columnWidth(_col))
+                if self.devices_table.isColumnHidden(_col):
+                    _hidden.append(_col)
+            _s.setValue(self._DEVICES_COLS_WIDTHS_KEY, _widths)
+            _s.setValue(self._DEVICES_COLS_HIDDEN_KEY, _hidden)
+            try:
+                _s.sync()
+            except Exception:
+                pass
+        except Exception as _s_exc:
+            logger.debug(f"[COLUMNS] save skipped: {_s_exc}")
+
+    def _on_devices_column_resized(self, _logical_index, _old_size, _new_size):
+        """Header sectionResized handler — persist immediately so
+        crashes don't lose the operator's column layout."""
+        self._save_devices_table_columns()
+
     def _remove_device_from_data_structure(self, device_info):
         """Remove device from all_devices data structure."""
         try:
@@ -7337,18 +7502,45 @@ class DevicesTab(QWidget):
                 devices_to_create.append(device_data)
         else:
             # Create single device - ensure unique name
+            # v0.5.389 (audit devices-tab E3): warn when a collision
+            # triggers auto-suffix. Pre-fix, the operator typed
+            # e.g. "spine01", collided with an existing device of
+            # the same name (perhaps from a session import), and
+            # the code silently created "spine01_2" — the row
+            # appeared with the wrong name and every subsequent
+            # reference-by-name (Edit, Delete, Copy) went to the
+            # original spine01 instead. Now: track whether the
+            # collision fired and surface an info dialog naming
+            # the ACTUAL persisted name.
+            _base_requested = base_name
+            _auto_suffixed = False
             if base_name == "device":
                 unique_name = "device1"
                 n = 1
                 while unique_name in all_existing_names:
                     n += 1
                     unique_name = f"device{n}"
+                # "device" is the default sentinel — never warn.
             else:
                 unique_name = base_name
                 n = 1
                 while unique_name in all_existing_names:
                     n += 1
                     unique_name = f"{base_name}_{n}"
+                if unique_name != _base_requested:
+                    _auto_suffixed = True
+
+            if _auto_suffixed:
+                QMessageBox.information(
+                    self,
+                    "Device name changed",
+                    f"A device named {_base_requested!r} already "
+                    f"exists in this session. The new device was "
+                    f"saved as {unique_name!r} instead.\n\n"
+                    f"If you meant to edit the existing device, "
+                    f"select it in the table and use Edit — this "
+                    f"new device is separate.",
+                )
             
             device_data = {
                 "Device Name": unique_name,

@@ -2,6 +2,55 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.389] - 2026-09-21
+
+### Fixed — Devices tab audit tail: session-load state, column persistence, name-collision warn, MAC validator
+
+**E1: `populate_device_table` preserves sort + selection**
+(`widgets/devices_tab.py:4686-4700, 4900-4960`) — Pre-fix, this
+called `setRowCount(0)` and rebuilt via `add_device` with NO
+sort/selection capture. Session load (Open Session or first
+server-connect) reset the sort back to insertion order and
+cleared the operator's selection — both of which the sibling
+`update_device_table` already preserved via
+`capture_sort_state` / `restore_sort_state`. Mirror that
+pattern so the two entry points behave the same.
+
+**E2: Column width + visibility persistence via QSettings**
+(`widgets/devices_tab.py:1794-1832, 6816-6900`) — Pre-fix, this
+table hardcoded column widths + hid cols 12..15 on every
+startup — operators who resized/reordered/unhid columns had to
+redo it every session. Added `_restore_devices_table_columns()`
+(on init) + `_save_devices_table_columns()` (on any resize)
+backed by `QSettings("netgen", "netgen-client")`. Mirrors
+v0.5.388 D4 window-layout shape.
+
+**E3: Warn on Add-device name collision auto-suffix**
+(`widgets/devices_tab.py:7503-7550`) — Pre-fix, single-device
+Add silently renamed on collision (`spine01` → `spine01_2`)
+with no user feedback. The row appeared with the wrong name
+and every subsequent reference-by-name (Edit, Delete, Copy)
+went to the ORIGINAL device instead. Fix: track whether the
+suffix fired and surface an info dialog naming the actual
+persisted name; nudge the operator toward Edit if they meant
+to modify the existing device. `"device"` default sentinel
+stays silent (it's a placeholder name, not an intentional one).
+
+**E4: MAC validator rejects broadcast + multicast source**
+(`widgets/add_device_dialog.py:238-260`) — Pre-fix, the regex
+`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$` accepted
+`FF:FF:FF:FF:FF:FF` (broadcast) and any MAC whose first octet
+had LSB=1 (multicast bit set, e.g. `01:00:5E:*`, `33:33:*`).
+Server + downstream switches SILENTLY DROP frames with those
+source MACs — TX traffic never left the wire and the operator
+had no clue why RX was zero. New regex: first-octet LSB must
+be 0 (unicast) AND the address must not be all-Fs.
+
+### Tests
+
+New: `tests/test_v05389_devices_tab_tail.py`. AST + structural
++ behavioral (MAC regex accept/reject).
+
 ## [0.5.388] - 2026-09-21
 
 ### Fixed — Device tab audit MEDs (5 items)
