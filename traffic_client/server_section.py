@@ -1394,6 +1394,31 @@ class TrafficGenClientServerSection():
                 if sid:
                     by_sid[sid] = s
 
+        # v0.5.392 (audit streams H5): TTL-ish prune of the
+        # `pushed` cache. Pre-fix, entries were only ever ADDED
+        # (line ~1429 sets pushed[sid] = color); deleted streams
+        # left stale entries forever, so on a client running for
+        # days across many stream create/delete cycles the cache
+        # grew monotonically. Fix: drop keys whose stream_id is
+        # no longer in `by_sid` — those streams are gone, their
+        # cached color has no meaning. Cheap: `by_sid` was just
+        # built above so the set-diff is O(cache_size) and
+        # runs only when the cache exceeds a soft cap (400) so
+        # the small-N common case is a no-op.
+        if len(pushed) > 400:
+            try:
+                _stale = set(pushed.keys()) - set(by_sid.keys())
+                if _stale:
+                    for _sid in _stale:
+                        pushed.pop(_sid, None)
+                    logger.debug(
+                        f"[STATUS-CACHE] pruned {len(_stale)} stale "
+                        f"stream_ids from _stream_status_pushed "
+                        f"(v0.5.392 audit streams H5)"
+                    )
+            except Exception as _prune_exc:
+                logger.debug(f"[STATUS-CACHE] prune skipped: {_prune_exc}")
+
         # Block itemChanged so any setItem below doesn't fire
         # handle_inline_edit (col 0 isn't editable; this is belt-and-
         # suspenders + matches the pattern in _do_update_stream_table).

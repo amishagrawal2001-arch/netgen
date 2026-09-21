@@ -747,7 +747,7 @@ class TrafficGenClientStreamControl:
         stream["rx_port"] = new_rx.strip()
         logger.info(f"Updated rx_port for stream '{stream.get('name')}' on {port} to {new_rx}")
 
-    def update_stream_status(self, row, color):
+    def update_stream_status(self, row, color, stream_id=None):
         """Update the stream status icon for a specific row.
 
         Uses status_dot_icon() (inline QPainter circle) so the dot
@@ -755,12 +755,38 @@ class TrafficGenClientStreamControl:
         was anti-aliasing badly at 12-14px and rendering as a
         square block. Matches the initial-render path in
         server_section.py.
+
+        v0.5.392 (audit streams H1): optional `stream_id` re-
+        resolves the row against the current table before writing.
+        Pre-fix, `start_stream` captured `row_by_id[sid] = row_idx`
+        BEFORE pumping local `QEventLoop`s via `_fetch_orphans`
+        (`_get_async`) and the reap-confirm `msg.exec_()`. A
+        stats-driven `_do_update_stream_table` firing mid-pump
+        shifts rows; the later `update_stream_status(r, ...)`
+        painted a DIFFERENT stream green/red/yellow. When
+        `stream_id` is provided, we walk the current table to
+        find the row currently holding that id (Qt.UserRole stash
+        on col 2) and use that instead of the stale `row` hint.
+        Backwards compat: when `stream_id` is None or the row
+        can't be resolved, we fall through to the original `row`.
         """
         from utils.qicon_loader import status_dot_icon
+        _target_row = row
+        if stream_id is not None:
+            try:
+                for _r in range(self.stream_table.rowCount()):
+                    _it = self.stream_table.item(_r, 2)
+                    if _it is None:
+                        continue
+                    if _it.data(Qt.UserRole) == stream_id:
+                        _target_row = _r
+                        break
+            except Exception:
+                _target_row = row
         status_item = QTableWidgetItem()
         status_item.setIcon(status_dot_icon(color, 14))
         status_item.setFlags(Qt.ItemIsEnabled)  # read-only
-        self.stream_table.setItem(row, 0, status_item)
+        self.stream_table.setItem(_target_row, 0, status_item)
 
     # ---------- copy/paste & CRUD ----------
 
@@ -1080,11 +1106,33 @@ class TrafficGenClientStreamControl:
         return repaired
 
     def open_add_stream_dialog(self):
+        # v0.5.392 (audit streams H3): re-entry guard. Pre-fix,
+        # `open_add_stream_dialog` ran `dialog.exec()` without
+        # disabling the Add Stream button or otherwise guarding
+        # re-entry. A double-click on the button, or triggering
+        # via keyboard mnemonic while the modal was already open,
+        # could spawn a second AddStreamDialog on top of the
+        # first — operator saved from the top dialog and the
+        # bottom one lingered until Cancel was clicked, sometimes
+        # persisting old-form data on top of the just-saved
+        # stream. Fix: track `_add_stream_dialog_open` and refuse
+        # a second entry. Cleared in a try/finally below so an
+        # exception in the dialog can't leave the guard stuck.
+        if getattr(self, "_add_stream_dialog_open", False):
+            logger.debug("Add Stream dialog already open — ignoring re-entry")
+            return
+        self._add_stream_dialog_open = True
+        try:
+            self._open_add_stream_dialog_body()
+        finally:
+            self._add_stream_dialog_open = False
+
+    def _open_add_stream_dialog_body(self):
         logger.debug(f"Add stream dialog requested")
         logger.debug(f"Has server_tree: {hasattr(self, 'server_tree')}")
         if hasattr(self, 'server_tree'):
             logger.debug(f"server_tree is not None: {self.server_tree is not None}")
-        
+
         if not hasattr(self, 'server_tree') or self.server_tree is None:
             QMessageBox.warning(self, "Server Tree Error", "Server tree is not available. Please restart the application.")
             return

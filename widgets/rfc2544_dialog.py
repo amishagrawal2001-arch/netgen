@@ -55,6 +55,16 @@ class Rfc2544Dialog(QDialog):
         self.server_url = (server_url or "").rstrip("/")
         self._poll_timer: Optional[QTimer] = None
         self._build_ui()
+        # v0.5.392 (audit streams H4): restore persisted test
+        # parameters from QSettings. Pre-fix, every open of the
+        # RFC 2544 dialog started with hardcoded defaults (TX
+        # iface, MACs, IPs, duration, resolution) so operators
+        # re-typed the same values every session. Now: restore
+        # after the widgets exist; save on Start + Close.
+        try:
+            self._restore_rfc2544_params()
+        except Exception as _r_exc:
+            logger.debug(f"[RFC2544] params restore skipped: {_r_exc}")
 
     # ------------------------------------------------------------- UI
 
@@ -353,6 +363,71 @@ class Rfc2544Dialog(QDialog):
             except Exception as exc:
                 logger.debug(f"[RFC 2544] stop on close failed: {exc}")
 
+    # v0.5.392 (audit streams H4): parameter persistence via
+    # QSettings. Save on Start + close, restore on __init__.
+    # Mirrors v0.5.388 D4 (window layout) + v0.5.389 E2 (device
+    # tab columns) shape.
+    _RFC2544_SETTINGS_ORG = "netgen"
+    _RFC2544_SETTINGS_APP = "netgen-client"
+    _RFC2544_KEYS = {
+        "tx_iface_field": "rfc2544/tx_iface",
+        "rx_iface_field": "rfc2544/rx_iface",
+        "mac_src_field": "rfc2544/mac_src",
+        "mac_dst_field": "rfc2544/mac_dst",
+        "ip_src_field": "rfc2544/ip_src",
+        "ip_dst_field": "rfc2544/ip_dst",
+        "duration_spin": "rfc2544/duration_s",
+        "resolution_spin": "rfc2544/resolution_pps",
+    }
+
+    def _rfc2544_settings(self):
+        from PyQt5.QtCore import QSettings
+        return QSettings(
+            self._RFC2544_SETTINGS_ORG, self._RFC2544_SETTINGS_APP)
+
+    def _restore_rfc2544_params(self):
+        _s = self._rfc2544_settings()
+        for _attr, _key in self._RFC2544_KEYS.items():
+            _val = _s.value(_key)
+            if _val is None:
+                continue
+            _w = getattr(self, _attr, None)
+            if _w is None:
+                continue
+            try:
+                if hasattr(_w, "setValue"):
+                    # Numeric spinboxes
+                    _w.setValue(int(_val))
+                else:
+                    _w.setText(str(_val))
+            except (ValueError, TypeError, Exception) as _rr_exc:
+                logger.debug(
+                    f"[RFC2544] restore {_attr} skipped: {_rr_exc}"
+                )
+
+    def _save_rfc2544_params(self):
+        try:
+            _s = self._rfc2544_settings()
+            for _attr, _key in self._RFC2544_KEYS.items():
+                _w = getattr(self, _attr, None)
+                if _w is None:
+                    continue
+                try:
+                    if hasattr(_w, "value"):
+                        _s.setValue(_key, int(_w.value()))
+                    else:
+                        _s.setValue(_key, str(_w.text() or "").strip())
+                except Exception as _sw_exc:
+                    logger.debug(
+                        f"[RFC2544] save {_attr} skipped: {_sw_exc}"
+                    )
+            try:
+                _s.sync()
+            except Exception:
+                pass
+        except Exception as _outer:
+            logger.debug(f"[RFC2544] save skipped: {_outer}")
+
     def closeEvent(self, event):
         """v0.3.0: gate window-close (X button + Esc + accept) behind
         a confirmation when a test is running. Without this the
@@ -375,6 +450,13 @@ class Rfc2544Dialog(QDialog):
                 event.ignore()
                 return
         self._stop_test_and_cleanup_timer()
+        # v0.5.392 (audit streams H4): persist current params on
+        # close so the next open starts with the operator's last
+        # values instead of hardcoded defaults.
+        try:
+            self._save_rfc2544_params()
+        except Exception as _cs_exc:
+            logger.debug(f"[RFC2544] close-save skipped: {_cs_exc}")
         super().closeEvent(event)
 
     def reject(self):
@@ -417,6 +499,14 @@ class Rfc2544Dialog(QDialog):
             QMessageBox.warning(self, "No server",
                                 "No server URL — can't run the test.")
             return
+
+        # v0.5.392 (audit streams H4): persist parameters on
+        # Start too so a crash mid-test doesn't lose the
+        # operator's setup.
+        try:
+            self._save_rfc2544_params()
+        except Exception as _ss_exc:
+            logger.debug(f"[RFC2544] start-save skipped: {_ss_exc}")
 
         # v0.3.0: pre-submit MAC + IPv4 validation. The live red-border
         # validators already flag bad input as the operator types, but

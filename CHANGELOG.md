@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.392] - 2026-09-21
+
+### Fixed — Streams tab audit tail (5 items)
+
+**H1: `start_stream` row-race — re-resolve rows by stream_id**
+(`traffic_client/stream_control.py:750-810`, `stream_logic.py:833-905`)
+— Pre-fix, `start_stream` cached `row_by_id[sid] = row_idx` at
+line ~:653 then pumped local `QEventLoop`s via `_fetch_orphans`
+(`_get_async`) and the reap-confirm `msg.exec_()`. A stats-
+driven `_do_update_stream_table` firing mid-pump shifted rows,
+so the later `update_stream_status(r, ...)` at ~:866/891/797
+painted the WRONG stream green/red/yellow. Same shape as G5
+(remove) and D1 (device multi-delete). Fix: extend
+`update_stream_status` to accept an optional `stream_id=` kwarg
+that re-resolves the row against the current table before
+writing (walks column-2 UserRole stashes). Wire the three
+post-pump call sites in `start_stream` to pass `stream_id=`.
+Backward-compat: `stream_id=None` falls through to the
+original row hint.
+
+**H2: `send_inline_update_to_server` sync HTTP froze UI on inline edits**
+(`traffic_client/stream_logic.py:2076-2155`) — Pre-fix, this
+called `requests.post(url, json=payload, timeout=5)`
+SYNCHRONOUSLY on the UI thread on every inline edit (Name,
+Enabled, Frame Size, Flow Tracking). One slow server = up to
+5s UI freeze per single edit; repeatedly clicking Enabled on
+5 streams could freeze the desktop client for 25 seconds. Fix:
+fire-and-forget QThread wrapper (permanent keepalive to dodge
+the PyQt5 5.15 + Python 3.14 GC race that killed prior
+attempts). Local state was already written before this call
+fires, so persistence going async is safe.
+
+**H3: Add Stream dialog re-entry guard**
+(`traffic_client/stream_control.py:1108-1135`) — Pre-fix,
+`open_add_stream_dialog` ran `dialog.exec()` without disabling
+the Add Stream button or otherwise guarding re-entry. A
+double-click on the button or a keyboard mnemonic while the
+modal was already open could spawn a SECOND AddStreamDialog on
+top of the first — operator saved from the top dialog and the
+bottom one lingered until Cancel, sometimes persisting old
+form data on top of the just-saved stream. Fix:
+`_add_stream_dialog_open` flag with a try/finally clear so an
+exception in the dialog can't leave the guard stuck.
+
+**H4: RFC 2544 dialog parameter persistence via QSettings**
+(`widgets/rfc2544_dialog.py:47-70, 366-465, 495-520`) — Pre-fix,
+every open of the RFC 2544 dialog started with hardcoded
+defaults (TX iface, MACs, IPs, duration, resolution) so
+operators re-typed the same values every session. Fix:
+`_save_rfc2544_params` on Start + closeEvent; `_restore_` on
+__init__. QSettings-backed. Mirrors v0.5.388 D4 (window
+layout) + v0.5.389 E2 (device tab columns) shape.
+
+**H5: `_stream_status_pushed` cache never evicted deleted streams**
+(`traffic_client/server_section.py:1384-1420`) — Pre-fix,
+entries were only ever ADDED (line ~1429 sets `pushed[sid] =
+color`); deleted streams left stale entries forever. On a
+client running for days across many create/delete cycles the
+cache grew monotonically. Fix: when cache exceeds a 400-entry
+soft cap, drop keys whose stream_id is no longer in `by_sid`
+(the just-built current-streams index). Small-N common case
+stays a no-op.
+
+### Tests
+
+New: `tests/test_v05392_streams_tab_tail.py`. AST + structural
++ regression coverage.
+
 ## [0.5.391] - 2026-09-21
 
 ### Fixed — Streams tab audit HIGHs (5 items)

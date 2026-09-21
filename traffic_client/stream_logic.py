@@ -836,15 +836,18 @@ class TrafficGenClientStreamLogic:
                             sid = st.get("stream_id")
                             if sid in started_ids_partial:
                                 # This one DID start — green it.
+                                # v0.5.392 (H1): pass stream_id so
+                                # update_stream_status re-resolves
+                                # the row against the current table.
                                 if r is not None:
-                                    self.update_stream_status(r, "green")
+                                    self.update_stream_status(r, "green", stream_id=sid)
                                 st["status"] = "running"
                                 st["enabled"] = True
                                 st.setdefault("protocol_selection", {})["enabled"] = True
                                 any_started = True
                             else:
                                 if r is not None:
-                                    self.update_stream_status(r, "red")
+                                    self.update_stream_status(r, "red", stream_id=sid)
                             if sid:
                                 in_flight.discard(sid)
                     continue
@@ -863,7 +866,10 @@ class TrafficGenClientStreamLogic:
                         r = row_by_id.get(sid)
                         st = stream_by_id.get(sid)
                         if r is not None:
-                            self.update_stream_status(r, "green")
+                            # v0.5.392 (H1): re-resolve row by
+                            # stream_id — the pump above may have
+                            # invalidated the cached index.
+                            self.update_stream_status(r, "green", stream_id=sid)
                         if st:
                             st["status"] = "running"
                             st["enabled"] = True
@@ -888,7 +894,8 @@ class TrafficGenClientStreamLogic:
                     # assume all sent are running
                     for port_label, items in per_port.items():
                         for st, r in items:
-                            self.update_stream_status(r, "green")
+                            # v0.5.392 (H1): re-resolve row by sid.
+                            self.update_stream_status(r, "green", stream_id=st.get("stream_id"))
                             st["status"] = "running"
                             st["enabled"] = True
                             st.setdefault("protocol_selection", {})["enabled"] = True
@@ -2067,7 +2074,20 @@ class TrafficGenClientStreamLogic:
         self.update_stream_table()
 
     def send_inline_update_to_server(self, port, stream):
-        """Send updated stream configuration to the corresponding TG server."""
+        """Send updated stream configuration to the corresponding TG server.
+
+        v0.5.392 (audit streams H2): moved off the UI thread. Pre-
+        fix, `requests.post(url, json=payload, timeout=5)` ran
+        SYNCHRONOUSLY here on EVERY inline edit (Name, Enabled,
+        Frame Size, Flow Tracking). One slow server = up to 5s
+        UI freeze per single edit — repeatedly clicking the
+        Enabled checkbox on 5 streams could freeze the desktop
+        client for 25 seconds. Now: fire-and-forget QThread
+        worker so the event loop keeps ticking. Server errors
+        still land in the log; the operator's edit already
+        persisted in-memory before this call fires (the caller
+        writes the local state first).
+        """
         try:
             tg_id = port.split(" - ")[0]  # "TG 0"
             matching_servers = [s for s in self.server_interfaces if f"TG {s['tg_id']}" == tg_id]
@@ -2078,12 +2098,49 @@ class TrafficGenClientStreamLogic:
             server = matching_servers[0]
             url = f"{server['address']}/api/streams/update"
             payload = {"port": port, "stream": stream}
-            response = requests.post(url, json=payload, timeout=5)
 
-            if response.status_code == 200:
-                logger.info(f"Stream update sent to {url}")
-            else:
-                logger.error(f"Failed to update stream. Status: {response.status_code}, Response: {response.text[:200]}")
+            # Fire-and-forget QThread. Best-effort — the caller
+            # already wrote local state; server-side persistence
+            # is now a background write instead of a blocking
+            # sync-write-then-continue.
+            from PyQt5.QtCore import QThread, pyqtSignal
+
+            class _InlineUpdateWorker(QThread):
+                done = pyqtSignal(int, str)  # (status_code, err_text)
+
+                def __init__(_self, _url, _payload):
+                    super().__init__()
+                    _self._url = _url
+                    _self._payload = _payload
+
+                def run(_self):
+                    try:
+                        _r = requests.post(_self._url, json=_self._payload, timeout=5)
+                        _self.done.emit(_r.status_code, "" if _r.ok else (_r.text or "")[:200])
+                    except Exception as _exc:
+                        _self.done.emit(0, str(_exc))
+
+            _worker = _InlineUpdateWorker(url, payload)
+
+            def _on_done(_code, _err):
+                if _code == 200:
+                    logger.info(f"Stream update sent to {url}")
+                elif _code == 0:
+                    logger.error(f"Error sending stream update to server: {_err}")
+                else:
+                    logger.error(f"Failed to update stream. Status: {_code}, Response: {_err}")
+
+            _worker.done.connect(_on_done)
+            # Permanent keepalive — same pattern used by
+            # _post_traffic_async and _PcapUploadWorker. Without
+            # this, the QThread wrapper can be GC'd before the
+            # HTTP call returns → SIGABRT on PyQt5 + Python 3.14.
+            try:
+                if hasattr(self, "_keepalive_worker"):
+                    self._keepalive_worker(_worker)
+            except Exception:
+                pass
+            _worker.start()
         except Exception as e:
             logger.error(f"Error sending stream update to server: {e}")
 
