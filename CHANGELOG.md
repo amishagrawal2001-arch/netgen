@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.385] - 2026-09-21
+
+### Fixed — BGP audit MED backlog (5 items)
+
+**A1: `configure_bgp_neighbor` VRF probe — timeout + no silent default-VRF fallback**
+(`utils/frr_docker.py:2190-2260`) — Pre-fix, the VRF-exists probe
+called `subprocess.run(["ip","-o","link","show",vrf_name])`
+WITHOUT `timeout=` (the sibling `configure_bgp_for_device` uses
+`timeout=2`). On netlink stall the whole apply hung. And any
+transient nonzero exit → `vrf_exists=False` → `router bgp <asn>`
+in the DEFAULT VRF, creating a duplicate BGP instance alongside
+the VRF-scoped one from `configure_bgp_for_device` that never
+establishes. Fix: add 2s timeout; distinguish genuine link
+absence from probe failure via stderr inspection; on probe
+failure/timeout, `return False` and log — DO NOT silently drop
+to the default VRF. The device's next apply will retry.
+
+**A2: `save_bgp_route_pools_batch` drops `increment_type`**
+(`run_tgen_server.py:16730-16760`) — The dict built for the
+batch save omitted `increment_type` entirely; every
+network-increment pool imported via batch was silently coerced
+to host-increment (the DB default), producing the wrong route
+set on advertisement. Fix: forward `increment_type` + also
+`address_family` from the payload.
+
+**A3: `DELETE /api/bgp/pools/<name>` — no in-use check**
+(`run_tgen_server.py:16698-16770`) — Pre-fix, unconditional
+DELETE let the FK cascade on `device_route_pools` silently strip
+every device's attachment. The device kept the pool name in its
+config; next Apply hit the v0.5.197 "unknown pool" warning and
+advertised nothing. DHCP got this guard in v0.5.350; BGP was the
+missing sibling. Fix: refuse with 409 + the device_id list when
+any device has this pool attached; `?force=true` bypasses.
+
+**A4: `_add_bgp_route` — VRF-scoped `ip route`**
+(`run_tgen_server.py:11573-11623`) — Pre-fix, the background
+default-route add issued `ip route 0.0.0.0/0 <gw>` with NO VRF
+suffix. Route landed in the container's default RIB, invisible
+to the per-device VRF BGP instance built earlier by the v0.5.198
+architecture. Operator saw the route configured but the peer
+never received a default. Fix: probe the device's VRF (same 2s
+timeout as A1), append `vrf <name>` when it exists. Mirrors the
+static-route emitter at `configure_bgp_route_advertisement`.
+
+**A5: Cleanup branch loses IPv6 attachments on dual-stack devices**
+(`run_tgen_server.py:11630-11680`) — Pre-fix, `neighbor_ip =
+bgp_config.get("bgp_neighbor_ipv4","") or bgp_config.get(
+"bgp_neighbor_ipv6","")` picked the FIRST non-empty AF and used
+it as the DB key for the cleanup call. A dual-stack device kept
+its IPv6 attachments in the DB forever (only v4 was cleaned).
+Also broke on comma-separated neighbor strings, which got used
+verbatim as the DB key. Fix: new `_split_neighbor_field(raw)`
+helper splits on comma/semicolon; collect all v4+v6 neighbors;
+loop the cleanup over every configured neighbor.
+
+### Tests
+
+New: `tests/test_v05385_bgp_med_backlog.py`. AST + structural +
+regression coverage.
+
 ## [0.5.384] - 2026-09-20
 
 ### Fixed — BGP + OSPF audit HIGHs (4 items)

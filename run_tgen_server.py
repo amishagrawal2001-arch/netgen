@@ -11574,16 +11574,48 @@ def configure_bgp():
                 import time
                 time.sleep(3)  # Short wait for existing container
                 try:
-                    from utils.frr_docker import FRRDockerManager
-                    frr_manager = FRRDockerManager()
-                    container_name = frr_manager._get_container_name(device_id, device_name)
-                    container = frr_manager.client.containers.get(container_name)
-                    
-                    route_cmd = f"vtysh -c 'configure terminal' -c 'ip route 0.0.0.0/0 {gateway}' -c 'end' -c 'write memory'"
+                    # v0.5.385 (audit BGP-A4): scope the default
+                    # route to the device's VRF so the per-device
+                    # `router bgp <asn> vrf <name>` instance can
+                    # actually see it. Pre-fix, `ip route
+                    # 0.0.0.0/0 <gw>` landed in the container's
+                    # DEFAULT RIB — invisible to the VRF-scoped
+                    # BGP instance (v0.5.198's default arch). The
+                    # operator saw the route configured but the
+                    # peer never received a default. Mirrors the
+                    # v0.5.198 pattern used in the route-adv
+                    # static-route emitter at ~:9834.
+                    from utils.frr_docker import frr_manager as _fm
+                    container_name = _fm._get_container_name(device_id, device_name)
+                    container = _fm.client.containers.get(container_name)
+
+                    _vrf_route_suffix = ""
+                    try:
+                        _vrf_name = _fm.vrf_name_for_device(device_id)
+                        if _vrf_name:
+                            _check = subprocess.run(
+                                ["ip", "-o", "link", "show", _vrf_name],
+                                capture_output=True, text=True, timeout=2,
+                            )
+                            if _check.returncode == 0 and (_check.stdout or "").strip():
+                                _vrf_route_suffix = f" vrf {_vrf_name}"
+                    except Exception as _vrf_exc:
+                        logging.debug(
+                            f"[BGP ROUTE BG] VRF lookup for {device_id}: {_vrf_exc}"
+                        )
+
+                    route_cmd = (
+                        f"vtysh -c 'configure terminal' "
+                        f"-c 'ip route 0.0.0.0/0 {gateway}{_vrf_route_suffix}' "
+                        f"-c 'end' -c 'write memory'"
+                    )
                     route_result = container.exec_run(route_cmd)
-                    
+
                     if route_result.exit_code == 0:
-                        logging.info(f"[BGP ROUTE BG] ✅ Added static route 0.0.0.0/0 via {gateway} for {device_name}")
+                        logging.info(
+                            f"[BGP ROUTE BG] ✅ Added static route 0.0.0.0/0 "
+                            f"via {gateway}{_vrf_route_suffix} for {device_name}"
+                        )
                     else:
                         output_str = route_result.output.decode('utf-8') if isinstance(route_result.output, bytes) else str(route_result.output)
                         logging.warning(f"[BGP ROUTE BG] Failed for {device_name}: {output_str}")
@@ -11599,12 +11631,36 @@ def configure_bgp():
         
         # Configure BGP route advertisement if route pools are attached
         route_pools_per_neighbor = bgp_config.get("route_pools", {})
-        # Support both IPv4 and IPv6 neighbors
-        neighbor_ip = bgp_config.get("bgp_neighbor_ipv4", "") or bgp_config.get("bgp_neighbor_ipv6", "")
+        # v0.5.385 (audit BGP-A5): dual-stack cleanup fix. Pre-fix,
+        # `neighbor_ip = bgp_config.get("bgp_neighbor_ipv4","") or
+        # bgp_config.get("bgp_neighbor_ipv6","")` picked the FIRST
+        # non-empty AF and used it as the DB key for cleanup — so a
+        # dual-stack device with both v4 and v6 neighbors kept its
+        # IPv6 attachments in the DB forever (the cleanup only
+        # touched the v4 row). Also broke on comma-separated
+        # neighbor strings ("10.0.0.1, 10.0.0.2"), which got used
+        # verbatim as the DB key. Fix: collect ALL configured
+        # neighbors (v4 + v6, comma-splittable) and clean each in
+        # turn.
+        def _split_neighbor_field(raw):
+            """Split a comma/semicolon list of neighbors; strip
+            surrounding whitespace. Empty list on empty input."""
+            if not raw:
+                return []
+            return [s.strip() for s in re.split(r"[,;]", str(raw))
+                    if s.strip()]
+        _v4_neighbors = _split_neighbor_field(bgp_config.get("bgp_neighbor_ipv4", ""))
+        _v6_neighbors = _split_neighbor_field(bgp_config.get("bgp_neighbor_ipv6", ""))
+        all_configured_neighbors = _v4_neighbors + _v6_neighbors
+        # Preserve legacy neighbor_ip for downstream code that still
+        # expects a single value (mostly logging + the v0.5.197
+        # warnings path); prefer v4 for backward-compat.
+        neighbor_ip = _v4_neighbors[0] if _v4_neighbors else (
+            _v6_neighbors[0] if _v6_neighbors else "")
         bgp_asn = bgp_config.get("bgp_asn", "65000")
-        
+
         # Save device-pool relationships to database
-        if neighbor_ip and route_pools_per_neighbor:
+        if all_configured_neighbors and route_pools_per_neighbor:
             for neighbor, attached_pools in route_pools_per_neighbor.items():
                 if attached_pools:  # Only save if there are pools attached
                     device_db.attach_route_pools_to_device(device_id, neighbor, attached_pools)
@@ -11614,10 +11670,12 @@ def configure_bgp():
                     device_db.remove_device_route_pools(device_id, neighbor)
                     logging.info(f"[BGP CONFIGURE] Removed route pool attachments for device {device_id} and neighbor {neighbor}")
         else:
-            # No route pools configured - remove all attachments for this device
-            if neighbor_ip:
-                device_db.remove_device_route_pools(device_id, neighbor_ip)
-                logging.info(f"[BGP CONFIGURE] Removed all route pool attachments for device {device_id} and neighbor {neighbor_ip}")
+            # No route pools configured - remove attachments for
+            # EVERY configured neighbor (v4 + v6), not just the
+            # first-picked one (v0.5.385 audit BGP-A5).
+            for _n in all_configured_neighbors:
+                device_db.remove_device_route_pools(device_id, _n)
+                logging.info(f"[BGP CONFIGURE] Removed all route pool attachments for device {device_id} and neighbor {_n}")
         
         # v0.5.198: auto-persist any route pool DEFINITIONS the
         # client sent in the request body. The Add-Device / Edit-BGP
@@ -16700,15 +16758,59 @@ def update_bgp_route_pool(pool_name):
 def delete_bgp_route_pool(pool_name):
     """Delete a BGP route pool from the database."""
     try:
+        # v0.5.385 (audit BGP-A3): in-use guard. Pre-fix, this DELETE
+        # unconditionally removed the pool row; the FK cascade on
+        # `device_route_pools` silently stripped every device's
+        # attachment. The device kept the pool NAME in its config
+        # payload, so next Apply hit v0.5.197's "unknown pool"
+        # warning and quietly advertised nothing. DHCP got this
+        # guard in v0.5.350; BGP was the missing sibling. Refuse
+        # with 409 + the device_id list when any device has this
+        # pool attached; ?force=true bypasses (for bulk teardown).
+        _force = str(request.args.get("force", "")).lower() in ("1", "true", "yes")
+        if not _force:
+            try:
+                import sqlite3 as _sqlite3
+                with _sqlite3.connect(device_db.db_path) as _conn:
+                    _conn.row_factory = _sqlite3.Row
+                    _rows = _conn.execute(
+                        "SELECT device_id, neighbor_ip FROM device_route_pools "
+                        "WHERE pool_name = ?",
+                        (pool_name,),
+                    ).fetchall()
+                    _in_use = [dict(r) for r in _rows]
+            except Exception as _use_exc:
+                logging.warning(
+                    f"[BGP POOLS API] v0.5.385 in-use lookup for "
+                    f"'{pool_name}' failed: {_use_exc} — allowing "
+                    f"delete (best-effort guard, not authoritative)"
+                )
+                _in_use = []
+            if _in_use:
+                _ids = list({str(r.get("device_id")) for r in _in_use})
+                return jsonify({
+                    "error": (
+                        f"BGP route pool '{pool_name}' is attached to "
+                        f"{len(_ids)} device(s): {', '.join(sorted(_ids))}. "
+                        f"Detach the pool from those devices first, "
+                        f"or re-issue DELETE with ?force=true to "
+                        f"remove the pool anyway (leaves orphaned "
+                        f"attachments in device_route_pools; next "
+                        f"Apply will hit the 'unknown pool' warning "
+                        f"and advertise nothing)."
+                    ),
+                    "in_use_by": _in_use,
+                }), 409
+
         success = device_db.remove_route_pool(pool_name)
-        
+
         if success:
             return jsonify({
                 "message": f"Route pool '{pool_name}' deleted successfully"
             }), 200
         else:
             return jsonify({"error": "Failed to delete route pool"}), 500
-            
+
     except Exception as e:
         logging.error(f"[BGP POOLS API] Failed to delete route pool '{pool_name}': {e}")
         return jsonify({"error": str(e)}), 500
@@ -16733,12 +16835,23 @@ def save_bgp_route_pools_batch():
             if not all(field in pool for field in ["name", "subnet", "count"]):
                 return jsonify({"error": "Each pool must have 'name', 'subnet', and 'count' fields"}), 400
             
+            # v0.5.385 (audit BGP-A2): preserve increment_type on
+            # batch import. Pre-fix, the dict built here dropped
+            # `increment_type` entirely, so `save_route_pools_batch`
+            # persisted every pool with the DB default ("host") →
+            # network-increment pools imported via batch silently
+            # became host-increment, producing the wrong route set
+            # on advertisement. Also carry `address_family` when
+            # provided so imports from the export endpoint preserve
+            # v4/v6 disambiguation.
             validated_pools.append({
                 "name": pool["name"],
                 "subnet": pool["subnet"],
                 "route_count": pool["count"],
                 "first_host_ip": pool.get("first_host", ""),
-                "last_host_ip": pool.get("last_host", "")
+                "last_host_ip": pool.get("last_host", ""),
+                "increment_type": pool.get("increment_type", "host"),
+                "address_family": pool.get("address_family", "ipv4"),
             })
         
         # Save to database

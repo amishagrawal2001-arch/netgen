@@ -2188,16 +2188,67 @@ def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: s
         # Extract device_id from container_name so we can look up its VRF.
         device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
         vrf_name = neighbor_config.get('vrf_name') or frr_manager.vrf_name_for_device(device_id)
-        # Only use the VRF if it actually exists on the host (lets
-        # legacy non-VRF deployments keep working until the device is
-        # re-applied through the new code path).
+        # v0.5.385 (audit BGP-A1): VRF probe hardening.
+        # Pre-fix, `subprocess.run(["ip","-o","link","show", vrf_name])`
+        # was called WITHOUT `timeout=` (the sibling
+        # `configure_bgp_for_device` uses `timeout=2`). On netlink
+        # stall the whole apply hung. Worse, any transient nonzero
+        # exit → `vrf_exists=False` → `router bgp <asn>` (DEFAULT
+        # VRF), creating a duplicate BGP instance that never
+        # establishes alongside the VRF-scoped one built earlier.
+        # Fix: (1) add 2s timeout to match the sibling call; (2)
+        # distinguish "VRF genuinely absent" (kernel confirmed no
+        # such link) from "probe couldn't complete" — when the
+        # probe fails (exception / non-zero + non-empty stderr),
+        # SKIP this configure_bgp_neighbor invocation entirely
+        # with a clear log line instead of silently landing in the
+        # default VRF. The device's next apply will retry.
         vrf_exists = False
-        try:
-            _check = subprocess.run(["ip", "-o", "link", "show", vrf_name],
-                                    capture_output=True, text=True)
-            vrf_exists = (_check.returncode == 0 and bool((_check.stdout or "").strip()))
-        except Exception:
-            vrf_exists = False
+        _probe_failed = False
+        if vrf_name:
+            try:
+                _check = subprocess.run(
+                    ["ip", "-o", "link", "show", vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if _check.returncode == 0:
+                    vrf_exists = bool((_check.stdout or "").strip())
+                else:
+                    # returncode!=0 with empty stderr = "link not
+                    # found" (legitimate absence). Anything on
+                    # stderr = probe interference — don't guess.
+                    _err = (_check.stderr or "").strip().lower()
+                    if _err and "does not exist" not in _err \
+                            and "cannot find" not in _err:
+                        _probe_failed = True
+                        logger.warning(
+                            f"[BGP NEIGHBOR] VRF probe for {vrf_name!r} "
+                            f"returned {_check.returncode} with stderr "
+                            f"{_check.stderr!r}; skipping this "
+                            f"configure_bgp_neighbor to avoid the "
+                            f"duplicate-default-VRF-instance trap "
+                            f"(v0.5.385 audit BGP-A1)"
+                        )
+            except subprocess.TimeoutExpired:
+                _probe_failed = True
+                logger.warning(
+                    f"[BGP NEIGHBOR] VRF probe for {vrf_name!r} timed "
+                    f"out after 2s; skipping this "
+                    f"configure_bgp_neighbor (v0.5.385 audit BGP-A1)"
+                )
+            except Exception as _probe_exc:
+                _probe_failed = True
+                logger.warning(
+                    f"[BGP NEIGHBOR] VRF probe for {vrf_name!r} raised "
+                    f"{_probe_exc}; skipping this configure_bgp_neighbor "
+                    f"(v0.5.385 audit BGP-A1)"
+                )
+        if _probe_failed:
+            # Defer this apply. Callers see False + a log line that
+            # names the reason; the device's next apply will retry
+            # the probe. Better than spawning a duplicate BGP
+            # instance in the default VRF that never establishes.
+            return False
         router_bgp_cmd = f"router bgp {local_as} vrf {vrf_name}" if vrf_exists else f"router bgp {local_as}"
 
         commands = [
