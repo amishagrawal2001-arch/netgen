@@ -24151,12 +24151,75 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       <div id="iface-table-wrap"><div class="iface-empty">Loading…</div></div>
     </div>
 
+    <!-- v0.5.378 (audit admin-cache-flush-card): wire the
+         /api/admin/caches/flush endpoint (v0.5.365 era) that
+         had no UI. Operators hitting stale LLDP / ethtool /
+         drvinfo state had to `curl` from a shell — one class
+         of bug that bit twice per audit comments. -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">Diagnostic Caches</h2>
+        <button class="secondary" id="btn-cache-flush">Flush All</button>
+      </div>
+      <p style="color: var(--muted); font-size: 12px; margin: 4px 0 8px;">
+        Per-iface sysfs / ethtool / lldpcli / driver-info caches.
+        Flush after out-of-band NIC changes (driver reload, bringup)
+        so the iface table re-queries everything from the wire.
+      </p>
+      <div class="row"><label style="font-size: 12px;"><input type="checkbox" id="cache-which-ethtool" checked> ethtool</label></div>
+      <div class="row"><label style="font-size: 12px;"><input type="checkbox" id="cache-which-drvinfo" checked> drvinfo</label></div>
+      <div class="row"><label style="font-size: 12px;"><input type="checkbox" id="cache-which-iface_details" checked> iface_details</label></div>
+      <div class="row"><label style="font-size: 12px;"><input type="checkbox" id="cache-which-lldp" checked> lldp</label></div>
+      <div id="cache-flush-result" style="font-size: 11px; color: var(--muted); margin-top: 6px;"></div>
+    </div>
+
+    <!-- v0.5.378 (audit admin-journal-card): wire the
+         /api/admin/journal endpoint (v0.5.80). Operators triaging
+         a runtime issue previously had to SSH + journalctl. This
+         card gives out-of-band access to the last 200 lines of
+         netgen-server's systemd journal, with a Refresh button
+         and simple filter chips. -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">Server Journal</h2>
+        <div>
+          <label style="font-size: 12px; color: var(--muted); margin-right: 8px;">
+            Lines:
+            <select id="journal-lines" style="margin-left: 4px;">
+              <option value="50">50</option>
+              <option value="200" selected>200</option>
+              <option value="500">500</option>
+            </select>
+          </label>
+          <label style="font-size: 12px; color: var(--muted); margin-right: 8px;">
+            <input type="checkbox" id="journal-only-warn"> WARN+ only
+          </label>
+          <button class="secondary" id="btn-refresh-journal">Refresh</button>
+        </div>
+      </div>
+      <p style="color: var(--muted); font-size: 12px; margin: 4px 0 8px;">
+        Tail of <code>journalctl -u netgen-server</code>. Tokens are
+        server-side redacted. Not live — click Refresh (or use
+        Ctrl+R while the card is focused) to re-pull.
+      </p>
+      <pre class="log" id="journal-view" style="max-height: 300px;">Click Refresh to load…</pre>
+    </div>
+
     <div class="card" style="grid-column: 1 / -1;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
         <h2 style="margin: 0;">Install Log</h2>
-        <label style="font-size: 12px; color: var(--muted); user-select: none;">
-          <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
-        </label>
+        <div>
+          <!-- v0.5.378 (audit admin-log-source-header): a per-log-
+               source label so the operator knows WHICH install owns
+               the current buffer. Pre-fix, DPDK / RDMA / Upgrade
+               all wrote to the shared <pre id="log"> and stomped
+               each other's output — this header at least surfaces
+               which stream the current content belongs to. -->
+          <span id="log-source" style="font-size: 12px; color: var(--muted); margin-right: 12px;">idle</span>
+          <label style="font-size: 12px; color: var(--muted); user-select: none;">
+            <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+          </label>
+        </div>
       </div>
       <!-- Phase indicator: hidden until first poll returns a phase -->
       <div id="phase-wrap" style="display: none; margin-bottom: 8px;">
@@ -24895,6 +24958,8 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       $('btn-install-dpdk').disabled = true;
       $('install-status').textContent = 'Starting…';
       $('log').textContent = 'Starting install…';
+      // v0.5.378 (audit admin-log-source-header): mark buffer.
+      if (window._setLogSource) window._setLogSource('DPDK install');
       // Reset incremental-fetch state + phase UI for the new install
       logOffset = 0;
       $('phase-wrap').style.display = 'none';
@@ -24978,6 +25043,8 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         $('btn-install-rdma').disabled = true;
         $('install-status').textContent = 'Starting RDMA install…';
         $('log').textContent = 'Starting install_rdma.sh…';
+        // v0.5.378 (audit admin-log-source-header): mark buffer.
+        if (window._setLogSource) window._setLogSource('RDMA install');
         try {
           const r = await fetch('/api/admin/install_rdma', { method: 'POST' });
           const d = await r.json();
@@ -25061,6 +25128,110 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       });
     }
 
+    // v0.5.378 (audit admin-cache-flush-card): Cache Flush handler.
+    // Reads the 4 checkbox toggles + POSTs `which` per toggle (or
+    // omit for `all`). Renders the returned `cleared` array in
+    // the small result line under the checkboxes.
+    if ($('btn-cache-flush')) {
+      $('btn-cache-flush').addEventListener('click', async () => {
+        const _kinds = [];
+        for (const _k of ['ethtool', 'drvinfo', 'iface_details', 'lldp']) {
+          const _cb = $('cache-which-' + _k);
+          if (_cb && _cb.checked) _kinds.push(_k);
+        }
+        if (!_kinds.length) {
+          toast('Select at least one cache to flush.');
+          return;
+        }
+        $('btn-cache-flush').disabled = true;
+        $('cache-flush-result').textContent = 'flushing…';
+        try {
+          // Multi-flush: hit the endpoint once per checked kind.
+          // (The endpoint accepts `which: "all"` too, but the
+          // per-kind loop lets us render exactly what the operator
+          // asked for even if they unchecked one.)
+          const _cleared = [];
+          for (const _k of _kinds) {
+            const _r = await fetch('/api/admin/caches/flush', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({which: _k}),
+            });
+            const _d = await _r.json();
+            if (_r.ok && _d && Array.isArray(_d.cleared)) {
+              _cleared.push(..._d.cleared);
+            }
+          }
+          $('cache-flush-result').textContent =
+            `cleared: ${_cleared.join(', ') || '(nothing)'}`;
+          toast(`Flushed ${_cleared.length} cache(s).`);
+        } catch (e) {
+          toast('Cache flush failed: ' + e);
+          $('cache-flush-result').textContent = 'failed';
+        } finally {
+          $('btn-cache-flush').disabled = false;
+        }
+      });
+    }
+
+    // v0.5.378 (audit admin-journal-card): Journal viewer.
+    // Fetches /api/admin/journal?lines=<N> and renders in the
+    // <pre id="journal-view">. Optional client-side WARN+ filter
+    // (WARNING / ERROR / SEVERE lines only).
+    async function _loadJournal() {
+      const _lines = ($('journal-lines') && $('journal-lines').value) || '200';
+      const _onlyWarn = $('journal-only-warn') && $('journal-only-warn').checked;
+      $('journal-view').textContent = 'loading…';
+      try {
+        const _r = await fetch('/api/admin/journal?lines=' + encodeURIComponent(_lines));
+        const _d = await _r.json();
+        if (!_r.ok) {
+          $('journal-view').textContent = `error: ${_d.error || _r.status}`;
+          return;
+        }
+        let _out = _d.lines || [];
+        if (_onlyWarn) {
+          _out = _out.filter(l =>
+            /\bWARNING\b|\bERROR\b|\bCRITICAL\b|\bSEVERE\b/.test(l)
+          );
+        }
+        $('journal-view').textContent = _out.join('\n')
+          || (_onlyWarn ? '(no WARN+ lines in the last ' + _lines + ')' : '(empty)');
+        // Auto-scroll to bottom (freshest first is a systemd
+        // convention, but journalctl -n <N> emits oldest-first —
+        // so bottom = most recent).
+        $('journal-view').scrollTop = $('journal-view').scrollHeight;
+      } catch (e) {
+        $('journal-view').textContent = 'request failed: ' + e;
+      }
+    }
+    if ($('btn-refresh-journal')) {
+      $('btn-refresh-journal').addEventListener('click', _loadJournal);
+    }
+    // Auto-load journal on first health render so operators see
+    // recent activity without clicking Refresh.
+    let _journalLoadedOnce = false;
+    document.addEventListener('DOMContentLoaded', () => {
+      if (!_journalLoadedOnce && $('journal-view')) {
+        _journalLoadedOnce = true;
+        // Small delay so the initial health load completes first
+        // and doesn't fight for the fetch queue.
+        setTimeout(_loadJournal, 1500);
+      }
+    });
+
+    // v0.5.378 (audit admin-log-source-header): helper to update
+    // the log-source label. Each install handler calls this so
+    // the operator knows which install owns the buffer.
+    function _setLogSource(source) {
+      const _el = $('log-source');
+      if (!_el) return;
+      _el.textContent = source ? `source: ${source}` : 'idle';
+      _el.style.color = source ? 'var(--accent)' : 'var(--muted)';
+      _el.style.fontWeight = source ? '600' : 'normal';
+    }
+    window._setLogSource = _setLogSource;
+
     // v0.5.374 (audit admin-upgrade-wheel-card): Upgrade Wheel
     // handler. Multipart-uploads the selected .whl to
     // /api/admin/upgrade_wheel (v0.5.23 endpoint), then polls
@@ -25143,6 +25314,8 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         $('btn-upgrade-wheel').disabled = true;
         $('upgrade-progress').style.display = 'block';
         $('log').textContent = `Uploading ${_file.name}…`;
+        // v0.5.378 (audit admin-log-source-header): mark buffer.
+        if (window._setLogSource) window._setLogSource('Upgrade wheel');
         const _fd = new FormData();
         _fd.append('wheel', _file);
         try {

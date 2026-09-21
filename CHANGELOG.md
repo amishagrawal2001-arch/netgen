@@ -2,6 +2,88 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.378] - 2026-09-20
+
+**Admin console feature bundle — three cards for endpoints that
+existed but had no UI.** Continues clearing the v0.5.370 audit's
+coverage-gap queue: operators no longer need to SSH for cache
+flush, journal tail, or "which install owns the log buffer?".
+
+### Fixes
+
+- **G1** — new Cache Flush card wires the v0.5.365
+  `/api/admin/caches/flush` endpoint. Per-cache checkboxes
+  (`ethtool`, `drvinfo`, `iface_details`, `lldp`) + Flush All
+  button. Result line names which caches got cleared. Endpoint
+  is `@require_role("admin")` (unchanged from v0.5.375 SEC
+  sweep). Fixes the "stale LLDP / ethtool state after out-of-
+  band NIC change" class of bug that bit twice per audit
+  comments — operators can now heal the iface table's cached
+  view without a `curl` from a shell.
+  Marker: `v0.5.378 (audit admin-cache-flush-card)`.
+
+- **G2** — new Server Journal card wires the v0.5.80
+  `/api/admin/journal` endpoint. Line-count dropdown (50 / 200
+  default / 500), WARN+ filter chip (matches
+  `WARNING|ERROR|CRITICAL|SEVERE`), Refresh button. Auto-loads
+  once on first page render (1.5 s after health poll so the
+  fetch queue doesn't fight itself). Tokens are server-side
+  redacted (v0.5.92). Endpoint stays `@require_role("viewer")`
+  since journal is read-only observability. Replaces the "SSH
+  + `journalctl -u netgen-server`" workflow for basic tailing.
+  Marker: `v0.5.378 (audit admin-journal-card)`.
+
+- **G3** — log-source header above the shared
+  `<pre id="log">`. Small UX addition — a `<span id="log-source">`
+  that names the install owning the current buffer (`DPDK
+  install` / `RDMA install` / `Upgrade wheel` / `idle`). Colored
+  accent when active, muted when idle. Hooked into each install
+  handler's start via `window._setLogSource(label)` — DPDK
+  (line 24960 area), RDMA (25042), Upgrade Wheel (25312). Falls
+  short of the full DOM dedupe queued for v0.5.379+, but
+  eliminates the "which install owns this output?" ambiguity
+  that surfaced on shared `<pre>` stomp between the three
+  install types.
+  Marker: `v0.5.378 (audit admin-log-source-header)`.
+
+### Tests
+
+`tests/test_v05378_admin_cards.py` — 19 tests, all pass:
+
+- AST-parse
+- Markers present (G3 requires ≥4 sites — HTML span + JS helper
+  + 3 install-start hookups)
+- G1: HTML elements + click handler POSTs to `/api/admin/caches/flush`;
+  per-kind iteration (not just bulk 'all'); endpoint still
+  admin-gated (regression guard for v0.5.375 SEC sweep)
+- G2: HTML elements; `_loadJournal` fetches `/api/admin/journal`;
+  auto-loads on `DOMContentLoaded`
+- G3: log-source span present; `_setLogSource` helper defined +
+  exposed on `window`; all three install paths call it with
+  distinct labels
+- Regression: v0.5.374 Upgrade Wheel card + Restart Server
+  button intact, v0.5.367 RDMA install button intact, v0.5.375
+  AI routes still gated
+
+### Verification
+
+- File AST-parses
+- 19/19 v0.5.378 tests pass
+- Operator UI verification pending — expect: `/admin` → Cache
+  Flush + Server Journal cards visible; Install Log heading
+  shows a "source: DPDK install" pill in accent color during
+  each install; label reverts to "idle" (muted) when nothing's
+  running
+
+### Deferred to v0.5.379+
+
+- **G3 full DOM dedupe** — split `<pre id="log">` into three
+  independent elements (`#log-dpdk`, `#log-rdma`, `#log-upgrade`)
+  with a tab bar. Preserves each install's log across parallel
+  polling (currently the label warns but they still stomp).
+- Streams card, FRR container card, Chassis / Peers cards
+- LLDP raw viewer card (endpoint exists — `/api/admin/lldp_raw`)
+
 ## [0.5.377] - 2026-09-20
 
 **Client confirm dialog + server WARN when Applying a device
