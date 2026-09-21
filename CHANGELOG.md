@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.384] - 2026-09-20
+
+### Fixed — BGP + OSPF audit HIGHs (4 items)
+
+**Z1: BGP PL/RM name collision across neighbors on one device**
+(`run_tgen_server.py:9575-9620, 9640-9905, 10282-10370`) — Pre-fix,
+`PL-EXPORT` / `RM-EXPORT` / `RM-IMPORT` (and their `-IPV6`
+siblings) were CONTAINER-GLOBAL FRR objects. A device with 2+
+BGP neighbors bound BOTH neighbors to the same names. When
+neighbor A's `cleanup_bgp_route_advertisement` fired (route-pool
+detach, config change), the unconditional `no ip prefix-list
+PL-EXPORT` + `no route-map RM-EXPORT` wiped state that neighbor
+B was STILL bound to → B's outbound announcements collapsed
+until B was re-applied. Fix: new `_bgp_pl_rm_names(neighbor_ip)`
+helper returns per-neighbor slugged names (`PL-EXPORT-<slug>`,
+`RM-EXPORT-<slug>`, etc.). Both configure and cleanup paths now
+use the neighbor-scoped names — cleanup on neighbor A no longer
+touches neighbor B's objects.
+
+**Z2: BGP daemon threads raced on FRR state (no lock)**
+(`run_tgen_server.py:9620-9660, 11640-11730`) — Pre-fix,
+`configure_bgp`'s `route_pools_per_neighbor.items()` loop
+spawned one daemon thread PER neighbor for
+`_cleanup_then_configure`. All threads targeted the SAME
+container's FRR state; two concurrent runs could interleave
+`no prefix-list` + rebuild + neighbor route-map bindings,
+yielding nondeterministic partial state while the endpoint
+returned 200 with stale routes still live. v0.5.383 X1's
+`start_frr_container` lock only guarded container startup —
+post-start config remained unserialised. Fix: new
+`_bgp_device_config_lock(device_id)` (module-level dict of
+per-device Locks with metalock). Every
+`_cleanup_then_configure` / `_cleanup_routes` daemon thread
+body now runs inside `with _bgp_device_config_lock(device_id)`
+so config for one device serialises regardless of how many
+neighbors are being processed.
+
+**Z3: `/api/bgp/neighbors` blind to VRF-scoped sessions + IPv6**
+(`run_tgen_server.py:14038-14135`) — Pre-fix, the endpoint ran
+ONLY `show ip bgp summary` in the container's default VRF and
+never queried IPv6. Every per-device VRF deployment (the
+DEFAULT architecture since v0.5.198) returned an empty
+neighbors list even when sessions were Established. IPv6 peers
+never appeared at all. Fix: enumerate `[(default, ""), (dev_vrf,
+" vrf <name>")]` scopes and issue both `show ip bgp<vrf>
+summary` (v4) and `show bgp<vrf> ipv6 unicast summary` (v6) per
+scope. Each parsed row is tagged with `vrf` so the client can
+distinguish; default-VRF fallback preserves legacy single-
+device behavior.
+
+**Z4: OSPF partial-apply rebuilt the unselected AF**
+(`run_tgen_server.py:6400-6412, 6777-6825`) — Pre-fix, this
+handler locally derived `ipv4_enabled = ipv4_enabled and "IPv4"
+in apply_address_families` at ~:6410, but then called
+`configure_ospf_neighbor(device_id, ospf_config, device_name)`
+with the ORIGINAL RAW payload. `utils/ospf.py:365-385, 297-298,
+569-624` re-read `ipv4_enabled` from the payload (still True)
+and derived `area_id_ipv4 = ... or area_id` — an IPv6-only
+partial apply then reconfigured IPv4 OSPF against the v6 area,
+and the symmetric v4-only apply hit v6. Fix: when
+`is_partial_apply`, write the locally-clamped `ipv4_enabled` +
+`ipv6_enabled` back onto `ospf_config` BEFORE calling
+`configure_ospf_neighbor` so its re-read sees the clamped
+values.
+
+### Tests
+
+New: `tests/test_v05384_bgp_ospf_highs.py`. AST + structural +
+regression + behavioral (per-neighbor slug + per-device lock).
+
 ## [0.5.383] - 2026-09-20
 
 ### Fixed — FRR + stats MED backlog (5 items)

@@ -6773,7 +6773,30 @@ def configure_ospf():
         except Exception as e:
             logging.warning(f"[OSPF CONFIGURE] Failed to save route pool attachments: {e}")
         
-        # Configure OSPF neighbor
+        # Configure OSPF neighbor.
+        #
+        # v0.5.384 (audit OSPF-Z4): partial-apply AF leak fix.
+        # Pre-fix, this handler locally derived
+        # `ipv4_enabled = ipv4_enabled and "IPv4" in apply_address_families`
+        # at line ~6410, but then called `configure_ospf_neighbor(
+        # device_id, ospf_config, device_name)` passing the ORIGINAL
+        # raw payload. `utils/ospf.py:365-385, 297-298, 569-624`
+        # re-reads `ipv4_enabled` from the payload (still True) and
+        # derives `area_id_ipv4 = ... or area_id` — so an IPv6-only
+        # partial apply reconfigured IPv4 OSPF against the v6 area,
+        # and the symmetric v4-only apply hit v6. Fix: overwrite
+        # the payload's `ipv4_enabled` / `ipv6_enabled` with the
+        # LOCALLY-DERIVED (partial-apply-clamped) values BEFORE
+        # passing to configure_ospf_neighbor so its re-read finds
+        # the clamped values.
+        if is_partial_apply:
+            ospf_config["ipv4_enabled"] = ipv4_enabled
+            ospf_config["ipv6_enabled"] = ipv6_enabled
+            logging.info(
+                f"[OSPF CONFIGURE] Partial apply clamp: "
+                f"ipv4_enabled={ipv4_enabled}, ipv6_enabled={ipv6_enabled} "
+                f"(v0.5.384 audit OSPF-Z4)"
+            )
         try:
             logging.info(f"[OSPF CONFIGURE] Configuring OSPF for device {device_name}")
             success = configure_ospf_neighbor(device_id, ospf_config, device_name)
@@ -9572,6 +9595,80 @@ def generate_network_routes_from_pool(network, count):
         logging.error(f"[BGP ROUTE ADV] Error generating network routes: {e}")
         return []
 
+# v0.5.384 (audit BGP-Z1): per-neighbor unique FRR object names
+# for prefix-list + route-map so cleanup on one neighbor doesn't
+# wipe another's binding. Pre-fix, PL-EXPORT / RM-EXPORT /
+# RM-IMPORT (and their -IPV6 siblings) were CONTAINER-GLOBAL —
+# a device with 2+ BGP neighbors bound BOTH to the same name.
+# When neighbor A's `cleanup_bgp_route_advertisement` fired
+# (route-pool detach, config change, etc.), the unconditional
+# `no ip prefix-list PL-EXPORT` + `no route-map RM-EXPORT` wiped
+# the objects that neighbor B was STILL bound to → B's outbound
+# announcements collapsed until B was re-applied. Fix: derive
+# per-neighbor names from a slug of neighbor_ip; each cleanup
+# only touches its own objects.
+#
+# Slug rules: replace `.` and `:` with `_`, keep alphanumerics;
+# FRR object names are safe up to ~80 chars, well under any
+# reasonable IPv6 slug length (~40 chars max).
+def _bgp_neighbor_slug(neighbor_ip):
+    """Slug an IPv4/IPv6 address into an FRR-safe suffix."""
+    _clean = "".join(c if c.isalnum() else "_"
+                     for c in (neighbor_ip or "").strip())
+    # Avoid all-empty / all-underscore edge cases.
+    return _clean or "default"
+
+
+def _bgp_pl_rm_names(neighbor_ip):
+    """Return the per-neighbor prefix-list + route-map name set."""
+    _slug = _bgp_neighbor_slug(neighbor_ip)
+    return {
+        "pl_export": f"PL-EXPORT-{_slug}",
+        "pl_export_v6": f"PL-EXPORT-{_slug}",  # ipv6 prefix-list scope is separate from ip prefix-list; same slug OK
+        "pl_import": f"PL-IMPORT-{_slug}",
+        "pl_import_v6": f"PL-IMPORT-{_slug}",
+        "rm_export": f"RM-EXPORT-{_slug}",
+        "rm_export_v6": f"RM-EXPORT-IPV6-{_slug}",
+        "rm_import": f"RM-IMPORT-{_slug}",
+        "rm_import_v6": f"RM-IMPORT-IPV6-{_slug}",
+    }
+
+
+# v0.5.384 (audit BGP-Z2): per-device serialisation lock for the
+# BGP configure/cleanup daemon threads. Pre-fix,
+# `configure_bgp`'s `route_pools_per_neighbor.items()` loop
+# spawned one daemon thread PER neighbor. All threads targeted
+# the SAME container's FRR state — two concurrent
+# `_cleanup_then_configure` calls could:
+#   1. Both remove prefix-lists then interleave rebuilds → one
+#      neighbor's rebuild lands mid-way through the other's
+#      cleanup → stale/partial state.
+#   2. Race `redistribute static` toggles in the same
+#      address-family stanza → the second `vtysh` transaction
+#      overwrites the first's structure before vtysh has
+#      committed → apply returns 200 but FRR carries a mix.
+# The v0.5.383 X1 fix added a per-device start lock inside
+# FRRDockerManager, but that only guards container start —
+# post-start config runs remained unserialised. Fix: acquire
+# a per-device lock around EACH thread body, so the neighbor
+# configure/cleanup chain for one device serialises even when
+# multiple threads run.
+import threading as _bgp_lock_th
+_BGP_DEVICE_CONFIG_LOCKS: Dict = {}  # {device_id: threading.Lock}
+_BGP_DEVICE_CONFIG_LOCKS_META = _bgp_lock_th.Lock()
+
+
+def _bgp_device_config_lock(device_id):
+    """Return the per-device BGP config lock, creating on first
+    access. Metalock protects the allocation."""
+    with _BGP_DEVICE_CONFIG_LOCKS_META:
+        _lock = _BGP_DEVICE_CONFIG_LOCKS.get(device_id)
+        if _lock is None:
+            _lock = _bgp_lock_th.Lock()
+            _BGP_DEVICE_CONFIG_LOCKS[device_id] = _lock
+        return _lock
+
+
 def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip, route_pools, all_pools):
     """Configure BGP route advertisement using prefix-lists and route-maps in FRR."""
     try:
@@ -9585,7 +9682,13 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
         if not route_pools:
             logging.info(f"[BGP ROUTE ADV] No route pools attached, skipping route advertisement config")
             return True
-        
+
+        # v0.5.384 (audit BGP-Z1): per-neighbor namespaced PL/RM names
+        # so this configure block + the paired cleanup on this
+        # neighbor don't collide with the objects belonging to any
+        # OTHER neighbor bound to the same container.
+        _rm = _bgp_pl_rm_names(neighbor_ip)
+
         frr_manager = FRRDockerManager()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
@@ -9628,9 +9731,9 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
                 
                 for route in generated_routes:
                     if is_ipv6:
-                        prefix_list_commands.append(f"ipv6 prefix-list PL-EXPORT seq {seq_num} permit {route}")
+                        prefix_list_commands.append(f"ipv6 prefix-list {_rm['pl_export_v6']} seq {seq_num} permit {route}")
                     else:
-                        prefix_list_commands.append(f"ip prefix-list PL-EXPORT seq {seq_num} permit {route}")
+                        prefix_list_commands.append(f"ip prefix-list {_rm['pl_export']} seq {seq_num} permit {route}")
                     seq_num += 5
                         
             except Exception as e:
@@ -9654,8 +9757,8 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
         logging.info(f"[BGP ROUTE ADV] Added {len(prefix_list_commands)} prefix-list commands, total: {len(vtysh_commands)}")
         
         # Add import prefix-list (allow all inbound - adjust as needed)
-        vtysh_commands.append("ip prefix-list PL-IMPORT seq 5 permit 0.0.0.0/0 le 32")
-        vtysh_commands.append("ipv6 prefix-list PL-IMPORT seq 5 permit ::/0 le 128")
+        vtysh_commands.append(f"ip prefix-list {_rm['pl_import']} seq 5 permit 0.0.0.0/0 le 32")
+        vtysh_commands.append(f"ipv6 prefix-list {_rm['pl_import_v6']} seq 5 permit ::/0 le 128")
         
         # Determine if neighbor is IPv6
         is_ipv6_neighbor = ':' in neighbor_ip
@@ -9706,14 +9809,14 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
         # catch-all is dropped; implicit deny handles non-matching
         # routes correctly.
         vtysh_commands.extend([
-            "no route-map RM-EXPORT",
-            "route-map RM-EXPORT permit 10",
-            " match ip address prefix-list PL-EXPORT",
-            "route-map RM-IMPORT permit 10",
-            " match ip address prefix-list PL-IMPORT",
-            "no route-map RM-EXPORT-IPV6",
-            "route-map RM-EXPORT-IPV6 permit 10",
-            " match ipv6 address prefix-list PL-EXPORT",
+            f"no route-map {_rm['rm_export']}",
+            f"route-map {_rm['rm_export']} permit 10",
+            f" match ip address prefix-list {_rm['pl_export']}",
+            f"route-map {_rm['rm_import']} permit 10",
+            f" match ip address prefix-list {_rm['pl_import']}",
+            f"no route-map {_rm['rm_export_v6']}",
+            f"route-map {_rm['rm_export_v6']} permit 10",
+            f" match ipv6 address prefix-list {_rm['pl_export_v6']}",
         ])
         
         # For IPv6 routes, set the next-hop to the device's IPv6 address
@@ -9724,7 +9827,7 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
         if ipv6_pools_check and device_ipv6 and is_ipv6_neighbor:
             vtysh_commands.append(f" set ipv6 next-hop global {device_ipv6}")
             vtysh_commands.append("exit")  # Exit route-map permit 10 block
-            logging.info(f"[BGP ROUTE ADV] Setting IPv6 next-hop to {device_ipv6} for route-map RM-EXPORT-IPV6 permit 10")
+            logging.info(f"[BGP ROUTE ADV] Setting IPv6 next-hop to {device_ipv6} for route-map {_rm['rm_export_v6']} permit 10")
         elif ipv6_pools_check and is_ipv6_neighbor:
             logging.warning(f"[BGP ROUTE ADV] IPv6 pools configured but device IPv6 address not found - next-hop may be incorrect")
             logging.warning(f"[BGP ROUTE ADV] device_ipv6={device_ipv6}, ipv6_pools_check={bool(ipv6_pools_check)}, is_ipv6_neighbor={is_ipv6_neighbor}")
@@ -9738,8 +9841,8 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
         # v0.5.200: removed the RM-EXPORT-IPV6 permit 20 catch-all
         # for the same reason as its IPv4 twin above.
         vtysh_commands.extend([
-            "route-map RM-IMPORT-IPV6 permit 10",
-            " match ipv6 address prefix-list PL-IMPORT",
+            f"route-map {_rm['rm_import_v6']} permit 10",
+            f" match ipv6 address prefix-list {_rm['pl_import_v6']}",
         ])
         
         # v0.5.198: scope static routes to the device's VRF so
@@ -9828,27 +9931,27 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
         if ipv4_pools:
             bgp_commands.append(" address-family ipv4 unicast")
             # Use redistribute static instead of individual network statements
-            bgp_commands.append("  redistribute static route-map RM-EXPORT")
+            bgp_commands.append(f"  redistribute static route-map {_rm['rm_export']}")
             logging.info(f"[BGP ROUTE ADV] Using redistribute static for IPv4 pools")
-            
+
             # Add IPv4 neighbor route-map configurations
             bgp_commands.extend([
-                f"  neighbor {neighbor_ip} route-map RM-EXPORT out",
-                f"  neighbor {neighbor_ip} route-map RM-IMPORT in",
+                f"  neighbor {neighbor_ip} route-map {_rm['rm_export']} out",
+                f"  neighbor {neighbor_ip} route-map {_rm['rm_import']} in",
             ])
             bgp_commands.append(" exit-address-family")
-        
+
         # Configure IPv6 address family if we have IPv6 pools
         if ipv6_pools:
             bgp_commands.append(" address-family ipv6 unicast")
             # Use redistribute static instead of individual network statements
-            bgp_commands.append("  redistribute static route-map RM-EXPORT-IPV6")
+            bgp_commands.append(f"  redistribute static route-map {_rm['rm_export_v6']}")
             logging.info(f"[BGP ROUTE ADV] Using redistribute static for IPv6 pools")
-            
+
             # Add IPv6 neighbor route-map configurations
             bgp_commands.extend([
-                f"  neighbor {neighbor_ip} route-map RM-EXPORT-IPV6 out",
-                f"  neighbor {neighbor_ip} route-map RM-IMPORT-IPV6 in",
+                f"  neighbor {neighbor_ip} route-map {_rm['rm_export_v6']} out",
+                f"  neighbor {neighbor_ip} route-map {_rm['rm_import_v6']} in",
             ])
             bgp_commands.append(" exit-address-family")
         
@@ -10238,9 +10341,16 @@ def cleanup_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip
     """Clean up BGP route advertisement by removing static routes, prefix-lists, and route-maps."""
     try:
         from utils.frr_docker import FRRDockerManager
-        
+
         logging.info(f"[BGP ROUTE CLEANUP] Starting cleanup for device {device_name}, neighbor {neighbor_ip}, AF={af_type}")
-        
+
+        # v0.5.384 (audit BGP-Z1): resolve per-neighbor PL/RM names
+        # so this cleanup ONLY removes objects owned by this
+        # neighbor. Pre-fix, the shared PL-EXPORT / RM-EXPORT
+        # names meant a cleanup on neighbor A wiped state that
+        # neighbor B was still bound to.
+        _rm = _bgp_pl_rm_names(neighbor_ip)
+
         frr_manager = FRRDockerManager()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
@@ -10330,36 +10440,36 @@ def cleanup_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip
         # an orphan tail. Wildcard-drop the whole prefix-list in
         # one shot; configure will re-create just what's needed.
         if not is_ipv6_only:
-            cleanup_commands.append("no ip prefix-list PL-EXPORT")
+            cleanup_commands.append(f"no ip prefix-list {_rm['pl_export']}")
 
         if not is_ipv4_only:
-            cleanup_commands.append("no ipv6 prefix-list PL-EXPORT")
-        
+            cleanup_commands.append(f"no ipv6 prefix-list {_rm['pl_export_v6']}")
+
         # Remove route-maps based on AF
         if not is_ipv6_only:
-            cleanup_commands.append("no route-map RM-EXPORT permit 10")
-        
+            cleanup_commands.append(f"no route-map {_rm['rm_export']} permit 10")
+
         if not is_ipv4_only:
-            cleanup_commands.append("no route-map RM-EXPORT-IPV6 permit 10")
-        
+            cleanup_commands.append(f"no route-map {_rm['rm_export_v6']} permit 10")
+
         # Remove BGP redistribution and route-map configurations based on AF
         cleanup_commands.append(_bgp_router_clause(bgp_asn, device_id))
-        
+
         if not is_ipv6_only:
             cleanup_commands.extend([
                 " address-family ipv4 unicast",
-                "  no redistribute static route-map RM-EXPORT",
-                f"  no neighbor {neighbor_ip} route-map RM-EXPORT out",
-                f"  no neighbor {neighbor_ip} route-map RM-IMPORT in",
+                f"  no redistribute static route-map {_rm['rm_export']}",
+                f"  no neighbor {neighbor_ip} route-map {_rm['rm_export']} out",
+                f"  no neighbor {neighbor_ip} route-map {_rm['rm_import']} in",
                 " exit-address-family"
             ])
-        
+
         if not is_ipv4_only:
             cleanup_commands.extend([
-                " address-family ipv6 unicast", 
-                "  no redistribute static route-map RM-EXPORT-IPV6",
-                f"  no neighbor {neighbor_ip} route-map RM-EXPORT-IPV6 out",
-                f"  no neighbor {neighbor_ip} route-map RM-IMPORT-IPV6 in",
+                " address-family ipv6 unicast",
+                f"  no redistribute static route-map {_rm['rm_export_v6']}",
+                f"  no neighbor {neighbor_ip} route-map {_rm['rm_export_v6']} out",
+                f"  no neighbor {neighbor_ip} route-map {_rm['rm_import_v6']} in",
                 " exit-address-family"
             ])
         
@@ -11587,10 +11697,12 @@ def configure_bgp():
 
             if not attached_pools:
                 logging.info(f"[BGP ROUTE DEBUG] No attached pools - cleaning up existing route advertisement for neighbor {current_neighbor_ip}")
+                # v0.5.384 (audit BGP-Z2): serialise per-device.
                 def _cleanup_routes(neighbor_ip=current_neighbor_ip):
-                    cleanup_bgp_route_advertisement(
-                        device_id, device_name, bgp_asn, neighbor_ip
-                    )
+                    with _bgp_device_config_lock(device_id):
+                        cleanup_bgp_route_advertisement(
+                            device_id, device_name, bgp_asn, neighbor_ip
+                        )
                 import threading
                 threading.Thread(target=_cleanup_routes, daemon=True).start()
                 continue
@@ -11628,47 +11740,53 @@ def configure_bgp():
                 # all_pools_db so stale routes from any prior pool
                 # get wiped, not just the currently-attached set.
                 # Operator report on san-hp-srv06 2026-08-23.
+                # v0.5.384 (audit BGP-Z2): serialise per-device.
                 def _cleanup_then_configure(neighbor_ip=current_neighbor_ip, pools=known_pools):
-                    try:
-                        cleanup_bgp_route_advertisement(
-                            device_id, device_name, bgp_asn, neighbor_ip
+                    with _bgp_device_config_lock(device_id):
+                        try:
+                            cleanup_bgp_route_advertisement(
+                                device_id, device_name, bgp_asn, neighbor_ip
+                            )
+                        except Exception as _clean_exc:
+                            logging.warning(
+                                f"[BGP CONFIGURE] Pre-configure cleanup for "
+                                f"neighbor {neighbor_ip} failed (continuing): {_clean_exc}"
+                            )
+                        configure_bgp_route_advertisement(
+                            device_id, device_name, bgp_asn, neighbor_ip,
+                            pools, all_pools
                         )
-                    except Exception as _clean_exc:
-                        logging.warning(
-                            f"[BGP CONFIGURE] Pre-configure cleanup for "
-                            f"neighbor {neighbor_ip} failed (continuing): {_clean_exc}"
-                        )
-                    configure_bgp_route_advertisement(
-                        device_id, device_name, bgp_asn, neighbor_ip,
-                        pools, all_pools
-                    )
                 import threading
                 threading.Thread(target=_cleanup_then_configure, daemon=True).start()
             else:
                 # Every attached pool was unknown — clean up any stale advertisement
                 logging.info(f"[BGP CONFIGURE] All attached pools were unknown for neighbor {current_neighbor_ip} - cleaning up any stale advertisement")
+                # v0.5.384 (audit BGP-Z2): serialise per-device.
                 def _cleanup_routes(neighbor_ip=current_neighbor_ip):
-                    cleanup_bgp_route_advertisement(
-                        device_id, device_name, bgp_asn, neighbor_ip
-                    )
+                    with _bgp_device_config_lock(device_id):
+                        cleanup_bgp_route_advertisement(
+                            device_id, device_name, bgp_asn, neighbor_ip
+                        )
                 import threading
                 threading.Thread(target=_cleanup_routes, daemon=True).start()
-        
+
         # Also handle cleanup for neighbors that are configured but have no route pools
         configured_neighbors = []
         if bgp_config.get("bgp_neighbor_ipv4", "").strip():
             configured_neighbors.append(bgp_config.get("bgp_neighbor_ipv4", "").strip())
         if bgp_config.get("bgp_neighbor_ipv6", "").strip():
             configured_neighbors.append(bgp_config.get("bgp_neighbor_ipv6", "").strip())
-        
+
         for configured_neighbor in configured_neighbors:
             if configured_neighbor not in route_pools_per_neighbor:
                 logging.info(f"[BGP ROUTE DEBUG] No route pools attached to configured neighbor {configured_neighbor} - cleaning up existing route advertisement")
-                # Run cleanup in background to avoid blocking
+                # Run cleanup in background to avoid blocking.
+                # v0.5.384 (audit BGP-Z2): serialise per-device.
                 def _cleanup_routes(neighbor_ip=configured_neighbor):
-                    cleanup_bgp_route_advertisement(
-                        device_id, device_name, bgp_asn, neighbor_ip
-                    )
+                    with _bgp_device_config_lock(device_id):
+                        cleanup_bgp_route_advertisement(
+                            device_id, device_name, bgp_asn, neighbor_ip
+                        )
                 import threading
                 threading.Thread(target=_cleanup_routes, daemon=True).start()
         
@@ -13957,28 +14075,95 @@ def get_bgp_neighbors():
             try:
                 # Get container and execute BGP summary
                 container = frr_manager.client.containers.get(container_name)
-                
-                # Get IPv4 BGP neighbors
+
+                # v0.5.384 (audit BGP-Z3): the pre-fix version ran
+                # ONLY `show ip bgp summary` in the default VRF,
+                # missing (a) every per-device VRF-scoped session
+                # (the default architecture — v0.5.198/v0.5.211
+                # scope BGP inside `router bgp <asn> vrf <name>`)
+                # and (b) every IPv6 peer. Every VRF-scoped
+                # deployment returned an empty list even when
+                # sessions were Established; the client's "BGP
+                # Neighbors" panel showed empty forever. Now:
+                #   1. Discover the VRF for this device (if any)
+                #      and query `vrf <name>` for both v4 + v6.
+                #   2. Also query the default VRF (legacy single-
+                #      device deployments still hit that path).
+                #   3. Each parsed row is tagged with the VRF it
+                #      came from so the client can distinguish.
+                _scopes = []  # list of (vrf_display, vtysh_scope_suffix)
+                # Default VRF (legacy)
+                _scopes.append(("default", ""))
+                # Per-device VRF (v0.5.198+ architecture)
                 try:
-                    result = container.exec_run("vtysh -c 'show ip bgp summary'")
-                    if result.exit_code == 0:
-                        lines = result.output.decode("utf-8").splitlines()
-                        for line in lines:
-                            parts = line.split()
-                            if len(parts) >= 10 and re.match(r"\d+\.\d+\.\d+\.\d+", parts[0]):
-                                neighbor_info = {
-                                    "device": device_id,
-                                    "neighbor_ip": parts[0],
-                                    "neighbor_type": "IPv4",
-                                    "local_as": "Unknown",
-                                    "remote_as": "Unknown", 
-                                    "state": parts[9] if len(parts) > 9 else "Unknown",
-                                    "routes": "Unknown"
-                                }
-                                all_neighbors.append(neighbor_info)
-                except Exception as e:
-                    logging.warning(f"Failed to get IPv4 BGP summary from {container_name}: {e}")
-                    
+                    _dev_vrf = frr_manager.vrf_name_for_device(device_id) or ""
+                    if _dev_vrf:
+                        _scopes.append((_dev_vrf, f" vrf {_dev_vrf}"))
+                except Exception as _vrf_lookup_exc:
+                    logging.debug(
+                        f"[BGP NEIGHBORS] VRF lookup for {device_id}: "
+                        f"{_vrf_lookup_exc}"
+                    )
+
+                for _vrf_display, _vrf_suffix in _scopes:
+                    # IPv4 summary
+                    try:
+                        _cmd_v4 = f"show ip bgp{_vrf_suffix} summary"
+                        result4 = container.exec_run(
+                            ["vtysh", "-c", _cmd_v4]
+                        )
+                        if result4.exit_code == 0:
+                            for line in result4.output.decode("utf-8", errors="replace").splitlines():
+                                parts = line.split()
+                                if len(parts) >= 10 and re.match(r"\d+\.\d+\.\d+\.\d+", parts[0]):
+                                    all_neighbors.append({
+                                        "device": device_id,
+                                        "neighbor_ip": parts[0],
+                                        "neighbor_type": "IPv4",
+                                        "vrf": _vrf_display,
+                                        "local_as": "Unknown",
+                                        "remote_as": "Unknown",
+                                        "state": parts[9] if len(parts) > 9 else "Unknown",
+                                        "routes": "Unknown",
+                                    })
+                    except Exception as _e4:
+                        logging.debug(
+                            f"[BGP NEIGHBORS] v4 summary "
+                            f"(vrf={_vrf_display}) on {container_name}: {_e4}"
+                        )
+                    # IPv6 summary — same VRF scope. FRR's
+                    # equivalent is `show bgp ipv6 unicast summary`
+                    # (works in both default and VRF scopes).
+                    try:
+                        _cmd_v6 = f"show bgp{_vrf_suffix} ipv6 unicast summary"
+                        result6 = container.exec_run(
+                            ["vtysh", "-c", _cmd_v6]
+                        )
+                        if result6.exit_code == 0:
+                            for line in result6.output.decode("utf-8", errors="replace").splitlines():
+                                parts = line.split()
+                                # v6 neighbor line starts with a
+                                # colon-bearing address; distinguish
+                                # from headers by the state token.
+                                if (len(parts) >= 10
+                                        and ":" in parts[0]
+                                        and not parts[0].lower().startswith("neighbor")):
+                                    all_neighbors.append({
+                                        "device": device_id,
+                                        "neighbor_ip": parts[0],
+                                        "neighbor_type": "IPv6",
+                                        "vrf": _vrf_display,
+                                        "local_as": "Unknown",
+                                        "remote_as": "Unknown",
+                                        "state": parts[9] if len(parts) > 9 else "Unknown",
+                                        "routes": "Unknown",
+                                    })
+                    except Exception as _e6:
+                        logging.debug(
+                            f"[BGP NEIGHBORS] v6 summary "
+                            f"(vrf={_vrf_display}) on {container_name}: {_e6}"
+                        )
+
             except Exception as e:
                 logging.warning(f"Failed to get BGP status from container {container_name}: {e}")
                 continue
