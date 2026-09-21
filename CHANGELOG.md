@@ -2,6 +2,78 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.401] - 2026-09-21
+
+### Fixed — menu_actions.py + dpdk_menu_actions.py: 5-min freeze, boot-breaker, and 3 more sync HTTP holes
+
+Client-side menu handler audit — every fix here removes either a
+multi-second UI freeze or a boot-affecting silent fallback.
+
+**R1: `import_devices_from_file` froze UI up to 5 MINUTES**
+(`traffic_client/menu_actions.py:import_devices_from_file`) — Pre-fix,
+this called `requests.post(f"{server_url}/api/devices/import", ...,
+timeout=300)` synchronously on the Qt event thread. WORST offender
+in the codebase — a slow server could freeze the whole app for FIVE
+MINUTES. Also no confirmation before overwriting/merging device
+state on the server, so an operator who clicked the wrong file
+could silently push arbitrary devices to the wrong TG. Fix:
+(1) confirmation dialog showing batch size + target server;
+(2) route through `_DpdkApiWorker` (the same async worker L1/L5 use
+in the Add Stream dialog); (3) result handler distinguishes network
+vs server-side errors.
+
+**R2: `_reboot_servers_list` froze UI N × 15 s per selected server**
+(`traffic_client/menu_actions.py:_reboot_servers_list` +
+new `_reboot_single_server`) — Pre-fix, the per-server loop did
+`requests.post(reboot_url, timeout=5)` then optional
+`subprocess.run(ssh, timeout=10)` synchronously on the Qt event
+thread. Selecting 4 unreachable servers = ~60 s freeze. Fix:
+extracted per-server body into `_reboot_single_server(server) -> str`,
+dispatched the list to new `_ServerListActionWorker(QThread)` that
+runs the body per-server and emits `finished_all(list)` when done.
+Confirmation + strong warnings still run on UI thread (correct —
+those are modal decisions).
+
+**R3: `_restart_servers_list` froze UI N × 30 s + modal-per-iteration**
+(`traffic_client/menu_actions.py:_restart_servers_list` +
+new `_restart_single_server`) — Pre-fix, `subprocess.run(ssh, ...,
+timeout=30)` on the UI thread per server. Worse: each iteration
+could pop a `QMessageBox.warning` for a bad address INSIDE the
+still-running loop, interleaving modal input with the wedged
+loop. Fix: same shape as R2 — helper + `_ServerListActionWorker`.
+Errors accumulate into the final summary dialog instead of modal-
+per-iteration.
+
+**R4: silent CPU-vendor fallback wrote `intel_iommu` on AMD → boot with IOMMU OFF**
+(`traffic_client/dpdk_menu_actions.py` around IOMMU config flow) —
+Pre-fix, if `/api/dpdk/cpu-vendor` failed for ANY reason (connection
+error, timeout, non-200, JSON parse fail), `cpu_vendor` silently
+defaulted to `"intel"`. Combined with `_perform_configure_iommu`
+writing `intel_iommu=on` to GRUB (:1717), an AMD box whose vendor
+probe hiccuped got the WRONG kernel parameter, the operator would
+confirm "yes, reboot now," and the box would come back with IOMMU
+still OFF (no visible error — just a silently-broken DPDK setup).
+Fix: bail out with a clear "Could not determine CPU vendor — refusing
+to guess" dialog. Also refuse when `/api/dpdk/status` returned
+non-200 for the same reason.
+
+**R5: `_perform_configure_iommu` sync POST froze UI 30 s while GRUB edited**
+(`traffic_client/dpdk_menu_actions.py:_perform_configure_iommu` +
+new `_handle_iommu_result`) — Pre-fix, this fired
+`requests.post(..., timeout=30)` synchronously on the UI thread.
+The endpoint edits GRUB and (if `reboot_after`) schedules a reboot;
+a slow/hung server froze the UI 30 s while the operator had already
+clicked "Yes, reboot." Also broad `except Exception` collapsed
+network vs server-500 into one message. Fix: reuse existing
+`_DpdkApiWorker` (every other DPDK admin path in this file already
+uses it); new `_handle_iommu_result` distinguishes network vs
+server-500 vs server-side operation failure.
+
+Tests: 20 new (`tests/test_v05401_menu_actions.py`), all pass.
+Regressions on v0.5.396–v0.5.400: intact.
+
+---
+
 ## [0.5.400] - 2026-09-21
 
 ### Fixed — statistics_section.py client-side stats poll audit (5 items)

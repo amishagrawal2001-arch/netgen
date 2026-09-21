@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 from PyQt5.QtWidgets import QMessageBox, QInputDialog, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, QAbstractItemView, QLabel
 from PyQt5.QtWidgets import QTableWidgetItem
 import uuid
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 import logging
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,48 @@ def sanitize_for_json(obj):
         return str(obj)
     else:
         return f"<non-serializable: {type(obj).__name__}>"
+
+# v0.5.401 (audit menu R2 + R3): shared per-server-list QThread
+# worker. Both _reboot_servers_list and _restart_servers_list were
+# per-server SYNC loops on the UI thread: reboot did HTTP POST
+# (5 s) + subprocess SSH (10 s) per server, restart did subprocess
+# SSH (30 s) per server. On N unreachable servers the whole app
+# froze for N × 15-30 s. This worker takes a list of servers and
+# a per-server callable (returning a formatted result string) and
+# runs them on a background thread. Results are emitted via
+# `per_server(str)` after each iteration so callers can render a
+# live progress list, and `finished_all(list[str])` when done.
+# The callable itself is what still does the HTTP / SSH — it
+# runs in the worker's thread, so it CAN'T touch Qt widgets;
+# return a plain string and the UI-thread slot renders it.
+class _ServerListActionWorker(QThread):
+    per_server = pyqtSignal(str)
+    finished_all = pyqtSignal(list)
+
+    def __init__(self, servers, action_fn, parent=None):
+        super().__init__(parent)
+        self._servers = list(servers)
+        self._action_fn = action_fn
+
+    def run(self):
+        _results = []
+        for _s in self._servers:
+            try:
+                _line = self._action_fn(_s)
+            except Exception as _exc:
+                _line = (
+                    f"❌ {_s.get('address', '?')}: worker exception — {_exc}"
+                )
+            _results.append(_line)
+            try:
+                self.per_server.emit(_line)
+            except Exception:
+                pass
+        try:
+            self.finished_all.emit(_results)
+        except Exception:
+            pass
+
 
 class TrafficGenClientMenuAction():
     def _keepalive_worker(self, worker):
@@ -903,9 +945,21 @@ class TrafficGenClientMenuAction():
     def import_devices_from_file(self):
         """File → Import Devices: read a JSON file produced by Export
         and apply each entry via /api/devices/import on the selected
-        server. Shows a summary of imported/failed."""
+        server. Shows a summary of imported/failed.
+
+        v0.5.401 (audit menu R1): pre-fix, this called
+        `requests.post(..., timeout=300)` synchronously on the Qt
+        event thread. `timeout=300` means a slow server could freeze
+        the WHOLE UI for FIVE MINUTES — worst offender in the
+        codebase. And there was no confirmation before overwriting/
+        merging device state on the server: an operator who clicked
+        the wrong file could push arbitrary devices to the wrong TG.
+        Fix: (1) confirm the batch size + target server; (2) route
+        through _DpdkApiWorker (already the standard async pattern);
+        (3) result handler distinguishes network vs server errors.
+        """
         from PyQt5.QtWidgets import QFileDialog
-        import requests, json as _json
+        import json as _json
         server_url = None
         if hasattr(self, "server_manager") and self.server_manager:
             try:
@@ -923,27 +977,76 @@ class TrafficGenClientMenuAction():
         try:
             with open(path, "r") as f:
                 payload = _json.load(f)
-            if not isinstance(payload, dict) or "devices" not in payload:
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", f"Could not read {path}: {exc}")
+            return
+        if not isinstance(payload, dict) or "devices" not in payload:
+            QMessageBox.critical(
+                self, "Bad File",
+                "Expected a JSON object with a 'devices' array — "
+                "see /api/devices/export for the format.",
+            )
+            return
+
+        # v0.5.401 R1: batch-size + target confirmation. Prevents
+        # the "wrong file → surprise devices on wrong TG" foot-gun.
+        _devices = payload.get("devices") or []
+        _n = len(_devices) if isinstance(_devices, list) else 0
+        reply = QMessageBox.question(
+            self, "Confirm device import",
+            f"About to POST {_n} device(s) from:\n\n  {path}\n\n"
+            f"to server:\n\n  {server_url}\n\n"
+            f"Existing devices with matching IDs will be updated. "
+            f"This can take up to 5 minutes for large batches.\n\n"
+            f"Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Fire the POST asynchronously via the shared _DpdkApiWorker
+        # (same pattern L1/L5 use in the Add Stream dialog). Pin via
+        # _keepalive_worker to dodge the PyQt5 5.15 GC race.
+        try:
+            from traffic_client.dpdk_menu_actions import _DpdkApiWorker
+        except Exception as _imp_exc:
+            QMessageBox.critical(
+                self, "Import Error",
+                f"Internal error: could not load async worker "
+                f"({_imp_exc}). Please report this."
+            )
+            return
+
+        _url = f"{server_url}/api/devices/import"
+        _worker = _DpdkApiWorker("POST", _url, json=payload, timeout=300)
+        if hasattr(self, "_keepalive_worker"):
+            self._keepalive_worker(_worker)
+
+        def _on_import_done(data, err):
+            if err:
                 QMessageBox.critical(
-                    self, "Bad File",
-                    "Expected a JSON object with a 'devices' array — "
-                    "see /api/devices/export for the format.",
+                    self, "Import failed (network)",
+                    f"Could not reach {server_url}:\n\n{err}\n\n"
+                    f"No devices were imported."
                 )
                 return
-            r = requests.post(
-                f"{server_url}/api/devices/import", json=payload,
-                timeout=300,  # batches can take a while
-            )
-            if r.status_code != 200:
+            _status = 0
+            if isinstance(data, dict):
+                try:
+                    _status = int(data.get("_status_code", 0))
+                except (TypeError, ValueError):
+                    _status = 0
+            if _status < 200 or _status >= 300:
+                _body = str(data.get("_full_text") or "")[:400] if isinstance(data, dict) else ""
                 QMessageBox.critical(
                     self, "Import Failed",
-                    f"Server returned HTTP {r.status_code}:\n{r.text[:300]}",
+                    f"Server returned HTTP {_status}:\n{_body or '(empty body)'}"
                 )
                 return
-            result = r.json()
-            imported = result.get("imported", 0)
-            failed = result.get("failed", 0)
-            errors = result.get("errors", []) or []
+            imported = data.get("imported", 0) if isinstance(data, dict) else 0
+            failed = data.get("failed", 0) if isinstance(data, dict) else 0
+            errors = (data.get("errors") if isinstance(data, dict) else []) or []
             msg = f"Imported {imported} device(s). Failed: {failed}."
             if errors:
                 msg += "\n\nFirst errors:\n• " + "\n• ".join(errors[:5])
@@ -951,9 +1054,13 @@ class TrafficGenClientMenuAction():
             box(self, "Import Complete", msg)
             # Refresh the device tree so the new rows show up.
             if hasattr(self, "update_server_tree"):
-                self.update_server_tree()
-        except Exception as exc:
-            QMessageBox.critical(self, "Import Error", str(exc))
+                try:
+                    self.update_server_tree()
+                except Exception as _tree_exc:
+                    logger.debug(f"[IMPORT] server tree refresh skipped: {_tree_exc}")
+
+        _worker.done.connect(_on_import_done)
+        _worker.start()
 
     def save_session(self, blocking: bool = False, manual: bool = False):
         """Save the current session to a JSON file.
@@ -3130,10 +3237,21 @@ class TrafficGenClientMenuAction():
         self._restart_servers_list(servers_to_restart)
 
     def _restart_servers_list(self, servers):
-        """Restart a list of servers via SSH/systemctl."""
+        """Restart a list of servers via SSH/systemctl.
+
+        v0.5.401 (audit menu R3): pre-fix, the per-server loop did
+        `subprocess.run(..., timeout=30)` synchronously on the Qt
+        event thread. N × 30 s UI freeze on unreachable servers.
+        Worse: each parse-error iteration popped a modal
+        QMessageBox.warning INSIDE the still-running loop,
+        interleaving user input with a wedged loop. Dispatch to
+        _ServerListActionWorker (same shape R2 uses); return
+        result strings from the helper; collect + show summary on
+        the UI thread.
+        """
         if not servers:
             return
-        
+
         # Confirm restart
         server_names = [f"TG {s.get('tg_id', '?')}: {s.get('address', 'Unknown')}" for s in servers]
         reply = QMessageBox.question(
@@ -3143,82 +3261,81 @@ class TrafficGenClientMenuAction():
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
-        
+
         if reply != QMessageBox.Yes:
             return
-        
-        # Restart each server
-        results = []
-        for server in servers:
-            address = server.get("address", "")
-            tg_id = server.get("tg_id", "?")
-            
-            # Extract hostname from URL (e.g., "http://svl-hp-ai-srv04:5051" -> "svl-hp-ai-srv04")
-            try:
-                parsed = urlparse(address)
-                hostname = parsed.hostname
-                if not hostname:
-                    # Fallback: try to extract from address string
-                    if "://" in address:
-                        hostname = address.split("://")[1].split(":")[0]
-                    else:
-                        hostname = address.split(":")[0]
-            except Exception as e:
-                QMessageBox.warning(self, "Invalid Server Address", f"Could not parse server address '{address}': {e}")
-                continue
-            
-            if not hostname:
-                QMessageBox.warning(self, "Invalid Server Address", f"Could not extract hostname from '{address}'")
-                continue
-            
-            # Restart via SSH. Try the canonical netgen-server unit first;
-            # fall back to the legacy ostg-server name for hosts that haven't
-            # been migrated yet (kept for at least one release of overlap).
-            try:
-                # Server-side: prefer netgen-server, fall back to ostg-server
-                # if that unit isn't installed. Single SSH round-trip.
-                remote = (
-                    "if systemctl list-unit-files netgen-server.service "
-                    "| grep -q netgen-server; then "
-                    "  systemctl restart netgen-server; "
-                    "elif systemctl list-unit-files ostg-server.service "
-                    "| grep -q ostg-server; then "
-                    "  systemctl restart ostg-server; "
-                    "else "
-                    "  echo 'Neither netgen-server nor ostg-server unit found' >&2; exit 1; "
-                    "fi"
-                )
-                cmd = ["ssh", f"root@{hostname}", remote]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
-                if result.returncode == 0:
-                    results.append(f"✅ TG {tg_id} ({hostname}): Restarted successfully")
-                    logger.info(f"[RESTART SERVER] Successfully restarted server TG {tg_id} on {hostname}")
+        # v0.5.401 R3: dispatch to background QThread.
+        _worker = _ServerListActionWorker(servers, self._restart_single_server)
+        self._keepalive_worker(_worker)
+
+        def _on_all_done(results):
+            result_text = "\n".join(results) if results else "(no results)"
+            QMessageBox.information(
+                self,
+                "TGEN Restart Results",
+                f"TGEN service restart results:\n\n{result_text}\n\nNote: Services may take a few seconds to come back online."
+            )
+            # Refresh server status after a delay
+            if hasattr(self, "update_server_tree"):
+                QTimer.singleShot(3000, self.update_server_tree)
+
+        _worker.finished_all.connect(_on_all_done)
+        _worker.start()
+
+    def _restart_single_server(self, server):
+        """v0.5.401 R3 helper: restart TGEN on ONE server via SSH.
+        Runs on the worker thread — return a formatted result
+        string, no Qt widget access.
+        """
+        address = server.get("address", "")
+        tg_id = server.get("tg_id", "?")
+
+        try:
+            parsed = urlparse(address)
+            hostname = parsed.hostname
+            if not hostname:
+                if "://" in address:
+                    hostname = address.split("://")[1].split(":")[0]
                 else:
-                    error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                    results.append(f"❌ TG {tg_id} ({hostname}): Failed - {error_msg}")
-                    logger.error(f"[RESTART SERVER] Failed to restart server TG {tg_id} on {hostname}: {error_msg}")
-            except subprocess.TimeoutExpired:
-                results.append(f"⏱️ TG {tg_id} ({hostname}): Timeout (server may be restarting)")
-                logger.info(f"[RESTART SERVER] Timeout restarting server TG {tg_id} on {hostname}")
-            except FileNotFoundError:
-                results.append(f"❌ TG {tg_id} ({hostname}): SSH not found (install OpenSSH client)")
-                logger.info(f"[RESTART SERVER] SSH command not found - OpenSSH client may not be installed")
-            except Exception as e:
-                results.append(f"❌ TG {tg_id} ({hostname}): Error - {str(e)}")
-                logger.info(f"[RESTART SERVER] Error restarting server TG {tg_id} on {hostname}: {e}")
-        
-        # Show results
-        result_text = "\n".join(results)
-        QMessageBox.information(
-            self,
-            "TGEN Restart Results",
-            f"TGEN service restart results:\n\n{result_text}\n\nNote: Services may take a few seconds to come back online."
-        )
-        
-        # Refresh server status after a delay
-        if hasattr(self, "update_server_tree"):
-            QTimer.singleShot(3000, self.update_server_tree)
+                    hostname = address.split(":")[0]
+        except Exception as e:
+            return f"❌ TG {tg_id}: Could not parse server address '{address}': {e}"
+
+        if not hostname:
+            return f"❌ TG {tg_id}: Could not extract hostname from '{address}'"
+
+        try:
+            remote = (
+                "if systemctl list-unit-files netgen-server.service "
+                "| grep -q netgen-server; then "
+                "  systemctl restart netgen-server; "
+                "elif systemctl list-unit-files ostg-server.service "
+                "| grep -q ostg-server; then "
+                "  systemctl restart ostg-server; "
+                "else "
+                "  echo 'Neither netgen-server nor ostg-server unit found' >&2; exit 1; "
+                "fi"
+            )
+            cmd = ["ssh", f"root@{hostname}", remote]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+            if result.returncode == 0:
+                logger.info(f"[RESTART SERVER] Successfully restarted server TG {tg_id} on {hostname}")
+                return f"✅ TG {tg_id} ({hostname}): Restarted successfully"
+            else:
+                error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                logger.error(f"[RESTART SERVER] Failed to restart server TG {tg_id} on {hostname}: {error_msg}")
+                return f"❌ TG {tg_id} ({hostname}): Failed - {error_msg}"
+        except subprocess.TimeoutExpired:
+            logger.info(f"[RESTART SERVER] Timeout restarting server TG {tg_id} on {hostname}")
+            return f"⏱️ TG {tg_id} ({hostname}): Timeout (server may be restarting)"
+        except FileNotFoundError:
+            logger.info(f"[RESTART SERVER] SSH command not found - OpenSSH client may not be installed")
+            return f"❌ TG {tg_id} ({hostname}): SSH not found (install OpenSSH client)"
+        except Exception as e:
+            logger.info(f"[RESTART SERVER] Error restarting server TG {tg_id} on {hostname}: {e}")
+            return f"❌ TG {tg_id} ({hostname}): Error - {str(e)}"
     
     def reboot_server(self):
         """Reboot selected server(s) via SSH/reboot command."""
@@ -3311,18 +3428,31 @@ class TrafficGenClientMenuAction():
         self._reboot_servers_list(servers_to_reboot)
     
     def _reboot_servers_list(self, servers):
-        """Reboot a list of servers via SSH/reboot command."""
+        """Reboot a list of servers via SSH/reboot command.
+
+        v0.5.401 (audit menu R2): pre-fix, the per-server loop
+        below ran SYNCHRONOUSLY on the Qt event thread —
+        `requests.post(..., timeout=5)` at :3453 then optional
+        `subprocess.run(..., timeout=10)` at :3506, meaning the
+        whole UI froze for up to N × 15 s (~60 s for 4 unreachable
+        servers). Refactor: extract the per-server body into
+        _reboot_single_server, dispatch to
+        _ServerListActionWorker (QThread), collect results, then
+        show the summary dialog on the UI thread. Confirmation
+        dialog + strong warnings still run first on the UI thread
+        (correct — those are modal decisions).
+        """
         if not servers:
             return
-        
+
         # Confirm reboot with strong warning
         server_names = [f"TG {s.get('tg_id', '?')}: {s.get('address', 'Unknown')}" for s in servers]
         reply = QMessageBox.warning(
             self,
             "Confirm Physical Server Reboot",
             f"⚠️ WARNING: This will REBOOT the entire physical server(s)!\n\n"
-            f"Are you sure you want to reboot the following physical server(s)?\n\n" + 
-            "\n".join(server_names) + 
+            f"Are you sure you want to reboot the following physical server(s)?\n\n" +
+            "\n".join(server_names) +
             "\n\nThis will:\n"
             "• Stop all running streams\n"
             "• Disconnect all network connections\n"
@@ -3332,174 +3462,143 @@ class TrafficGenClientMenuAction():
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
-        
+
         if reply != QMessageBox.Yes:
             return
-        
-        # Reboot each server
-        results = []
-        for server in servers:
-            address = server.get("address", "")
-            tg_id = server.get("tg_id", "?")
-            
-            # Extract hostname from URL
-            try:
-                parsed = urlparse(address)
-                hostname = parsed.hostname
-                if not hostname:
-                    if "://" in address:
-                        hostname = address.split("://")[1].split(":")[0]
-                    else:
-                        hostname = address.split(":")[0]
-            except Exception as e:
-                QMessageBox.warning(self, "Invalid Server Address", f"Could not parse server address '{address}': {e}")
-                continue
-            
-            if not hostname:
-                QMessageBox.warning(self, "Invalid Server Address", f"Could not extract hostname from '{address}'")
-                continue
-            
-            # v0.5.2: reboot via HTTP POST to /api/system/reboot. The
-            # server runs as root and self-schedules the reboot.
-            # NO SSH credentials needed.
-            #
-            # Pre-v0.5.2 this path was `ssh root@host reboot` which
-            # assumed passwordless root SSH (rarely available) and
-            # treated SSH exit code 255 as SUCCESS — operators saw
-            # "✅ Reboot initiated successfully" with no actual
-            # reboot. Operator-reported pattern; classic silent-
-            # failure trap.
-            #
-            # On v0.5.1+ servers the new endpoint exists; on older
-            # servers we get 404 and fall back to the legacy SSH
-            # path. Operators on mixed-version fleets get the right
-            # behavior without per-host configuration.
-            try:
-                # The server entry may carry a scheme already (e.g.
-                # http://srv01:5050); reconstruct the API URL
-                # robustly even if the address is bare host:port.
-                api_base = address.rstrip("/")
-                if "://" not in api_base:
-                    api_base = f"http://{api_base}"
-                reboot_url = f"{api_base}/api/system/reboot"
-                # 5-second timeout — the endpoint returns quickly
-                # (Popen-and-return, doesn't wait for the actual
-                # reboot to start).
-                r = requests.post(reboot_url, json={"delay_s": 5}, timeout=5)
-                if r.status_code == 200:
-                    body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                    delay = body.get("delay_s", 5)
-                    results.append(
-                        f"✅ TG {tg_id} ({hostname}): Reboot scheduled in {delay}s (HTTP API)"
-                    )
-                    logger.info(
-                        f"[REBOOT SERVER] HTTP API scheduled reboot for "
-                        f"TG {tg_id} on {hostname} in {delay}s"
-                    )
-                    continue
-                elif r.status_code == 404:
-                    # Pre-v0.5.1 server — endpoint doesn't exist.
-                    # Fall through to legacy SSH path.
-                    logger.info(
-                        f"[REBOOT SERVER] /api/system/reboot 404 on "
-                        f"TG {tg_id} — falling back to SSH (legacy server)"
-                    )
-                else:
-                    # Server-side failure; surface to operator instead
-                    # of silently falling back (the SSH path would
-                    # probably ALSO fail).
-                    results.append(
-                        f"❌ TG {tg_id} ({hostname}): HTTP reboot failed "
-                        f"(HTTP {r.status_code} — {r.text[:120]})"
-                    )
-                    logger.error(
-                        f"[REBOOT SERVER] HTTP API returned {r.status_code} "
-                        f"for TG {tg_id}: {r.text[:300]}"
-                    )
-                    continue
-            except requests.exceptions.RequestException as exc:
-                # Network failure — could mean server is already
-                # offline. Try SSH as a fallback only if it might
-                # actually work (the operator may have keys); the
-                # fallback below distinguishes real "Permission
-                # denied" from network errors.
-                logger.info(
-                    f"[REBOOT SERVER] HTTP /api/system/reboot failed for "
-                    f"TG {tg_id} ({exc}); trying SSH fallback"
-                )
 
-            # Legacy SSH path — kept for v0.4.x servers that don't
-            # have /api/system/reboot. v0.5.2 makes the rc=255 check
-            # honest: rc=255 with stderr containing "Permission
-            # denied" / "Connection refused" is FAILURE, not the
-            # expected "SSH disconnected during reboot" success.
-            try:
-                cmd = ["ssh",
-                       "-o", "BatchMode=yes",
-                       "-o", "ConnectTimeout=5",
-                       f"root@{hostname}", "reboot"]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                stderr_lc = (result.stderr or "").lower()
-                # Real-success markers
-                hard_fail_markers = (
-                    "permission denied",
-                    "host key verification failed",
-                    "connection refused",
-                    "no route to host",
-                    "could not resolve hostname",
-                    "operation timed out",
-                )
-                hard_fail = any(m in stderr_lc for m in hard_fail_markers)
-                if result.returncode == 0 and not hard_fail:
-                    results.append(
-                        f"✅ TG {tg_id} ({hostname}): SSH reboot initiated"
-                    )
-                    logger.info(f"[REBOOT SERVER] SSH-init reboot for TG {tg_id}")
-                elif result.returncode == 255 and not hard_fail:
-                    # rc=255 WITHOUT a known-failure marker is the
-                    # genuine "SSH disconnected mid-reboot" case.
-                    results.append(
-                        f"✅ TG {tg_id} ({hostname}): SSH reboot initiated "
-                        f"(SSH disconnected — expected)"
-                    )
-                    logger.info(f"[REBOOT SERVER] SSH-init reboot rc=255 OK")
+        # v0.5.401 R2: dispatch to background QThread.
+        _worker = _ServerListActionWorker(servers, self._reboot_single_server)
+        self._keepalive_worker(_worker)
+
+        def _on_all_done(results):
+            _text = "\n".join(results) if results else "(no results)"
+            QMessageBox.information(
+                self,
+                "Physical Server Reboot Results",
+                _text + "\n\n⚠️ IMPORTANT:\n"
+                "• Physical servers are now rebooting\n"
+                "• This will take 3-5 minutes\n"
+                "• All network connections will be lost\n"
+                "• Wait 3-5 minutes before checking server status\n"
+                "• After reboot, hardware/firmware issues should be resolved\n"
+                "• Interfaces should appear in 'ip link show' after reboot"
+            )
+
+        _worker.finished_all.connect(_on_all_done)
+        _worker.start()
+
+    def _reboot_single_server(self, server):
+        """v0.5.401 R2 helper: reboot ONE server, return a formatted
+        result string. Runs on the _ServerListActionWorker thread —
+        must NOT touch Qt widgets (return a string, caller renders it).
+        Extracted verbatim from the pre-fix per-server loop body.
+        """
+        address = server.get("address", "")
+        tg_id = server.get("tg_id", "?")
+
+        # Extract hostname from URL
+        try:
+            parsed = urlparse(address)
+            hostname = parsed.hostname
+            if not hostname:
+                if "://" in address:
+                    hostname = address.split("://")[1].split(":")[0]
                 else:
-                    err = (result.stderr or result.stdout or "Unknown").strip()
-                    results.append(
-                        f"❌ TG {tg_id} ({hostname}): SSH reboot FAILED — "
-                        f"{err[:200]}\n"
-                        f"   Upgrade the server to v0.5.1+ to use the HTTP "
-                        f"reboot endpoint (no SSH required)."
-                    )
-                    logger.error(
-                        f"[REBOOT SERVER] SSH reboot failed for TG {tg_id}: {err}"
-                    )
-            except subprocess.TimeoutExpired:
-                results.append(
+                    hostname = address.split(":")[0]
+        except Exception as e:
+            return f"❌ TG {tg_id}: Could not parse server address '{address}': {e}"
+
+        if not hostname:
+            return f"❌ TG {tg_id}: Could not extract hostname from '{address}'"
+
+        # v0.5.2: reboot via HTTP POST to /api/system/reboot. The
+        # server runs as root and self-schedules the reboot.
+        # NO SSH credentials needed.
+        try:
+            api_base = address.rstrip("/")
+            if "://" not in api_base:
+                api_base = f"http://{api_base}"
+            reboot_url = f"{api_base}/api/system/reboot"
+            r = requests.post(reboot_url, json={"delay_s": 5}, timeout=5)
+            if r.status_code == 200:
+                body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                delay = body.get("delay_s", 5)
+                logger.info(
+                    f"[REBOOT SERVER] HTTP API scheduled reboot for "
+                    f"TG {tg_id} on {hostname} in {delay}s"
+                )
+                return f"✅ TG {tg_id} ({hostname}): Reboot scheduled in {delay}s (HTTP API)"
+            elif r.status_code == 404:
+                # Pre-v0.5.1 server — endpoint doesn't exist.
+                # Fall through to legacy SSH path.
+                logger.info(
+                    f"[REBOOT SERVER] /api/system/reboot 404 on "
+                    f"TG {tg_id} — falling back to SSH (legacy server)"
+                )
+            else:
+                logger.error(
+                    f"[REBOOT SERVER] HTTP API returned {r.status_code} "
+                    f"for TG {tg_id}: {r.text[:300]}"
+                )
+                return (
+                    f"❌ TG {tg_id} ({hostname}): HTTP reboot failed "
+                    f"(HTTP {r.status_code} — {r.text[:120]})"
+                )
+        except requests.exceptions.RequestException as exc:
+            logger.info(
+                f"[REBOOT SERVER] HTTP /api/system/reboot failed for "
+                f"TG {tg_id} ({exc}); trying SSH fallback"
+            )
+
+        # Legacy SSH path — kept for v0.4.x servers.
+        try:
+            cmd = ["ssh",
+                   "-o", "BatchMode=yes",
+                   "-o", "ConnectTimeout=5",
+                   f"root@{hostname}", "reboot"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            stderr_lc = (result.stderr or "").lower()
+            hard_fail_markers = (
+                "permission denied",
+                "host key verification failed",
+                "connection refused",
+                "no route to host",
+                "could not resolve hostname",
+                "operation timed out",
+            )
+            hard_fail = any(m in stderr_lc for m in hard_fail_markers)
+            if result.returncode == 0 and not hard_fail:
+                logger.info(f"[REBOOT SERVER] SSH-init reboot for TG {tg_id}")
+                return f"✅ TG {tg_id} ({hostname}): SSH reboot initiated"
+            elif result.returncode == 255 and not hard_fail:
+                logger.info(f"[REBOOT SERVER] SSH-init reboot rc=255 OK")
+                return (
                     f"✅ TG {tg_id} ({hostname}): SSH reboot initiated "
-                    f"(SSH timed out — expected)"
+                    f"(SSH disconnected — expected)"
                 )
-                logger.info(f"[REBOOT SERVER] SSH timeout for TG {tg_id} — expected")
-            except FileNotFoundError:
-                results.append(
-                    f"❌ TG {tg_id} ({hostname}): SSH not found AND HTTP "
-                    f"endpoint unreachable. Upgrade the server to v0.5.1+ "
-                    f"OR install OpenSSH client locally."
+            else:
+                err = (result.stderr or result.stdout or "Unknown").strip()
+                logger.error(
+                    f"[REBOOT SERVER] SSH reboot failed for TG {tg_id}: {err}"
                 )
-            except Exception as e:
-                results.append(f"❌ TG {tg_id} ({hostname}): Error - {str(e)}")
-                logger.info(f"[REBOOT SERVER] Error rebooting TG {tg_id}: {e}")
-        
-        # Show results
-        result_text = "\n".join(results)
-        QMessageBox.information(
-            self,
-            "Physical Server Reboot Results",
-            result_text + "\n\n⚠️ IMPORTANT:\n"
-            "• Physical servers are now rebooting\n"
-            "• This will take 3-5 minutes\n"
-            "• All network connections will be lost\n"
-            "• Wait 3-5 minutes before checking server status\n"
-            "• After reboot, hardware/firmware issues should be resolved\n"
-            "• Interfaces should appear in 'ip link show' after reboot"
-        )
+                return (
+                    f"❌ TG {tg_id} ({hostname}): SSH reboot FAILED — "
+                    f"{err[:200]}\n"
+                    f"   Upgrade the server to v0.5.1+ to use the HTTP "
+                    f"reboot endpoint (no SSH required)."
+                )
+        except subprocess.TimeoutExpired:
+            logger.info(f"[REBOOT SERVER] SSH timeout for TG {tg_id} — expected")
+            return (
+                f"✅ TG {tg_id} ({hostname}): SSH reboot initiated "
+                f"(SSH timed out — expected)"
+            )
+        except FileNotFoundError:
+            return (
+                f"❌ TG {tg_id} ({hostname}): SSH not found AND HTTP "
+                f"endpoint unreachable. Upgrade the server to v0.5.1+ "
+                f"OR install OpenSSH client locally."
+            )
+        except Exception as e:
+            logger.info(f"[REBOOT SERVER] Error rebooting TG {tg_id}: {e}")
+            return f"❌ TG {tg_id} ({hostname}): Error - {str(e)}"

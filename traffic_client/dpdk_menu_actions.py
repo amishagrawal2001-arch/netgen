@@ -1286,19 +1286,59 @@ class TrafficGenClientDPDKMenuActions():
                 current_iommu_enabled = status_data.get('iommu_enabled', False)
                 iommu_details = status_data.get('iommu_details', '')
                 
-                # Detect CPU vendor from server
-                cpu_vendor = "intel"  # default
+                # Detect CPU vendor from server.
+                # v0.5.401 (audit menu R4): pre-fix, this silently
+                # defaulted to "intel" if /api/dpdk/cpu-vendor
+                # failed for ANY reason (connection error, timeout,
+                # non-200, JSON parse fail). Combined with
+                # _perform_configure_iommu writing `intel_iommu=on`
+                # to GRUB (:1717), an AMD box whose vendor probe
+                # hiccuped would get the WRONG kernel parameter,
+                # the operator would confirm "yes, reboot now,"
+                # and the box would come back with IOMMU still
+                # OFF (no visible error — just a silently-broken
+                # DPDK setup). This is a boot-affecting decision;
+                # bail out with a clear error rather than guessing.
+                cpu_vendor = None
                 try:
                     cpu_vendor_response = requests.get(f"{address}/api/dpdk/cpu-vendor", timeout=3)
                     if cpu_vendor_response.status_code == 200:
                         cpu_vendor_data = cpu_vendor_response.json()
-                        cpu_vendor = cpu_vendor_data.get('vendor', 'intel').lower()
-                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                    pass
+                        _v = cpu_vendor_data.get('vendor', '').lower()
+                        if _v in ("intel", "amd"):
+                            cpu_vendor = _v
+                except Exception as _cpu_exc:
+                    logging.warning(
+                        f"[DPDK] CPU-vendor probe failed for {address}: "
+                        f"{_cpu_exc}"
+                    )
+                if cpu_vendor is None:
+                    QMessageBox.warning(
+                        self, "Cannot determine CPU vendor",
+                        f"Could not determine the CPU vendor "
+                        f"(Intel vs AMD) from {address}.\n\n"
+                        f"IOMMU requires a vendor-specific kernel "
+                        f"parameter — writing the wrong one would "
+                        f"leave IOMMU disabled after reboot with no "
+                        f"visible error. Refusing to guess.\n\n"
+                        f"Retry when the server is reachable, or "
+                        f"check the server's /api/dpdk/cpu-vendor "
+                        f"endpoint directly."
+                    )
+                    return
             else:
                 current_iommu_enabled = False
                 iommu_details = "Could not determine current status"
-                cpu_vendor = "intel"
+                # v0.5.401 (audit menu R4): same reasoning — refuse
+                # to guess a vendor when we can't determine it.
+                QMessageBox.warning(
+                    self, "Cannot determine IOMMU status",
+                    f"Server {address} did not return a 200 for "
+                    f"/api/dpdk/status. Cannot safely configure "
+                    f"IOMMU without knowing the current state and "
+                    f"CPU vendor."
+                )
+                return
         except requests.exceptions.ConnectionError:
             QMessageBox.warning(self, "Error", f"Server is unreachable: {address}")
             return
@@ -1688,60 +1728,128 @@ If DPDK still fails:
         return dialog
     
     def _perform_configure_iommu(self, server_address, enable_iommu, cpu_vendor, reboot_after):
-        """Perform IOMMU configuration via API."""
-        try:
-            payload = {
-                "enable": enable_iommu,
-                "cpu_vendor": cpu_vendor,
-                "reboot": reboot_after
-            }
-            
-            # Show confirmation dialog
-            action = "enable" if enable_iommu else "disable"
-            reboot_msg = " and reboot the server" if reboot_after else ""
-            reply = QMessageBox.question(
+        """Perform IOMMU configuration via API.
+
+        v0.5.401 (audit menu R5): pre-fix, this fired
+        `requests.post(..., timeout=30)` synchronously on the UI
+        thread. The endpoint edits GRUB and (if reboot_after)
+        schedules a reboot — a slow/hung server froze the whole
+        UI for 30 s while the operator had already clicked "Yes,
+        reboot." Also `except Exception` collapsed network vs
+        server-500 into one message. Now routed through the
+        existing _DpdkApiWorker (used by every other DPDK admin
+        path in this file), with a progress dialog and a proper
+        result handler that distinguishes network vs server-side
+        errors.
+        """
+        payload = {
+            "enable": enable_iommu,
+            "cpu_vendor": cpu_vendor,
+            "reboot": reboot_after,
+        }
+
+        # Show confirmation dialog (unchanged — same modal, same wording)
+        action = "enable" if enable_iommu else "disable"
+        reboot_msg = " and reboot the server" if reboot_after else ""
+        reply = QMessageBox.question(
+            self,
+            "Confirm IOMMU Configuration",
+            f"This will {action} IOMMU{reboot_msg}.\n\n"
+            f"Server: {server_address}\n"
+            f"CPU Vendor: {cpu_vendor.upper()}\n\n"
+            f"{'WARNING: Server will reboot and all connections will be lost!' if reboot_after else ''}\n\n"
+            f"Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        progress = self._make_dpdk_progress(
+            "Configuring IOMMU",
+            f"Writing GRUB configuration on {server_address}...",
+        )
+        worker = _DpdkApiWorker(
+            "POST",
+            f"{server_address}/api/dpdk/iommu",
+            json=payload,
+            timeout=30,
+        )
+        self._track_dpdk_worker(worker)
+
+        def _cb(data, err):
+            progress.close()
+            self._handle_iommu_result(server_address, enable_iommu, reboot_after, data, err)
+
+        worker.done.connect(_cb)
+        worker.start()
+
+    def _handle_iommu_result(self, server_address, enable_iommu, reboot_after, data, err):
+        """Process the IOMMU configuration API result. v0.5.401 R5
+        companion to _perform_configure_iommu. Distinguishes:
+          * `err` set → network error (no HTTP response ever came back).
+          * data['_status_code'] != 200 → server responded with error.
+          * data['success'] falsy → server responded 200 but the
+            underlying grubby / grub-mkconfig operation failed.
+        Each surfaces a specific message so the operator can
+        diagnose without SSHing.
+        """
+        if err:
+            QMessageBox.critical(
                 self,
-                "Confirm IOMMU Configuration",
-                f"This will {action} IOMMU{reboot_msg}.\n\n"
-                f"Server: {server_address}\n"
-                f"CPU Vendor: {cpu_vendor.upper()}\n\n"
-                f"{'WARNING: Server will reboot and all connections will be lost!' if reboot_after else ''}\n\n"
-                f"Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
+                "IOMMU configure failed (network)",
+                f"Could not reach {server_address} to configure "
+                f"IOMMU: {err}\n\nNo GRUB changes were made. "
+                f"Retry when the server is reachable.",
             )
-            
-            if reply != QMessageBox.Yes:
-                return
-            
-            response = requests.post(f"{server_address}/api/dpdk/iommu", json=payload, timeout=30)
-            
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('success'):
-                    if reboot_after:
-                        QMessageBox.information(
-                            self,
-                            "Success",
-                            f"IOMMU configuration updated successfully.\n\n"
-                            f"Server will reboot in a few seconds.\n\n"
-                            f"After reboot, check DPDK Status to verify IOMMU is enabled."
-                        )
-                    else:
-                        QMessageBox.information(
-                            self,
-                            "Success",
-                            f"IOMMU configuration updated successfully.\n\n"
-                            f"GRUB configuration has been modified.\n\n"
-                            f"Please reboot the server manually to apply changes:\n"
-                            f"ssh root@<server> 'reboot'"
-                        )
-                else:
-                    QMessageBox.warning(self, "Failed", f"Failed to configure IOMMU: {result.get('message', 'Unknown error')}")
-            else:
-                QMessageBox.warning(self, "Error", f"HTTP {response.status_code}: {response.text}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to configure IOMMU: {str(e)}")
+            return
+        _status = 0
+        if isinstance(data, dict):
+            try:
+                _status = int(data.get("_status_code", 0))
+            except (TypeError, ValueError):
+                _status = 0
+        if _status < 200 or _status >= 300:
+            _body = ""
+            if isinstance(data, dict):
+                _body = str(data.get("_full_text") or "")[:400]
+            QMessageBox.warning(
+                self,
+                "IOMMU configure failed (server)",
+                f"Server {server_address} returned HTTP {_status}:\n\n"
+                f"{_body or '(empty body)'}",
+            )
+            return
+        if not (isinstance(data, dict) and data.get("success")):
+            _msg = "Unknown error"
+            if isinstance(data, dict):
+                _msg = str(data.get("message") or _msg)
+            QMessageBox.warning(
+                self,
+                "IOMMU configure failed",
+                f"Server acknowledged the request but reported "
+                f"failure:\n\n{_msg}",
+            )
+            return
+        # Success
+        if reboot_after:
+            QMessageBox.information(
+                self,
+                "Success",
+                f"IOMMU configuration updated successfully.\n\n"
+                f"Server will reboot in a few seconds.\n\n"
+                f"After reboot, check DPDK Status to verify IOMMU is enabled.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Success",
+                f"IOMMU configuration updated successfully.\n\n"
+                f"GRUB configuration has been modified.\n\n"
+                f"Please reboot the server manually to apply changes:\n"
+                f"ssh root@<server> 'reboot'",
+            )
     
     def _perform_bind(self, server_address, interface, force=False):
         """Perform bind operation via API — runs the POST off the GUI thread.
