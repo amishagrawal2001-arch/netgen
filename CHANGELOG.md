@@ -2,6 +2,85 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.379] - 2026-09-20
+
+**Three more admin console cards + full log-tab dedupe.**
+Continues clearing the v0.5.370 audit coverage-gap queue.
+Operators can now inspect running streams, view raw LLDP frames,
+and switch between DPDK / RDMA / Upgrade install logs without
+having each one stomp the other.
+
+### Fixes
+
+- **H1** — Full log DOM dedupe. Adds a 3-tab bar (DPDK / RDMA /
+  Upgrade) above the shared `<pre id="log">`. New per-source
+  `_logBuffers = {dpdk, rdma, upgrade}` state + `_renderActiveLog()`
+  + click handlers on `.log-tab` buttons. Extended
+  `_setLogSource(source)` from v0.5.378 to also flip the active
+  tab + render the corresponding buffer. Existing pollers stay
+  put but each mirrors `log.textContent` into
+  `window._logBuffers[source]` at the end of every poll — so
+  when an operator switches tabs mid-parallel-install, the
+  previous buffer is restored, not lost.
+  Marker: `v0.5.379 (audit admin-log-tab-dedupe)`.
+
+- **H2** — new LLDP Raw card wires `/api/admin/lldp_raw`
+  (v0.5.86). Show button → `<pre>` renders the raw
+  `lldpcli -f json show neighbors` output (pretty-printed when
+  parseable, raw stdout as fallback). Endpoint stays
+  `@require_role("viewer")`. Cap 64 KB (server-side).
+  Marker: `v0.5.379 (audit admin-lldp-raw-card)`.
+
+- **H3** — new Running Streams card wires `/api/streams/stats?
+  status=Running`. Compact table with columns Stream / Interface
+  / Engine / TX rate / TX count / RX count. Auto-loads on first
+  page render (2 s after DOM ready) + Refresh button + stream
+  count in header. Bounded to 200 rows so a runaway stream
+  response can't lock up the browser. `_escapeHtml` helper on
+  every rendered cell so a stream name containing `<script>`
+  can't XSS the console. Fills the biggest gap operators
+  flagged: `/admin` shows systems state but not what traffic is
+  actually running.
+  Marker: `v0.5.379 (audit admin-streams-card)`.
+
+### Tests
+
+`tests/test_v05379_admin_more.py` — 22 tests, all pass:
+
+- AST-parse
+- Markers present (H1 requires ≥4 sites — HTML tabs + JS state
+  + 3 poller mirrors)
+- H1: tab-bar HTML has all 3 `data-source` attrs; `_logBuffers`
+  + `_activeLogSource` state defined; `_renderActiveLog` +
+  `_setLogSource` translate labels to keys; each poller
+  mirrors into `window._logBuffers.<key>`; tab click switches
+  source + re-renders + updates label
+- H2: HTML elements present; handler fetches endpoint + does
+  JSON pretty-print; endpoint still viewer-gated
+- H3: HTML elements present; handler fetches endpoint + renders
+  all 6 columns; `_escapeHtml` helper defined with all 5 char
+  entities; row count bounded to 200
+- Regression: v0.5.378 cache flush + journal + log-source
+  label + v0.5.374 restart button intact
+
+### Verification
+
+- File AST-parses
+- 22/22 v0.5.379 tests pass
+- Operator UI verification pending — expect: `/admin` gains 3
+  new cards (LLDP Raw, Running Streams, and the DPDK/RDMA/Upgrade
+  tab bar over Install Log); switching tabs restores each
+  install's log content
+
+### Deferred to v0.5.380+
+
+- FRR container card (docker container health per device)
+- Chassis / Peers cards (BGP/OSPF/ISIS session views in
+  admin console; today operator needs desktop client)
+- Fresh audit findings from the parallel stream-gen + monitors
+  audit spawned in v0.5.379 (queued for scoping when the
+  report lands)
+
 ## [0.5.378] - 2026-09-20
 
 **Admin console feature bundle — three cards for endpoints that

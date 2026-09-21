@@ -24205,6 +24205,44 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       <pre class="log" id="journal-view" style="max-height: 300px;">Click Refresh to load…</pre>
     </div>
 
+    <!-- v0.5.379 (audit admin-lldp-raw-card): wires /api/admin/
+         lldp_raw. Renders raw lldpcli JSON so operators can
+         inspect the actual neighbor frames when the parsed LLDP
+         column in the iface table looks wrong. Useful for
+         diagnosing per-vendor field-name differences. -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">LLDP Raw</h2>
+        <button class="secondary" id="btn-lldp-raw">Show</button>
+      </div>
+      <p style="color: var(--muted); font-size: 12px; margin: 4px 0 8px;">
+        Raw JSON from <code>lldpcli -f json show neighbors</code>.
+        For when the parsed LLDP column looks wrong and you need
+        to see the actual protocol frame. Capped at 64 KB.
+      </p>
+      <pre class="log" id="lldp-raw-view" style="max-height: 240px; font-size: 11px;">Click Show to load…</pre>
+    </div>
+
+    <!-- v0.5.379 (audit admin-streams-card): wires /api/streams/
+         stats. Read-only overview of currently-running streams
+         so the operator can see WHAT traffic is actually
+         active without needing to open the desktop client. -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">Running Streams</h2>
+        <div>
+          <span id="streams-count" style="font-size: 12px; color: var(--muted); margin-right: 12px;">—</span>
+          <button class="secondary" id="btn-refresh-streams">Refresh</button>
+        </div>
+      </div>
+      <p style="color: var(--muted); font-size: 12px; margin: 4px 0 8px;">
+        Read-only view of streams the server considers Running.
+        To start/stop streams, use the desktop client. Auto-
+        refreshes with the health poll.
+      </p>
+      <div id="streams-table-wrap"><div class="iface-empty">Click Refresh to load…</div></div>
+    </div>
+
     <div class="card" style="grid-column: 1 / -1;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
         <h2 style="margin: 0;">Install Log</h2>
@@ -24214,7 +24252,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
                the current buffer. Pre-fix, DPDK / RDMA / Upgrade
                all wrote to the shared <pre id="log"> and stomped
                each other's output — this header at least surfaces
-               which stream the current content belongs to. -->
+               which stream the current content belongs to.
+               v0.5.379 (audit admin-log-tab-dedupe): now also
+               drives a per-source tab bar so the operator can
+               switch between DPDK / RDMA / Upgrade panes and each
+               keeps its own buffer. -->
+          <span id="log-tabs" style="display: inline-block; margin-right: 12px;">
+            <button class="secondary log-tab" data-source="dpdk" style="padding: 2px 8px; font-size: 11px;">DPDK</button>
+            <button class="secondary log-tab" data-source="rdma" style="padding: 2px 8px; font-size: 11px;">RDMA</button>
+            <button class="secondary log-tab" data-source="upgrade" style="padding: 2px 8px; font-size: 11px;">Upgrade</button>
+          </span>
           <span id="log-source" style="font-size: 12px; color: var(--muted); margin-right: 12px;">idle</span>
           <label style="font-size: 12px; color: var(--muted); user-select: none;">
             <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
@@ -24822,6 +24869,12 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           log.scrollTop = log.scrollHeight;
         }
 
+        // v0.5.379 (audit admin-log-tab-dedupe): mirror current
+        // DPDK log DOM state into the per-source buffer so tab
+        // switches restore correctly. Existing chunked-append
+        // + trim logic stays; this just captures the result.
+        if (window._logBuffers) window._logBuffers.dpdk = log.textContent;
+
         // Phase + progress bar
         renderPhase(d.phase, d.elapsed_sec);
 
@@ -25004,6 +25057,9 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           if ($('log-autoscroll').checked && isNearBottom(log)) {
             log.scrollTop = log.scrollHeight;
           }
+          // v0.5.379 (audit admin-log-tab-dedupe): mirror RDMA
+          // log into its buffer so a DPDK-tab-switch restores.
+          if (window._logBuffers) window._logBuffers.rdma = log.textContent;
         }
         if (!d.running) {
           _stopRdmaPoll();
@@ -25223,14 +25279,222 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     // v0.5.378 (audit admin-log-source-header): helper to update
     // the log-source label. Each install handler calls this so
     // the operator knows which install owns the buffer.
+    //
+    // v0.5.379 (audit admin-log-tab-dedupe): extended to drive
+    // a full per-source buffer store. Pre-fix each install
+    // handler wrote directly to `$('log').textContent`, so DPDK
+    // + RDMA + Upgrade running in parallel stomped each other
+    // (the label helped identify which stomp was last, but the
+    // other buffers were lost). Now `_logBuffers` retains each
+    // source's content across writes, and `_setLogText(source,
+    // text)` routes to the right buffer, only updating the
+    // visible `<pre>` when that source is the active tab.
+    // Existing pollers gain a small adapter shim so they don't
+    // need per-site rewrites.
+    const _logBuffers = {dpdk: '', rdma: '', upgrade: ''};
+    // Map of source-key → button element for styling.
+    const _logTabs = {};
+    let _activeLogSource = null;
+
+    function _renderActiveLog() {
+      const _pre = $('log');
+      if (!_pre) return;
+      if (_activeLogSource && _logBuffers.hasOwnProperty(_activeLogSource)) {
+        _pre.textContent = _logBuffers[_activeLogSource]
+          || `(${_activeLogSource} log is empty)`;
+      } else {
+        _pre.textContent = 'No install in progress.';
+      }
+      // Auto-scroll to bottom only if operator hasn't scrolled up.
+      const _asEl = $('log-autoscroll');
+      if (_asEl && _asEl.checked && isNearBottom(_pre)) {
+        _pre.scrollTop = _pre.scrollHeight;
+      }
+    }
+
     function _setLogSource(source) {
+      // Update label chrome.
       const _el = $('log-source');
-      if (!_el) return;
-      _el.textContent = source ? `source: ${source}` : 'idle';
-      _el.style.color = source ? 'var(--accent)' : 'var(--muted)';
-      _el.style.fontWeight = source ? '600' : 'normal';
+      if (_el) {
+        _el.textContent = source ? `source: ${source}` : 'idle';
+        _el.style.color = source ? 'var(--accent)' : 'var(--muted)';
+        _el.style.fontWeight = source ? '600' : 'normal';
+      }
+      // v0.5.379: also flip the active tab + render that buffer.
+      // Translate the human-friendly labels the install-start
+      // handlers pass ("DPDK install", "RDMA install", "Upgrade
+      // wheel") into the short tab keys the buffer store uses.
+      let _key = null;
+      if (source) {
+        const _s = source.toLowerCase();
+        if (_s.indexOf('dpdk') !== -1) _key = 'dpdk';
+        else if (_s.indexOf('rdma') !== -1) _key = 'rdma';
+        else if (_s.indexOf('upgrade') !== -1 || _s.indexOf('wheel') !== -1) _key = 'upgrade';
+      }
+      if (_key) {
+        _activeLogSource = _key;
+        _renderActiveLog();
+        // Highlight the active tab.
+        for (const _k in _logTabs) {
+          const _btn = _logTabs[_k];
+          if (!_btn) continue;
+          if (_k === _key) {
+            _btn.style.background = 'var(--accent)';
+            _btn.style.color = 'white';
+            _btn.style.borderColor = 'var(--accent)';
+          } else {
+            _btn.style.background = '';
+            _btn.style.color = '';
+            _btn.style.borderColor = '';
+          }
+        }
+      }
     }
     window._setLogSource = _setLogSource;
+
+    // v0.5.379 (audit admin-log-tab-dedupe): write into a
+    // named source buffer. Only updates the visible <pre> if
+    // that source is currently active (so operator can watch
+    // one install without another stomping the view).
+    function _setLogText(source, text) {
+      if (!_logBuffers.hasOwnProperty(source)) return;
+      _logBuffers[source] = text;
+      if (_activeLogSource === source) {
+        _renderActiveLog();
+      }
+    }
+    window._setLogText = _setLogText;
+    // v0.5.379: expose the buffer object so existing pollers
+    // that write directly to $('log').textContent can mirror
+    // their state without a full rewrite.
+    window._logBuffers = _logBuffers;
+
+    // Tab click handlers. Wire on DOMContentLoaded so buttons
+    // exist. Clicking a tab shows that source's buffer.
+    document.addEventListener('DOMContentLoaded', () => {
+      const _tabButtons = document.querySelectorAll('.log-tab');
+      _tabButtons.forEach(_btn => {
+        const _key = _btn.getAttribute('data-source');
+        _logTabs[_key] = _btn;
+        _btn.addEventListener('click', () => {
+          _activeLogSource = _key;
+          _renderActiveLog();
+          _setLogSource(_key === 'dpdk' ? 'DPDK install'
+                        : _key === 'rdma' ? 'RDMA install'
+                        : 'Upgrade wheel');
+        });
+      });
+    });
+
+    // v0.5.379 (audit admin-lldp-raw-card): LLDP raw viewer.
+    if ($('btn-lldp-raw')) {
+      $('btn-lldp-raw').addEventListener('click', async () => {
+        $('lldp-raw-view').textContent = 'loading…';
+        try {
+          const r = await fetch('/api/admin/lldp_raw');
+          const d = await r.json();
+          if (!r.ok) {
+            $('lldp-raw-view').textContent = `error: ${d.error || r.status}`;
+            return;
+          }
+          if (d.error) {
+            $('lldp-raw-view').textContent = `error: ${d.error}`;
+            return;
+          }
+          // Pretty-print if the stdout is JSON; else show raw.
+          try {
+            const _parsed = JSON.parse(d.stdout);
+            $('lldp-raw-view').textContent =
+              `[rc=${d.returncode}]\n` +
+              JSON.stringify(_parsed, null, 2);
+          } catch (_je) {
+            $('lldp-raw-view').textContent =
+              `[rc=${d.returncode}]\n` +
+              (d.stdout || '(empty)') +
+              (d.stderr ? '\n\n--- stderr ---\n' + d.stderr : '');
+          }
+        } catch (e) {
+          $('lldp-raw-view').textContent = 'request failed: ' + e;
+        }
+      });
+    }
+
+    // v0.5.379 (audit admin-streams-card): Streams overview.
+    async function _refreshStreams() {
+      const _wrap = $('streams-table-wrap');
+      const _count = $('streams-count');
+      if (!_wrap) return;
+      try {
+        const r = await fetch('/api/streams/stats?status=Running', {cache: 'no-store'});
+        const d = await r.json();
+        if (!r.ok) {
+          _wrap.innerHTML = `<div class="iface-empty">error: ${d.error || r.status}</div>`;
+          return;
+        }
+        const _streams = Array.isArray(d) ? d
+                        : Array.isArray(d.streams) ? d.streams
+                        : [];
+        if (_count) _count.textContent = `${_streams.length} running`;
+        if (_streams.length === 0) {
+          _wrap.innerHTML = '<div class="iface-empty">No running streams.</div>';
+          return;
+        }
+        // Render a compact table.
+        const _rows = _streams.slice(0, 200).map(s => {
+          const _name = s.stream_name || s.name || s.stream_id || '?';
+          const _iface = s.interface || s.port || s.iface || '—';
+          const _engine = s.engine || s.stream_type || (s.dpdk_requested ? 'DPDK' : 'Scapy');
+          const _rate = s.tx_rate != null
+            ? Number(s.tx_rate).toLocaleString(undefined, {maximumFractionDigits: 0}) + ' pps'
+            : '—';
+          const _tx = s.tx_count != null
+            ? Number(s.tx_count).toLocaleString()
+            : '—';
+          const _rx = s.rx_count != null
+            ? Number(s.rx_count).toLocaleString()
+            : '—';
+          return (
+            '<tr>' +
+              '<td>' + _escapeHtml(_name) + '</td>' +
+              '<td>' + _escapeHtml(_iface) + '</td>' +
+              '<td>' + _escapeHtml(_engine) + '</td>' +
+              '<td style="text-align: right;">' + _rate + '</td>' +
+              '<td style="text-align: right;">' + _tx + '</td>' +
+              '<td style="text-align: right;">' + _rx + '</td>' +
+            '</tr>'
+          );
+        }).join('');
+        _wrap.innerHTML =
+          '<table style="width: 100%; font-size: 12px; border-collapse: collapse;">' +
+            '<thead><tr style="border-bottom: 1px solid var(--muted);">' +
+              '<th style="text-align: left;">Stream</th>' +
+              '<th style="text-align: left;">Interface</th>' +
+              '<th style="text-align: left;">Engine</th>' +
+              '<th style="text-align: right;">TX rate</th>' +
+              '<th style="text-align: right;">TX count</th>' +
+              '<th style="text-align: right;">RX count</th>' +
+            '</tr></thead>' +
+            '<tbody>' + _rows + '</tbody>' +
+          '</table>';
+      } catch (e) {
+        _wrap.innerHTML = `<div class="iface-empty">request failed: ${e}</div>`;
+      }
+    }
+    function _escapeHtml(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+    if ($('btn-refresh-streams')) {
+      $('btn-refresh-streams').addEventListener('click', _refreshStreams);
+    }
+    // Kick a first load once the DOM is ready.
+    document.addEventListener('DOMContentLoaded', () => {
+      if ($('streams-table-wrap')) {
+        setTimeout(_refreshStreams, 2000);
+      }
+    });
 
     // v0.5.374 (audit admin-upgrade-wheel-card): Upgrade Wheel
     // handler. Multipart-uploads the selected .whl to
@@ -25253,6 +25517,9 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           if ($('log-autoscroll') && $('log-autoscroll').checked && isNearBottom(log)) {
             log.scrollTop = log.scrollHeight;
           }
+          // v0.5.379 (audit admin-log-tab-dedupe): mirror upgrade
+          // log into its buffer so a DPDK/RDMA-tab-switch restores.
+          if (window._logBuffers) window._logBuffers.upgrade = log.textContent;
         }
         if (d.wheel_name) $('p-upgrade-wheel-name').textContent = d.wheel_name;
         if (d.started_at) $('p-upgrade-started').textContent = d.started_at;
