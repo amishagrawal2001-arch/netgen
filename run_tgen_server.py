@@ -664,6 +664,25 @@ active_streams_lock = Lock()
 STREAMS = {}
 capture_processes = {}
 
+# v0.5.396 (audit streams M2): TOCTOU guard for launch_single_stream.
+# Pre-fix, /api/traffic/start's `stream_tracker.find_stream_by_id`
+# check at :2007 and launch_single_stream's `executor.submit` at
+# :1894 were separated by unlocked code, and stream_tracker's own
+# find/add pair uses two separate lock acquisitions. Two concurrent
+# starts for the same (interface, stream_id) — from a double-click
+# on Start Selected, or from an auto-restart racing a manual start —
+# both saw None from find_stream_by_id, both spawned a tx_worker
+# subprocess, then add_stream collapsed to one tracker row. Result:
+# TWO tx_worker processes on the wire, one tracker entry that only
+# tracks one of them, and /api/traffic/stop kills only the tracked
+# one — the second becomes a permanent orphan doubling the wire
+# rate. This reservation set closes that window: launch_single_stream
+# atomically reserves (interface, stream_id), re-checks the tracker
+# INSIDE the reservation, and releases when the launch is fully
+# committed (or on early exit).
+_launch_reservations = set()
+_launch_reservations_lock = Lock()
+
 # v0.3.1: serialise /api/dpdk/bind + /api/dpdk/unbind. Two concurrent
 # bind requests targeting the same PCI device used to race —
 # dpdk_bind.sh would unbind from the old driver while a parallel
@@ -1170,6 +1189,7 @@ def save_session():
 
 
 @app.route("/api/streams/load", methods=["GET"])
+@require_role("operator")  # v0.5.396 (audit streams M5): mutates global STREAMS
 def load_session():
     import json
     from utils.path_utils import get_ostg_data_directory
@@ -1186,6 +1206,7 @@ def load_session():
         return jsonify({"error": "No session file found.", "file": session_file}), 404
 
 @app.route("/api/streams/stats", methods=["GET"])
+@require_role("viewer")  # v0.5.396 (audit streams M5): reveals per-stream DPDK engine, tx_cores, hw_imissed/ierrors, tx/rx counters
 def stream_stats():
     """Get stream statistics from database (preferred) or stream_tracker (fallback)."""
     try:
@@ -1365,15 +1386,53 @@ def stream_stats():
                 tx_rate = stream.get("tx_rate", 0.0)
                 rx_rate = stream.get("rx_rate", 0.0)
             else:
-                # Stream is already marked as "Stopped" in database, or status is unknown
-                actual_status = db_status
-                # Zero out rates for stopped streams (they shouldn't have active rates)
-                if actual_status == "Stopped":
-                    tx_rate = 0.0
-                    rx_rate = 0.0
-                else:
+                # v0.5.396 (audit streams M3): J1 MIRROR. Pre-fix,
+                # this branch trusted `db_status` unconditionally,
+                # so `db_status="Stopped"` was reported even when
+                # the tracker had the stream OR tx_count was
+                # advancing. That misfires in two known scenarios:
+                #   1. /api/traffic/restart at :1753 reuses a
+                #      stream_id and adds a fresh tracker entry
+                #      via launch_single_stream but never calls
+                #      stream_db.register_stream, so if the
+                #      previous stop wrote status='Stopped' the DB
+                #      stays Stopped forever — client renders a
+                #      live stream red-with-zero-rates (the exact
+                #      J1 complaint in reverse).
+                #   2. Any code path that updates the tracker
+                #      without pushing to DB in the same
+                #      transaction.
+                # Same shape as J1: trust the counters. If DB says
+                # Stopped but the stream is actually running (in
+                # tracker OR tx_count/rx_count advancing), flip
+                # actual_status to Running + log the drift so we
+                # can trace root cause.
+                if db_status != "Running" and (
+                    is_actually_running
+                    or tx_count_now > 0
+                    or rx_count_now > 0
+                ):
+                    logging.warning(
+                        f"[STATS] Stream '{stream.get('stream_name')}' "
+                        f"(id={stream_id}) on {interface} DB says "
+                        f"'{db_status}' but tracker={is_actually_running}, "
+                        f"tx_count={tx_count_now}, rx_count={rx_count_now} "
+                        f"— trusting counters/tracker and reporting "
+                        f"status='Running' (DB drift)"
+                    )
+                    actual_status = "Running"
                     tx_rate = stream.get("tx_rate", 0.0)
                     rx_rate = stream.get("rx_rate", 0.0)
+                else:
+                    # Stream is genuinely stopped OR status is unknown
+                    actual_status = db_status
+                    # Zero out rates for stopped streams
+                    if actual_status == "Stopped":
+                        tx_rate = 0.0
+                        rx_rate = 0.0
+                    else:
+                        tx_rate = stream.get("tx_rate", 0.0)
+                        rx_rate = stream.get("rx_rate", 0.0)
             
             active_streams.append({
                 "stream_id": stream_id,
@@ -1535,6 +1594,7 @@ def stream_stats():
 # user's flow-tracking case (multithreaded_traffic_gen.py:454 ff)
 # take ~1 second instead of ~15 min SSH-poking.
 @app.route("/api/streams/<stream_id>/rx_debug", methods=["GET"])
+@require_role("viewer")  # v0.5.396 (audit streams M5): leaks BPF filters, sniff iface names, sub-iface refcounts
 def stream_rx_debug(stream_id):
     """Return the RX sniffer's internal observability snapshot for a
     running stream. Populated only when flow_tracking_enabled=true on
@@ -1615,6 +1675,7 @@ def stream_rx_debug(stream_id):
 # ─────────────────────────────────────────── v0.5.168 orphan workers
 
 @app.route("/api/streams/orphans", methods=["GET"])
+@require_role("viewer")  # v0.5.396 (audit streams M5): leaks worker PIDs, cmdlines, BDFs, file_prefix (recon surface for reap)
 def api_streams_orphans():
     """Enumerate tx_worker / rx_worker processes not tracked by
     `stream_tracker`. Returned shape:
@@ -1860,6 +1921,67 @@ def launch_single_stream(stream_data, interface):
     stream_id = stream_data.setdefault("stream_id", str(uuid.uuid4()))
     from multithreaded_traffic_gen import _resolve_stream_name
     stream_name = _resolve_stream_name(stream_data, interface, stream_id)
+
+    # v0.5.396 (audit streams M2): reserve the (interface, stream_id)
+    # slot atomically BEFORE any subprocess spawn. Second concurrent
+    # caller sees the reservation, refuses to launch, and returns a
+    # duplicate-hint payload so the calling endpoint can log + skip
+    # cleanly instead of blindly spawning a second tx_worker. Also
+    # re-check stream_tracker inside the reservation — if another
+    # request completed a launch between find_stream_by_id in
+    # /api/traffic/start (at :2007) and our reservation window here,
+    # we still detect it and refuse.
+    _launch_key = (interface, stream_id)
+    with _launch_reservations_lock:
+        if _launch_key in _launch_reservations:
+            logging.warning(
+                f"⚠️ launch_single_stream: concurrent-start for "
+                f"'{stream_name}' on {interface} (sid={stream_id}) — "
+                f"another thread is already spawning this tx_worker; "
+                f"refusing to double-launch"
+            )
+            return {
+                "interface": interface,
+                "stream_id": stream_id,
+                "stream_name": stream_name,
+                "error": "concurrent-start-in-progress",
+            }
+        _launch_reservations.add(_launch_key)
+
+    try:
+        # Re-check tracker inside the reservation. Covers the window
+        # between the caller's own find_stream_by_id and our lock
+        # acquisition above.
+        try:
+            _dup = stream_tracker.find_stream_by_id(interface, stream_id)
+        except Exception:
+            _dup = None
+        if _dup is not None:
+            logging.warning(
+                f"⚠️ launch_single_stream: stream_tracker already has "
+                f"'{stream_name}' on {interface} (sid={stream_id}); "
+                f"refusing to launch a second tx_worker"
+            )
+            return {
+                "interface": interface,
+                "stream_id": stream_id,
+                "stream_name": stream_name,
+                "error": "already-running",
+            }
+        return _launch_single_stream_body(
+            stream_data, interface, stream_id, stream_name,
+            _launch_key,
+        )
+    finally:
+        with _launch_reservations_lock:
+            _launch_reservations.discard(_launch_key)
+
+
+def _launch_single_stream_body(stream_data, interface, stream_id,
+                               stream_name, _launch_key):
+    """v0.5.396 (audit streams M2): body split from
+    launch_single_stream so the outer function can hold the
+    reservation across the whole spawn + tracker-add cycle."""
     stop_event = Event()
 
     # Normalize rx_port - handle "Same as TX Port" and various formats
@@ -2459,38 +2581,39 @@ def stop_traffic():
                     import time
                     time.sleep(0.5)
                 else:
-                    # Last resort: try to find ANY stream on this interface (in case name doesn't match either)
-                    logging.warning(f"❌ Stream ID '{stream_id}' and name '{stream_name}' not found. Checking all streams on interface '{interface_normalized}'")
-                    if matching_interface_streams:
-                        logging.warning(f"⚠️ Found {len(matching_interface_streams)} other stream(s) on this interface. Stopping all to prevent orphaned streams.")
-                        for s in matching_interface_streams:
-                            actual_stream_id = s.get("stream_id")
-                            actual_name = s.get("stream_name")
-                            logging.info(f"Stopping orphaned stream {actual_stream_id} (name: '{actual_name}') on {interface_normalized}")
-                            # Find the stream object to set stop_event
-                            stream_obj = stream_tracker.find_stream_by_id(interface_normalized, actual_stream_id)
-                            if stream_obj:
-                                stream_obj["stop_event"].set()
-                                
-                                # Wait for the thread to actually finish (with timeout)
-                                future = stream_obj.get("future")
-                                if future:
-                                    try:
-                                        future.result(timeout=5.0)
-                                        logging.info(f"✅ Thread completed for orphaned stream {actual_stream_id}")
-                                    except Exception as e:
-                                        logging.warning(f"⚠️ Thread for orphaned stream {actual_stream_id} did not complete within timeout: {e}")
-                                
-                                stream_tracker.remove_stream_by_id(interface_normalized, actual_stream_id)
-                                try:
-                                    stream_db.stop_stream(actual_stream_id)
-                                except Exception:
-                                    pass
-                                stopped.append({"interface": interface_normalized, "stream_id": actual_stream_id})
-                        import time
-                        time.sleep(0.5)
-                    else:
-                        logging.warning(f"❌ Stream ID '{stream_id}' and name '{stream_name}' not found on interface '{interface_normalized}'")
+                    # v0.5.396 (audit streams M4): the pre-fix
+                    # "last resort" branch here iterated
+                    # `matching_interface_streams` and mass-stopped
+                    # every stream on the interface — even ones the
+                    # operator hadn't asked to stop. Combined with
+                    # matching_interface_streams being snapshotted
+                    # BEFORE the entry loop, N miss-entries all
+                    # kicked the same mass-stop N times. An operator
+                    # clicking "Stop stream A" could silently kill
+                    # streams B, C, D on the same interface too. The
+                    # `except: pass` around stream_db.stop_stream
+                    # further swallowed DB errors so the caller saw
+                    # success.
+                    #
+                    # Fix: don't mass-stop. If the specific stream_id
+                    # and name both missed, log a hard warning and
+                    # skip. The operator can always retry with a
+                    # fresh stream_id if they meant to stop something
+                    # else — but we won't guess and kill unrelated
+                    # streams on their behalf. Same "close gap at
+                    # authoritative side" principle as the memory
+                    # note: don't invent authority you don't have.
+                    logging.warning(
+                        f"❌ Stream ID '{stream_id}' and name "
+                        f"'{stream_name}' not found on interface "
+                        f"'{interface_normalized}' — refusing to "
+                        f"mass-stop other streams on this interface. "
+                        f"There are "
+                        f"{len(matching_interface_streams) if matching_interface_streams else 0} "
+                        f"other stream(s) here; if any of them is "
+                        f"orphaned, use /api/streams/orphans/reap "
+                        f"(admin) to target them explicitly."
+                    )
             else:
                 logging.warning(f"❌ Stream ID '{stream_id}' not found on interface '{interface_normalized}' and no stream_name provided for fallback")
 
@@ -13582,7 +13705,18 @@ def frr_status():
 
 
 
-@app.route('/api/streams/register', methods=['POST'])
+# v0.5.396 (audit streams M1): DELETED a dangling
+# `@app.route('/api/streams/register', methods=['POST'])` that
+# lived here with NO function immediately below it. The stack of
+# decorators — dangling one + the BGP route decorator + the role
+# gate — all applied to advertise_bgp_routes(), so a POST to
+# /api/streams/register was hijacked into the BGP route
+# advertisement handler and 400'd on missing device_id. The
+# intended per-port stream registration handler at line ~14398
+# (register_streams) was either shadowed or lost the URL rule
+# depending on Flask's rule-collision behavior. Deleting the
+# dangling decorator restores both routes to their intended
+# handlers.
 # ============================================================================
 # BGP Route Management API Endpoints
 # ============================================================================
@@ -14396,6 +14530,7 @@ def stop_device_frr():
 
 
 @app.route('/api/streams/register', methods=['POST'])
+@require_role("operator")  # v0.5.396 (audit streams M5): mutates global STREAMS[port]
 def register_streams():
     data = request.json
     port = data.get("port")
@@ -14409,6 +14544,7 @@ def register_streams():
 
 
 @app.route('/api/streams/update', methods=['POST'])
+@require_role("operator")  # v0.5.396 (audit streams M5): mutates global STREAMS[port] with attacker-chosen port + stream
 def update_stream():
     data = request.json
     port = data.get("port")

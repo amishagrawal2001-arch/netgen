@@ -2,6 +2,85 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.396] - 2026-09-21
+
+### Fixed — server-side streams endpoints audit (5 items)
+
+**M1: Dangling `@app.route('/api/streams/register')` hijacks BGP route**
+(`run_tgen_server.py:13585` — deleted) — Pre-fix a bare
+`@app.route('/api/streams/register', methods=['POST'])` sat above the
+BGP-endpoint section header comment with NO function immediately
+below. The stack of decorators — the dangling one + the BGP route
+decorator + `@require_role("operator")` — all applied to
+`advertise_bgp_routes()`, so POSTs to `/api/streams/register` were
+hijacked into the BGP route advertisement handler and 400'd on
+missing `device_id`. The intended `register_streams` at line
+~14528 (now 14530 after fix) was either shadowed or lost its URL
+rule depending on Flask's rule-collision handling. Fix: delete the
+dangling decorator. Both routes now resolve to their intended
+handlers.
+
+**M2: `/api/traffic/start` TOCTOU double-launches `tx_worker`**
+(`run_tgen_server.py:1851-1940`) — Pre-fix,
+`stream_tracker.find_stream_by_id` check at :2007 and
+`launch_single_stream`'s `executor.submit` at :1894 were separated
+by unlocked code, and `stream_tracker`'s own find/add pair uses two
+separate lock acquisitions. Two concurrent starts for the same
+`(interface, stream_id)` (from a double-click on Start Selected, or
+from an auto-restart racing a manual start) both saw None from the
+check, both spawned a `tx_worker` subprocess, then `add_stream`
+collapsed to one tracker row. Result: TWO tx_worker processes on
+the wire, one tracker entry, and `/api/traffic/stop` only killed
+the tracked one — the second became a permanent orphan doubling
+the wire rate. Fix: added module-level `_launch_reservations`
+set + `Lock`; `launch_single_stream` atomically reserves
+`(interface, stream_id)`, re-checks the tracker INSIDE the
+reservation, releases in `finally`. Second concurrent caller sees
+the reservation, refuses to launch, and returns a
+`{"error": "concurrent-start-in-progress"}` payload. Body split
+into `_launch_single_stream_body` so the outer function can hold
+the reservation across the whole spawn + tracker-add cycle.
+
+**M3: J1 mirror — DB `Stopped` returned while stream is running**
+(`run_tgen_server.py:1386-1435`) — v0.5.393 J1 fixed the
+`db_status="Running" & !tracker` case but the OPPOSITE — DB says
+`Stopped` while tracker has the stream OR `tx_count/rx_count` are
+advancing — fell into the else branch and returned `Stopped` with
+zeroed rates. Triggered by `/api/traffic/restart` (`:1753`), which
+reuses `stream_id`, adds a fresh tracker entry via
+`launch_single_stream`, but never calls `stream_db.register_stream`
+or any DB write. If the previous stop wrote `status='Stopped'`,
+restart left DB stopped forever and the client rendered the running
+stream red-with-zero-rates — exact J1 complaint in reverse. Fix:
+apply J1's counter-trust to the else branch. If DB isn't
+`Running` but tracker has the stream OR counts are advancing,
+report `Running` and log the drift.
+
+**M4: `/api/traffic/stop` last-resort branch mass-stops unrelated streams**
+(`run_tgen_server.py:2580-2600`) — Pre-fix, when a specific
+`stream_id` AND `stream_name` both missed on the interface, the
+"last resort" branch iterated `matching_interface_streams`
+(snapshotted before the entry loop) and stopped EVERY stream on
+that interface. Combined with N miss-entries all kicking the same
+mass-stop, and the `except: pass` swallowing DB errors so the
+caller saw success — an operator's "Stop stream A" click could
+silently kill streams B, C, D on the same interface. Fix: remove
+the mass-stop. Log a hard warning and skip. If any orphans exist,
+`/api/streams/orphans/reap` (admin-gated) is the right target.
+
+**M5: Role gates on 5 unprotected endpoints**
+(`run_tgen_server.py`) — Added:
+  * `@require_role("operator")` on `/api/streams/load` (:1191, mutates global `STREAMS`).
+  * `@require_role("viewer")` on `/api/streams/stats` (:1207, reveals per-stream DPDK engine, tx_cores, hw_imissed/ierrors, tx/rx counters).
+  * `@require_role("viewer")` on `/api/streams/<stream_id>/rx_debug` (:1596, leaks BPF filters, sniff iface names, sub-iface refcounts).
+  * `@require_role("viewer")` on `/api/streams/orphans` (:1675, leaks worker PIDs, cmdlines, BDFs, `file_prefix` — recon surface for the admin-gated reap).
+  * `@require_role("operator")` on `/api/streams/register` (:14530) and `/api/streams/update` (:14544) — both mutate global `STREAMS[port]` with attacker-chosen `port` + `stream`.
+
+Tests: 20 new (`tests/test_v05396_server_streams_endpoints.py`),
+all pass. Regressions on v0.5.391–v0.5.395: intact.
+
+---
+
 ## [0.5.395] - 2026-09-21
 
 ### Fixed — Add Stream dialog: 5 sync HTTP GETs moved off UI thread
