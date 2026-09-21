@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.391] - 2026-09-21
+
+### Fixed — Streams tab audit HIGHs (5 items)
+
+**G1: Duplicate `AddStreamDialog.accept` — restore cross-layer validation**
+(`widgets/stream_dialog.py:8645-8695, 8850-8925`) — Pre-fix,
+two `def accept(self)` methods on the same class: the first
+at ~:8645 (cross-layer validator) and the second at ~:8795
+(v0.2.96 per-field validator). Python's method resolution
+took the SECOND, silently killing all cross-layer checks:
+Random needs Min<Max, L2=None + L3=IPv4/IPv6/ARP rejection,
+PCAP+L3/L4 warning. Invalid configs saved silently, the
+server rejected them later. Fix: delete the first accept;
+fold its cross-layer validation into the surviving second
+accept so BOTH sets of checks fire on Save.
+
+**G2: Edit-Stream name change was a no-op**
+(`traffic_client/stream_control.py:1440-1530`) — Pre-fix,
+`updated["protocol_selection"]["name"] = stream_name`
+overwrote the dialog's edited name with `stream_name`
+captured from the ORIGINAL table cell at line ~:1268 before
+the dialog opened. Any rename in Edit Stream was SILENTLY
+DISCARDED. Also, the top-level `updated["name"]` was never
+set, so `stream.get("name")` returned `None` for edited
+rows. Fix: prefer `edited["name"]` from the dialog; set BOTH
+top-level `name` AND `protocol_selection.name`; match target
+row by `stream_id` (not old name) so the replacement lookup
+succeeds after rename.
+
+**G3: Add-Stream silent auto-suffix on name collision**
+(`traffic_client/stream_control.py:1232-1272`) — Pre-fix,
+when the operator typed a name that collided with an
+existing stream on the same port (e.g. `bgp-flood` twice),
+the collision was silently rewritten to `Stream_1`,
+`Stream_2`, ... with no feedback — operator thought their
+name stuck. Every subsequent reference (Edit, Delete, stats
+join) went to the ORIGINAL stream. Parity with v0.5.389 E3
+(device-tab name-collision warn). Track whether the
+collision fired; surface a QMessageBox naming the persisted
+name and nudging toward Edit.
+
+**G4: `remove_selected_stream` deleted ALL same-named streams**
+(`traffic_client/stream_control.py:1617-1690`) — Pre-fix,
+the delete predicate filtered `self.streams[port_key]` by
+`.protocol_selection.name == stream_name`. Any TWO streams
+sharing that name on the same port (an import + a fresh Add
+with the same string, or two identical templates) BOTH got
+deleted with one row-click. Fix: delete by `stream_id` (the
+row's UserRole stash is unique); fall back to name-match only
+for legacy rows without a stream_id. Also fixed the sibling
+`_cancel_auto_stop_timer` loop that was cancelling ALL timers
+for same-named siblings.
+
+**G5: `remove_selected_stream` row-shift race during confirm modal**
+(`traffic_client/stream_control.py:1533-1620`) — Pre-fix,
+`selected_rows` was captured BEFORE the confirm QMessageBox.
+The modal spins the event loop; a 500 ms-debounced
+`_do_update_stream_table` or SSE reload during the confirm
+rebuilds the table, invalidating the row indices used in the
+delete loop — Name/Interface cells now belong to DIFFERENT
+streams. Same shape as v0.5.388 D1 (device multi-delete).
+Fix: snapshot `(stream_id, name, port_key, iface_text)`
+tuples up-front BEFORE the confirm modal; act on the
+snapshot afterwards.
+
+### Tests
+
+New: `tests/test_v05391_streams_tab_highs.py`. AST + structural
++ regression coverage.
+
 ## [0.5.390] - 2026-09-21
 
 ### Added — /admin Containers card (selective FRR container + interface cleanup)

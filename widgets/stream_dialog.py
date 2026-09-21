@@ -8640,50 +8640,15 @@ class AddStreamDialog(QDialog):
                 f"Template '{key}' failed to apply: {exc}"
             )
 
-    # ─────────────────────────────── v0.3.11: pre-save validation
-
-    def accept(self):
-        """Override QDialog.accept to run cross-layer validation
-        before the dialog closes. Catches invalid combos that
-        single-field validators (validators on individual QLineEdits)
-        can't see — like 'L2=None + L3=IPv4' which is fine field-by-
-        field but produces a headerless IP frame the server drops.
-
-        On any validation failure: show a QMessageBox describing
-        the problem AND its fix, then keep the dialog open so the
-        operator can correct it without losing all their other
-        edits. Only call super().accept() when everything's clean.
-
-        Skip-on-edit-existing: if stream_data was passed in
-        (operator is editing a previously-saved stream), validation
-        still runs — better to surface long-standing bugs in
-        existing saved streams than to ship them unchanged.
-        """
-        problems = self._validate_cross_layer()
-        if problems:
-            from PyQt5.QtWidgets import QMessageBox
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Warning)
-            box.setWindowTitle("Stream has invalid combinations")
-            box.setText(
-                "The stream you're saving has fields that don't "
-                "form a transmittable packet:"
-            )
-            box.setInformativeText("\n".join(f"• {p}" for p in problems))
-            box.setStandardButtons(
-                QMessageBox.Cancel | QMessageBox.Save
-            )
-            box.setDefaultButton(QMessageBox.Cancel)
-            box.button(QMessageBox.Save).setText("Save Anyway")
-            box.button(QMessageBox.Cancel).setText("Fix First")
-            choice = box.exec_()
-            if choice != QMessageBox.Save:
-                # Operator chose to fix — keep dialog open. Their
-                # other edits are preserved (this is the whole point
-                # of validating in accept() vs at field-edit time).
-                return
-        super().accept()
-
+    # v0.5.391 (audit streams G1): the OLD `def accept` that used
+    # to live here has been DELETED — a second `def accept` at
+    # ~line 8795 (the v0.2.96 per-field validator) was shadowing
+    # it, silently dropping the cross-layer checks below (Random
+    # needs Min<Max, L2=None with L3=IPv4/IPv6/ARP rejection,
+    # PCAP+L3/L4 warning). The cross-layer logic is now folded
+    # INTO the surviving accept so BOTH run on Save. This helper
+    # (`_validate_cross_layer`) is unchanged so future callers +
+    # tests keep working.
     def _validate_cross_layer(self) -> list:
         """Run every cross-layer / multi-field sanity check.
         Returns a list of human-readable problem strings (empty
@@ -8880,6 +8845,41 @@ class AddStreamDialog(QDialog):
                 self, "Stream configuration invalid", "\n".join(lines),
             )
             return  # stay open
+
+        # v0.5.391 (audit streams G1): also run cross-layer
+        # validation before super().accept(). Pre-fix, a SECOND
+        # `def accept` at this same line SHADOWED the first
+        # (defined ~150 lines up), so its cross-layer checks —
+        # Random needs Min<Max, L2=None with L3=IPv4/IPv6/ARP
+        # rejection, PCAP+L3/L4 warning — were dead code and
+        # invalid configs saved silently. The shadow is removed;
+        # cross-layer validation folded in here so BOTH sets of
+        # checks fire on Save.
+        try:
+            _problems = self._validate_cross_layer()
+        except Exception as _cx_exc:
+            # If the helper raises for any reason, fall through
+            # (better to save than to trap the operator).
+            _problems = []
+            import logging as _lg
+            _lg.debug(f"[STREAM DIALOG] cross-layer validate raised: {_cx_exc}")
+        if _problems:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Stream has invalid combinations")
+            box.setText(
+                "The stream you're saving has fields that don't "
+                "form a transmittable packet:"
+            )
+            box.setInformativeText("\n".join(f"• {p}" for p in _problems))
+            box.setStandardButtons(
+                QMessageBox.Cancel | QMessageBox.Save
+            )
+            box.setDefaultButton(QMessageBox.Cancel)
+            box.button(QMessageBox.Save).setText("Save Anyway")
+            box.button(QMessageBox.Cancel).setText("Fix First")
+            if box.exec_() != QMessageBox.Save:
+                return  # stay open
         super().accept()
 
     def populate_stream_fields(self, stream_data=None):

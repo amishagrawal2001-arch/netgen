@@ -1233,8 +1233,25 @@ class TrafficGenClientStreamControl:
             existing_names = [
                 s.get("protocol_selection", {}).get("name", "") for s in self.streams[full_port_name]
             ]
-            stream_name = protocol_section.get("name", "").strip()
-            if not stream_name or stream_name in existing_names:
+            # v0.5.391 (audit streams G3): warn on auto-suffix.
+            # Pre-fix, when the operator typed a name that
+            # collided with an existing stream on the same port
+            # (e.g. `bgp-flood` twice), the collision was silently
+            # rewritten to `Stream_1`, `Stream_2`, ... with no
+            # feedback — operator thought their name stuck and
+            # the row appeared with the wrong label. Every
+            # subsequent reference (Edit, Delete, stats join)
+            # went to the ORIGINAL stream. Parity with v0.5.389
+            # E3 (device tab name-collision warn). Track whether
+            # the collision fired so we can surface a QMessageBox
+            # naming the persisted name.
+            _requested_name = protocol_section.get("name", "").strip()
+            _was_empty = not _requested_name
+            _was_collision = (
+                (not _was_empty) and (_requested_name in existing_names)
+            )
+            stream_name = _requested_name
+            if _was_empty or _was_collision:
                 base = "Stream"
                 idx = 1
                 while f"{base}_{idx}" in existing_names:
@@ -1243,6 +1260,21 @@ class TrafficGenClientStreamControl:
 
             protocol_section["name"] = stream_name
             stream_details["name"] = stream_name
+
+            if _was_collision:
+                try:
+                    QMessageBox.information(
+                        self,
+                        "Stream name changed",
+                        f"A stream named {_requested_name!r} already "
+                        f"exists on {full_port_name}. The new stream "
+                        f"was saved as {stream_name!r} instead.\n\n"
+                        f"If you meant to edit the existing stream, "
+                        f"select it in the Streams table and use Edit "
+                        f"— this new stream is separate."
+                    )
+                except Exception as _warn_exc:
+                    logger.debug(f"[STREAM ADD] G3 warn skipped: {_warn_exc}")
 
             self.streams[full_port_name].append(stream_details)
             self.ensure_unique_stream_ids()
@@ -1440,15 +1472,60 @@ class TrafficGenClientStreamControl:
                 if "flow_tracking_enabled" in edited:
                     updated["protocol_selection"]["flow_tracking_enabled"] = edited["flow_tracking_enabled"]
                 updated["flow_tracking_enabled"] = edited.get("flow_tracking_enabled", False)
-                updated["protocol_selection"]["name"] = stream_name
 
+                # v0.5.391 (audit streams G2): persist the dialog's
+                # NEW name. Pre-fix, this line unconditionally set
+                # `updated["protocol_selection"]["name"] = stream_name`
+                # — but `stream_name` was captured from the ORIGINAL
+                # table cell at line ~1268, before the dialog opened.
+                # Any rename the operator typed in Edit Stream was
+                # SILENTLY DISCARDED here (the loop above at ~:1424
+                # DID put edited["name"] into protocol_selection, but
+                # this line then overwrote it). Also pre-fix, the
+                # top-level `updated["name"]` was never set, so
+                # `stream.get("name")` returned None on subsequent
+                # reads and callers that read the top-level field
+                # (server_section stream_id resolver) misbehaved.
+                # Fix: prefer the dialog's `edited["name"]`, fall
+                # back to the captured cell name only if the dialog
+                # somehow didn't return one; write BOTH the top-level
+                # `name` AND `protocol_selection.name`.
+                _new_name = (
+                    (edited.get("name") if isinstance(edited, dict) else None)
+                    or updated["protocol_selection"].get("name")
+                    or stream_name
+                )
+                updated["name"] = _new_name
+                updated["protocol_selection"]["name"] = _new_name
+
+                # v0.5.391 (audit streams G2): match target row by
+                # stream_id, NOT by name — the rename above would
+                # otherwise break this lookup (the row's name in
+                # `self.streams[tx_port]` still holds the old name
+                # until we replace it here). Fall back to the
+                # original-name match for legacy rows without a
+                # stream_id (which shouldn't exist anymore but the
+                # fallback is cheap).
+                _orig_sid = original.get("stream_id") if original else None
+                _replaced = False
                 for i, s in enumerate(self.streams[tx_port]):
-                    if s.get("protocol_selection", {}).get("name") == stream_name:
+                    if _orig_sid and s.get("stream_id") == _orig_sid:
                         self.streams[tx_port][i] = updated
+                        _replaced = True
                         break
+                if not _replaced:
+                    for i, s in enumerate(self.streams[tx_port]):
+                        if s.get("protocol_selection", {}).get("name") == stream_name:
+                            self.streams[tx_port][i] = updated
+                            break
 
                 self.update_stream_table()
-                logger.info(f"Stream '{stream_name}' updated successfully.")
+                logger.info(
+                    f"Stream renamed {stream_name!r} → {_new_name!r} "
+                    f"(v0.5.391 G2)"
+                    if _new_name != stream_name
+                    else f"Stream '{_new_name}' updated successfully."
+                )
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to edit the stream: {e}")
@@ -1467,12 +1544,57 @@ class TrafficGenClientStreamControl:
         # QMessageBox.question gate that lists the names + count
         # before doing any work. Follows the pattern of
         # devices_tab.py's proper delete-device confirm.
-        _names = []
+        #
+        # v0.5.391 (audit streams G4 + G5): TWO more bugs on this
+        # path:
+        #   G4  The delete predicate at ~:1617 filtered
+        #       `self.streams[port_key]` by `.protocol_selection.
+        #       name == stream_name`. Any TWO streams sharing that
+        #       name on the same port (an operator import + a
+        #       fresh Add with the same string, or two identical
+        #       templates) BOTH got deleted with one row-click.
+        #       Fix: delete by stream_id (the row's UserRole stash
+        #       is authoritative and unique).
+        #   G5  `selected_rows` was captured BEFORE the confirm
+        #       QMessageBox at ~:1555. The modal spins the event
+        #       loop; a 500 ms-debounced `_do_update_stream_table`
+        #       or SSE reload during the confirm rebuilds the
+        #       table, and the row indices used at ~:1568 read
+        #       Name/Interface cells that now belong to DIFFERENT
+        #       streams. Same shape as v0.5.388 D1 (device
+        #       multi-delete). Fix: snapshot (stream_id, name,
+        #       port_key) up-front BEFORE the confirm modal; act
+        #       on the snapshot afterwards.
+        from traffic_client.stream_logic import find_port_key
+        _targets = []  # [(stream_id, name, port_key)]
         for _row in selected_rows:
-            _n_item = self.stream_table.item(_row.row(), 2)
-            _names.append(_n_item.text().strip() if _n_item else "?")
-        _count = len(_names)
-        _preview = "\n".join(f"  - {_n}" for _n in _names[:8])
+            _r = _row.row()
+            _iface_item = self.stream_table.item(_r, 1)
+            _name_item = self.stream_table.item(_r, 2)
+            if not _iface_item or not _name_item:
+                continue
+            _iface_text = _iface_item.text().strip()
+            _sname = _name_item.text().strip()
+            _sid = _name_item.data(Qt.UserRole)
+            # Resolve the port key using the same 3-tier logic as
+            # edit_selected_stream. Do it NOW, before the modal.
+            _port_key = None
+            if _sid:
+                for _p, _lst in self.streams.items():
+                    if any(_s.get("stream_id") == _sid for _s in _lst):
+                        _port_key = _p
+                        break
+            if not _port_key:
+                _resolve_text = _iface_text
+                if _resolve_text == "↳":
+                    _resolve_text = (_iface_item.toolTip() or "").strip()
+                _port_key = find_port_key(self.streams, _resolve_text)
+            _targets.append((_sid, _sname, _port_key, _iface_text))
+        _count = len(_targets)
+        if _count == 0:
+            QMessageBox.warning(self, "No Selection", "Nothing valid to remove.")
+            return
+        _preview = "\n".join(f"  - {_t[1]}" for _t in _targets[:8])
         if _count > 8:
             _preview += f"\n  ... and {_count - 8} more"
         if QMessageBox.question(
@@ -1487,63 +1609,42 @@ class TrafficGenClientStreamControl:
             return
 
         try:
-            for row in selected_rows:
-                r = row.row()
-                interface_item = self.stream_table.item(r, 1)
-                stream_name_item = self.stream_table.item(r, 2)
-                if not interface_item or not stream_name_item:
-                    QMessageBox.critical(self, "Error", "Invalid selection. Missing interface or stream name.")
-                    continue
-
-                interface_text = interface_item.text().strip()
-                stream_name = stream_name_item.text().strip()
-
-                # Resolve the row to a port key. Continuation rows show "↳"
-                # and never match a key directly; prefer the stream_id
-                # stashed on the name cell, then fall back to the tooltip
-                # (which holds the real iface name on continuation rows),
-                # then the visible text. See edit_selected_stream() for the
-                # full rationale — same three-tier resolution.
-                from traffic_client.stream_logic import find_port_key
-                port_key = None
-                stream_id = stream_name_item.data(Qt.UserRole)
-                if stream_id:
-                    for p, lst in self.streams.items():
-                        if any(s.get("stream_id") == stream_id for s in lst):
-                            port_key = p
-                            break
-                if not port_key:
-                    resolve_text = interface_text
-                    if resolve_text == "↳":
-                        resolve_text = (interface_item.toolTip() or "").strip()
-                    port_key = find_port_key(self.streams, resolve_text)
-
+            for _sid, stream_name, port_key, _iface_text in _targets:
                 if not port_key:
                     QMessageBox.warning(
                         self, "Error",
-                        f"Interface '{interface_text}' not found in streams. "
+                        f"Interface '{_iface_text}' not found in streams. "
                         f"Available: {list(self.streams.keys())[:3]}..."
                     )
                     continue
 
-                logger.info(f"Removing stream '{stream_name}' from port '{port_key}'")
+                logger.info(
+                    f"Removing stream '{stream_name}' "
+                    f"(id={_sid}) from port '{port_key}'"
+                )
 
-                # Cancel any pending auto-stop timer for the stream(s)
-                # being removed — without this, the timer fires later
-                # against a stream_id that no longer exists locally and
-                # the server gets an orphan /stop POST.
-                if hasattr(self, "_cancel_auto_stop_timer"):
-                    for s in self.streams.get(port_key, []):
-                        if s.get("protocol_selection", {}).get("name") == stream_name:
-                            self._cancel_auto_stop_timer(s.get("stream_id"))
+                # Cancel any pending auto-stop timer for the stream.
+                # v0.5.391 (G4): cancel by stream_id (not name) so
+                # we don't cancel a same-named sibling's timer.
+                if hasattr(self, "_cancel_auto_stop_timer") and _sid:
+                    self._cancel_auto_stop_timer(_sid)
 
-                self.streams[port_key] = [
-                    s for s in self.streams[port_key]
-                    if s.get("protocol_selection", {}).get("name") != stream_name
-                ]
-                
+                # v0.5.391 (G4): delete by stream_id when available,
+                # falling back to name-match only for legacy rows
+                # without a stream_id.
+                if _sid:
+                    self.streams[port_key] = [
+                        s for s in self.streams.get(port_key, [])
+                        if s.get("stream_id") != _sid
+                    ]
+                else:
+                    self.streams[port_key] = [
+                        s for s in self.streams.get(port_key, [])
+                        if s.get("protocol_selection", {}).get("name") != stream_name
+                    ]
+
                 # If no streams left for this port, remove the port key
-                if not self.streams[port_key]:
+                if port_key in self.streams and not self.streams[port_key]:
                     del self.streams[port_key]
 
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
