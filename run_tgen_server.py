@@ -1204,11 +1204,17 @@ def stream_stats():
         if status_filter == "Running" and not streams:
             import time
             from datetime import datetime, timezone
-            recent_streams = stream_db.get_all_streams(status="Stopped", tg_id=tg_id)
-            # Filter to streams stopped within last 5 minutes (likely due to restart)
+            # v0.5.382 (audit stats-W6): pre-fix, `get_all_streams(
+            # status="Stopped")` was called TWICE per empty-Running
+            # response — once at :1207 and once inside the loop at
+            # :1211. The first call's result was thrown away by the
+            # `recent_streams = []` reassignment two lines later.
+            # Every 2s poll from every client paid the wasted DB
+            # round-trip. Now: one call, cached into `_all_stopped`.
             current_time = time.time()
             recent_streams = []
-            for s in stream_db.get_all_streams(status="Stopped", tg_id=tg_id):
+            _all_stopped = stream_db.get_all_streams(status="Stopped", tg_id=tg_id)
+            for s in _all_stopped:
                 updated_at = s.get("updated_at")
                 if updated_at:
                     try:

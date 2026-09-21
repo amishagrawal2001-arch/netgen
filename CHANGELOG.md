@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.382] - 2026-09-20
+
+### Fixed — FRR docker + stats polling bundle (6 HIGH items)
+
+**W1: `_release_vrf_table` was DEFINED but never called**
+(`utils/frr_docker.py:609, 1970-1978`) — Every device add
+allocated a VRF table id in `_vrf_allocated` and persisted to
+`vrf_table_map.json`; on device removal the entry stayed. Over
+long-running server lifetime with add/delete churn, the 3000-
+slot range at 1000..3999 grew monotonically until exhaustion,
+at which point `_vrf_table` fell back to the collision-prone
+hash-only path. Fix: `stop_frr_container(remove=True)` now
+calls `_release_vrf_table(device_id)` in the same always-run
+block as `_remove_vrf`.
+
+**W2: `_get_container_name` used LIVE `dhcp_mode` → orphan container**
+(`utils/frr_docker.py:431, 1775-1815`) — Container was created
+as `dhcp-frr-<id>` when `dhcp_mode=="client"`. If the operator
+later flipped the device off DHCP (or deleted the DB row before
+stopping), `_get_container_name` computed `ostg-frr-<id>` →
+`stop_frr_container` hit NotFound, returned True, and left the
+`dhcp-frr-<id>` container running with its VRF still enslaving
+the interface. `cleanup_all_containers` would then reap it as an
+"orphan" 5 min later, silently yanking the VRF from under
+whatever the operator did next. Fix: new
+`_find_existing_container` helper tries BOTH `ostg-frr-<id>` and
+`dhcp-frr-<id>` and returns whichever exists.
+
+**W3: Partial teardown leak — `container.remove()` raise skipped VRF cleanup**
+(`utils/frr_docker.py:1775-1972`) — If `container.stop()`
+succeeded but `container.remove(force=True)` raised, the outer
+`except` returned False and skipped `_remove_vrf`. Interface
+stayed enslaved to `vrf-<id>` with no container to own it; the
+next re-apply hit the "already in vrf" branch on a VRF
+referencing a dead container. Fix: swallow the `remove()`
+exception inline (log-only) so the VRF teardown + W1 table
+release block below always runs on `remove=True`.
+
+**W4: Client stats polling — no exponential backoff on partition**
+(`traffic_client/statistics_section.py:1148-1250, 892-955, 1470-1530, 1615-1650`) —
+`fetch_and_update_statistics` and `poll_stream_stats` both fire
+every 2s and iterate `online_servers` sequentially with per-
+request timeouts of 4s (interfaces) + 3s (streams) + 2s per
+latency-iface. On a network partition affecting N TGens, each
+poll cycle stalled for ≥3N seconds; the `isRunning()` guards
+silently dropped every subsequent tick — no user-visible
+partitioned-server state until the 30s health timer fired. Fix:
+per-server backoff tracker (2s→4s→8s→16s→32s→60s cap on
+consecutive failures, reset on success); polling filters skip
+servers currently in backoff. Partitioned TGen no longer stalls
+the panel.
+
+**W5: `_stream_baselines` / `_latched_loss_pct` grow unbounded**
+(`traffic_client/statistics_section.py:2038-2100`) — Both dicts
+added an entry for every stream ID ever seen; pruning only
+happened on Clear Stats or TGen removal. UUID-shaped keys × days
+of create/delete churn → dead cache the operator wouldn't notice
+until the client started swapping. Fix: TTL-based prune —
+`_stream_last_seen` timestamp updated per poll response; when
+either cache exceeds `_STREAM_CACHE_SOFT_CAP` (1000), evict
+entries whose last-seen is > `_STREAM_CACHE_TTL_S` (30 min)
+ago. Preserves the Spirent-style loss latch for recently-stopped
+streams.
+
+**W6: `/api/streams/stats` — duplicate `get_all_streams(status="Stopped")` call**
+(`run_tgen_server.py:1207-1235`) — When the "Running" filter
+returned empty, the endpoint called `get_all_streams(status=
+"Stopped")` at :1207 AND again inside the loop at :1211. The
+first call's result was thrown away by the `recent_streams = []`
+reassignment two lines later. Every 2s poll from every connected
+client paid the wasted DB round-trip when no streams were
+running. Fix: hoist to `_all_stopped` once.
+
+### Tests
+
+New: `tests/test_v05382_frr_stats_bundle.py`. AST + structural +
+regression coverage.
+
 ## [0.5.381] - 2026-09-20
 
 ### Fixed — Monitor + RX correctness bundle (5 items)

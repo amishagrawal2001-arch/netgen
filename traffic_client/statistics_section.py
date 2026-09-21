@@ -913,9 +913,15 @@ class TrafficGenClientStatisticsSection():
         
         # Start background worker to fetch data
         online_servers = [s for s in self.server_interfaces if s.get("online", True)]
+        # v0.5.382 (W4): skip servers currently in backoff. Without
+        # this, a partitioned server drags every 2s cycle into a
+        # ≥3-second stall (per-request timeouts add up), silently
+        # dropping subsequent ticks via the isRunning guard above.
+        online_servers = [s for s in online_servers
+                          if self._should_poll_server(s)]
         if not online_servers:
             return
-        
+
         self._stats_worker = StatisticsFetchWorker(
             online_servers,
             fetch_type="both",
@@ -1119,11 +1125,13 @@ class TrafficGenClientStatisticsSection():
         interfaces = data.get("interfaces", [])
         tg_id = server.get("tg_id")
         server_address = server.get("address")
-        
+
         server["online"] = True
         if server in self.failed_servers:
             self.failed_servers.remove(server)
         self.update_server_status_icon(server, True)
+        # v0.5.382 (W4): server responded → reset any polling backoff.
+        self._record_stats_success(server)
         
         # Store interfaces data for processing (use server address as key since dicts are unhashable)
         if server_address not in self._pending_stats_data:
@@ -1145,6 +1153,83 @@ class TrafficGenClientStatisticsSection():
         self._pending_stats_data[server_address]["streams"] = stream_stats
         self._pending_stream_stats.extend(stream_stats)
     
+    # v0.5.382 (audit stats-W4): per-server polling backoff.
+    #
+    # Pre-fix, `fetch_and_update_statistics` + `poll_stream_stats`
+    # both fire every 2s and iterate `online_servers` sequentially.
+    # `StatisticsFetchWorker.run()` uses per-request timeouts of
+    # 4s (interfaces) + 3s (streams) + 2s per latency-iface. On a
+    # network partition affecting N TGens, EACH poll cycle stalls
+    # for ≥3N seconds; the `isRunning()` guards at :911 and :1472
+    # silently drop every subsequent 2s tick — no user-visible
+    # partitioned-server state until the 30s health timer fires.
+    #
+    # Fix: track a per-server-address backoff. Each fetch_error
+    # doubles the backoff (2→4→8→16→32→60s cap). Successful fetch
+    # (interfaces_fetched OR stream_stats_fetched) resets to 0.
+    # `_should_poll_server(server)` returns False while the server
+    # is in backoff, so the poll skips it entirely — the worker
+    # never dials, the panel never stalls.
+    _STATS_BACKOFF_INITIAL_S = 2.0
+    _STATS_BACKOFF_MAX_S = 60.0
+
+    def _stats_backoff_state(self):
+        """Lazy-init the per-server backoff tracker."""
+        _state = getattr(self, "_stats_server_backoff", None)
+        if not isinstance(_state, dict):
+            self._stats_server_backoff = {}
+            _state = self._stats_server_backoff
+        return _state
+
+    def _should_poll_server(self, server) -> bool:
+        """True if this server is not currently in backoff."""
+        try:
+            import time as _time_mod
+            _addr = server.get("address")
+            if not _addr:
+                return True
+            _state = self._stats_backoff_state().get(_addr)
+            if not _state:
+                return True
+            _next_ok_at = _state.get("next_ok_at", 0.0)
+            return _time_mod.monotonic() >= _next_ok_at
+        except Exception:
+            return True
+
+    def _record_stats_success(self, server):
+        """Reset the per-server backoff on any successful fetch."""
+        try:
+            _addr = server.get("address")
+            if not _addr:
+                return
+            _state = self._stats_backoff_state()
+            if _addr in _state:
+                del _state[_addr]
+        except Exception:
+            pass
+
+    def _record_stats_failure(self, server):
+        """Bump the per-server backoff on fetch error. Doubles up
+        to _STATS_BACKOFF_MAX_S."""
+        try:
+            import time as _time_mod
+            _addr = server.get("address")
+            if not _addr:
+                return
+            _state = self._stats_backoff_state()
+            _cur = _state.get(_addr, {})
+            _delay = _cur.get("delay", self._STATS_BACKOFF_INITIAL_S)
+            _new_delay = min(_delay * 2.0, self._STATS_BACKOFF_MAX_S)
+            _state[_addr] = {
+                "delay": _new_delay,
+                "next_ok_at": _time_mod.monotonic() + _new_delay,
+            }
+            logger.debug(
+                f"[STATS BACKOFF] {_addr}: next poll in {_new_delay:.1f}s"
+            )
+        except Exception as _bo_exc:
+            logger.debug(f"[STATS BACKOFF] tracker update skipped: {_bo_exc}")
+
     def _on_fetch_error(self, server, error_message):
         """Handle fetch error from background worker."""
         server_address = server.get("address")
@@ -1153,6 +1238,10 @@ class TrafficGenClientStatisticsSection():
         self.update_server_status_icon(server, False)
         if server not in self.failed_servers:
             self.failed_servers.append(server)
+        # v0.5.382 (W4): bump backoff so the next poll cycle skips
+        # this server for a while instead of re-stalling on the
+        # same dead endpoint.
+        self._record_stats_failure(server)
     
     def _on_stats_fetch_finished(self):
         """Process all fetched data and update UI when worker finishes."""
@@ -1496,12 +1585,17 @@ class TrafficGenClientStatisticsSection():
                             servers_to_poll.append(server)
                             break
         
+        # v0.5.382 (W4): drop servers in backoff before firing the
+        # worker. Same rationale as fetch_and_update_statistics.
+        servers_to_poll = [s for s in servers_to_poll
+                           if self._should_poll_server(s)]
+
         if not servers_to_poll:
             if hasattr(self, "update_stream_table"):
                 from PyQt5.QtCore import QTimer
                 QTimer.singleShot(0, lambda: self.update_stream_table())
             return
-        
+
         # Start background worker to fetch stream stats
         self._poll_worker = StatisticsFetchWorker(
             servers_to_poll,
@@ -1526,12 +1620,17 @@ class TrafficGenClientStatisticsSection():
         for stream in stream_stats:
             stream["_tg_id"] = tg_id
         self._pending_poll_stream_stats.extend(stream_stats)
+        # v0.5.382 (W4): server responded → reset backoff.
+        self._record_stats_success(server)
         self.update_per_stream_statistics(stream_stats)
-    
+
     def _on_poll_fetch_error(self, server, error_message):
         """Handle poll fetch error."""
-        # Just log, don't mark server offline for poll errors
-        pass
+        # v0.5.382 (W4): bump per-server backoff so partitioned
+        # servers don't stall subsequent 2s poll cycles. `pass` was
+        # the pre-fix behavior — errors here are quiet-log-only,
+        # but the stall came from re-dialing every 2s regardless.
+        self._record_stats_failure(server)
     
     def _on_poll_finished(self):
         """Process polled stream stats and update UI when worker finishes."""
@@ -2030,8 +2129,72 @@ class TrafficGenClientStatisticsSection():
         if not stream_stats_list:
             logger.debug(f"[DEBUG STREAM STATS] stream_stats_list is empty")
             return
-        
+
         logger.debug(f"[DEBUG STREAM STATS] Updating table with {len(stream_stats_list)} stream(s)")
+
+        # v0.5.382 (audit stats-W5): TTL-based prune of per-stream
+        # caches. Pre-fix, `_stream_baselines` (built up by the
+        # loop below at :2069) and `_latched_loss_pct` (:2145,
+        # :2180) added an entry for every stream ID EVER seen and
+        # never evicted anything — over days of use on a client
+        # left running through many create/delete cycles both
+        # dicts grew unbounded (UUID-shaped keys are ~40 B each
+        # plus dict overhead, so 100k stream churn ~= 8 MB of dead
+        # cache the operator would never notice until the client
+        # started swapping).
+        #
+        # Strategy:
+        #   1. On every poll response, refresh a `_stream_last_seen`
+        #      timestamp for every stream_id present.
+        #   2. When either cache exceeds _STREAM_CACHE_SOFT_CAP,
+        #      drop entries whose last-seen is older than
+        #      _STREAM_CACHE_TTL_S (default 30 min). This preserves
+        #      the Spirent-style loss latch for recently-stopped
+        #      streams (operator can still see the final loss for
+        #      up to 30 min after the stream stops).
+        #
+        # Latch semantics preserved: `_latched_loss_pct` is only
+        # evicted when the stream has been absent from responses
+        # for >30 min, which is well past the operator's normal
+        # "look at the panel after the test" window.
+        _STREAM_CACHE_SOFT_CAP = 1000
+        _STREAM_CACHE_TTL_S = 30 * 60
+        _last_seen = getattr(self, "_stream_last_seen", None)
+        if not isinstance(_last_seen, dict):
+            self._stream_last_seen = {}
+            _last_seen = self._stream_last_seen
+        try:
+            import time as _time_mod
+            _now = _time_mod.monotonic()
+            for _s in stream_stats_list:
+                _sid_touch = _s.get("stream_id")
+                if _sid_touch:
+                    _last_seen[_sid_touch] = _now
+            # Only walk the caches when they exceed the soft cap
+            # (cheap no-op in the small-N common case).
+            _baselines_dict = getattr(self, "_stream_baselines", None)
+            _latched_dict = getattr(self, "_latched_loss_pct", None)
+            _need_prune = (
+                (isinstance(_baselines_dict, dict) and len(_baselines_dict) > _STREAM_CACHE_SOFT_CAP)
+                or (isinstance(_latched_dict, dict) and len(_latched_dict) > _STREAM_CACHE_SOFT_CAP)
+            )
+            if _need_prune:
+                _evict_before = _now - _STREAM_CACHE_TTL_S
+                _stale = {sid for sid, ts in _last_seen.items()
+                          if ts < _evict_before}
+                for _sid_e in _stale:
+                    if isinstance(_baselines_dict, dict):
+                        _baselines_dict.pop(_sid_e, None)
+                    if isinstance(_latched_dict, dict):
+                        _latched_dict.pop(_sid_e, None)
+                    _last_seen.pop(_sid_e, None)
+                if _stale:
+                    logger.debug(
+                        f"[STATS] Pruned {len(_stale)} stale stream "
+                        f"cache entries (>{_STREAM_CACHE_TTL_S//60}m old)"
+                    )
+        except Exception as _prune_exc:
+            logger.debug(f"[STATS] Cache prune skipped: {_prune_exc}")
         
         def format_number(num):
             """Format number with commas for readability."""

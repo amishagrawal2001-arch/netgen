@@ -1772,56 +1772,115 @@ class FRRDockerManager:
             logger.error(f"[FRR] Traceback: {traceback.format_exc()}")
             return False
     
-    def stop_frr_container(self, device_id: str, device_name: str = None, remove: bool = False) -> bool:
-        """Stop (and optionally remove) FRR container"""
+    def _find_existing_container(self, device_id: str, device_name: str = None):
+        """v0.5.382 (audit FRR-W2): look up the container under
+        BOTH candidate prefixes.
+
+        Pre-fix, `_get_container_name` picked its prefix from the
+        LIVE `dhcp_mode` value in the DB. If the operator flipped
+        dhcp_mode after container creation (e.g. client → server, or
+        deleted the DB row before stopping), stop_frr_container
+        looked up the wrong name, got NotFound, returned True, and
+        left the original `dhcp-frr-<id>` (or `ostg-frr-<id>`)
+        container running with its VRF still enslaving the
+        interface — a silent orphan that `cleanup_all_containers`
+        would then reap 5 min later, yanking the VRF out from under
+        whatever the operator did next.
+
+        Returns (container, actual_name) or (None, primary_name).
+        """
+        primary_name = self._get_container_name(device_id, device_name)
         try:
-            container_name = self._get_container_name(device_id, device_name)
-            
-            # Stop container without removing it so configuration/state is preserved
-            try:
-                container = self.client.containers.get(container_name)
-                
-                # Before stopping, remove loopback IP addresses if device info is available
+            _c = self.client.containers.get(primary_name)
+            return _c, primary_name
+        except docker.errors.NotFound:
+            pass
+        except Exception as _e:
+            logger.warning(f"[FRR] primary lookup {primary_name} raised: {_e}")
+            return None, primary_name
+        # Try the alt prefix (mode-flipped since creation).
+        _alt_prefix = (self.container_prefix
+                       if primary_name.startswith("dhcp-frr-")
+                       else "dhcp-frr")
+        _alt_name = f"{_alt_prefix}-{device_id}"
+        if _alt_name == primary_name:
+            return None, primary_name
+        try:
+            _c = self.client.containers.get(_alt_name)
+            logger.info(
+                f"[FRR] container found under alt name {_alt_name} "
+                f"(primary was {primary_name}); dhcp_mode likely "
+                f"changed since creation"
+            )
+            return _c, _alt_name
+        except docker.errors.NotFound:
+            return None, primary_name
+        except Exception as _e:
+            logger.warning(f"[FRR] alt lookup {_alt_name} raised: {_e}")
+            return None, primary_name
+
+    def stop_frr_container(self, device_id: str, device_name: str = None, remove: bool = False) -> bool:
+        """Stop (and optionally remove) FRR container.
+
+        v0.5.382 (audit FRR-W1 + W2 + W3): three coupled fixes:
+        - W2: try BOTH `ostg-frr-<id>` and `dhcp-frr-<id>` when
+          looking up (dhcp_mode may have flipped since creation).
+        - W3: VRF teardown moved to a `finally`-shaped path so a
+          `container.remove()` failure no longer leaves the
+          interface stuck enslaved to a dead VRF.
+        - W1: on `remove=True`, release the VRF table-id allocation
+          via `_release_vrf_table` so the 1000..3999 range doesn't
+          leak entries across device delete churn. Was a defined-
+          but-never-called helper.
+        """
+        try:
+            container, container_name = self._find_existing_container(
+                device_id, device_name)
+
+            _stopped_ok = False
+            _removed_ok = False
+            if container is not None:
+                # Loopback cleanup happens before stop/remove.
                 if remove:
                     try:
                         from utils.device_database import DeviceDatabase
                         device_db = DeviceDatabase()
                         device_data = device_db.get_device(device_id) if device_id else None
-                        
+
                         if device_data:
                             loopback_ipv4 = device_data.get('loopback_ipv4', '')
                             loopback_ipv6 = device_data.get('loopback_ipv6', '')
-                            
+
                             if loopback_ipv4 or loopback_ipv6:
                                 logger.info(f"[FRR] Removing loopback IPs from container {container_name} before removal")
-                                
+
                                 # Build vtysh commands to remove loopback IPs
                                 vtysh_commands = [
                                     "configure terminal",
                                     "interface lo",
                                 ]
-                                
+
                                 # Remove IPv4 loopback if configured
                                 if loopback_ipv4:
                                     loopback_ipv4_clean = loopback_ipv4.split('/')[0] if '/' in loopback_ipv4 else loopback_ipv4
                                     vtysh_commands.append(f" no ip address {loopback_ipv4_clean}/32")
                                     logger.info(f"[FRR] Removing loopback IPv4 {loopback_ipv4_clean}/32 from container {container_name}")
-                                
+
                                 # Remove IPv6 loopback if configured
                                 if loopback_ipv6:
                                     loopback_ipv6_clean = loopback_ipv6.split('/')[0] if '/' in loopback_ipv6 else loopback_ipv6
                                     vtysh_commands.append(f" no ipv6 address {loopback_ipv6_clean}/128")
                                     logger.info(f"[FRR] Removing loopback IPv6 {loopback_ipv6_clean}/128 from container {container_name}")
-                                
+
                                 vtysh_commands.extend([
                                     "exit",
                                     "exit",
                                 ])
-                                
+
                                 # Execute commands using here-doc to maintain context
                                 config_commands = "\n".join(vtysh_commands)
                                 exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
-                                
+
                                 try:
                                     loopback_result = container.exec_run(["bash", "-c", exec_cmd], timeout=10)
                                     if loopback_result.exit_code == 0:
@@ -1834,42 +1893,68 @@ class FRRDockerManager:
                     except Exception as cleanup_error:
                         logger.warning(f"[FRR] Could not remove loopback IPs before container removal: {cleanup_error}")
                         # Continue with container removal even if loopback cleanup fails
-                
+
                 logger.info(f"[FRR] Stopping container {container_name}")
-                container.stop(timeout=10)
+                try:
+                    container.stop(timeout=10)
+                    _stopped_ok = True
+                except Exception as _stop_exc:
+                    logger.warning(
+                        f"[FRR] container.stop() failed for "
+                        f"{container_name}: {_stop_exc}"
+                    )
                 if remove:
                     logger.info(f"[FRR] Removing container {container_name}")
-                    container.remove(force=True)
-                    logger.info(f"[FRR] Container {container_name} removed successfully")
-                    # Only tear down the VRF on a full remove — a plain
-                    # stop is treated as a pause and the VRF should
-                    # survive so the device can resume cleanly. We
-                    # don't know the iface here; nomaster is best-effort
-                    # via _remove_vrf which logs and continues.
                     try:
-                        # Look up the iface from the device record so we
-                        # can detach it before deleting the VRF.
-                        _iface = None
-                        try:
-                            from utils.device_database import DeviceDatabase
-                            _rec = DeviceDatabase().get_device(device_id) if device_id else None
-                            if _rec:
-                                _stored = (_rec.get("interface") or "").strip()
-                                # Stored form may be "vlanN@base" — strip
-                                # the @base for the kernel iface name.
-                                _iface = _stored.split("@", 1)[0] if _stored else None
-                        except Exception:
-                            _iface = None
-                        self._remove_vrf(device_id, _iface)
-                    except Exception as _vrf_exc:
-                        logger.warning(f"[VRF] cleanup on stop failed for {device_id}: {_vrf_exc}")
+                        container.remove(force=True)
+                        _removed_ok = True
+                        logger.info(f"[FRR] Container {container_name} removed successfully")
+                    except Exception as _remove_exc:
+                        # v0.5.382 (W3): SWALLOW here so the VRF
+                        # cleanup below still runs. Pre-fix, this
+                        # raise fell through to the outer except
+                        # and _remove_vrf was skipped.
+                        logger.warning(
+                            f"[FRR] container.remove() failed for "
+                            f"{container_name}: {_remove_exc}; "
+                            f"proceeding with VRF teardown anyway"
+                        )
                 else:
                     logger.info(f"[FRR] Container {container_name} stopped successfully (not removed)")
-            except docker.errors.NotFound:
+            else:
                 logger.info(f"[FRR] Container {container_name} not found")
-            
+
+            # v0.5.382 (W3 + W1): VRF teardown + table release always
+            # run on remove=True, regardless of whether container.stop
+            # or container.remove succeeded. Pre-fix, a remove()
+            # exception skipped this whole block.
+            if remove:
+                try:
+                    _iface = None
+                    try:
+                        from utils.device_database import DeviceDatabase
+                        _rec = DeviceDatabase().get_device(device_id) if device_id else None
+                        if _rec:
+                            _stored = (_rec.get("interface") or "").strip()
+                            _iface = _stored.split("@", 1)[0] if _stored else None
+                    except Exception:
+                        _iface = None
+                    self._remove_vrf(device_id, _iface)
+                except Exception as _vrf_exc:
+                    logger.warning(f"[VRF] cleanup on stop failed for {device_id}: {_vrf_exc}")
+                # v0.5.382 (W1): release the VRF table id
+                # allocation so the 1000..3999 slot range doesn't
+                # leak entries over device delete churn.
+                try:
+                    self._release_vrf_table(device_id)
+                except Exception as _rel_exc:
+                    logger.warning(
+                        f"[VRF ALLOC] release on stop failed for "
+                        f"{device_id}: {_rel_exc}"
+                    )
+
             return True
-            
+
         except Exception as e:
             logger.error(f"[FRR] Failed to stop FRR container for device {device_id}: {e}")
             return False
