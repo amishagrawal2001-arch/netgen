@@ -2,6 +2,80 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.400] - 2026-09-21
+
+### Fixed — statistics_section.py client-side stats poll audit (5 items)
+
+Client-side counterpart to the recent server-side DB fixes (v0.5.398
+O1-O5, v0.5.399 P1-P5). Now that the server returns correct data,
+the client's ability to display it correctly matters even more.
+
+**Q1: multi-TG per-signal status flicker**
+(`traffic_client/statistics_section.py:_on_poll_stream_stats_fetched`
++ `:_on_poll_finished`) — Pre-fix, `_on_poll_stream_stats_fetched`
+fired per-server and called `update_per_stream_statistics(stream_stats)`
+with ONLY the current server's streams. Every row in `stream_table`
+was walked; rows belonging to OTHER TGs were absent from THIS server's
+`stat_map` and hit the "not in stat_map" else branch → painted
+red/stopped. When the OTHER TG's signal arrived milliseconds later,
+those rows got repainted green. On multi-TG setups (like srv06's
+2-TG topology) this produced a visible red↔green strobe on non-focus
+TGs every 2 s. Fix: only accumulate per-signal;
+`update_per_stream_statistics` now runs ONCE from `_on_poll_finished`
+with the full aggregated stream_stats.
+
+**Q2: throughput chart lies with flat non-zero line after server dies**
+(`traffic_client/statistics_section.py:_on_stats_fetch_finished`) —
+Pre-fix, the no-fresh-data branch at ~:1510 re-rendered
+`_last_statistics` AND re-pushed it to the chart on every tick.
+`send_bps` in `_last_statistics` was the last observed rate, so the
+chart drew a flat non-zero line indefinitely after the server
+partitioned. Operator saw "traffic still flowing" on a wedged
+server. Fix: push a zeroed copy (same `{iface: {send_bps: 0, ...}}`
+shape) so the chart line drops to 0 (accurate: no fresh data means
+no known throughput).
+
+**Q3: `format_rate` returns confident "0.00 pps" on parse failure**
+(`traffic_client/statistics_section.py:format_rate`) — Pre-fix, any
+`TypeError`/`ValueError` from a malformed server payload returned
+`"0.00 pps"` — visually indistinguishable from a genuine idle
+stream. Operator saw an actively-running stream as idle with no
+signal to investigate. Also `rate_val is None` (legit for
+just-started streams before a delta is available) mapped to the
+same `"0.00 pps"`. Fix: distinguish three cases —
+`None`/parse-failure → `"—"` (muted "unknown", matches placeholder
+used elsewhere), genuine `0.0` → `"0.00 pps"` (accurate), else →
+formatted rate.
+
+**Q4: stale worker `finished` signal clears table on rebind**
+(`traffic_client/statistics_section.py:fetch_and_update_statistics`) —
+The `_keepalive_worker` pattern (v0.5.392 H2) retains the previous
+worker's Python ref for ≥30 s. That's necessary to dodge the PyQt5
+5.15 + Python 3.14 GC destructor race, but it means the OLD worker's
+`finished` signal can still be queued in the event loop when the
+NEXT poll cycle starts. When it fires, it invokes
+`_on_stats_fetch_finished` AFTER the new cycle has already reset
+`_pending_stats_data = {}` → empty merged dict →
+`reset_statistics_table_structure()` → visible table clear/flicker
+before the fresh data lands. Fix: disconnect the previous worker's
+slots (`interfaces_fetched`, `stream_stats_fetched`, `fetch_error`,
+`finished`) BEFORE binding the new worker.
+
+**Q5: `_stream_counter_history` grows unboundedly**
+(`traffic_client/statistics_section.py:update_stream_statistics_table`) —
+The counter-history cache introduced by v0.5.393 J2/J3 (for the
+counter-advance override) was never wired into the existing
+`_stream_last_seen` TTL sweep that already prunes `_stream_baselines`
+and `_latched_loss_pct`. On long-lived clients this leaked 40 B ×
+N unique stream_ids forever. Fix: fold `_stream_counter_history`
+into the same soft-cap-triggered prune (30-min TTL,
+1000-entry soft cap).
+
+Tests: 15 new (`tests/test_v05400_statistics_section.py`), all
+pass. Regressions on v0.5.395–v0.5.399: intact.
+
+---
+
 ## [0.5.399] - 2026-09-21
 
 ### Fixed — device_database.py DB layer audit (5 items, parallel to v0.5.398 O1-O5)

@@ -922,6 +922,30 @@ class TrafficGenClientStatisticsSection():
         if not online_servers:
             return
 
+        # v0.5.400 (audit stats-Q4): disconnect the previous
+        # worker's slots BEFORE rebinding self._stats_worker.
+        # Pre-fix, the old worker's `finished` signal could still
+        # be queued in the event loop when the next tick started.
+        # When it fired, it invoked _on_stats_fetch_finished AFTER
+        # the new cycle had already reset _pending_stats_data={}
+        # at :954 → empty merged dict → reset_statistics_table_structure
+        # → visible table clear/flicker before the new data lands.
+        # The keepalive kept the OLD worker alive for ≥30 s so this
+        # was a real race. Disconnecting drops the queued signal
+        # deliveries pointed at this instance's slot bindings.
+        _prev_worker = getattr(self, "_stats_worker", None)
+        if _prev_worker is not None:
+            for _sig_name in (
+                "interfaces_fetched",
+                "stream_stats_fetched",
+                "fetch_error",
+                "finished",
+            ):
+                try:
+                    getattr(_prev_worker, _sig_name).disconnect()
+                except (TypeError, RuntimeError):
+                    # Already disconnected or C++ object gone.
+                    pass
         self._stats_worker = StatisticsFetchWorker(
             online_servers,
             fetch_type="both",
@@ -1509,7 +1533,31 @@ class TrafficGenClientStatisticsSection():
                 self._last_statistics = {}
             else:
                 self.update_statistics_table(self._last_statistics)
-                self._push_chart_sample(self._last_statistics)
+                # v0.5.400 (audit stats-Q2): the chart was drawing
+                # a FLAT NON-ZERO LINE indefinitely after every
+                # server died. Pre-fix, this re-pushed the last
+                # observed `send_bps` values from `_last_statistics`
+                # on every no-data tick — the chart interpreted
+                # that as "traffic is still flowing at N pps"
+                # forever, so the operator's throughput chart lied
+                # about a wedged / partitioned server. Build a
+                # zeroed copy in the same nested `{iface: {send_bps: 0, ...}}`
+                # shape _push_chart_sample expects so the chart
+                # line drops to 0 (accurate: no fresh data means
+                # no known throughput).
+                try:
+                    _zeroed_stats = {}
+                    for _ifn, _v in (self._last_statistics or {}).items():
+                        if not isinstance(_v, dict):
+                            continue
+                        _copy = dict(_v)
+                        _copy["send_bps"] = 0.0
+                        _zeroed_stats[_ifn] = _copy
+                    self._push_chart_sample(_zeroed_stats)
+                except Exception as _chart_exc:
+                    logger.debug(
+                        f"[CHART] Q2 zero-push failed: {_chart_exc}"
+                    )
         else:
             if hasattr(self, "reset_statistics_table_structure"):
                 self.reset_statistics_table_structure()
@@ -1615,14 +1663,28 @@ class TrafficGenClientStatisticsSection():
         self._poll_worker.start()
     
     def _on_poll_stream_stats_fetched(self, server, stream_stats):
-        """Handle stream stats fetched from poll worker."""
+        """Handle stream stats fetched from poll worker.
+
+        v0.5.400 (audit stats-Q1): pre-fix, this called
+        `update_per_stream_statistics(stream_stats)` with ONLY the
+        current server's streams. On multi-TG setups, every 2 s
+        poll signal would then paint the OTHER TGs' rows red —
+        their sids are absent from THIS server's stat_map, so the
+        row hit the "not in stat_map" else branch at ~:1882 and
+        was marked stopped/red until the OTHER server's signal
+        arrived and repainted them green. Visible as a strobing
+        red↔green flicker on non-focus TGs. Fix: only accumulate
+        per-signal here; the aggregated
+        `update_per_stream_statistics` call is now in
+        `_on_poll_finished` (once, with ALL servers' streams
+        merged) so every row is evaluated against the full stat_map.
+        """
         tg_id = server.get("tg_id")
         for stream in stream_stats:
             stream["_tg_id"] = tg_id
         self._pending_poll_stream_stats.extend(stream_stats)
         # v0.5.382 (W4): server responded → reset backoff.
         self._record_stats_success(server)
-        self.update_per_stream_statistics(stream_stats)
 
     def _on_poll_fetch_error(self, server, error_message):
         """Handle poll fetch error."""
@@ -1679,6 +1741,20 @@ class TrafficGenClientStatisticsSection():
         # Update stream statistics table
         logger.debug(f"[DEBUG STREAM STATS POLL] Calling update_stream_statistics_table with {len(_filtered)} stream(s)")
         self.update_stream_statistics_table(_filtered)
+        # v0.5.400 (audit stats-Q1): single aggregated call with
+        # ALL servers' streams merged. Fixes the multi-TG flicker
+        # that made non-focus TG rows strobe red every 2 s while
+        # the focus TG's signal was in flight (see the Q1 note in
+        # _on_poll_stream_stats_fetched above). Use `_filtered`
+        # (already scrubbed of client-removed ghost rows by the
+        # X5 pass above) instead of the raw pending list.
+        try:
+            self.update_per_stream_statistics(_filtered)
+        except Exception as _upps_exc:
+            logger.error(
+                f"[STATS] aggregated update_per_stream_statistics "
+                f"failed: {_upps_exc}"
+            )
     def update_per_stream_statistics(self, stream_stats):
         # print(f"[DEBUG] update_per_stream_statistics() called with {len(stream_stats)} entries")
 
@@ -2317,9 +2393,17 @@ class TrafficGenClientStatisticsSection():
             # (cheap no-op in the small-N common case).
             _baselines_dict = getattr(self, "_stream_baselines", None)
             _latched_dict = getattr(self, "_latched_loss_pct", None)
+            # v0.5.400 (audit stats-Q5): _stream_counter_history was
+            # added in v0.5.393 J2/J3 for the counter-advance override
+            # but was never wired into this TTL sweep, so it grew
+            # unboundedly on long-lived clients — 40 B × N unique
+            # stream_ids forever. Fold it in here so it evicts on the
+            # same trigger as the other per-sid caches.
+            _counter_hist_dict = getattr(self, "_stream_counter_history", None)
             _need_prune = (
                 (isinstance(_baselines_dict, dict) and len(_baselines_dict) > _STREAM_CACHE_SOFT_CAP)
                 or (isinstance(_latched_dict, dict) and len(_latched_dict) > _STREAM_CACHE_SOFT_CAP)
+                or (isinstance(_counter_hist_dict, dict) and len(_counter_hist_dict) > _STREAM_CACHE_SOFT_CAP)
             )
             if _need_prune:
                 _evict_before = _now - _STREAM_CACHE_TTL_S
@@ -2330,6 +2414,8 @@ class TrafficGenClientStatisticsSection():
                         _baselines_dict.pop(_sid_e, None)
                     if isinstance(_latched_dict, dict):
                         _latched_dict.pop(_sid_e, None)
+                    if isinstance(_counter_hist_dict, dict):
+                        _counter_hist_dict.pop(_sid_e, None)
                     _last_seen.pop(_sid_e, None)
                 if _stale:
                     logger.debug(
@@ -2347,23 +2433,38 @@ class TrafficGenClientStatisticsSection():
                 return str(num)
         
         def format_rate(rate_val):
-            """Format rate with appropriate unit."""
+            """Format rate with appropriate unit.
+
+            v0.5.400 (audit stats-Q3): pre-fix, any TypeError /
+            ValueError from a malformed server payload returned
+            "0.00 pps" — visually indistinguishable from an
+            actively-running stream that's producing zero packets
+            or from a genuinely idle stream. Operator saw a
+            running stream as idle and had no signal to
+            investigate. Also `rate_val is None` (which happens
+            legitimately when the server hasn't populated tx_rate
+            yet — no delta available) is different from a genuine
+            zero. Distinguish:
+              * None or parse failure → "—" (muted "unknown",
+                matches placeholder used elsewhere for missing).
+              * Genuine 0.0 → "0.00 pps" (accurate — idle stream).
+              * Otherwise → formatted rate.
+            """
+            if rate_val is None:
+                return "—"
             try:
-                # Handle None, 0, or empty values
-                if rate_val is None:
-                    return "0.00 pps"
                 rate_val = float(rate_val)
-                if rate_val == 0.0:
-                    return "0.00 pps"
-                if rate_val >= 1_000_000:
-                    return f"{rate_val / 1_000_000:.2f} Mpps"
-                elif rate_val >= 1_000:
-                    return f"{rate_val / 1_000:.2f} Kpps"
-                else:
-                    return f"{rate_val:.2f} pps"
             except (ValueError, TypeError) as e:
                 logger.debug(f"[DEBUG STREAM STATS] Error formatting rate {rate_val}: {e}")
+                return "—"
+            if rate_val == 0.0:
                 return "0.00 pps"
+            if rate_val >= 1_000_000:
+                return f"{rate_val / 1_000_000:.2f} Mpps"
+            elif rate_val >= 1_000:
+                return f"{rate_val / 1_000:.2f} Kpps"
+            else:
+                return f"{rate_val:.2f} pps"
         
         # Process all streams from all servers
         all_streams = []
