@@ -2,6 +2,96 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.398] - 2026-09-21
+
+### Fixed — stream_database.py DB layer audit (5 items)
+
+Every fix in this release fixes something that has been silently
+broken on srv06 for weeks and was compounding the "DB lies about
+state" bugs targeted by v0.5.393 J1, v0.5.396 M3, and
+v0.5.397 N1–N5.
+
+**O1: Cleanup queries never deleted anything (dead code)**
+(`utils/stream_database.py:cleanup_old_statistics` +
+`:cleanup_old_stopped_streams`) — Rows are stored via
+`datetime.now(timezone.utc).isoformat()` which emits e.g.
+`"2026-09-21T15:30:00.123456+00:00"` — literal `T` at position 10.
+But SQLite's `datetime('now', ...)` emits `"2026-09-21 15:30:00"` —
+space at position 10. Under SQLite's default TEXT collation `T`
+(0x54) > space (0x20), so EVERY ISO-formatted `timestamp` /
+`stopped_at` / `updated_at` compared as GREATER than ANY
+SQLite-formatted cutoff. `WHERE ... < cutoff` matched zero rows.
+Both cleanup queries were silently dead code — DB grew unbounded
+despite the poll thread calling cleanup every ~20 s. On srv06 this
+compounded until `get_all_streams` polls degraded to O(N). Fix:
+compute cutoffs in Python as ISO strings via
+`datetime.now(timezone.utc) - timedelta(...)` so both sides of the
+compare use the same format.
+
+**O2: `stop_stream` leaves lingering rates + returns True on 0-row match**
+(`utils/stream_database.py:stop_stream`) — Two bugs:
+(a) `tx_rate`/`rx_rate` were NOT touched by the UPDATE, so
+`get_all_streams(status='Stopped')` returned rows displaying live
+pps from the last poll — same "DB lies" class as M3. Client's
+Traffic Statistics tab showed a Stopped stream still emitting
+packets.
+(b) `cursor.rowcount` was never checked; the method returned True
+even when zero rows matched (already-deleted / typo id). Callers
+at `run_tgen_server.py:2516/:2574/:30719/:30814` all trusted the
+bool, so a stopped stream missing from DB looked successful and
+the operator got no feedback that the stop-write didn't land. Fix:
+also set `tx_rate=0.0, rx_rate=0.0`; check `cursor.rowcount` and
+return False + log warning when zero.
+
+**O3: `register_stream` TOCTOU + false-positive on delete race**
+(`utils/stream_database.py:register_stream`) — Pre-fix, the method
+did SELECT-then-INSERT-or-UPDATE across THREE separate statements
+with no transaction wrapping them. Two known bugs:
+  1. Concurrent register_stream calls for the same stream_id both
+     saw `exists=False`, one INSERT succeeded, the other raised
+     `IntegrityError` caught by the bare `except Exception` and
+     returned False with no way to distinguish "duplicate" from
+     "disk full" for telemetry.
+  2. If `delete_stream` slipped between the SELECT and the UPDATE
+     branch, the UPDATE affected zero rows, `commit()` succeeded,
+     the method returned True — same M3 pattern.
+
+Fix: `BEGIN IMMEDIATE` to acquire the write lock up front, then
+`INSERT ... ON CONFLICT(stream_id) DO UPDATE SET ...` in a single
+atomic statement. Mirrors the v0.5.397 N1 approach on the in-memory
+tracker.
+
+**O4: `update_stream_statistics` reincarnates rates on Stopped rows**
+(`utils/stream_database.py:update_stream_statistics`) — Pre-fix,
+the stats UPDATE had no `AND status='Running'` clause. A stats
+update racing with `stop_stream` (from another thread OR from
+`_poll_stream_statistics`'s own reconcile at
+`run_tgen_server.py:30814`) would overwrite the zero'd rates from
+stop_stream (v0.5.398 O2) with the pre-stop live tx_rate/rx_rate.
+Combined with pre-O2 behavior, a Stopped stream could show
+`tx_rate=42000 pps` indefinitely. Fix: `AND status='Running'`
+filter; when rowcount==0 the row was stopped/deleted between the
+SELECT and this UPDATE — skip the history INSERT (a history row
+for a stopped stream is misleading noise).
+
+**O5: `get_all_streams` unbounded + no recent-stopped filter**
+(`utils/stream_database.py:get_all_streams`) — Pre-fix, this
+`SELECT * FROM streams ORDER BY created_at DESC` had no `LIMIT`.
+Because cleanup (O1) was dead, the streams table grew forever;
+the poll thread called this every ~2 s and the `/api/streams` UI
+poll also called it. Each poll became O(N) plus O(N * JSON parse)
+for `stream_config`. Fix: default `limit=1000`; when no explicit
+status filter, also exclude Stopped rows older than
+`include_stopped_within_hours` (default 24 h — matches cleanup
+window) so the UI doesn't render pending-cleanup ghosts.
+
+Tests: 20 new (`tests/test_v05398_stream_database.py`), all pass
+(including a runtime datetime-format regression test that repro's
+the exact `T` vs space compare bug). Regressions on
+v0.5.393–v0.5.397: intact.
+
+---
+
 ## [0.5.397] - 2026-09-21
 
 ### Fixed — multithreaded_traffic_gen.py concurrency + resource audit (5 items)

@@ -7,7 +7,7 @@ import sqlite3
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 
@@ -130,27 +130,46 @@ class StreamDatabase:
         Returns:
             True if successful, False otherwise
         """
+        # v0.5.398 (audit stream-db O3): atomic UPSERT under
+        # BEGIN IMMEDIATE. Pre-fix, register_stream did
+        # SELECT-then-INSERT-or-UPDATE across THREE separate
+        # statements with no transaction wrapping them. Two known bugs:
+        #   1. TOCTOU: two concurrent register_streams for the same
+        #      stream_id both saw `exists=False`, one INSERT succeeded,
+        #      the other raised IntegrityError caught by the bare
+        #      `except Exception` at :209 — returned False with no way
+        #      to distinguish "duplicate" from "disk full" for
+        #      telemetry.
+        #   2. Delete race: if delete_stream slipped between the SELECT
+        #      and the UPDATE branch, the UPDATE affected zero rows,
+        #      commit() succeeded, and this method still returned
+        #      True — SAME "DB lies" class as M3.
+        # Fix: BEGIN IMMEDIATE to acquire the write lock up front,
+        # then INSERT ... ON CONFLICT(stream_id) DO UPDATE in a single
+        # atomic statement. Also compute the was_stopped decision via
+        # ON CONFLICT with a SELECT inside — no separate query.
         try:
             config_json = json.dumps(stream_config) if stream_config else None
             now = datetime.now(timezone.utc).isoformat()
-            
+
             with sqlite3.connect(self.db_path) as conn:
-                # Check if stream already exists
-                cursor = conn.execute("SELECT stream_id FROM streams WHERE stream_id = ?", (stream_id,))
-                exists = cursor.fetchone()
-                
-                if exists:
-                    # Check if stream was previously stopped - if so, reset last_update
+                conn.isolation_level = None  # manage txn ourselves
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    # Snapshot pre-existing status under the write
+                    # lock so the was_stopped branch decision matches
+                    # what the UPSERT will see.
                     cursor_status = conn.execute(
                         "SELECT status FROM streams WHERE stream_id = ?",
-                        (stream_id,)
+                        (stream_id,),
                     )
-                    status_row = cursor_status.fetchone()
-                    was_stopped = status_row and status_row[0] == 'Stopped'
-                    
-                    # Update existing stream
-                    # If stream was stopped, reset last_update to current time for accurate rate calculation
-                    if was_stopped:
+                    _row = cursor_status.fetchone()
+                    _existed = _row is not None
+                    _was_stopped = _existed and _row[0] == 'Stopped'
+
+                    if _existed and not _was_stopped:
+                        # Continuing stream — preserve last_update /
+                        # counter baselines for accurate rate calc.
                         conn.execute("""
                             UPDATE streams SET
                                 stream_name = ?,
@@ -159,51 +178,61 @@ class StreamDatabase:
                                 server_url = ?,
                                 tg_id = ?,
                                 flow_tracking_enabled = ?,
-                                status = ?,
-                                started_at = ?,
+                                status = 'Running',
                                 updated_at = ?,
-                                last_update = ?,
+                                stream_config = ?
+                            WHERE stream_id = ?
+                        """, (
+                            stream_name, interface, rx_interface, server_url, tg_id,
+                            int(flow_tracking_enabled), now, config_json, stream_id,
+                        ))
+                    else:
+                        # New OR reincarnating (was_stopped) — INSERT
+                        # ON CONFLICT UPDATE so the whole thing is one
+                        # atomic statement no matter which branch wins
+                        # the race. Reset baseline counters (they're
+                        # the from-zero-since-last-start counters, not
+                        # the historical totals).
+                        conn.execute("""
+                            INSERT INTO streams (
+                                stream_id, stream_name, interface, rx_interface,
+                                server_url, tg_id, flow_tracking_enabled, status,
+                                started_at, updated_at, last_update,
+                                last_tx_count, last_rx_count, tx_count, rx_count,
+                                stream_config
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Running', ?, ?, ?, 0, 0, 0, 0, ?)
+                            ON CONFLICT(stream_id) DO UPDATE SET
+                                stream_name = excluded.stream_name,
+                                interface = excluded.interface,
+                                rx_interface = excluded.rx_interface,
+                                server_url = excluded.server_url,
+                                tg_id = excluded.tg_id,
+                                flow_tracking_enabled = excluded.flow_tracking_enabled,
+                                status = 'Running',
+                                started_at = excluded.started_at,
+                                updated_at = excluded.updated_at,
+                                last_update = excluded.last_update,
                                 last_tx_count = 0,
                                 last_rx_count = 0,
                                 tx_count = 0,
                                 rx_count = 0,
-                                stream_config = ?
-                            WHERE stream_id = ?
+                                tx_rate = 0.0,
+                                rx_rate = 0.0,
+                                stopped_at = NULL,
+                                stream_config = excluded.stream_config
                         """, (
-                            stream_name, interface, rx_interface, server_url, tg_id,
-                            int(flow_tracking_enabled), 'Running', now, now, now, config_json, stream_id
+                            stream_id, stream_name, interface, rx_interface,
+                            server_url, tg_id, int(flow_tracking_enabled),
+                            now, now, now, config_json,
                         ))
-                    else:
-                        # Stream is continuing - preserve last_update for rate calculation
-                        conn.execute("""
-                            UPDATE streams SET
-                                stream_name = ?,
-                                interface = ?,
-                                rx_interface = ?,
-                                server_url = ?,
-                                tg_id = ?,
-                                flow_tracking_enabled = ?,
-                                status = ?,
-                                updated_at = ?,
-                                stream_config = ?
-                            WHERE stream_id = ?
-                        """, (
-                            stream_name, interface, rx_interface, server_url, tg_id,
-                            int(flow_tracking_enabled), 'Running', now, config_json, stream_id
-                        ))
-                else:
-                    # Insert new stream with initial last_update
-                    conn.execute("""
-                        INSERT INTO streams (
-                            stream_id, stream_name, interface, rx_interface, server_url, tg_id,
-                            flow_tracking_enabled, status, started_at, updated_at, last_update, stream_config
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        stream_id, stream_name, interface, rx_interface, server_url, tg_id,
-                        int(flow_tracking_enabled), 'Running', now, now, now, config_json
-                    ))
-                conn.commit()
-            
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+
             logger.info(f"[STREAM DB] Registered stream '{stream_name}' (ID: {stream_id}) on {interface}")
             return True
         except Exception as e:
@@ -352,8 +381,23 @@ class StreamDatabase:
                             tx_rate = tx_rate or 0.0
                             rx_rate = rx_rate or 0.0
                     
-                    # Update stream statistics
-                    conn.execute("""
+                    # v0.5.398 (audit stream-db O4): guard against
+                    # reincarnating rates on a just-stopped row.
+                    # Pre-fix, this UPDATE had no `AND status='Running'`
+                    # clause — a stats update racing with stop_stream
+                    # (from another thread OR from
+                    # _poll_stream_statistics's own reconcile at
+                    # run_tgen_server.py:30814) would overwrite the
+                    # zero'd rates from stop_stream (v0.5.398 O2)
+                    # with the pre-stop live tx_rate/rx_rate. Combined
+                    # with pre-O2 behavior, a Stopped stream could
+                    # show tx_rate=42000 pps indefinitely. Now: filter
+                    # on status='Running'; if rowcount==0 the row was
+                    # stopped/deleted between the SELECT above and
+                    # this UPDATE — log + skip the history INSERT (a
+                    # history row for a stopped stream is misleading
+                    # noise).
+                    _upd_cursor = conn.execute("""
                         UPDATE streams SET
                             tx_count = ?,
                             rx_count = ?,
@@ -363,15 +407,24 @@ class StreamDatabase:
                             last_rx_count = ?,
                             last_update = ?,
                             updated_at = ?
-                        WHERE stream_id = ?
+                        WHERE stream_id = ? AND status = 'Running'
                     """, (tx_count, rx_count, tx_rate, rx_rate, tx_count, rx_count, now, now, stream_id))
-                    
-                    # Insert into history table
+                    if _upd_cursor.rowcount == 0:
+                        logger.debug(
+                            f"[STREAM DB] Skipping stats update for "
+                            f"{stream_id}: row is no longer Running "
+                            f"(stopped/deleted between fetch and write)"
+                        )
+                        conn.commit()
+                        return False
+
+                    # Insert into history table (only when the UPDATE
+                    # actually touched a Running row).
                     conn.execute("""
                         INSERT INTO stream_stats (stream_id, timestamp, tx_count, rx_count, tx_rate, rx_rate)
                         VALUES (?, ?, ?, ?, ?, ?)
                     """, (stream_id, now, tx_count, rx_count, tx_rate, rx_rate))
-                    
+
                     conn.commit()
                     return True
                 else:
@@ -384,62 +437,129 @@ class StreamDatabase:
     def stop_stream(self, stream_id: str) -> bool:
         """
         Mark a stream as stopped in the database.
-        
+
         Args:
             stream_id: Stream identifier
-            
+
         Returns:
-            True if successful, False otherwise
+            True if a row was updated, False if the stream_id was not
+            found or the update failed. v0.5.398 (audit stream-db O2):
+            pre-fix this returned True unconditionally on any commit
+            success — even when zero rows matched (already-deleted or
+            typo id). Callers at run_tgen_server.py:2516 / :2574 /
+            :30719 / :30814 all trust the bool, so a stopped stream
+            missing from DB looked successful and the operator got no
+            feedback that the stop-write didn't land.
         """
+        # v0.5.398 (audit stream-db O2): also zero tx_rate / rx_rate.
+        # Pre-fix, stop_stream left those fields intact so
+        # `get_all_streams(status='Stopped')` returned rows displaying
+        # the LIVE pps values from the last poll. This is the same
+        # "DB lies about state" class as v0.5.396 M3 — the client's
+        # Traffic Statistics tab would show a "Stopped" stream still
+        # putting out packets. tx_count / rx_count are preserved
+        # (they're historical totals the operator wants to keep
+        # visible for the final tally); only the per-second rates
+        # are cleared.
         try:
             now = datetime.now(timezone.utc).isoformat()
-            
+
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
+                cursor = conn.execute("""
                     UPDATE streams SET
                         status = 'Stopped',
                         stopped_at = ?,
-                        updated_at = ?
+                        updated_at = ?,
+                        tx_rate = 0.0,
+                        rx_rate = 0.0
                     WHERE stream_id = ?
                 """, (now, now, stream_id))
+                _rowcount = cursor.rowcount
                 conn.commit()
-            
-            logger.info(f"[STREAM DB] Marked stream {stream_id} as stopped")
+
+            if _rowcount == 0:
+                logger.warning(
+                    f"[STREAM DB] stop_stream: no row matched "
+                    f"stream_id={stream_id} — already-deleted or typo id"
+                )
+                return False
+            logger.info(f"[STREAM DB] Marked stream {stream_id} as stopped (rowcount={_rowcount})")
             return True
         except Exception as e:
             logger.error(f"[STREAM DB] Failed to stop stream {stream_id}: {e}")
             return False
     
-    def get_all_streams(self, status: Optional[str] = None, tg_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def get_all_streams(self, status: Optional[str] = None,
+                        tg_id: Optional[int] = None,
+                        limit: int = 1000,
+                        include_stopped_within_hours: int = 24) -> List[Dict[str, Any]]:
         """
         Get all streams from the database.
-        
+
         Args:
             status: Filter by status ('Running', 'Stopped', 'Error')
             tg_id: Filter by traffic generator ID
-            
+            limit: Hard cap on the number of rows returned.
+                v0.5.398 (audit stream-db O5): pre-fix this method had
+                no LIMIT and was called by the ~2 s poll thread in
+                run_tgen_server.py + by every /api/streams client
+                poll. Combined with the pre-O1 broken cleanup, the
+                `streams` table grew without bound and each poll
+                turned into O(N) plus O(N * JSON parse) for the
+                stream_config field. Default 1000 protects the poll
+                path; callers that legitimately need everything
+                (admin exports, cleanup drivers) can pass a bigger
+                number or None.
+            include_stopped_within_hours: Only return Stopped rows
+                whose stopped_at is within this many hours (defaults
+                to matching cleanup_old_stopped_streams's 24 h
+                default). Older Stopped rows are pending-cleanup and
+                the UI shouldn't render them.
+
         Returns:
             List of stream dictionaries
         """
+        # Compute the "recent Stopped" cutoff in the same ISO shape
+        # rows are stored (v0.5.398 O1 fix — string compare only works
+        # when both sides use the same format).
+        _stopped_cutoff = None
+        if include_stopped_within_hours and include_stopped_within_hours > 0:
+            _stopped_cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(hours=include_stopped_within_hours)
+            ).isoformat()
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 query = "SELECT * FROM streams WHERE 1=1"
-                params = []
-                
+                params: List[Any] = []
+
                 if status:
                     query += " AND status = ?"
                     params.append(status)
-                
+
                 if tg_id is not None:
                     query += " AND tg_id = ?"
                     params.append(tg_id)
-                
+
+                # v0.5.398 O5: when NO explicit status filter, hide
+                # stopped rows older than the cutoff so the UI/poll
+                # doesn't render pending-cleanup ghosts.
+                if not status and _stopped_cutoff is not None:
+                    query += (
+                        " AND (status = 'Running' OR status IS NULL"
+                        " OR stopped_at IS NULL"
+                        " OR stopped_at >= ?)"
+                    )
+                    params.append(_stopped_cutoff)
+
                 query += " ORDER BY created_at DESC"
-                
+                if limit is not None and limit > 0:
+                    query += f" LIMIT {int(limit)}"
+
                 cursor = conn.execute(query, params)
                 rows = cursor.fetchall()
-                
+
                 streams = []
                 for row in rows:
                     stream = dict(row)
@@ -450,7 +570,7 @@ class StreamDatabase:
                         except Exception:
                             pass
                     streams.append(stream)
-                
+
                 return streams
         except Exception as e:
             logger.error(f"[STREAM DB] Failed to get streams: {e}")
@@ -489,37 +609,66 @@ class StreamDatabase:
     def cleanup_old_statistics(self, days: int = 7) -> int:
         """
         Clean up old statistics records.
-        
+
         Args:
             days: Number of days to keep statistics
-            
+
         Returns:
             Number of records deleted
         """
+        # v0.5.398 (audit stream-db O1): datetime format-compare bug.
+        # Rows are stored via `datetime.now(timezone.utc).isoformat()`
+        # which emits e.g. "2026-09-21T15:30:00.123456+00:00" — ISO
+        # 8601 with the literal 'T' separator at position 10. But
+        # SQLite's `datetime('now', ...)` emits
+        # "2026-09-21 15:30:00" — space separator at position 10.
+        # String comparison in SQLite (default TEXT collation) sees
+        # 'T' (0x54) > ' ' (0x20) at position 10, so EVERY ISO-formatted
+        # `timestamp` value compares as GREATER than ANY SQLite-formatted
+        # cutoff value from the same instant. Result: `WHERE timestamp
+        # < cutoff` matched ZERO rows, both cleanup queries were
+        # silently dead code, and the DB grew unbounded despite the
+        # poll thread calling cleanup every ~20 s. On weeks-long srv06
+        # uptime the `stream_stats` history table exploded. Fix:
+        # compute the cutoff in the same ISO shape Python writes
+        # (with 'T' separator + '+00:00') so the string compare is
+        # correct.
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=days)).isoformat()
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.execute("""
                     DELETE FROM stream_stats
-                    WHERE timestamp < datetime('now', '-' || ? || ' days')
-                """, (days,))
+                    WHERE timestamp < ?
+                """, (cutoff,))
                 deleted = cursor.rowcount
                 conn.commit()
-                logger.info(f"[STREAM DB] Cleaned up {deleted} old statistics records")
+                if deleted > 0:
+                    logger.info(f"[STREAM DB] Cleaned up {deleted} old statistics records (cutoff={cutoff})")
                 return deleted
         except Exception as e:
             logger.error(f"[STREAM DB] Failed to cleanup old statistics: {e}")
             return 0
-    
+
     def cleanup_old_stopped_streams(self, hours: int = 24) -> int:
         """
         Clean up old stopped streams from the database.
-        
+
         Args:
             hours: Number of hours to keep stopped streams (default: 24 hours = 1 day)
-            
+
         Returns:
             Number of streams deleted
         """
+        # v0.5.398 (audit stream-db O1): same datetime format-compare
+        # bug as cleanup_old_statistics above. `datetime('now', '-N
+        # hours')` returned a space-separated string that compared
+        # LESS than any ISO-formatted `stopped_at`/`updated_at`, so
+        # this cleanup was dead code too — combined with the
+        # exploding stream_stats table, srv06's DB grew forever until
+        # /api/streams/stats polls degraded to O(N).
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(hours=hours)).isoformat()
         try:
             with sqlite3.connect(self.db_path) as conn:
                 # v0.5.266 (audit DB-F1): SQL operator-precedence bug —
@@ -538,14 +687,14 @@ class StreamDatabase:
                     DELETE FROM streams
                     WHERE status = 'Stopped'
                       AND (
-                            (stopped_at IS NOT NULL AND stopped_at < datetime('now', '-' || ? || ' hours'))
-                         OR (stopped_at IS NULL     AND updated_at < datetime('now', '-' || ? || ' hours'))
+                            (stopped_at IS NOT NULL AND stopped_at < ?)
+                         OR (stopped_at IS NULL     AND updated_at < ?)
                           )
-                """, (hours, hours))
+                """, (cutoff, cutoff))
                 deleted = cursor.rowcount
                 conn.commit()
                 if deleted > 0:
-                    logger.info(f"[STREAM DB] Cleaned up {deleted} old stopped stream(s) (older than {hours} hours)")
+                    logger.info(f"[STREAM DB] Cleaned up {deleted} old stopped stream(s) (older than {hours} hours, cutoff={cutoff})")
                 return deleted
         except Exception as e:
             logger.error(f"[STREAM DB] Failed to cleanup old stopped streams: {e}")
