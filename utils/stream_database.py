@@ -554,15 +554,31 @@ class StreamDatabase:
     def delete_stream(self, stream_id: str) -> bool:
         """
         Delete a stream from the database.
-        
+
+        v0.5.375 (audit db-foreign-keys-off): sibling of the
+        device_database.remove_route_pool / remove_dhcp_pool fix
+        — pre-fix the bare `sqlite3.connect(self.db_path)` opened
+        with FKs OFF, so any child rows in stream_stats keyed on
+        stream_id became permanent orphans on delete. Now:
+        `PRAGMA foreign_keys = ON` first so ON DELETE CASCADE
+        actually fires.
+
         Args:
             stream_id: Stream identifier
-            
+
         Returns:
             True if successful, False otherwise
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
+                # v0.5.375: enable FKs on this connection.
+                try:
+                    conn.execute("PRAGMA foreign_keys = ON")
+                except Exception as _pragma_exc:
+                    logger.warning(
+                        f"[STREAM DB] PRAGMA foreign_keys ON failed: "
+                        f"{_pragma_exc}"
+                    )
                 cursor = conn.execute("DELETE FROM streams WHERE stream_id = ?", (stream_id,))
                 deleted = cursor.rowcount
                 conn.commit()

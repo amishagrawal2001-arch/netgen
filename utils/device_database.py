@@ -579,7 +579,36 @@ class DeviceDatabase:
             logger.debug("[DEVICE DB] Starting database migrations")
             self._run_migrations(conn)
             logger.debug("[DEVICE DB] Database migrations completed")
-    
+
+    def _connect_fk_on(self):
+        """v0.5.375 (audit db-foreign-keys-off): return a sqlite3
+        connection with `PRAGMA foreign_keys = ON` + `synchronous =
+        NORMAL` already applied. SQLite defaults to foreign_keys=OFF
+        PER CONNECTION — only `init_database` and (pre-v0.5.375)
+        `remove_device` set it. Every other CRUD path opened a
+        vanilla connect() with FKs OFF → cascade deletes silently
+        SKIPPED, leaving orphan rows in device_route_pools,
+        device_dhcp_pools, stream_stats, device_stats,
+        device_events, device_state_history whenever a parent was
+        removed.
+
+        Use this helper for any CRUD path whose correctness depends
+        on ON DELETE CASCADE — remove_route_pool, remove_dhcp_pool,
+        remove_device_dhcp_pools, remove_device_route_pools,
+        stream_database.delete_stream — so the cascade actually
+        fires. Non-cascade paths can keep the raw sqlite3.connect
+        for compat during this hotfix; a broader migration of
+        every call site is a v0.5.376+ refactor."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        except Exception as _pragma_exc:
+            logger.warning(
+                f"[DEVICE DB] PRAGMA fk/sync setup failed: {_pragma_exc}"
+            )
+        return conn
+
     def _run_migrations(self, conn):
         """Run database migrations to add new columns or modify schema."""
         # v0.5.288 (log-spam fix): fast-return when this process has
@@ -588,6 +617,16 @@ class DeviceDatabase:
         # from firing on every one of the ~30 inline DeviceDatabase()
         # constructions across the codebase (~500 log lines/min on
         # srv06 pre-fix, drowning out dhcp/bgp/arp diagnostics).
+        #
+        # v0.5.375 (audit db-migrations-mark-before-run): pre-fix,
+        # the mark was added BEFORE the migration body ran, and
+        # ANY exception mid-migration left the path permanently
+        # marked "applied" — every subsequent DeviceDatabase()
+        # short-circuited without ever completing the remaining
+        # ALTER TABLEs. Schema silently drifted; later add_device
+        # calls failed with "no such column". Fix: mark BEFORE for
+        # concurrency, but remove-on-failure in the except so a
+        # retry on next construction reruns the migration body.
         with _MIGRATIONS_LOCK:
             if self.db_path in _MIGRATIONS_APPLIED_FOR_PATHS:
                 return
@@ -597,6 +636,7 @@ class DeviceDatabase:
             # second entry mid-run at worst re-checks the schema
             # (via the same connection semantics as before).
             _MIGRATIONS_APPLIED_FOR_PATHS.add(self.db_path)
+        _migration_started = True
         try:
             # v0.5.288: DEBUG (was INFO) — fires every migration
             # attempt, useful only when actively debugging schema
@@ -936,8 +976,19 @@ class DeviceDatabase:
 
         except Exception as e:
             logger.error(f"[DEVICE DB] Migration failed: {e}")
+            # v0.5.375 (audit db-migrations-mark-before-run): un-
+            # mark this path so a retry on next DeviceDatabase()
+            # construction actually reruns _run_migrations instead
+            # of silently short-circuiting. Pre-fix a single failed
+            # migration left every subsequent init believing the
+            # schema was up-to-date → later add_device raised
+            # "no such column" because the failing ALTER never
+            # ran. The remaining ALTERs above ARE idempotent, so
+            # a rerun cleanly finishes any partial state.
+            with _MIGRATIONS_LOCK:
+                _MIGRATIONS_APPLIED_FOR_PATHS.discard(self.db_path)
             # Don't raise the exception to avoid breaking the database initialization
-    
+
     def add_device(self, device_data: Dict[str, Any]) -> bool:
         """
         Add a new device to the database.
@@ -2001,19 +2052,54 @@ class DeviceDatabase:
     def restore_database(self) -> bool:
         """
         Restore database from backup.
-        
+
+        v0.5.375 (audit db-restore-wal-inconsistency): pre-fix used
+        `shutil.copy2(backup, live)` while the DB was open in WAL
+        mode. The `-wal` / `-shm` sidecars from the previous state
+        stayed on disk, so on the next open SQLite rolled the OLD
+        WAL onto the RESTORED main file — producing an inconsistent
+        snapshot. Fix (mirrors v0.5.266 backup): use
+        `sqlite3.Connection.backup()`, which serializes the target
+        DB pages properly and reconciles WAL state at commit time.
+
         Returns:
             bool: True if successful, False otherwise
         """
+        if not os.path.exists(self.backup_path):
+            logger.warning("[DEVICE DB] Backup file does not exist for restore")
+            return False
         try:
-            if os.path.exists(self.backup_path):
-                shutil.copy2(self.backup_path, self.db_path)
-                logger.info(f"[DEVICE DB] Database restored from {self.backup_path}")
-                return True
-            else:
-                logger.warning("[DEVICE DB] Backup file does not exist for restore")
-                return False
-                
+            # Reverse of v0.5.266: source is the backup, target is
+            # the live DB. Both are opened via sqlite3 so WAL /
+            # journal handling is coherent.
+            src_conn = sqlite3.connect(self.backup_path)
+            try:
+                dst_conn = sqlite3.connect(self.db_path)
+                try:
+                    src_conn.backup(dst_conn)
+                    dst_conn.commit()
+                    # v0.5.375: remove stale WAL / SHM sidecars if
+                    # any are still on disk (pre-fix restore left
+                    # them and the next open replayed the old WAL).
+                    for _side in (self.db_path + "-wal",
+                                  self.db_path + "-shm"):
+                        try:
+                            if os.path.exists(_side):
+                                os.remove(_side)
+                        except OSError as _rm_exc:
+                            logger.debug(
+                                f"[DEVICE DB] could not remove sidecar "
+                                f"{_side}: {_rm_exc}"
+                            )
+                finally:
+                    dst_conn.close()
+            finally:
+                src_conn.close()
+            logger.info(
+                f"[DEVICE DB] Database restored from {self.backup_path} "
+                f"(sqlite3 Connection.backup, WAL sidecars cleared)"
+            )
+            return True
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to restore database: {e}")
             return False
@@ -2286,20 +2372,24 @@ class DeviceDatabase:
             bool: True if successful, False otherwise
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            # v0.5.375 (audit db-foreign-keys-off): use _connect_fk_on
+            # so device_route_pools rows referencing this pool_name
+            # actually cascade-delete. Pre-fix vanilla sqlite3.connect
+            # left FKs OFF → child rows became permanent orphans.
+            with self._connect_fk_on() as conn:
                 # Check if pool exists
                 cursor = conn.execute("SELECT id FROM route_pools WHERE pool_name = ?", (pool_name,))
                 if not cursor.fetchone():
                     logger.warning(f"[DEVICE DB] Route pool '{pool_name}' not found for removal")
                     return True  # Consider it successful if already removed
-                
+
                 # Remove pool
                 conn.execute("DELETE FROM route_pools WHERE pool_name = ?", (pool_name,))
                 conn.commit()
-                
+
                 logger.info(f"[DEVICE DB] Successfully removed route pool '{pool_name}'")
                 return True
-                
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to remove route pool '{pool_name}': {e}")
             return False
@@ -2571,7 +2661,10 @@ class DeviceDatabase:
     def remove_dhcp_pool(self, pool_name: str) -> bool:
         """Remove a DHCP pool definition."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            # v0.5.375 (audit db-foreign-keys-off): _connect_fk_on so
+            # device_dhcp_pools rows referencing this pool cascade
+            # via FK ON DELETE CASCADE instead of orphaning.
+            with self._connect_fk_on() as conn:
                 cursor = conn.execute("SELECT id FROM dhcp_pools WHERE pool_name = ?", (pool_name,))
                 if not cursor.fetchone():
                     logger.warning(f"[DEVICE DB] DHCP pool '{pool_name}' not found for removal")
@@ -2650,7 +2743,11 @@ class DeviceDatabase:
     def remove_device_dhcp_pools(self, device_id: str) -> bool:
         """Detach all DHCP pools from a device."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            # v0.5.375 (audit db-foreign-keys-off): _connect_fk_on so
+            # dependent rows (stream mappings, per-family pool
+            # bindings) participate in cascade cleanup on device
+            # removal instead of being left as orphans.
+            with self._connect_fk_on() as conn:
                 conn.execute("DELETE FROM device_dhcp_pools WHERE device_id = ?", (device_id,))
                 conn.commit()
                 logger.info(f"[DEVICE DB] Detached all DHCP pools from device {device_id}")
@@ -2743,23 +2840,26 @@ class DeviceDatabase:
             bool: True if successful, False otherwise
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            # v0.5.375 (audit db-foreign-keys-off): _connect_fk_on so
+            # any child rows referencing this device_route_pools
+            # entry cascade instead of orphaning.
+            with self._connect_fk_on() as conn:
                 if neighbor_ip:
                     conn.execute("""
-                        DELETE FROM device_route_pools 
+                        DELETE FROM device_route_pools
                         WHERE device_id = ? AND neighbor_ip = ?
                     """, (device_id, neighbor_ip))
                     logger.info(f"[DEVICE DB] Removed route pool attachments for device {device_id} and neighbor {neighbor_ip}")
                 else:
                     conn.execute("""
-                        DELETE FROM device_route_pools 
+                        DELETE FROM device_route_pools
                         WHERE device_id = ?
                     """, (device_id,))
                     logger.info(f"[DEVICE DB] Removed all route pool attachments for device {device_id}")
-                
+
                 conn.commit()
                 return True
-                
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to remove route pool attachments for device {device_id}: {e}")
             return False

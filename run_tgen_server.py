@@ -29428,8 +29428,121 @@ def main(argv=None):
         
         return base
     
+    # ============================================================
+    # v0.5.375 (audit ai-subsystem-sec-hotfix): SECURITY HOTFIX
+    # helpers for the AI subsystem. The parallel audit found 8 HIGH-
+    # severity findings; these helpers close the path-traversal +
+    # SSRF + arbitrary-write classes. @require_role sweeps are
+    # applied directly on the route decorators below.
+    #
+    # F11 (model/activate) — version interpolated into filesystem
+    #     path. `_ai_safe_model_version` enforces a strict allowlist
+    #     (alnum + dots + underscores + hyphens) so `version="../evil"`
+    #     can't escape /opt/OSTG/ai_models/.
+    # F14 (pytest/generate) — file_path is a write-anywhere primitive.
+    #     `_ai_safe_pytest_write_path` enforces resolution inside
+    #     `/opt/OSTG/pytest_scripts/` and a `.py` extension.
+    # F15 (pytest/script/<name>) — script_name interpolated into
+    #     read/delete. `_ai_safe_script_name` enforces plain-filename
+    #     (no slashes, no dot-dot components).
+    # F16 (settings openai_api_base) — was raw user URL → SSRF + API
+    #     key exfil. `_ai_safe_api_base_url` restricts to a hostname
+    #     allowlist (api.openai.com + openrouter.ai + azure.com +
+    #     loopback for local Ollama/LM Studio).
+    # ============================================================
+
+    _AI_MODEL_DIR = os.path.realpath("/opt/OSTG/ai_models")
+    _AI_PYTEST_DIR = os.path.realpath("/opt/OSTG/pytest_scripts")
+    _AI_MODEL_VERSION_RE = re.compile(r"^[A-Za-z0-9._\-]{1,64}$")
+    _AI_SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9._\-]{1,128}\.py$")
+    # v0.5.375 (audit ai-openai-api-base-ssrf): allowlist of hostname
+    # substrings for openai_api_base. The default cloud endpoints
+    # (OpenAI, Azure OpenAI, OpenRouter) plus loopback for locally-
+    # run Ollama / LM Studio / vLLM. Any other hostname → 400.
+    # Operators who need a different provider must set the env var
+    # OPENAI_API_BASE directly on the server (out-of-band trust
+    # boundary), not accept a client POST.
+    _AI_API_BASE_ALLOWED_SUFFIXES = (
+        "api.openai.com",
+        "openai.azure.com",
+        "azure.com",  # covers *.openai.azure.com
+        "openrouter.ai",
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    )
+
+    def _ai_safe_model_version(v):
+        """Return the version string only if it's a plain identifier
+        that can't escape the model directory. `None` on bad input."""
+        if not isinstance(v, str) or not v:
+            return None
+        if not _AI_MODEL_VERSION_RE.match(v):
+            return None
+        # Belt-and-braces: reject any '..' or path separators even
+        # if the regex is later loosened.
+        if ".." in v or "/" in v or "\\" in v:
+            return None
+        return v
+
+    def _ai_safe_script_name(name):
+        """Return the script_name only if it's a plain .py filename
+        with no path components. `None` on bad input."""
+        if not isinstance(name, str) or not name:
+            return None
+        if not _AI_SCRIPT_NAME_RE.match(name):
+            return None
+        if ".." in name or "/" in name or "\\" in name:
+            return None
+        return name
+
+    def _ai_safe_pytest_write_path(p):
+        """Resolve `p` and require it lies inside _AI_PYTEST_DIR.
+        Returns the resolved absolute path or None."""
+        if not isinstance(p, str) or not p:
+            return None
+        if not p.endswith(".py"):
+            return None
+        # Resolve and check containment against realpath so a
+        # symlink can't escape.
+        try:
+            _abs = os.path.realpath(p)
+        except Exception:
+            return None
+        _base = _AI_PYTEST_DIR + os.sep
+        if not (_abs == _AI_PYTEST_DIR or _abs.startswith(_base)):
+            return None
+        return _abs
+
+    def _ai_safe_api_base_url(url):
+        """Validate an openai_api_base string. Empty is allowed
+        (clears the override). Otherwise must be a well-formed
+        http/https URL whose hostname ends with one of the
+        allowlisted suffixes. Returns the trimmed URL or None."""
+        if url is None:
+            return ""
+        _u = str(url).strip()
+        if _u == "":
+            return ""
+        try:
+            from urllib.parse import urlparse as _urlparse
+            _p = _urlparse(_u)
+        except Exception:
+            return None
+        if _p.scheme not in ("http", "https"):
+            return None
+        _host = (_p.hostname or "").lower()
+        if not _host:
+            return None
+        for _allowed in _AI_API_BASE_ALLOWED_SUFFIXES:
+            if _host == _allowed or _host.endswith("." + _allowed):
+                return _u
+        return None
+
     # AI Settings API Endpoints
     @app.route("/api/ai/settings", methods=["GET"])
+    @require_role("viewer")  # v0.5.375 (audit ai-subsystem-sec-hotfix):
+    #                        gate GET behind viewer minimum.
     def get_ai_settings():
         """Get current AI settings (without exposing sensitive keys)"""
         try:
@@ -29444,11 +29557,18 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/settings", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix):
+    # F16 — this endpoint mutates the process's OPENAI_API_KEY +
+    # OPENAI_API_BASE and persists them to disk. Pre-fix any
+    # unauthenticated caller could rewrite the base URL to their
+    # own server, then wait for the operator to trigger /api/ai/chat
+    # → API key exfiltrated as Bearer header. Admin gate + URL
+    # allowlist below closes that path.
     def set_ai_settings():
         """Set AI settings from client and persist to file"""
         try:
             data = request.get_json()
-            
+
             # Update settings
             if "openai_api_key" in data:
                 ai_settings["openai_api_key"] = data.get("openai_api_key", "").strip()
@@ -29461,15 +29581,37 @@ def main(argv=None):
                     if "OPENAI_API_KEY" in os.environ:
                         del os.environ["OPENAI_API_KEY"]
                     logging.info("[AI SETTINGS] API key cleared")
-            
+
             if "openai_api_base" in data:
-                ai_settings["openai_api_base"] = data.get("openai_api_base", "").strip()
-                if ai_settings["openai_api_base"]:
-                    # Also set environment variable for modules that check it directly
-                    os.environ["OPENAI_API_BASE"] = ai_settings["openai_api_base"]
-                    logging.info(f"[AI SETTINGS] API base URL updated: {ai_settings['openai_api_base']}")
+                # v0.5.375 (audit ai-openai-api-base-ssrf): validate
+                # against allowlist before we ever write it to
+                # os.environ. Empty string is allowed (clears
+                # override); anything else must resolve to an
+                # allowlisted hostname (OpenAI, Azure OpenAI,
+                # OpenRouter, loopback for local Ollama/LM Studio).
+                _requested = data.get("openai_api_base", "")
+                _validated = _ai_safe_api_base_url(_requested)
+                if _validated is None:
+                    logging.warning(
+                        f"[AI SETTINGS] Rejected openai_api_base — "
+                        f"hostname not on allowlist: {_requested!r}"
+                    )
+                    return jsonify({
+                        "error": (
+                            "openai_api_base must point to an "
+                            "allowlisted provider "
+                            "(api.openai.com, azure.com, "
+                            "openrouter.ai) or loopback for a "
+                            "local LLM. To use a different "
+                            "hostname, set OPENAI_API_BASE on "
+                            "the server env directly."
+                        ),
+                    }), 400
+                ai_settings["openai_api_base"] = _validated
+                if _validated:
+                    os.environ["OPENAI_API_BASE"] = _validated
+                    logging.info(f"[AI SETTINGS] API base URL updated: {_validated}")
                 else:
-                    # Clear from environment if empty
                     if "OPENAI_API_BASE" in os.environ:
                         del os.environ["OPENAI_API_BASE"]
                     logging.info("[AI SETTINGS] API base URL cleared")
@@ -29546,6 +29688,7 @@ def main(argv=None):
     
     # AI Troubleshooting API Endpoints
     @app.route("/api/ai/troubleshoot", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/troubleshoot
     def ai_troubleshoot():
         """AI-powered network troubleshooting"""
         if not ai_troubleshooter:
@@ -29567,6 +29710,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/add-config", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/add-config
     def ai_add_config():
         """Add device configuration to AI knowledge base"""
         if not ai_kb:
@@ -29589,6 +29733,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/train-case", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/train-case
     def ai_train_case():
         """Train AI from a resolved troubleshooting case"""
         if not ai_troubleshooter:
@@ -29610,6 +29755,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/import-ostg-configs", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/import-ostg-configs
     def ai_import_ostg_configs():
         """Import all device configurations from OSTG database"""
         if not ai_kb:
@@ -29624,6 +29770,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/suggest-config-fix", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/suggest-config-fix
     def ai_suggest_config_fix():
         """Suggest configuration fixes for an issue"""
         if not ai_troubleshooter:
@@ -29923,6 +30070,7 @@ def main(argv=None):
     
     # Test Framework API Endpoints
     @app.route("/api/ai/test/suggest", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/suggest
     def ai_suggest_tests():
         """Suggest test cases for a device"""
         if not test_framework:
@@ -29952,6 +30100,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/run", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/run
     def ai_run_tests():
         """Run a test suite"""
         if not test_framework:
@@ -29983,6 +30132,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/report/<report_id>", methods=["GET"])
+    @require_role("viewer")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/report/<report_id>
     def ai_get_report(report_id):
         """Get test report by ID"""
         if not test_report_storage:
@@ -30006,6 +30156,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/reports/<device_id>", methods=["GET"])
+    @require_role("viewer")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/reports/<device_id>
     def ai_get_device_reports(device_id):
         """Get test reports for a device"""
         if not test_report_storage:
@@ -30020,6 +30171,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/case/create", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/case/create
     def ai_create_test_case():
         """Create a user-defined test case"""
         if not test_case_manager:
@@ -30055,6 +30207,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/case/list", methods=["GET"])
+    @require_role("viewer")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/case/list
     def ai_list_test_cases():
         """List all test cases (built-in and user-defined)"""
         if not test_framework:
@@ -30078,6 +30231,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/case/<test_id>", methods=["GET", "PUT", "DELETE"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/case/<test_id>
     def ai_manage_test_case(test_id):
         """Get, update, or delete a test case"""
         if not test_case_manager:
@@ -30152,26 +30306,47 @@ def main(argv=None):
     
     # Pytest and Code Generation API Endpoints
     @app.route("/api/ai/pytest/generate", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix):
+    # F14 — writes generated script to a caller-controlled file_path
+    # → write-anywhere primitive. Admin gate + _ai_safe_pytest_write_path
+    # containment below closes it.
     def ai_generate_pytest():
         """Generate pytest script"""
         if not pytest_generator:
             return jsonify({"error": "Pytest generator not available"}), 503
-        
+
         try:
             data = request.get_json()
             test_requirements = data.get("test_requirements", {})
             device_config = data.get("device_config")
             save_file = data.get("save_file", False)
             file_path = data.get("file_path")
-            
+
             script = pytest_generator.generate_pytest_script(test_requirements, device_config)
-            
+
             # Save if requested
             if save_file:
                 if not file_path:
                     file_path = f"/opt/OSTG/pytest_scripts/test_{int(time.time())}.py"
+                # v0.5.375: reject any file_path that escapes the
+                # pytest_scripts dir. Pre-fix
+                # `file_path="/etc/systemd/system/evil.service"` would
+                # silently write the generated script anywhere.
+                _safe = _ai_safe_pytest_write_path(file_path)
+                if _safe is None:
+                    logging.warning(
+                        f"[AI PYTEST GENERATE] Rejected file_path "
+                        f"outside {_AI_PYTEST_DIR}: {file_path!r}"
+                    )
+                    return jsonify({
+                        "error": (
+                            f"file_path must be a .py file inside "
+                            f"{_AI_PYTEST_DIR}"
+                        ),
+                    }), 400
+                file_path = _safe
                 pytest_generator.save_pytest_script(script, file_path)
-            
+
             return jsonify({
                 "script": script,
                 "file_path": file_path if save_file else None
@@ -30179,60 +30354,108 @@ def main(argv=None):
         except Exception as e:
             logging.error(f"[AI PYTEST GENERATE] Error: {e}")
             return jsonify({"error": str(e)}), 500
-    
+
     @app.route("/api/ai/pytest/run", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix):
+    # F13 — executes arbitrary client-supplied script_content OR
+    # runs a pytest against a caller-controlled script_path (RCE as
+    # netgen-server user). Admin gate + path containment below.
     def ai_run_pytest():
         """Run pytest script"""
         if not pytest_runner:
             return jsonify({"error": "Pytest runner not available"}), 503
-        
+
         try:
             data = request.get_json()
             script_content = data.get("script_content")
             script_name = data.get("script_name")
             script_path = data.get("script_path")
             additional_args = data.get("additional_args", [])
-            
+
             if script_path:
+                # v0.5.375: refuse to run pytest against any file
+                # outside the sanctioned pytest_scripts dir. Pre-fix
+                # `script_path="/etc/cron.d/whatever"` was accepted.
+                _safe_path = _ai_safe_pytest_write_path(script_path)
+                if _safe_path is None:
+                    return jsonify({
+                        "error": (
+                            f"script_path must be a .py file inside "
+                            f"{_AI_PYTEST_DIR}"
+                        ),
+                    }), 400
                 # Run from file
-                result = pytest_runner.run_pytest_file(script_path, additional_args)
+                result = pytest_runner.run_pytest_file(_safe_path, additional_args)
             elif script_content:
+                # v0.5.375: script_name (if supplied) must be a plain
+                # filename — used by pytest_runner to name a temp
+                # file. Reject path components.
+                if script_name is not None:
+                    _safe_name = _ai_safe_script_name(script_name)
+                    if _safe_name is None:
+                        return jsonify({
+                            "error": (
+                                "script_name must be a plain .py "
+                                "filename (no path components)"
+                            ),
+                        }), 400
+                    script_name = _safe_name
                 # Run from content
                 result = pytest_runner.run_pytest_script(script_content, script_name, additional_args)
             else:
                 return jsonify({"error": "script_content or script_path is required"}), 400
-            
+
             return jsonify(result), 200
         except Exception as e:
             logging.error(f"[AI PYTEST RUN] Error: {e}")
             return jsonify({"error": str(e)}), 500
-    
+
     @app.route("/api/ai/pytest/scripts", methods=["GET"])
+    @require_role("viewer")  # v0.5.375: read-only list — viewer OK.
     def ai_list_pytest_scripts():
         """List pytest scripts"""
         if not pytest_runner:
             return jsonify({"error": "Pytest runner not available"}), 503
-        
+
         try:
             scripts = pytest_runner.list_scripts()
             return jsonify({"scripts": scripts}), 200
         except Exception as e:
             logging.error(f"[AI PYTEST LIST] Error: {e}")
             return jsonify({"error": str(e)}), 500
-    
+
     @app.route("/api/ai/pytest/script/<script_name>", methods=["GET", "DELETE"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix):
+    # F15 — path traversal on script_name (joined onto scripts_dir
+    # inside pytest_runner). GET reads any file; DELETE removes
+    # any file. Admin gate + `_ai_safe_script_name` below. GET is
+    # decorated as admin too because the read-path is the same
+    # vector; if you have viewer-only reasons to see scripts, use
+    # /api/ai/pytest/scripts (the listing endpoint).
     def ai_manage_pytest_script(script_name):
         """Get or delete pytest script"""
         if not pytest_runner:
             return jsonify({"error": "Pytest runner not available"}), 503
-        
+
+        # v0.5.375: reject any script_name that isn't a plain .py
+        # filename before it can be joined onto the scripts dir.
+        _safe = _ai_safe_script_name(script_name)
+        if _safe is None:
+            logging.warning(
+                f"[AI PYTEST MANAGE] Rejected script_name: {script_name!r}"
+            )
+            return jsonify({
+                "error": "script_name must be a plain .py filename",
+            }), 400
+        script_name = _safe
+
         try:
             if request.method == "GET":
                 content = pytest_runner.get_script_content(script_name)
                 if content is None:
                     return jsonify({"error": "Script not found"}), 404
                 return jsonify({"script": content, "name": script_name}), 200
-            
+
             elif request.method == "DELETE":
                 if pytest_runner.delete_script(script_name):
                     return jsonify({"status": "success"}), 200
@@ -30244,6 +30467,7 @@ def main(argv=None):
     
     # Code Generation API Endpoints (Cursor.ai-like)
     @app.route("/api/ai/code/generate", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/generate
     def ai_generate_code():
         """Generate code from prompt using LLM"""
         try:
@@ -30327,6 +30551,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/refactor", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/refactor
     def ai_refactor_code():
         """Refactor code"""
         if not code_generator:
@@ -30347,6 +30572,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/fix", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/fix
     def ai_fix_code():
         """Fix code errors"""
         if not code_generator:
@@ -30367,6 +30593,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/explain", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/explain
     def ai_explain_code():
         """Explain code"""
         if not code_generator:
@@ -30386,6 +30613,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/optimize", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/optimize
     def ai_optimize_code():
         """Optimize code"""
         if not code_generator:
@@ -30405,6 +30633,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/test", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/test
     def ai_generate_test():
         """Generate test script for code"""
         if not code_generator:
@@ -30425,6 +30654,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/documentation", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/documentation
     def ai_code_documentation():
         """Generate documentation for code"""
         if not code_generator:
@@ -30446,6 +30676,7 @@ def main(argv=None):
     
     # Advanced Code Generator Endpoints
     @app.route("/api/ai/code/generate-advanced", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/generate-advanced
     def ai_generate_advanced_code():
         """Generate code in multiple languages with advanced features"""
         try:
@@ -30474,6 +30705,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/generate-network-script", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/generate-network-script
     def ai_generate_network_script():
         """Generate network automation script"""
         try:
@@ -30499,6 +30731,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/generate-config", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/generate-config
     def ai_generate_config():
         """Generate device configuration template"""
         try:
@@ -30526,6 +30759,7 @@ def main(argv=None):
     
     # Code Analyzer Endpoints
     @app.route("/api/ai/code/analyze", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/analyze
     def ai_analyze_code():
         """Analyze code quality and security"""
         try:
@@ -30551,6 +30785,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/security-scan", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/security-scan
     def ai_security_scan():
         """Scan code for security vulnerabilities"""
         try:
@@ -30576,6 +30811,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/code/optimize-suggestions", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/code/optimize-suggestions
     def ai_optimize_suggestions():
         """Get performance optimization suggestions"""
         try:
@@ -30602,6 +30838,7 @@ def main(argv=None):
     
     # Unified Troubleshooter Endpoints
     @app.route("/api/ai/troubleshoot/unified", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/troubleshoot/unified
     def ai_troubleshoot_unified():
         """Unified troubleshooting for all domains"""
         try:
@@ -30627,6 +30864,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/troubleshoot/code", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/troubleshoot/code
     def ai_troubleshoot_code():
         """Troubleshoot code issues"""
         try:
@@ -30648,6 +30886,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/troubleshoot/system", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/troubleshoot/system
     def ai_troubleshoot_system():
         """Troubleshoot system issues"""
         try:
@@ -30669,6 +30908,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/troubleshoot/integration", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/troubleshoot/integration
     def ai_troubleshoot_integration():
         """Troubleshoot integration issues"""
         try:
@@ -30709,6 +30949,7 @@ def main(argv=None):
     
     # Comprehensive Test Framework Endpoints
     @app.route("/api/ai/test/generate-unit", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/generate-unit
     def ai_generate_unit_tests():
         """Generate unit tests from code"""
         try:
@@ -30734,6 +30975,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/generate-integration", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/generate-integration
     def ai_generate_integration_tests():
         """Generate integration tests"""
         try:
@@ -30758,6 +31000,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/generate-suite", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/generate-suite
     def ai_generate_test_suite():
         """Generate complete test suite"""
         try:
@@ -30784,6 +31027,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/coverage", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/coverage
     def ai_analyze_test_coverage():
         """Analyze test coverage"""
         try:
@@ -30810,6 +31054,7 @@ def main(argv=None):
     
     # Intelligent Device Manager Endpoints
     @app.route("/api/ai/device/provision", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/device/provision
     def ai_provision_device():
         """Automated device provisioning"""
         try:
@@ -30834,6 +31079,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/device/manage-config", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/device/manage-config
     def ai_manage_device_config():
         """Intelligent configuration management"""
         try:
@@ -30859,6 +31105,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/device/health/<device_id>", methods=["GET"])
+    @require_role("viewer")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/device/health/<device_id>
     def ai_device_health(device_id):
         """Get device health status"""
         try:
@@ -30877,6 +31124,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/device/auto-remediate", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/device/auto-remediate
     def ai_auto_remediate_device():
         """Automated issue remediation"""
         try:
@@ -30903,6 +31151,7 @@ def main(argv=None):
     
     # Proactive AI Assistant Endpoints
     @app.route("/api/ai/assistant/suggest", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/assistant/suggest
     def ai_assistant_suggest():
         """Get proactive suggestions"""
         try:
@@ -30924,6 +31173,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/assistant/learn", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/assistant/learn
     def ai_assistant_learn():
         """Learn from user actions"""
         try:
@@ -30946,6 +31196,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/assistant/personalize/<user_id>", methods=["GET"])
+    @require_role("viewer")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/assistant/personalize/<user_id>
     def ai_assistant_personalize(user_id):
         """Get personalized experience settings"""
         try:
@@ -30964,6 +31215,7 @@ def main(argv=None):
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/assistant/contextual-help", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/assistant/contextual-help
     def ai_assistant_contextual_help():
         """Get contextual help"""
         try:
@@ -31503,6 +31755,11 @@ Return only the corrected text, without any explanation."""
         return normalized
     
     @app.route("/api/ai/chat", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix):
+    # F17 — pre-fix unauthenticated → attacker can burn the operator's
+    # cloud-API budget AND submit arbitrary prompts to a model whose
+    # responses downstream agent flows trust. Operator tier is the
+    # minimum that makes sense (viewer role shouldn't consume tokens).
     def ai_chat():
         """Handle AI chat messages using LLM (Ollama or Cloud API)"""
         try:
@@ -31826,6 +32083,7 @@ If off-topic, ask for clarification."""
             }), 500
     
     @app.route("/api/ai/analytics/performance", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/analytics/performance
     def ai_analytics_performance():
         """Analyze network performance"""
         try:
@@ -31859,6 +32117,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/analytics/traffic", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/analytics/traffic
     def ai_analytics_traffic():
         """Analyze network traffic"""
         try:
@@ -31880,6 +32139,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/analytics/protocol/<protocol>", methods=["GET"])
+    @require_role("viewer")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/analytics/protocol/<protocol>
     def ai_analytics_protocol(protocol):
         """Analyze protocol performance"""
         try:
@@ -31904,6 +32164,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/analytics/insights", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/analytics/insights
     def ai_analytics_insights():
         """Generate insights from analytics data"""
         try:
@@ -31926,6 +32187,7 @@ If off-topic, ask for clarification."""
     
     # Test Plan Generator Endpoints
     @app.route("/api/ai/test/plan/generate", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/plan/generate
     def ai_generate_test_plan():
         """Generate comprehensive test plan from functional specification"""
         try:
@@ -31990,6 +32252,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/plan/generate-unit", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/plan/generate-unit
     def ai_generate_unit_tests_from_spec():
         """Generate unit tests from functional specification"""
         try:
@@ -32016,6 +32279,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/plan/generate-document", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/plan/generate-document
     def ai_generate_test_plan_document():
         """Generate detailed test plan document (markdown)"""
         try:
@@ -32041,6 +32305,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/plan/generate-pytest", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/plan/generate-pytest
     def ai_generate_pytest_from_test_plan():
         """Generate pytest script from test plan"""
         try:
@@ -32067,6 +32332,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/plan/generate-pytest-from-spec", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/plan/generate-pytest-from-spec
     def ai_generate_pytest_from_spec():
         """Generate executable pytest script directly from functional specification"""
         try:
@@ -32097,6 +32363,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/test/plan/agent", methods=["POST"])
+    @require_role("operator")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/test/plan/agent
     def ai_test_plan_agent():
         """AI Agent endpoint for autonomous test plan generation"""
         try:
@@ -32276,6 +32543,7 @@ If off-topic, ask for clarification."""
     
     # Pytest Device Execution Endpoints
     @app.route("/api/ai/pytest/execute-devices", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/pytest/execute-devices
     def ai_execute_pytest_for_devices():
         """Execute pytest script against external devices"""
         try:
@@ -32301,6 +32569,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/pytest/execute-device-type", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/pytest/execute-device-type
     def ai_execute_pytest_for_device_type():
         """Execute pytest script for all devices of a specific type"""
         try:
@@ -32329,6 +32598,7 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/pytest/generate-device-specific", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix): default tier for /api/ai/pytest/generate-device-specific
     def ai_generate_device_specific_pytest():
         """Generate vendor-specific pytest script"""
         try:
@@ -32357,6 +32627,7 @@ If off-topic, ask for clarification."""
     
     # AI Model Management Endpoints
     @app.route("/api/ai/model/backup", methods=["POST"])
+    @require_role("admin")  # v0.5.375: state-mutating disk write.
     def ai_model_backup():
         """Backup current AI model"""
         try:
@@ -32395,6 +32666,8 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/model/train", methods=["POST"])
+    @require_role("admin")  # v0.5.375: writes .pkl (F19 in audit)
+    # + heavy CPU. Admin-tier action.
     def ai_model_train():
         """Train new AI model version"""
         try:
@@ -32490,22 +32763,54 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/model/activate", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix):
+    # F11 — no auth + `version` interpolated into path → traversal +
+    # arbitrary pickle activation → RCE via LocalAIEngine's
+    # pickle.load at model init. Admin gate + strict version
+    # allowlist below closes the exploit chain.
     def ai_model_activate():
         """Activate a model version"""
         try:
             from pathlib import Path
             import shutil
-            
+
             data = request.get_json()
             version = data.get("version")
-            
-            if not version:
-                return jsonify({"error": "version required"}), 400
-            
+
+            # v0.5.375: strict version allowlist (alnum + . _ -).
+            # Pre-fix `version="../../../tmp/evil"` resolved outside
+            # /opt/OSTG/ai_models and shutil.copy2'd any attacker-
+            # writable .pkl to become the live classifier — next
+            # /api/ai/troubleshoot then pickle-loaded arbitrary code.
+            _safe_version = _ai_safe_model_version(version)
+            if _safe_version is None:
+                logging.warning(
+                    f"[AI MODEL ACTIVATE] Rejected version: {version!r}"
+                )
+                return jsonify({
+                    "error": (
+                        "version must be a plain identifier "
+                        "(alphanumeric + . _ - only, up to 64 chars)"
+                    ),
+                }), 400
+            version = _safe_version
+
             MODEL_DIR = Path("/opt/OSTG/ai_models")
             versioned_file = MODEL_DIR / f"troubleshooting_classifier_v{version}.pkl"
             CURRENT_MODEL = MODEL_DIR / "troubleshooting_classifier.pkl"
-            
+
+            # v0.5.375: belt-and-braces — after resolving, confirm
+            # the versioned_file still lives inside MODEL_DIR (guards
+            # against a symlink at that path pointing elsewhere).
+            _versioned_real = os.path.realpath(str(versioned_file))
+            if not (_versioned_real == _AI_MODEL_DIR
+                    or _versioned_real.startswith(_AI_MODEL_DIR + os.sep)):
+                logging.warning(
+                    f"[AI MODEL ACTIVATE] versioned_file resolves "
+                    f"outside {_AI_MODEL_DIR}: {_versioned_real!r}"
+                )
+                return jsonify({"error": "invalid version"}), 400
+
             if not versioned_file.exists():
                 return jsonify({"error": f"Model version {version} not found"}), 404
             
@@ -32548,12 +32853,19 @@ If off-topic, ask for clarification."""
             return jsonify({"error": str(e)}), 500
     
     @app.route("/api/ai/model/rollback", methods=["POST"])
+    @require_role("admin")  # v0.5.375 (audit ai-subsystem-sec-hotfix):
+    # F11 — literally `return ai_model_activate()`. Even though
+    # activate has its own decorator now, this route's decorator is
+    # what Flask actually consults (activate's decorator only fires
+    # on HTTP hits to /api/ai/model/activate). Explicit gate here.
     def ai_model_rollback():
         """Rollback to a previous model version"""
         # Same as activate
         return ai_model_activate()
-    
+
     @app.route("/api/ai/model/versions", methods=["GET"])
+    @require_role("viewer")  # v0.5.375: read-only listing of model
+    # versions + metadata. Viewer OK.
     def ai_model_versions():
         """List all model versions"""
         try:
