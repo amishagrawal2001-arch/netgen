@@ -18,6 +18,50 @@ from utils.table_sort_state import capture_sort_state, restore_sort_state
 logger = logging.getLogger(__name__)
 
 
+# v0.5.374 (audit stream-stats-string-sort): numeric-aware
+# QTableWidgetItem subclass. Pre-fix the stream-stats table had
+# setSortingEnabled(True) but cells held format_number ("1,234,567")
+# / format_rate ("1.50 Gbps") as raw text. Qt's default sort is
+# text-lexicographic, so "9,000" placed above "1,000,000" and
+# "999.00 Mbps" above "1.50 Gbps" — an operator sorting by TX
+# rate to find the biggest talker saw the smallest.
+#
+# Attach the raw numeric via `setData(Qt.UserRole, value)`; this
+# subclass's `__lt__` compares those numerics when both cells
+# have them, falling back to string compare when they don't
+# (empty rows, "N/A", "—" placeholders).
+class NumericSortItem(QTableWidgetItem):
+    def __lt__(self, other):
+        try:
+            _self_v = self.data(Qt.UserRole)
+            _other_v = other.data(Qt.UserRole)
+        except Exception:
+            _self_v = None
+            _other_v = None
+        if _self_v is not None and _other_v is not None:
+            try:
+                return float(_self_v) < float(_other_v)
+            except (TypeError, ValueError):
+                pass
+        # Fallback: default text compare so mixed-content columns
+        # (numeric + "N/A") still order consistently.
+        return super().__lt__(other)
+
+
+def _make_numeric_item(display, value):
+    """Convenience: build a NumericSortItem with display text and
+    the underlying numeric that drives sort order. `value` may be
+    None (for "N/A" cells) — the item then sorts by text."""
+    _it = NumericSortItem(display)
+    if value is not None:
+        try:
+            _it.setData(Qt.UserRole, float(value))
+        except (TypeError, ValueError):
+            pass
+    _it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    return _it
+
+
 # v0.5.144: iface-level packet-loss helper.
 #
 # Why this exists (and why v0.5.139's per-stream rx_count aggregation
@@ -2283,8 +2327,12 @@ class TrafficGenClientStatisticsSection():
             self.stream_statistics_table.setItem(row, 2, engine_item)
 
             # TX Count
-            tx_item = QTableWidgetItem(format_number(stream["tx_count"]))
-            tx_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            # v0.5.374 (audit stream-stats-string-sort): use
+            # NumericSortItem so numeric column sort works.
+            tx_item = _make_numeric_item(
+                format_number(stream["tx_count"]),
+                stream["tx_count"],
+            )
             self.stream_statistics_table.setItem(row, 3, tx_item)
 
             # RX Count
@@ -2303,8 +2351,14 @@ class TrafficGenClientStatisticsSection():
             wdw = stream.get("wire_delivery_warning")
             if wdw and isinstance(wdw, dict):
                 rx_display = f"⚠ {rx_display}"
-            rx_item = QTableWidgetItem(rx_display)
-            rx_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            # v0.5.374: numeric-aware item; sort by rx_count when
+            # it's a real integer, else fall back to text order
+            # ("N/A" sinks to bottom, warning-prefixed rows sort
+            # by the underlying number not the ⚠ glyph).
+            rx_item = _make_numeric_item(
+                rx_display,
+                rx_count if isinstance(rx_count, (int, float)) else None,
+            )
             if stream["flow_tracking"] and isinstance(rx_count, int) and stream["tx_count"] > 0 and rx_count == 0:
                 rx_item.setForeground(QColor("#ef4444"))  # Red for 100% loss
             if wdw and isinstance(wdw, dict):
@@ -2330,8 +2384,8 @@ class TrafficGenClientStatisticsSection():
                 tx_rate_display = "0.00 pps"
             else:
                 tx_rate_display = format_rate(tx_rate)
-            tx_rate_item = QTableWidgetItem(tx_rate_display)
-            tx_rate_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            # v0.5.374: numeric-aware; sort by raw pps.
+            tx_rate_item = _make_numeric_item(tx_rate_display, tx_rate or 0.0)
             tx_rate_item.setFont(QFont("Monaco, Consolas, monospace", 12, QFont.Bold))
             tx_rate_item.setForeground(QColor("#1d4ed8"))  # Blue for TX
             self.stream_statistics_table.setItem(row, 5, tx_rate_item)
@@ -2343,8 +2397,8 @@ class TrafficGenClientStatisticsSection():
                 rx_rate_display = "0.00 pps"
             else:
                 rx_rate_display = format_rate(rx_rate)
-            rx_rate_item = QTableWidgetItem(rx_rate_display)
-            rx_rate_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            # v0.5.374: numeric-aware; sort by raw pps.
+            rx_rate_item = _make_numeric_item(rx_rate_display, rx_rate or 0.0)
             rx_rate_item.setForeground(QColor("#111827"))
             self.stream_statistics_table.setItem(row, 6, rx_rate_item)
 
@@ -2372,15 +2426,15 @@ class TrafficGenClientStatisticsSection():
                 return f"{v:.2f} bps"
 
             # TX Bit Rate — bold + blue (paired with TX Rate at col 5).
-            tx_bps_item = QTableWidgetItem(_format_bps(tx_bps_val))
-            tx_bps_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            # v0.5.374: numeric-aware; sort by raw bps.
+            tx_bps_item = _make_numeric_item(_format_bps(tx_bps_val), tx_bps_val)
             tx_bps_item.setFont(QFont("Monaco, Consolas, monospace", 12, QFont.Bold))
             tx_bps_item.setForeground(QColor("#1d4ed8"))
             self.stream_statistics_table.setItem(row, 7, tx_bps_item)
 
             # RX Bit Rate — neutral, matches RX Rate styling.
-            rx_bps_item = QTableWidgetItem(_format_bps(rx_bps_val))
-            rx_bps_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            # v0.5.374: numeric-aware; sort by raw bps.
+            rx_bps_item = _make_numeric_item(_format_bps(rx_bps_val), rx_bps_val)
             rx_bps_item.setForeground(QColor("#111827"))
             self.stream_statistics_table.setItem(row, 8, rx_bps_item)
 

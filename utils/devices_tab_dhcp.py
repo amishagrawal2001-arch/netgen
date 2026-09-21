@@ -1754,34 +1754,107 @@ class DHCPHandler:
         # Pre-fix, the operator saw "Read timed out" on every
         # Restart click even though the server-side restart WAS
         # in progress — the button felt dead.
+        #
+        # v0.5.374 (audit dhcp-restart-ui-freeze): move the
+        # requests.post into a QThread worker so the UI stays
+        # responsive during the 60 s worst-case wait. Pre-fix the
+        # synchronous call on the main thread + `processEvents()`
+        # gave the operator a frozen dialog with no cancel option
+        # — clicking anywhere else in the client did nothing until
+        # the request returned. Now: dedicated worker, cancel
+        # button that terminates the worker (server side keeps
+        # going but the UI unblocks), and result posted back via
+        # signal to the main thread.
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class RestartDHCPWorker(QThread):
+            finished_ok = pyqtSignal(object)   # response
+            finished_err = pyqtSignal(str)     # error msg
+
+            def __init__(self, url, device_id):
+                super().__init__()
+                self._url = url
+                self._device_id = device_id
+
+            def run(self):
+                try:
+                    resp = requests.post(
+                        self._url,
+                        json={"device_id": self._device_id},
+                        timeout=60,
+                    )
+                    self.finished_ok.emit(resp)
+                except requests.RequestException as _exc:
+                    self.finished_err.emit(str(_exc))
+
         _prog = QProgressDialog(
             "Restarting DHCP daemon on the selected device…\n"
             "(kill old dhclient/dnsmasq, spawn fresh, wait for lease)",
-            None,  # No Cancel button — the server-side cycle can't
-                   # be interrupted mid-way without leaving daemons
-                   # in a half-torn-down state.
+            "Cancel",  # v0.5.374: real Cancel button now — the
+                       # worker stops on our side; the server-side
+                       # cycle continues but we no longer freeze
+                       # the operator's UI.
             0, 0, self.parent,
         )
         _prog.setWindowTitle("Restart DHCP")
         _prog.setWindowModality(Qt.WindowModal)
         _prog.setMinimumDuration(0)
-        _prog.show()
-        QApplication.processEvents()
-        try:
-            resp = requests.post(
-                f"{server_url}/api/device/dhcp/restart",
-                json={"device_id": device_id},
-                timeout=60,
-            )
-        except requests.RequestException as exc:
+
+        _worker = RestartDHCPWorker(
+            f"{server_url}/api/device/dhcp/restart",
+            device_id,
+        )
+        _result_box = {"resp": None, "err": None, "cancelled": False}
+
+        def _on_ok(_r):
+            _result_box["resp"] = _r
             _prog.close()
+
+        def _on_err(_msg):
+            _result_box["err"] = _msg
+            _prog.close()
+
+        def _on_cancel():
+            # v0.5.374: user hit Cancel — flag it. QThread.quit()
+            # signals event-loop exit; the actual requests.post
+            # will continue on the socket until the 60 s timeout
+            # or server response, but the UI is free again.
+            _result_box["cancelled"] = True
+            _prog.close()
+
+        _worker.finished_ok.connect(_on_ok)
+        _worker.finished_err.connect(_on_err)
+        _prog.canceled.connect(_on_cancel)
+        _worker.start()
+        # Modal wait: exec_() blocks on THIS dialog only, so the
+        # rest of the app remains responsive to events other than
+        # this window. Cancel + finish both call _prog.close(),
+        # which returns exec_ immediately.
+        _prog.exec_()
+
+        # Keep worker alive until it exits — otherwise QThread's
+        # C++ destructor runs while the Python thread is still
+        # active. Same anti-GC guard the refresh path uses.
+        if not _worker.isFinished():
+            _worker.wait(2000)
+        # Rebind for the classic linear flow below.
+        if _result_box["cancelled"]:
+            # Cancelled — no error surface, no state refresh.
+            return
+        if _result_box["err"] is not None:
             QMessageBox.warning(
                 self.parent, "Restart Failed",
-                f"Could not reach the server:\n{exc}",
+                f"Could not reach the server:\n{_result_box['err']}",
             )
             return
-        finally:
-            _prog.close()
+        resp = _result_box["resp"]
+        if resp is None:
+            # Should never happen (one branch always fires), but be safe.
+            QMessageBox.warning(
+                self.parent, "Restart Failed",
+                "No response received from the server.",
+            )
+            return
         if resp.status_code != 200:
             # v0.5.244: unpack the structured error body. Server now
             # returns {error, family_errors: [...]} on hard failures.

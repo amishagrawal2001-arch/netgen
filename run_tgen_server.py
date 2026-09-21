@@ -21071,9 +21071,24 @@ def api_admin_health():
     """Consolidated server health for the admin portal."""
     import socket
     import shutil as _shutil
+    # v0.5.374 (audit admin-server-card-restart-button): surface
+    # netgen_version + running_version to /api/admin/health so the
+    # admin console's Server card can render the drift lie (pip
+    # installed X but process is still Y). Mirrors v0.5.370 B8's
+    # /api/health fields; here we expose them at the admin-console
+    # level too so a single health poll fills the whole card.
+    _installed_ver = "unknown"
+    try:
+        from importlib.metadata import version as _pkg_version
+        _installed_ver = _pkg_version("ostg-trafficgen")
+    except Exception:
+        pass
     out = {
         "hostname": socket.gethostname(),
         "netgen_server": {"port": int(os.environ.get("PORT", "5050"))},
+        "netgen_version": _installed_ver,
+        "netgen_running_version": _STARTUP_NETGEN_VERSION,
+        "netgen_restart_pending": _installed_ver != _STARTUP_NETGEN_VERSION,
         "dpdk": {},
         "iommu": {},
         "vfio": {},
@@ -23875,11 +23890,50 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
          admin console is served by the very systemd unit it claims
          to administer; pre-fix it surfaced nothing about it. -->
     <div class="card">
-      <h2>Server</h2>
+      <!-- v0.5.374 (audit admin-server-card-restart-button): add
+           Restart button + running-version row. /api/system/restart_service
+           was gated to admin in v0.5.370 B2 but had no UI — operators
+           had to open the desktop client's chassis window to restart.
+           Running-version row surfaces the v0.5.370 B8 running_version
+           + restart_pending fields so operators can spot the drift
+           lie (pip installed X, process still running Y) at a glance. -->
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">Server</h2>
+        <button id="btn-restart-server" class="secondary">Restart…</button>
+      </div>
       <div class="row"><span class="label">Service</span><span class="pill" id="p-svc-state">…</span></div>
+      <div class="row"><span class="label">Running version</span><span id="p-svc-running-ver">…</span></div>
       <div class="row"><span class="label">PID / RSS</span><span id="p-svc-pid">…</span></div>
       <div class="row"><span class="label">Uptime</span><span id="p-svc-uptime">…</span></div>
       <div class="row"><span class="label">Disk free (/tmp)</span><span id="p-disk-tmp">…</span></div>
+    </div>
+
+    <!-- v0.5.374 (audit admin-upgrade-wheel-card): Upgrade Wheel
+         card. /api/admin/upgrade_wheel + /log endpoints have
+         existed since v0.5.23 but nothing in _ADMIN_HTML posted to
+         them — operators had to use the desktop client. This card
+         gives out-of-band upgrade capability. Progress bar tied to
+         /api/admin/upgrade_wheel/log poll; restart-pending pill
+         surfaces v0.5.370 B8's `restart_pending` (on-disk vs
+         running version drift) so the operator sees when the auto-
+         restart is still catching up. -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">Upgrade Wheel</h2>
+        <span class="pill" id="p-upgrade-state">idle</span>
+      </div>
+      <div class="row">
+        <input type="file" id="upgrade-wheel-file" accept=".whl" style="flex: 1;">
+        <button id="btn-upgrade-wheel">Upload &amp; Install</button>
+      </div>
+      <div id="upgrade-progress" style="margin-top: 8px; display: none;">
+        <div class="row"><span class="label">Started</span><span id="p-upgrade-started">—</span></div>
+        <div class="row"><span class="label">Wheel</span><span id="p-upgrade-wheel-name">—</span></div>
+        <div class="row"><span class="label">Restart</span><span class="pill" id="p-upgrade-restart">—</span></div>
+      </div>
+      <p style="color: var(--muted); font-size: 11px; margin: 8px 0 0;">
+        Uploads a Netgen wheel (`.whl`) and runs `pip install --upgrade` under a systemd-run cgroup so the running server can safely be restarted mid-install. Log streams into the shared Install Log card below. v0.5.368 auto-restarts on completion; the Running version row in the Server card confirms the swap.
+      </p>
     </div>
 
     <!-- v0.5.367 (audit admin-rdma-install-button): pre-fix, the
@@ -24263,6 +24317,31 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           $('p-svc-uptime').textContent = d_ ? `${d_}d ${h}h` : (h ? `${h}h ${m}m` : `${m}m`);
         } else {
           $('p-svc-uptime').textContent = '—';
+        }
+
+        // v0.5.374 (audit admin-server-card-restart-button):
+        // running-version pill from /api/admin/health's netgen +
+        // running_version fields (v0.5.370 B8). When they differ,
+        // pip installed a new wheel but the process hasn't
+        // restarted yet — the pill goes amber with "restart
+        // pending" so operators aren't misled by the on-disk
+        // version report.
+        const _rv = d.netgen_running_version || d.running_version || null;
+        const _iv = d.netgen_version || null;
+        const _rvEl = $('p-svc-running-ver');
+        if (_rvEl) {
+          if (_rv && _iv && _rv !== _iv) {
+            _rvEl.textContent = `${_rv} → ${_iv}`;
+            _rvEl.style.color = 'var(--warn)';
+            _rvEl.title = 'On-disk version differs from running process — restart pending.';
+          } else if (_rv) {
+            _rvEl.textContent = _rv;
+            _rvEl.style.color = 'var(--ink)';
+            _rvEl.title = 'Running process matches on-disk version.';
+          } else {
+            _rvEl.textContent = _iv || '—';
+            _rvEl.style.color = 'var(--muted)';
+          }
         }
         const _diskTmp = (d.disk || {}).tmp;
         const _diskEl = $('p-disk-tmp');
@@ -24773,6 +24852,174 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         } catch (e) {
           toast('Request failed: ' + e);
           $('btn-install-rdma').disabled = false;
+        }
+      });
+    }
+
+    // v0.5.374 (audit admin-server-card-restart-button): Restart
+    // Server button. Posts to /api/system/restart_service which
+    // v0.5.370 B2 gated to admin role. Confirm dialog covers the
+    // "you'll lose /admin for ~5 s" case. Poll /api/health after
+    // 3s to catch the server coming back up.
+    if ($('btn-restart-server')) {
+      $('btn-restart-server').addEventListener('click', async () => {
+        if (!confirm(
+          'Restart the netgen-server systemd unit?\n\n' +
+          'The service drops for ~2–5 seconds while systemctl ' +
+          'stops + starts it. All active sessions (this console, ' +
+          'desktop client, in-flight installs) will need to ' +
+          'reconnect. In-progress RFC 2544 / RDMA blast tests ' +
+          'will be cancelled server-side.'
+        )) return;
+        $('btn-restart-server').disabled = true;
+        try {
+          const r = await fetch('/api/system/restart_service', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({delay_s: 2}),
+          });
+          const d = await r.json();
+          if (!r.ok || d.ok === false) {
+            toast('Restart failed: ' + (d.error || r.status));
+            $('btn-restart-server').disabled = false;
+            return;
+          }
+          toast(`Restart scheduled in ${d.delay_s}s. Reconnecting…`);
+          // Poll /api/health until it responds — the server is
+          // down for a few seconds then comes back at the same
+          // port/PID. Once we see a fresh netgen_version, refresh
+          // the whole card.
+          let _attempts = 0;
+          const _maxAttempts = 30;  // 60s cap at 2s intervals
+          const _reconnect = async () => {
+            _attempts += 1;
+            try {
+              const _h = await fetch('/api/health', {cache: 'no-store'});
+              if (_h.ok) {
+                toast('Server is back up.');
+                $('btn-restart-server').disabled = false;
+                if (typeof refreshHealth === 'function') refreshHealth();
+                return;
+              }
+            } catch (_e) {
+              // still restarting — retry.
+            }
+            if (_attempts < _maxAttempts) {
+              setTimeout(_reconnect, 2000);
+            } else {
+              toast('Server did not respond within 60 s. Check systemctl status.');
+              $('btn-restart-server').disabled = false;
+            }
+          };
+          setTimeout(_reconnect, 3500);
+        } catch (e) {
+          toast('Request failed: ' + e);
+          $('btn-restart-server').disabled = false;
+        }
+      });
+    }
+
+    // v0.5.374 (audit admin-upgrade-wheel-card): Upgrade Wheel
+    // handler. Multipart-uploads the selected .whl to
+    // /api/admin/upgrade_wheel (v0.5.23 endpoint), then polls
+    // /api/admin/upgrade_wheel/log every 2 s until running goes
+    // false. Log streams into the shared #log <pre>. The
+    // restart-pending pill goes amber via refreshHealth's
+    // running-version drift detection.
+    let _upgradePollTimer = null;
+    function _stopUpgradePoll() {
+      if (_upgradePollTimer) { clearInterval(_upgradePollTimer); _upgradePollTimer = null; }
+    }
+    async function _pollUpgradeLog() {
+      try {
+        const r = await fetch('/api/admin/upgrade_wheel/log', {cache: 'no-store'});
+        const d = await r.json();
+        const log = $('log');
+        if (d.log !== undefined) {
+          log.textContent = d.log || '(no output yet)';
+          if ($('log-autoscroll') && $('log-autoscroll').checked && isNearBottom(log)) {
+            log.scrollTop = log.scrollHeight;
+          }
+        }
+        if (d.wheel_name) $('p-upgrade-wheel-name').textContent = d.wheel_name;
+        if (d.started_at) $('p-upgrade-started').textContent = d.started_at;
+        const _rp = $('p-upgrade-restart');
+        if (_rp) {
+          if (d.restart_scheduled) {
+            _rp.textContent = 'scheduled';
+            _rp.style.color = 'var(--warn)';
+          } else if (d.running) {
+            _rp.textContent = 'installing';
+          } else {
+            _rp.textContent = '—';
+          }
+        }
+        const _st = $('p-upgrade-state');
+        if (_st) {
+          if (d.running) {
+            _st.textContent = 'running';
+            _st.style.color = 'var(--warn)';
+          } else if (d.return_code === 0) {
+            _st.textContent = 'complete';
+            _st.style.color = 'var(--ink)';
+          } else if (d.return_code != null) {
+            _st.textContent = `failed (rc=${d.return_code})`;
+            _st.style.color = 'var(--bad)';
+          } else {
+            _st.textContent = 'idle';
+            _st.style.color = 'var(--muted)';
+          }
+        }
+        if (!d.running) {
+          _stopUpgradePoll();
+          $('btn-upgrade-wheel').disabled = false;
+          if (typeof refreshHealth === 'function') refreshHealth();
+        }
+      } catch (e) {
+        _stopUpgradePoll();
+        toast('Upgrade log poll failed: ' + e);
+        $('btn-upgrade-wheel').disabled = false;
+      }
+    }
+    if ($('btn-upgrade-wheel')) {
+      $('btn-upgrade-wheel').addEventListener('click', async () => {
+        const _fileEl = $('upgrade-wheel-file');
+        const _file = _fileEl && _fileEl.files && _fileEl.files[0];
+        if (!_file) {
+          toast('Choose a .whl file first.');
+          return;
+        }
+        if (!_file.name.endsWith('.whl')) {
+          toast('Selected file is not a wheel (.whl).');
+          return;
+        }
+        if (!confirm(
+          `Upload ${_file.name} (${(_file.size/1024).toFixed(0)} KB) and pip-install ` +
+          `it on this server?\n\nThe running netgen-server will restart automatically ` +
+          `on completion (~10–30 seconds).`
+        )) return;
+        $('btn-upgrade-wheel').disabled = true;
+        $('upgrade-progress').style.display = 'block';
+        $('log').textContent = `Uploading ${_file.name}…`;
+        const _fd = new FormData();
+        _fd.append('wheel', _file);
+        try {
+          const r = await fetch('/api/admin/upgrade_wheel', {
+            method: 'POST', body: _fd,
+          });
+          const d = await r.json();
+          if (!r.ok || d.ok === false) {
+            toast('Upgrade start failed: ' + (d.error || r.status));
+            $('btn-upgrade-wheel').disabled = false;
+            return;
+          }
+          toast(`Upgrade started (${d.wheel_name}).`);
+          _stopUpgradePoll();
+          _pollUpgradeLog();
+          _upgradePollTimer = setInterval(_pollUpgradeLog, 2000);
+        } catch (e) {
+          toast('Upload failed: ' + e);
+          $('btn-upgrade-wheel').disabled = false;
         }
       });
     }

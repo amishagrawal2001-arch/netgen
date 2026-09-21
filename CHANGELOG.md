@@ -2,6 +2,112 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.374] - 2026-09-20
+
+**2 bug fixes + 2 admin console cards.** Continues clearing the
+audit backlog: closes the last client-side UI-freeze finding
+(DHCP restart) and the stream-stats sort finding, and wires two
+high-value admin console cards for endpoints that have existed
+server-side but had no UI.
+
+### Fixes
+
+- **E1** — `utils/devices_tab_dhcp.py:1750+` DHCP restart async.
+  Pre-fix a `requests.post(timeout=60)` ran on the main thread
+  inside a `QProgressDialog(cancel=None)` — the UI froze for up
+  to 60 s and the operator couldn't cancel. Now: `RestartDHCPWorker(
+  QThread)` with `finished_ok` / `finished_err` signals, real
+  Cancel button that closes the dialog, and `_prog.exec_()` blocks
+  only THIS window while the rest of the app stays responsive.
+  Anti-GC guard on the worker matches the refresh-path pattern
+  already used elsewhere in the file.
+  Marker: `v0.5.374 (audit dhcp-restart-ui-freeze)`.
+
+- **E2** — `traffic_client/statistics_section.py` stream-stats
+  numeric sort. Pre-fix the stream-stats table had
+  `setSortingEnabled(True)` but cells held `format_number`
+  (`"1,234,567"`) / `format_rate` (`"1.50 Gbps"`) as raw text.
+  Qt's default sort is text-lexicographic → `"9,000"` placed
+  above `"1,000,000"`, `"999.00 Mbps"` above `"1.50 Gbps"` — an
+  operator sorting by TX rate to find the biggest talker saw the
+  smallest. Fix: new `NumericSortItem(QTableWidgetItem)` subclass
+  overrides `__lt__` to compare via `Qt.UserRole`-stored numeric
+  values. `_make_numeric_item(display, value)` helper wraps
+  construction. All 6 numeric columns (TX Count, RX Count, TX
+  Rate, RX Rate, TX Bit Rate, RX Bit Rate) wired through the
+  helper.
+  Marker: `v0.5.374 (audit stream-stats-string-sort)`.
+
+### New admin console cards
+
+- **E3** — `/admin` Upgrade Wheel card. `/api/admin/upgrade_wheel
+  + /log` endpoints have existed since v0.5.23 but nothing in
+  `_ADMIN_HTML` posted to them — operators had to use the desktop
+  client. New card in the admin console with file input, upload
+  button, progress bar tied to `/api/admin/upgrade_wheel/log`
+  poll, restart-pending pill, and complete-with-rc status. Log
+  streams into the shared `#log <pre>` element. Confirm dialog
+  before upload since it's a destructive action.
+  Marker: `v0.5.374 (audit admin-upgrade-wheel-card)`.
+
+- **E4** — `/admin` Restart Server button + running-version drift
+  indicator. `/api/system/restart_service` was gated to admin role
+  in v0.5.370 B2 but had no UI — operators had to use the desktop
+  client's chassis window. New button in the Server card with
+  confirm dialog, `/api/health` reconnect polling (30 attempts
+  over 60 s), and toast on success/failure. Server card also
+  gains a Running version row backed by three new fields on
+  `/api/admin/health` (`netgen_version`, `netgen_running_version`,
+  `netgen_restart_pending`) — when installed and running differ,
+  the row goes amber with "X → Y" showing the pending swap. This
+  makes the v0.5.368/v0.5.370 drift lie visible at a glance in
+  the admin console — no more "why is pip done but the code
+  looks old?" confusion.
+  Marker: `v0.5.374 (audit admin-server-card-restart-button)`.
+
+### Tests
+
+`tests/test_v05374_bundle.py` — 25 tests, all pass:
+
+- AST-parse all 3 edited files
+- E1: `RestartDHCPWorker` class + `finished_ok`/`finished_err`
+  signals; Cancel button; `_worker.start()` + `_prog.exec_()`
+  + `isFinished()` / `wait()` anti-GC guard
+- E2: `NumericSortItem` subclass + `__lt__`; `_make_numeric_item`
+  helper with `setData(Qt.UserRole, ...)`; all 6 numeric columns
+  use the helper
+- E3: HTML elements (btn-upgrade-wheel, upgrade-wheel-file,
+  p-upgrade-*, upgrade-progress); click handler builds
+  `FormData` with `wheel` field and POSTs to
+  `/api/admin/upgrade_wheel`; `_pollUpgradeLog` fetches
+  `/log` endpoint
+- E4: `btn-restart-server` + `p-svc-running-ver` HTML;
+  `/api/admin/health` payload includes `netgen_version`,
+  `netgen_running_version`, `netgen_restart_pending`; click
+  handler POSTs `/api/system/restart_service` + polls
+  `/api/health` on reconnect; drift indicator goes amber
+- Regression: v0.5.373 VRF allocator, v0.5.372 URL-guard,
+  v0.5.371 install_dpdk marker, v0.5.370 B8 `/api/health`
+  running_version, v0.5.367 RDMA install button
+
+### Verification
+
+- All 3 files AST-parse
+- 25/25 v0.5.374 tests pass
+- srv06 verification pending — operator clicks Upgrade Wheel or
+  Restart Server in the admin console
+
+### Deferred to v0.5.375+
+
+- Admin console: Cache Flush, Journal viewer, Streams card, FRR
+  container card, Chassis / Peers cards
+- Log-stream UX: timestamps, download button, dedupe
+  DPDK/RDMA `<pre id="log">` (currently shared → they stomp
+  each other's output)
+- Server DB + AI subsystem audit findings (fresh audit spawned
+  in parallel with this ship — findings queued for v0.5.375
+  scoping)
+
 ## [0.5.373] - 2026-09-20
 
 **5-fix bundle clearing v0.5.372's deferred queue** — one HIGH
