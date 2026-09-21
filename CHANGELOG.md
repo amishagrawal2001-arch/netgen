@@ -2,6 +2,70 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.395] - 2026-09-21
+
+### Fixed — Add Stream dialog: 5 sync HTTP GETs moved off UI thread
+
+Companion release to v0.5.394 K1 — the same sync-HTTP-on-UI-thread
+pattern that bit RFC 2544 also lived in `widgets/stream_dialog.py`
+(the Add / Edit Stream dialog). Every occurrence hit
+`/api/interfaces/{iface}/*` or `/api/dpdk/recommend` on the Qt event
+thread with a 3 s timeout. Against a slow or unreachable TG each
+one froze the whole dialog for the full timeout. All 5 sites now
+route through a new `_stream_async_get(url, on_ok, on_err, timeout)`
+helper that spawns a `_DpdkApiWorker(QThread)` from
+`traffic_client.dpdk_menu_actions` (same worker
+`rdma_preflight_dialog.py` uses; no new QThread subclass required)
+and pins it in `_stream_dialog_workers` so PyQt5 5.15 + Python 3.14
+don't GC the worker mid-flight.
+
+**L1: `_recommend_tx_cores` DPDK button**
+(`widgets/stream_dialog.py:6499-6570`) — Sync GET `/api/dpdk/recommend?...`
+on button click froze dialog 3 s. `_DpdkApiWorker` doesn't accept a
+`params=` argument, so URL-encode via `urllib.parse.urlencode`.
+Optimistic feedback ("Fetching recommendation…") shows immediately;
+response updates hint label + combo when it lands.
+
+**L2: `populate_stream_fields` dst-MAC prefill**
+(`widgets/stream_dialog.py:9082-9128`) — Sync GET
+`/api/interfaces/{rx_iface}/mac` fired inside `populate_stream_fields`,
+which runs every time the Add / Edit Stream dialog opens (or a
+template is applied). Blocked dialog open for up to 3 s. Now async;
+guarded so a manual edit made while the fetch is in flight isn't
+clobbered when the response lands.
+
+**L3: `_fetch_rx_engine_advice` lazy-cache converted to async**
+(`widgets/stream_dialog.py:9700-9770` + callers) — Fired on every
+`rx_engine_combo` change AND on dialog open (`populate_stream_fields`
+at 8919–8920). A combo tweak → 3 s UI stall was surprising. Now:
+cache hit returns synchronously; cache miss fires a worker and
+returns None; workers are dedup'd via `_rx_engine_advice_in_flight`;
+the worker invokes an `on_ready` callback when the cache lands so
+callers (`_refresh_rx_engine_advice`, `_maybe_apply_rx_engine_default`)
+can re-run their logic with the fresh cache. Strips the worker's
+`_status_code` / `_full_text` metadata keys before caching so
+downstream `.get("recommended")` still works exactly like the
+pre-v0.5.395 direct JSON parse.
+
+**L4: `_on_autopopulate_dst_mac` (Auto button per row)**
+(`widgets/stream_dialog.py:9895-9930`) — Dedicated "Auto" button
+for Destination MAC. Sync GET froze dialog 3 s on slow TG. Now
+async: success writes the field; failure surfaces the red error
+label with the failure reason.
+
+**L5: `_fetch_iface_mac_from_server` + `_on_autopopulate_src_mac`
+(source-MAC Auto button + mismatch-chip link)**
+(`widgets/stream_dialog.py:9630-9700`) — Same lazy-cache pattern as
+L3. Adds a `_last_click_pending_src_mac` sentinel to prevent an
+infinite re-invocation loop when the async fetch permanently fails
+(cache stays None forever, but the flag turns the second entry into
+a terminal "show error label" path).
+
+Tests: 22 new (`tests/test_v05395_stream_dialog_async_http.py`),
+all pass. Regressions on v0.5.390–v0.5.394: intact.
+
+---
+
 ## [0.5.394] - 2026-09-21
 
 ### Fixed — RFC 2544 sync HTTP + streams deferred tail (5 items)

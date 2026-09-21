@@ -6492,29 +6492,58 @@ class AddStreamDialog(QDialog):
             base = addr.rstrip("/")
         else:
             base = "http://" + addr.rstrip("/")
-        url = f"{base}/api/dpdk/recommend"
-        params = {"iface": iface, "frame_size": frame_size, "pps": target_pps}
-
+        # v0.5.395 (audit dialogs L1): async — pre-fix the sync
+        # requests.get(url, params=params, timeout=3) froze the
+        # whole dialog for up to 3 s against an unreachable TG.
+        # _DpdkApiWorker doesn't accept params=, so URL-encode
+        # them into the URL string instead.
+        from urllib.parse import urlencode
+        url = (
+            f"{base}/api/dpdk/recommend?"
+            f"{urlencode({'iface': iface, 'frame_size': frame_size, 'pps': target_pps})}"
+        )
+        # Optimistic feedback so the operator knows the click landed.
         try:
-            r = requests.get(url, params=params, timeout=3)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            self.dpdk_tx_cores_hint.setText(f"Recommendation request failed: {e}")
-            return
+            self.dpdk_tx_cores_hint.setText("Fetching recommendation…")
+        except Exception:
+            pass
 
-        if not data.get("ok"):
-            self.dpdk_tx_cores_hint.setText(
-                f"Server error: {data.get('error', 'unknown')}"
-            )
-            return
+        def _rec_ok(data):
+            if not isinstance(data, dict) or not data.get("ok"):
+                try:
+                    self.dpdk_tx_cores_hint.setText(
+                        f"Server error: {data.get('error', 'unknown')}"
+                        if isinstance(data, dict) else "Server error"
+                    )
+                except Exception:
+                    pass
+                return
+            try:
+                rec = int(data.get("recommended_tx_cores") or 1)
+            except (TypeError, ValueError):
+                rec = 1
+            try:
+                idx = self.dpdk_tx_cores_combo.findData(rec)
+                if idx >= 0:
+                    self.dpdk_tx_cores_combo.setCurrentIndex(idx)
+                explanation = data.get("explanation") or f"Recommended: {rec}"
+                self.dpdk_tx_cores_hint.setText(explanation)
+            except Exception as _cb_exc:
+                logging.debug(
+                    f"[stream_dialog] recommend apply failed: {_cb_exc}"
+                )
 
-        rec = int(data.get("recommended_tx_cores") or 1)
-        idx = self.dpdk_tx_cores_combo.findData(rec)
-        if idx >= 0:
-            self.dpdk_tx_cores_combo.setCurrentIndex(idx)
-        explanation = data.get("explanation") or f"Recommended: {rec}"
-        self.dpdk_tx_cores_hint.setText(explanation)
+        def _rec_err(msg):
+            try:
+                self.dpdk_tx_cores_hint.setText(
+                    f"Recommendation request failed: {msg}"
+                )
+            except Exception:
+                pass
+
+        self._stream_async_get(
+            url, on_ok=_rec_ok, on_err=_rec_err, timeout=3.0,
+        )
 
     def _show_dpdk_usage_guide(self):
         """Open the DPDK Workflow Guide. Same dialog used by the Help menu."""
@@ -9075,26 +9104,49 @@ class AddStreamDialog(QDialog):
                 # Resolve RX iface from the rx_port_dropdown — set
                 # by the host when the dialog opens. Reuses the
                 # same helpers the Auto button does.
+                # v0.5.395 (audit dialogs L2): async — pre-fix the
+                # sync GET here blocked dialog open for up to 3 s
+                # against a slow TG (every Edit Stream click).
                 _rx_iface = self._resolve_rx_iface_name()
                 _base = self._resolve_server_base_for_tx()
                 if _rx_iface and _base:
-                    try:
-                        import requests as _req
-                        _r = _req.get(
-                            f"{_base}/api/interfaces/{_rx_iface}/mac",
-                            timeout=3,
-                        )
-                        if _r.ok:
-                            _real_dst = ((_r.json() or {}).get(
-                                "mac_address") or "").strip().lower()
-                            if _real_dst and _real_dst not in (
-                                "00:00:00:00:00:00", "",
-                            ):
-                                self.mac_destination_address.setText(_real_dst)
-                    except Exception as _exc:
+                    def _pf_ok(_data):
+                        _real_dst = ""
+                        if isinstance(_data, dict):
+                            _real_dst = (_data.get("mac_address") or "")
+                        _real_dst = str(_real_dst).strip().lower()
+                        if _real_dst and _real_dst != "00:00:00:00:00:00":
+                            try:
+                                # Only overwrite if the field is still
+                                # showing a synthetic MAC (the caller's
+                                # precondition for choosing to prefill).
+                                # Prevents clobbering a manual edit the
+                                # operator made while the async fetch
+                                # was in flight.
+                                _cur = (
+                                    self.mac_destination_address.text() or ""
+                                ).strip().lower()
+                                if _cur == "" or _cur == "00:00:00:00:00:00" \
+                                        or _cur.startswith("de:ad:be:ef"):
+                                    self.mac_destination_address.setText(_real_dst)
+                            except Exception as _cb_exc:
+                                logging.debug(
+                                    f"[stream_dialog] dst prefill "
+                                    f"apply failed: {_cb_exc}"
+                                )
+
+                    def _pf_err(_msg):
                         logging.debug(
-                            f"[stream_dialog] dst auto-prefill failed: {_exc}"
+                            f"[stream_dialog] dst auto-prefill "
+                            f"failed: {_msg}"
                         )
+
+                    self._stream_async_get(
+                        f"{_base}/api/interfaces/{_rx_iface}/mac",
+                        on_ok=_pf_ok,
+                        on_err=_pf_err,
+                        timeout=3.0,
+                    )
         except Exception as e:
             logger.warning("populate_stream_fields: failed to load MAC section: %s", e)
 
@@ -9623,11 +9675,115 @@ class AddStreamDialog(QDialog):
                     return addr
         return None
 
-    def _fetch_iface_mac_from_server(self):
-        """Hit /api/interfaces/<iface>/mac on the TG that owns
-        the TX iface. Returns the MAC string (lowercase, colon-
-        separated) or None on any failure. Cached for the
-        dialog's lifetime in self._cached_iface_mac.
+    # v0.5.395 (audit dialogs L1-L5): the Add Stream dialog had 5
+    # sync HTTP GETs sitting on the Qt event thread — DPDK recommend
+    # button, source/dst MAC Auto buttons, RX-engine-advice fetch
+    # (fired on combo change AND dialog open), and the dst-MAC
+    # prefill inside populate_stream_fields. Each froze the dialog
+    # for up to 3 s against a slow/unreachable TG. Fixed by routing
+    # every one through _stream_async_get, which spawns a
+    # _DpdkApiWorker(QThread) from traffic_client.dpdk_menu_actions
+    # (same worker rdma_preflight_dialog.py uses; no need for a new
+    # QThread subclass here). Workers are pinned in _stream_dialog_workers
+    # so PyQt5 5.15 + Python 3.14 don't GC them mid-flight.
+    def _stream_dialog_workers_set(self):
+        if not hasattr(self, "_stream_dialog_workers"):
+            self._stream_dialog_workers = set()
+        return self._stream_dialog_workers
+
+    def _stream_async_get(self, url, on_ok, on_err=None, timeout=3.0):
+        """Fire a GET off the UI thread. on_ok(data_dict) fires on
+        2xx with a parsed JSON dict; on_err(msg) on any failure
+        (network exception, non-2xx, JSON decode error).
+
+        Worker is pinned via _stream_dialog_workers to survive Qt's
+        garbage collector — same shape as v0.5.392 H2's
+        _InlineUpdateWorker keepalive.
+        """
+        try:
+            from traffic_client.dpdk_menu_actions import _DpdkApiWorker
+        except Exception as _imp_exc:
+            # Import failure would be catastrophic; log and fall
+            # back to sync so the button still works.
+            logging.warning(
+                f"[stream_dialog] _DpdkApiWorker import failed: "
+                f"{_imp_exc}; falling back to sync GET"
+            )
+            try:
+                import requests as _req
+                r = _req.get(url, timeout=timeout)
+                if r.ok:
+                    try:
+                        on_ok(r.json() if r.text else {})
+                    except Exception as _cb_exc:
+                        logging.debug(
+                            f"[stream_dialog] on_ok fallback cb "
+                            f"failed: {_cb_exc}"
+                        )
+                elif on_err:
+                    on_err(f"HTTP {r.status_code}")
+            except Exception as _sync_exc:
+                if on_err:
+                    on_err(str(_sync_exc))
+            return
+        _w = _DpdkApiWorker("GET", url, timeout=timeout)
+        _live = self._stream_dialog_workers_set()
+
+        def _on_done(data, err):
+            try:
+                _live.discard(_w)
+            except Exception:
+                pass
+            try:
+                _w.deleteLater()
+            except Exception:
+                pass
+            if err:
+                if on_err:
+                    try:
+                        on_err(err)
+                    except Exception as _cb_exc:
+                        logging.debug(
+                            f"[stream_dialog] on_err cb failed: "
+                            f"{_cb_exc}"
+                        )
+                return
+            _status = 0
+            if isinstance(data, dict):
+                try:
+                    _status = int(data.get("_status_code", 0))
+                except (TypeError, ValueError):
+                    _status = 0
+            if 200 <= _status < 300:
+                try:
+                    on_ok(data or {})
+                except Exception as _cb_exc:
+                    logging.debug(
+                        f"[stream_dialog] on_ok cb failed: {_cb_exc}"
+                    )
+            elif on_err:
+                try:
+                    on_err(f"HTTP {_status}")
+                except Exception:
+                    pass
+
+        _w.done.connect(_on_done)
+        _live.add(_w)
+        _w.start()
+
+    def _fetch_iface_mac_from_server(self, on_ready=None):
+        """Lazy-cache the TX iface's MAC. v0.5.395: converted to
+        async. Behavior:
+          * If cache is present, returns the MAC string immediately.
+          * If cache is absent, fires an async GET; when it lands,
+            populates the cache and invokes on_ready() (a no-arg
+            callable) so the caller can re-run its logic with the
+            fresh cache. Returns None on this first (cache-miss)
+            path so callers can bail cleanly.
+          * If another worker for the same fetch is already in
+            flight, do NOT fire a duplicate — return None; the
+            in-flight one will trigger on_ready when it lands.
+        Cache is dialog-lifetime.
         """
         if self._cached_iface_mac:
             return self._cached_iface_mac
@@ -9635,60 +9791,126 @@ class AddStreamDialog(QDialog):
         iface = self.tx_port_name
         if not base or not iface:
             return None
-        try:
-            import requests as _req
-            resp = _req.get(
-                f"{base}/api/interfaces/{iface}/mac",
-                timeout=3,
-            )
-            if not resp.ok:
-                return None
-            mac = (resp.json() or {}).get("mac_address") or ""
-            mac = mac.strip().lower()
+        if getattr(self, "_iface_mac_fetch_in_flight", False):
+            return None
+        self._iface_mac_fetch_in_flight = True
+
+        def _ok(data):
+            self._iface_mac_fetch_in_flight = False
+            mac = (data.get("mac_address") if isinstance(data, dict) else "") or ""
+            mac = str(mac).strip().lower()
             if mac and mac != "00:00:00:00:00:00":
                 self._cached_iface_mac = mac
-                return mac
-        except Exception as exc:
+            if callable(on_ready):
+                try:
+                    on_ready()
+                except Exception as _cb_exc:
+                    logging.debug(
+                        f"[stream_dialog] iface MAC on_ready cb "
+                        f"failed: {_cb_exc}"
+                    )
+
+        def _err(msg):
+            self._iface_mac_fetch_in_flight = False
             logging.debug(
-                f"[stream_dialog] iface MAC fetch failed: {exc}"
+                f"[stream_dialog] iface MAC fetch failed: {msg}"
             )
+            if callable(on_ready):
+                try:
+                    on_ready()
+                except Exception:
+                    pass
+
+        self._stream_async_get(
+            f"{base}/api/interfaces/{iface}/mac",
+            on_ok=_ok,
+            on_err=_err,
+            timeout=3.0,
+        )
         return None
 
-    def _fetch_rx_engine_advice(self):
+    def _fetch_rx_engine_advice(self, on_ready=None):
         """v0.5.114: hit /api/interfaces/<tx_iface>/rx_engine_advice
         and cache. Returns the response dict or None on failure.
         The advice tells the dialog what rx_engine should default
         to on this NIC — Scapy on Mellanox bifurcated mode (to
         avoid the rx_worker chip-grab + die trap), DPDK
-        elsewhere. See project_srv06_rx_worker_blindness."""
+        elsewhere. See project_srv06_rx_worker_blindness.
+
+        v0.5.395 (audit dialogs L3): converted to async. Same
+        contract as _fetch_iface_mac_from_server — cache hit is
+        synchronous; cache miss fires a worker and returns None,
+        then invokes on_ready() when the cache lands. Dedup in-
+        flight fetches so combo-change bursts don't stack workers.
+        """
         if self._rx_engine_advice_cache is not None:
             return self._rx_engine_advice_cache
         base = self._resolve_server_base_for_tx()
         iface = self.tx_port_name
         if not base or not iface:
             return None
-        try:
-            import requests as _req
-            resp = _req.get(
-                f"{base}/api/interfaces/{iface}/rx_engine_advice",
-                timeout=3,
-            )
-            if resp.ok:
-                self._rx_engine_advice_cache = resp.json() or {}
-                return self._rx_engine_advice_cache
-        except Exception as exc:
+        if getattr(self, "_rx_engine_advice_in_flight", False):
+            return None
+        self._rx_engine_advice_in_flight = True
+
+        def _ok(data):
+            self._rx_engine_advice_in_flight = False
+            # Strip the worker-added metadata keys before caching so
+            # downstream .get("recommended") / .get("reason") work
+            # exactly like the pre-v0.5.395 direct requests.json().
+            if isinstance(data, dict):
+                _clean = {
+                    k: v for k, v in data.items()
+                    if not k.startswith("_")
+                }
+                self._rx_engine_advice_cache = _clean
+            else:
+                self._rx_engine_advice_cache = {}
+            if callable(on_ready):
+                try:
+                    on_ready()
+                except Exception as _cb_exc:
+                    logging.debug(
+                        f"[stream_dialog] rx_engine on_ready cb "
+                        f"failed: {_cb_exc}"
+                    )
+
+        def _err(msg):
+            self._rx_engine_advice_in_flight = False
             logging.debug(
-                f"[stream_dialog] rx_engine advice fetch failed: {exc}"
+                f"[stream_dialog] rx_engine advice fetch failed: "
+                f"{msg}"
             )
+            if callable(on_ready):
+                try:
+                    on_ready()
+                except Exception:
+                    pass
+
+        self._stream_async_get(
+            f"{base}/api/interfaces/{iface}/rx_engine_advice",
+            on_ok=_ok,
+            on_err=_err,
+            timeout=3.0,
+        )
         return None
 
     def _refresh_rx_engine_advice(self):
         """Show / hide the warning chip based on whether the
         current rx_engine combo selection contradicts the
-        server's recommendation."""
+        server's recommendation.
+
+        v0.5.395 (audit dialogs L3): _fetch_rx_engine_advice is
+        now async — first call fires a worker + returns None; we
+        pass ourselves as on_ready so the worker re-invokes this
+        method when the cache lands, at which point the cache
+        hits synchronously and the label updates.
+        """
         if not hasattr(self, "_rx_engine_advice_label"):
             return
-        advice = self._fetch_rx_engine_advice()
+        advice = self._fetch_rx_engine_advice(
+            on_ready=self._refresh_rx_engine_advice,
+        )
         if not advice:
             self._rx_engine_advice_label.hide()
             return
@@ -9748,7 +9970,10 @@ class AddStreamDialog(QDialog):
             "scapy", "dpdk",
         ):
             return
-        advice = self._fetch_rx_engine_advice()
+        # v0.5.395 (audit dialogs L3): async — re-run when cache lands.
+        advice = self._fetch_rx_engine_advice(
+            on_ready=lambda: self._maybe_apply_rx_engine_default(stream_data),
+        )
         if not advice:
             return
         recommended = (advice.get("recommended") or "").strip().lower()
@@ -9764,22 +9989,44 @@ class AddStreamDialog(QDialog):
         MAC field. On failure, surface a hint instead of failing
         silently (operator clicked it for a reason; tell them
         why nothing happened).
+
+        v0.5.395 (audit dialogs L5): _fetch_iface_mac_from_server
+        is now async. Distinguish three cases: cache hit → apply
+        directly; cache miss + fetch fired → return, we'll be
+        re-invoked when the worker lands; cache miss + fetch NOT
+        fireable (no base/iface) → surface the error label. The
+        _last_click_pending_src_mac flag prevents an infinite
+        loop of re-invocations if the async fetch permanently
+        fails (cache stays None forever, but the flag turns the
+        second entry into a terminal "show error" path).
         """
-        mac = self._fetch_iface_mac_from_server()
-        if not mac:
-            self._mac_mismatch_label.setText(
-                "Could not fetch the TX interface's MAC from the "
-                "server (interface may be down or vfio-bound — "
-                "MAC is hidden from the kernel after vfio-pci "
-                "bind). Type the iface's burned-in MAC manually."
-            )
-            self._mac_mismatch_label.setStyleSheet(
-                "QLabel { background: #fee2e2; border: 1px solid "
-                "#ef4444; border-radius: 4px; padding: 4px 8px; "
-                "color: #991b1b; font-size: 11px; }"
-            )
-            self._mac_mismatch_label.show()
+        mac = self._fetch_iface_mac_from_server(
+            on_ready=self._on_autopopulate_src_mac,
+        )
+        if mac is None:
+            # Async fetch fired (or is in flight, or resolve failed).
+            # If we already tried and failed to get a cache once
+            # this click cycle, surface the error label now instead
+            # of looping forever.
+            if getattr(self, "_last_click_pending_src_mac", False):
+                self._last_click_pending_src_mac = False
+                self._mac_mismatch_label.setText(
+                    "Could not fetch the TX interface's MAC from the "
+                    "server (interface may be down or vfio-bound — "
+                    "MAC is hidden from the kernel after vfio-pci "
+                    "bind). Type the iface's burned-in MAC manually."
+                )
+                self._mac_mismatch_label.setStyleSheet(
+                    "QLabel { background: #fee2e2; border: 1px solid "
+                    "#ef4444; border-radius: 4px; padding: 4px 8px; "
+                    "color: #991b1b; font-size: 11px; }"
+                )
+                self._mac_mismatch_label.show()
+                return
+            self._last_click_pending_src_mac = True
             return
+        # Cache hit — apply and clear the pending flag.
+        self._last_click_pending_src_mac = False
         self.mac_source_address.setText(mac)
         # textChanged will fire _refresh_mac_mismatch_warning,
         # which will hide the chip now that the field matches.
@@ -9843,16 +10090,25 @@ class AddStreamDialog(QDialog):
             )
             self._mac_mismatch_label.show()
             return
-        try:
-            import requests as _req
-            resp = _req.get(
-                f"{base}/api/interfaces/{rx_iface}/mac",
-                timeout=3,
-            )
-            if not resp.ok:
+        # v0.5.395 (audit dialogs L4): async — the sync GET here
+        # froze the whole Add Stream dialog for 3 s against a slow
+        # or unreachable TG.
+        def _dst_ok(data):
+            mac = ""
+            if isinstance(data, dict):
+                mac = (data.get("mac_address") or "")
+            mac = str(mac).strip().lower()
+            if mac and mac != "00:00:00:00:00:00":
+                try:
+                    self.mac_destination_address.setText(mac)
+                except Exception:
+                    pass
+
+        def _dst_err(msg):
+            try:
                 self._mac_mismatch_label.setText(
                     f"Could not fetch {rx_iface}'s MAC from the "
-                    f"server. Type it manually."
+                    f"server ({msg}). Type it manually."
                 )
                 self._mac_mismatch_label.setStyleSheet(
                     "QLabel { background: #fee2e2; border: 1px "
@@ -9860,14 +10116,18 @@ class AddStreamDialog(QDialog):
                     "4px 8px; color: #991b1b; font-size: 11px; }"
                 )
                 self._mac_mismatch_label.show()
-                return
-            mac = ((resp.json() or {}).get("mac_address") or "").strip().lower()
-            if mac and mac != "00:00:00:00:00:00":
-                self.mac_destination_address.setText(mac)
-        except Exception as exc:
-            logging.debug(
-                f"[stream_dialog] dst MAC fetch failed: {exc}"
-            )
+            except Exception as _cb_exc:
+                logging.debug(
+                    f"[stream_dialog] dst MAC error label "
+                    f"failed: {_cb_exc}"
+                )
+
+        self._stream_async_get(
+            f"{base}/api/interfaces/{rx_iface}/mac",
+            on_ok=_dst_ok,
+            on_err=_dst_err,
+            timeout=3.0,
+        )
 
     def _refresh_mac_mismatch_warning(self):
         """Show/hide the inline warning chip based on whether
