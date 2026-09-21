@@ -148,11 +148,40 @@ static int tx_loop(void *arg){
             continue;
         }
 
+        /* v0.5.380 (audit stream-gen T1): jumbo-frame NULL-mbuf
+         * crash + mempool leak. Pre-fix, when
+         * `rte_pktmbuf_append(m, hdr_len + payload_len)` returned
+         * NULL (requested len > mbuf tailroom — happens once the
+         * combined frame exceeds the default mbuf's ~2 KiB data
+         * room), we set `pkts[i] = NULL` but left the NULL in the
+         * array AND never freed the original mbuf. The subsequent
+         * `rte_eth_tx_burst(port, queue, pkts, need)` iterated
+         * pkts[] and dereferenced a NULL → SIGSEGV in the PMD
+         * (observed on jumbo streams > 2100 B on both ixgbe and
+         * mlx5). The un-appended mbufs also leaked one per
+         * failure — a jumbo stream at 500 kpps drains the
+         * mempool in under 30 s and TX stalls silently.
+         *
+         * Fix: on NULL, free the mbuf immediately, count it as
+         * dropped, and compact the array so the tx_burst call
+         * only sees valid mbufs. `built` is the compacted count.
+         */
+        uint16_t built = 0;
+
         /* Build packets from template */
         for (uint16_t i=0; i<need; i++){
             struct rte_mbuf *m = pkts[i];
             uint8_t *p = (uint8_t*)rte_pktmbuf_append(m, hdr_len + payload_len);
-            if (!p){ pkts[i]=NULL; continue; }
+            if (!p){
+                /* Return the un-appendable mbuf to the mempool
+                 * and count it as a drop. Do NOT leave a NULL
+                 * slot in pkts[] — rte_eth_tx_burst would
+                 * dereference it. */
+                rte_pktmbuf_free(m);
+                local_dropped++;
+                continue;
+            }
+            pkts[built++] = m;
 
             rte_memcpy(p, c->hdr_template, hdr_len);
 
@@ -249,10 +278,16 @@ static int tx_loop(void *arg){
             next_tsc += cycles_per_burst;
         }
 
-        /* Transmit */
-        uint16_t nb = rte_eth_tx_burst(port_id, queue_id, pkts, need);
-        local_sent += nb;
-        for (uint16_t j=nb; j<need; j++){
+        /* Transmit. v0.5.380 (audit stream-gen T1): use `built`
+         * (compacted count of successfully-built mbufs) — NEVER
+         * `need`, since need may reference slots we already freed
+         * during the NULL-mbuf path. */
+        uint16_t nb = 0;
+        if (built > 0) {
+            nb = rte_eth_tx_burst(port_id, queue_id, pkts, built);
+            local_sent += nb;
+        }
+        for (uint16_t j=nb; j<built; j++){
             if (pkts[j]) rte_pktmbuf_free(pkts[j]);
             local_dropped++;
         }

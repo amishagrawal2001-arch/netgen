@@ -511,6 +511,20 @@ class DHCPClientMonitor:
             new_state = "No Pool"
         else:
             new_state = "Server Down"
+        # v0.5.380 (audit monitor M1): DHCP monitor per-device write
+        # lock. Pre-fix, `_dhcp_write_lock_for` was DEFINED at
+        # line ~47 (v0.5.267) but NEVER ACQUIRED — a copy-paste
+        # oversight when the sibling monitors (ARP v0.5.262 / BGP
+        # + OSPF + ISIS v0.5.264) got their locks wired in. The
+        # server-mode branch does one update_device + one
+        # add_state_transition per tick; concurrent writers
+        # (/api/device/dhcp/restart, stop_dhcp_services, manual
+        # override toggle) could interleave the flag-clear vs
+        # state-write and leave `devices.dhcp_state` disagreeing
+        # with `device_statistics.dhcp_state`. Same shape as the
+        # sibling monitors' locks — now actually acquired.
+        _dhcp_lock = _dhcp_write_lock_for(device_id)
+        _dhcp_lock.acquire()
         try:
             update_payload = {
                 "dhcp_state": new_state,
@@ -572,6 +586,13 @@ class DHCPClientMonitor:
                 "[DHCP MONITOR] Failed to write server-mode DHCP state for %s: %s",
                 device_id, exc,
             )
+        finally:
+            # v0.5.380 (audit monitor M1): release the write lock
+            # regardless of exception path.
+            try:
+                _dhcp_lock.release()
+            except Exception:
+                pass
 
         if running:
             self._note_leased(device_id)
@@ -660,6 +681,14 @@ class DHCPClientMonitor:
 
             # Client-mode: unchanged flow, plus backoff gate and
             # override clearing on successful lease.
+            # v0.5.380 (audit monitor M1): acquire per-device write
+            # lock around the entire client-mode DB-write block so
+            # concurrent writers (dhcp restart / override toggle /
+            # stop_dhcp_services) don't interleave with our
+            # snapshot write, state transition, and post-restart
+            # refresh.
+            _dhcp_lock_client = _dhcp_write_lock_for(device_id)
+            _dhcp_lock_client.acquire()
             try:
                 snapshot = dhcp_utils.get_dhcp_client_snapshot(
                     self.device_db, device_id, interface, dhcp_config
@@ -820,3 +849,10 @@ class DHCPClientMonitor:
                     device_id,
                     exc,
                 )
+            finally:
+                # v0.5.380 (audit monitor M1): always release the
+                # client-mode per-device write lock.
+                try:
+                    _dhcp_lock_client.release()
+                except Exception:
+                    pass

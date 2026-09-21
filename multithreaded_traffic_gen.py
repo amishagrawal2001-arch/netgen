@@ -113,7 +113,19 @@ class StreamTracker:
                 "future": stream.get("future"),  # Track Future object to wait for thread completion
                 "frame_size": stream.get("frame_size", 64),  # Store frame_size for statistics
                 "tx_count": 0,
-                "rx_count": 0
+                "rx_count": 0,
+                # v0.5.380 (audit stream-gen T5): RX-drain coordination
+                # event. Set by the RX sniffer's `stopper()` after
+                # `sniffer.stop()` completes. `on_stream_stopped` waits
+                # on this before removing the tracker row, so the
+                # `update_rx()` handler always finds the row alive
+                # while packets are still being counted from libpcap
+                # backlog. Pre-fix, `on_stream_stopped` slept 2 s AND
+                # the stopper slept 2 s concurrently; the shorter of
+                # the two determined whether tail packets were counted
+                # or silently dropped when their tracker row
+                # disappeared.
+                "rx_drained_event": threading.Event(),
             })
 
     # ----- by-stream_id TX increment -----
@@ -206,6 +218,24 @@ class StreamTracker:
                 if s["interface"] == interface and s["stream_id"] == stream_id:
                     return s
         return None
+
+    # v0.5.380 (audit stream-gen T5): signal that RX-sniffer drain
+    # + teardown is complete for `stream_id`. Called from the RX
+    # sniffer's `stopper()` (which knows rx_interface + stream_id
+    # but not the TX interface). Sets the row's `rx_drained_event`
+    # so `on_stream_stopped` can safely remove the row without
+    # racing tail packets.
+    def signal_rx_drained(self, stream_id):
+        with self.lock:
+            for s in self.active_streams:
+                if s.get("stream_id") == stream_id:
+                    _ev = s.get("rx_drained_event")
+                    if _ev is not None:
+                        try:
+                            _ev.set()
+                        except Exception:
+                            pass
+                    return
 
     def find_streams_by_name(self, interface, stream_name):
         """Find all streams with matching name on the given interface."""
@@ -873,6 +903,15 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
         # second stream's sniffer became a zombie.
         if created_vlan_subif:
             _release_vlan_subif(created_vlan_subif)
+        # v0.5.380 (audit stream-gen T5): signal that RX drain +
+        # sniffer teardown is complete so `on_stream_stopped` may
+        # now remove the tracker row without racing tail packets.
+        # Uses `signal_rx_drained(stream_id)` — this scope only
+        # knows rx_interface + stream_id, not the TX interface.
+        try:
+            tracker.signal_rx_drained(stream_id)
+        except Exception as _e:
+            logging.debug(f"[RX Sniffer] signal_rx_drained skipped: {_e}")
         logging.info(f"RX sniffer stopped on {sniff_iface} for '{stream_name}'")
 
     threading.Thread(target=stopper, daemon=True).start()
@@ -912,9 +951,47 @@ def on_stream_stopped(interface, stream_id, reason="manual"):
             logging.debug(f"[STREAM-STOP] stop_event.set() raised: {_e}")
 
     if flow_tracking_enabled and rx_interface != interface:
-        logging.info(f"RX grace period 2s for stream '{stream_name}' on {rx_interface}")
-        time.sleep(2)
-        logging.info(f"RX sniffer fully stopped for stream '{stream_name}' on {rx_interface}")
+        # v0.5.380 (audit stream-gen T5): coordinate RX drain via
+        # `rx_drained_event` instead of a blind 2s sleep. The
+        # sniffer's `stopper()` sleeps 2s to drain in-flight
+        # packets, then calls `sniffer.stop()`, then calls
+        # `tracker.signal_rx_drained(stream_id)`. Waiting on that
+        # event here guarantees the tracker row stays alive
+        # THROUGHOUT the drain window — pre-fix, both slept 2s
+        # concurrently and whichever `time.sleep(2)` returned
+        # first raced `remove_stream_by_id` against the tail
+        # packets still landing in `update_rx`.
+        #
+        # Timeout=5s bounds the wait in case the sniffer thread
+        # is wedged (e.g. libpcap hang); prefer eventual removal
+        # over indefinite tracker leak. Matches the pattern used
+        # by v0.5.265 F1 for `stop_event`.
+        _row = stream_tracker.find_stream_by_id(interface, stream_id)
+        _drained_evt = _row.get("rx_drained_event") if _row else None
+        if _drained_evt is not None:
+            logging.info(
+                f"RX drain wait (event) for stream '{stream_name}' "
+                f"on {rx_interface}"
+            )
+            _got = _drained_evt.wait(timeout=5.0)
+            if _got:
+                logging.info(
+                    f"RX drain complete for stream '{stream_name}' "
+                    f"on {rx_interface}"
+                )
+            else:
+                logging.warning(
+                    f"RX drain timeout (5s) for stream '{stream_name}' "
+                    f"on {rx_interface} — tail packets may be lost. "
+                    f"Sniffer thread may be wedged."
+                )
+        else:
+            # Fallback for streams without the event field (e.g.
+            # a mid-upgrade tracker row). Preserves pre-v0.5.380
+            # behavior.
+            logging.info(f"RX grace period 2s for stream '{stream_name}' on {rx_interface}")
+            time.sleep(2)
+            logging.info(f"RX sniffer fully stopped for stream '{stream_name}' on {rx_interface}")
 
     logging.info(f"Stream stopped: {stream_id} on {interface} (reason={reason})")
     stream_tracker.remove_stream_by_id(interface, stream_id)
@@ -1815,6 +1892,28 @@ def generate_packets(stream_data, interface, stop_event):
             return True
         return False
 
+    # v0.5.380 (audit stream-gen T2): bounded-max overshoot fix.
+    # Pre-fix, `_maybe_stop_on_max` fired AFTER the batch had
+    # already been committed to the tracker. With batch=200 and
+    # max=1000, a stream at tx_count=900 would send the full 200-
+    # packet batch → tx_count=1100 → check trips → stop. The
+    # operator asked for 1000 packets and got up to 1000+batch_size
+    # (up to 20,000 in line-rate mode with batch_size=20000).
+    # Fix: clamp the batch's `to_send` list to
+    # `max_packets - current_tx_count` BEFORE sending. All four
+    # engine branches (RoCEv2 / UEC / RoCE / generic Scapy) call
+    # this helper to trim their per-iteration send list.
+    def _clamp_to_max(pkt_list):
+        if not max_packets or not pkt_list:
+            return pkt_list
+        _current = stream_tracker.get_tx_count_by_id(interface, stream_id)
+        _remaining = max_packets - _current
+        if _remaining <= 0:
+            return []
+        if _remaining < len(pkt_list):
+            return pkt_list[:_remaining]
+        return pkt_list
+
     # ---- RoCEv2 + ibperf ----
     if l4_sel == "RoCEv2" and stream_data.get("use_ibperf", False):
         # v0.5.355 (audit rdma-ibperf-tracker-leak): pre-fix, this
@@ -1914,12 +2013,18 @@ def generate_packets(stream_data, interface, stop_event):
                     pkt = _apply_frame_size(pkt, stream_data)
                     for _ in range(batch_size):
                         to_send.append(add_sig(pkt.copy()))
-                
+
+                # v0.5.380 (audit stream-gen T2): clamp to
+                # max_packets-remaining before the sendp so the
+                # bounded stream doesn't overshoot by up to
+                # `batch_size`. Was a post-hoc check.
+                to_send = _clamp_to_max(to_send)
+
                 if to_send:
                     sendp(to_send, iface=interface, verbose=False)
                     # Optimize: increment counter by batch_size instead of per-packet loop
                     stream_tracker.update_tx_by_id(interface, stream_id, count=len(to_send))
-                
+
                 # Increment index for next iteration (cycles through increment lists)
                 index += 1
             except Exception as e:
@@ -2038,6 +2143,11 @@ def generate_packets(stream_data, interface, stop_event):
                 for _ in range(batch_size):
                     to_send.append(add_sig(pkt.copy()))
 
+                # v0.5.380 (audit stream-gen T2): clamp to
+                # max_packets-remaining so bounded UEC streams
+                # don't overshoot.
+                to_send = _clamp_to_max(to_send)
+
                 # v0.5.265 (audit stream-gen F3): guard on to_send so
                 # batch_size=0 (PPS=0 sentinel) doesn't sendp an
                 # empty list (Scapy tolerates but wastes a syscall).
@@ -2094,6 +2204,10 @@ def generate_packets(stream_data, interface, stop_event):
                 to_send = []
                 for _ in range(batch_size):
                     to_send.append(add_sig(pkt.copy()))
+                # v0.5.380 (audit stream-gen T2): clamp to
+                # max_packets-remaining so bounded ARP streams
+                # don't overshoot.
+                to_send = _clamp_to_max(to_send)
                 if to_send:
                     sendp(to_send, iface=interface, verbose=False)
                     # Optimize: increment counter by batch_size instead of per-packet loop
@@ -2207,6 +2321,10 @@ def generate_packets(stream_data, interface, stop_event):
             to_send = []
             for _ in range(batch_size):
                 to_send.append(add_sig(pkt.copy()))
+            # v0.5.380 (audit stream-gen T2): clamp to
+            # max_packets-remaining so bounded generic streams
+            # don't overshoot by up to `batch_size` at the tail.
+            to_send = _clamp_to_max(to_send)
             if to_send:
                 sendp(to_send, iface=interface, verbose=False)
                 # Increment counter by actual number of packets sent

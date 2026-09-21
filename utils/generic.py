@@ -1,10 +1,57 @@
 # utils/generic.py
 import logging
 import random
+import threading
 
 from scapy.all import (
     Ether, IP, IPv6, UDP, TCP, ICMP, Raw, Dot1Q, fragment
 )
+
+# v0.5.380 (audit stream-gen T3): per-stream deterministic RNG
+# for IMIX / Random frame sizing. Pre-fix, `_apply_frame_size`
+# called module-level `random.randint()` / `random.random()`
+# unseeded. Two consequences:
+#   1. RFC 2544 runs with the same config (same frame_min /
+#      frame_max, same IMIX distribution) produced DIFFERENT
+#      packet-size distributions between runs — the operator's
+#      "test A" and "test B" weren't identical inputs so any
+#      throughput delta reflected RNG drift, not the DUT.
+#   2. Module-level `random` state is also touched by monitors,
+#      audit workers, and Scapy itself; the frame-size RNG
+#      advanced non-deterministically depending on how much
+#      other code ran in between.
+# Fix: honor `random_seed` (or `frame_random_seed`) from
+# stream_data. When present + >0, use a per-stream `random.Random`
+# instance seeded with that value. When absent, fall back to
+# module-level random for backward compat with streams that
+# don't opt in.
+_FRAME_RNG_LOCK = threading.Lock()
+_FRAME_RNG_CACHE: dict = {}  # {(stream_id_or_None, seed): random.Random}
+
+
+def _get_frame_rng(stream_data: dict):
+    """Return a random.Random for this stream_data's frame sizing.
+
+    If stream_data has an int `random_seed` or `frame_random_seed`
+    > 0, return a cached per-stream Random(seed). Otherwise return
+    the module-level `random` module (unchanged legacy behavior).
+    """
+    try:
+        seed_raw = (stream_data.get("frame_random_seed")
+                    or stream_data.get("random_seed"))
+        seed = int(seed_raw) if seed_raw is not None else 0
+    except (ValueError, TypeError):
+        seed = 0
+    if seed <= 0:
+        return random
+    _sid = stream_data.get("stream_id") or stream_data.get("id")
+    _key = (_sid, seed)
+    with _FRAME_RNG_LOCK:
+        rng = _FRAME_RNG_CACHE.get(_key)
+        if rng is None:
+            rng = random.Random(seed)
+            _FRAME_RNG_CACHE[_key] = rng
+        return rng
 from scapy.contrib.igmp import IGMP
 from scapy.contrib.mpls import MPLS
 
@@ -310,6 +357,11 @@ def _apply_frame_size(pkt, stream_data):
         logging.warning(f"[FRAME SIZE] frame_min ({frame_min}) > frame_max ({frame_max}), swapping values")
         frame_min, frame_max = frame_max, frame_min
     
+    # v0.5.380 (audit stream-gen T3): use per-stream seeded RNG
+    # when `random_seed` / `frame_random_seed` is set — see
+    # `_get_frame_rng` for rationale.
+    _rng = _get_frame_rng(stream_data)
+
     # Calculate target frame size based on frame_type
     if frame_type == "Fixed":
         target_size = frame_size
@@ -317,10 +369,10 @@ def _apply_frame_size(pkt, stream_data):
         # Ensure frame_min <= frame_max before random selection
         if frame_min > frame_max:
             frame_min, frame_max = frame_max, frame_min
-        target_size = random.randint(frame_min, frame_max)
+        target_size = _rng.randint(frame_min, frame_max)
     elif frame_type == "IMIX":
         # Standard IMIX distribution: 58% 64B, 33% 576B, 9% 1518B
-        rand = random.random()
+        rand = _rng.random()
         if rand < 0.58:
             target_size = 64
         elif rand < 0.91:
@@ -330,20 +382,20 @@ def _apply_frame_size(pkt, stream_data):
     else:
         # Default to Fixed
         target_size = frame_size
-    
+
     # Ensure target_size is within valid Ethernet range
     target_size = max(64, min(target_size, 9216))
-    
+
     # Get current packet size (Ethernet frame size without FCS)
     # len(pkt) includes 14 bytes Ethernet header + payload
     current_size = len(pkt)
-    
+
     # Calculate padding needed
     # Total Ethernet frame = 14 (Ethernet header) + payload + 4 (FCS)
     # If target_size = 64 bytes total, then: 14 + payload + 4 = 64, so payload = 46
     # Since len(pkt) = 14 + payload, we need len(pkt) = target_size - 4 (FCS)
     target_frame_size = target_size - 4  # Subtract FCS (4 bytes)
-    
+
     if current_size < target_frame_size:
         padding_needed = target_frame_size - current_size
         if padding_needed > 0:
@@ -357,7 +409,57 @@ def _apply_frame_size(pkt, stream_data):
             else:
                 # Add new Raw layer with padding
                 pkt = pkt / Raw(load=b'\x00' * padding_needed)
-    
+    elif current_size > target_frame_size:
+        # v0.5.380 (audit stream-gen T4): oversize base packet.
+        # Pre-fix, `_apply_frame_size` had ONLY the pad branch
+        # (`current_size < target_frame_size`). When the built
+        # packet was already larger than the requested target
+        # (e.g. IPv6 + UDP + TCP options + protocol overhead
+        # already >= 128 B and the operator asks for a 64 B
+        # frame, or an IMIX 64 B slice on a v6 flow), the code
+        # silently returned the oversize packet unchanged. The
+        # operator-visible bit-rate stats (calculate_interval
+        # multiplies pps × target_size × 8) were then off by up
+        # to 2× because the *actual* wire size didn't match
+        # `target_size`. Fix: try to trim the trailing Raw
+        # payload first (safe, non-destructive), and always emit
+        # a WARNING so operators see the size mismatch instead
+        # of debugging invisible rate skew.
+        _excess = current_size - target_frame_size
+        _truncated = False
+        try:
+            if Raw in pkt:
+                _load = bytes(pkt[Raw].load) if pkt[Raw].load else b""
+                if len(_load) >= _excess:
+                    pkt[Raw].load = _load[:len(_load) - _excess]
+                    _truncated = True
+                    # Rebuild len fields (IP total_len, UDP len)
+                    # by dropping cached __bytes__ so scapy
+                    # recomputes on next serialisation.
+                    try:
+                        del pkt.__dict__["raw_packet_cache"]
+                    except Exception:
+                        pass
+        except Exception as _e:
+            logging.debug(f"[FRAME SIZE] truncate attempt failed: {_e}")
+        if _truncated:
+            logging.warning(
+                f"[FRAME SIZE] base packet {current_size}B > target "
+                f"{target_frame_size}B (frame_type={frame_type}); "
+                f"trimmed {_excess}B of Raw payload to fit. "
+                f"Operator: shrink headers/options or raise "
+                f"frame_size to avoid silent rate skew."
+            )
+        else:
+            logging.warning(
+                f"[FRAME SIZE] base packet {current_size}B > target "
+                f"{target_frame_size}B (frame_type={frame_type}), "
+                f"and no Raw payload large enough to trim. "
+                f"Wire-size will be {current_size + 4}B instead of "
+                f"{target_size}B; calculate_interval bit-rate math "
+                f"will be off. Raise frame_size or shrink headers."
+            )
+
     return pkt
 
 

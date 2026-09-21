@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.380] - 2026-09-20
+
+### Fixed — Traffic-gen + monitor bundle (7 bugs)
+
+**T1: DPDK tx_worker NULL-mbuf crash + mempool leak on jumbo frames**
+(`resources/dpdk/tx_worker/tx_worker.c:143-165, 252-267`) — When
+`rte_pktmbuf_append(m, hdr_len+payload_len)` returned NULL (requested
+length exceeded the default mbuf's ~2 KiB tailroom, hit routinely on
+jumbo streams >2100 B), the pre-fix path set `pkts[i]=NULL` but left
+the NULL in the array AND leaked the un-appended mbuf. The subsequent
+`rte_eth_tx_burst(port, queue, pkts, need)` iterated the array and
+dereferenced NULL → SIGSEGV in the PMD (observed on both ixgbe and
+mlx5). Fix: on NULL, immediately `rte_pktmbuf_free(m)` + increment
+`local_dropped`, and compact valid mbufs into a leading `built` count.
+The transmit call now uses `built` (compacted count) instead of `need`
+so the PMD never sees NULLs and no valid mbuf is skipped.
+
+**T2: `max_packets` overshoots by up to `batch_size` at the tail**
+(`multithreaded_traffic_gen.py:1811-1841, plus 4 send sites`) — Pre-fix,
+`_maybe_stop_on_max()` checked `tx_count >= max_packets` AFTER the
+current batch had already been committed to the tracker. With
+`batch_size=200` and `max_packets=1000`, a stream at `tx_count=900`
+would still send the full 200-packet batch → `tx_count=1100` before
+the check fired. In line-rate mode with `batch_size=20000`, bounded
+RFC 2544 tests could overshoot by 20k packets. Fix: added
+`_clamp_to_max(pkt_list)` that trims the per-iteration `to_send`
+list to `max_packets - current_tx_count` BEFORE sending. Wired into
+all four engine branches (RoCEv2 / UEC / ARP / generic Scapy).
+
+**T3: RFC 2544 reproducibility — seed IMIX/Random frame sizing**
+(`utils/generic.py:1-55, 313-336`) — Pre-fix, `_apply_frame_size`
+called module-level `random.randint()` / `random.random()` unseeded.
+Two RFC 2544 runs with identical stream configs produced DIFFERENT
+frame-size distributions between runs, and module-level `random`
+state was also advanced by monitors + audit workers + Scapy itself,
+so timing determined the distribution. Fix: honor `random_seed` (or
+`frame_random_seed`) from stream_data. When set + >0, a per-stream
+`random.Random` instance is cached and reused, giving deterministic
+distributions per seed. When absent, module-level random is used
+(backward-compatible for streams that don't opt in).
+
+**T4: `_apply_frame_size` silently returns oversize base packets**
+(`utils/generic.py:396-450`) — Pre-fix, the function had only the
+pad branch (`if current_size < target_frame_size`). When the built
+packet was already LARGER than the requested target (e.g. IPv6 +
+UDP + protocol overhead already ≥128B and the operator asks for a
+64B frame, or an IMIX 64B slice on a v6 flow), the code silently
+returned the oversize packet unchanged and the operator-visible
+bit-rate stats — `calculate_interval` multiplies pps × `target_size` ×
+8 — were off by up to 2× because actual wire size didn't match
+`target_size`. Fix: try to trim the trailing Raw payload
+non-destructively; always emit a WARNING when
+`current_size > target_frame_size` so operators see the size
+mismatch instead of debugging invisible rate skew.
+
+**T5: RX drain race in stream-stop window**
+(`multithreaded_traffic_gen.py:105-131, 205-224, 867-878, 907-953`) —
+Pre-fix, `on_stream_stopped()` slept 2s AND the RX sniffer's
+`stopper()` slept 2s CONCURRENTLY after `stop_event.set()`; whichever
+`time.sleep(2)` returned first raced `remove_stream_by_id()` against
+tail packets still landing in `update_rx()`. Operator-visible symptom:
+inconsistent RX loss on stream-stop even for lossless configs — 1-2%
+loss that appeared and vanished per stop-click. Fix: added
+`rx_drained_event` field to each tracker row. Sniffer's `stopper()`
+now calls `tracker.signal_rx_drained(stream_id)` AFTER `sniffer.stop()`
+completes. `on_stream_stopped()` waits on that event (5s timeout)
+before removing the row, so the row stays alive throughout the drain
+window and `update_rx()` always finds it. Fallback preserves pre-v0.5.380
+behavior for rows without the new field.
+
+**M1: DHCP monitor per-device write lock — actually acquire it**
+(`utils/dhcp_monitor.py:507-593, 662-826`) — Pre-fix, `_dhcp_write_lock_for()`
+was DEFINED at line ~47 (v0.5.267) but NEVER ACQUIRED — a copy-paste
+oversight when sibling monitors (ARP v0.5.262, BGP + OSPF + ISIS
+v0.5.264) got their locks wired in. DHCP was the missed sibling.
+Concurrent writers (`/api/device/dhcp/restart`, `stop_dhcp_services`,
+manual-override toggle) could interleave the flag-clear vs the
+state-write and leave `devices.dhcp_state` disagreeing with
+`device_statistics.dhcp_state`. Fix: acquire the lock around the
+server-mode `update_device + add_state_transition` block AND the
+client-mode DB-write block. `finally:` clauses guarantee release on
+any exception path.
+
+**M2: ISIS monitor FRRDockerManager singleton**
+(`utils/isis_monitor.py:228-245, 496-508`) — Pre-fix, both the
+per-device check path and `check_existing_containers` instantiated
+a NEW `FRRDockerManager()` on every call. Under load (10s tick × 50
+devices), a fresh Docker client + engine handshake happened 300
+times per minute, piling up socket handles and occasionally starving
+polls with cold-connect latency. The singleton pattern was already
+in place for ARP (v0.5.277), BGP, and OSPF monitors; ISIS was the
+miss. Fix: import the module-level `frr_manager` (LazyFRRManager,
+utils/frr_docker.py:1912) instead — one client, reused everywhere.
+
+### Tests
+
+New: `tests/test_v05380_stream_gen_bundle.py`, `tests/test_v05380_monitor_bundle.py`.
+AST + structural + regression coverage for all 7 bugs.
+
 ## [0.5.379] - 2026-09-20
 
 **Three more admin console cards + full log-tab dedupe.**

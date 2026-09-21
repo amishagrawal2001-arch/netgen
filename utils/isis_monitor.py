@@ -227,11 +227,22 @@ class ISISMonitor:
             
             # Import ISIS utility functions and FRR manager
             from .isis import get_isis_status
-            from .frr_docker import FRRDockerManager
+            # v0.5.380 (audit monitor M2): use the module-level
+            # `frr_manager` LazyFRRManager singleton (defined in
+            # utils/frr_docker.py at line 1912). Pre-fix, this
+            # branch instantiated a NEW FRRDockerManager() per
+            # device per tick. The singleton pattern was already
+            # in place for ARP (v0.5.277), BGP, and OSPF monitors;
+            # ISIS was the miss. Under load (10s tick × 50 devices)
+            # a fresh Docker client + engine handshake happened
+            # 300 times per minute, piling up socket handles and
+            # occasionally starving polls with cold-connect
+            # latency. The lazy singleton connects once at first
+            # use and reuses the client.
+            from .frr_docker import frr_manager
             import docker.errors
-            
-            # Get container name using FRRDockerManager
-            frr_manager = FRRDockerManager()
+
+            # Get container name using the shared frr_manager.
             container_name = frr_manager._get_container_name(device_id, device_name)
             
             # Check if container exists
@@ -494,12 +505,17 @@ class ISISMonitor:
     def check_existing_containers(self):
         """Check all existing FRR containers and sync ISIS status with database."""
         try:
-            from .frr_docker import FRRDockerManager
+            # v0.5.380 (audit monitor M2): use the shared
+            # `frr_manager` singleton — same rationale as the
+            # per-device check path above. Called once on startup
+            # so the per-tick benefit is smaller, but keeping the
+            # imports consistent avoids re-introducing the
+            # per-call pattern in future edits.
+            from .frr_docker import frr_manager
             import docker.errors
-            
+
             logger.info("[ISIS MONITOR] Checking existing FRR containers")
-            
-            frr_manager = FRRDockerManager()
+
             all_containers = frr_manager.client.containers.list(all=True)
             
             # Filter for OSTG FRR containers
