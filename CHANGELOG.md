@@ -2,6 +2,89 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.397] - 2026-09-21
+
+### Fixed — multithreaded_traffic_gen.py concurrency + resource audit (5 items)
+
+Follow-up to v0.5.396 M2 (which added a `_launch_reservations`
+lock in `launch_single_stream` to fix a TOCTOU that doubled the
+wire rate). The same class of bug — and several adjacent ones —
+lived inside `multithreaded_traffic_gen.py`.
+
+**N1: `generate_packets` find→add TOCTOU (M2 sibling)**
+(`multithreaded_traffic_gen.py:1583-1593` + new
+`StreamTracker.find_or_add_stream`) — Pre-fix, the defensive
+"register stream row if launcher didn't" block did
+`find_stream_by_id` then (lock released) `add_stream`. If the
+launcher's own `add_stream` (with `future`, `frame_size`,
+`stop_event` etc.) landed between them, `add_stream`'s internal
+dedup would DELETE the launcher's row and re-insert the minimal
+one here — silently dropping the launcher's `Future` handle so
+the downstream Stop button appeared to succeed but the future
+never resolved. Added `StreamTracker.find_or_add_stream` that
+holds the lock across the whole check + insert. When a row
+exists, returns it UNMODIFIED (defensive registration doesn't
+overwrite the launcher's fields).
+
+**N2: unlocked iteration over `active_streams` at :816**
+(`multithreaded_traffic_gen.py:888-913` + new
+`StreamTracker.attach_rx_debug`) — Pre-fix,
+`for s in list(tracker.active_streams)` snapshotted the list
+WITHOUT holding `tracker.lock`. `list()` races with add/remove
+and can raise `RuntimeError: dictionary changed size during
+iteration`, which the surrounding `except Exception: pass`
+swallowed silently. `/api/streams/<id>/rx_debug` sometimes
+returned nothing with no log trace. `attach_rx_debug` does the
+search + set under one lock and logs a debug line when the row
+isn't present.
+
+**N3: sniffer setup resource leak on partial init**
+(`multithreaded_traffic_gen.py:949-1000`) — `register_sniffer`
+added the `(rx_interface, stream_id)` key BEFORE
+`AsyncSniffer.start()`, and `_ensure_vlan_rx_visible` had
+already bumped `_VLAN_SUBIF_REFS[sub]`. If `sniffer.start()`
+raised (libpcap OOM, iface hiccup, permission denied), the
+exception propagated but the tracker still thought a sniffer
+was registered on that key. Every subsequent `register_sniffer`
+returned False (permanent "sniffer already running" until server
+restart), AND `_VLAN_SUBIF_REFS[sub]` never reached 0 so
+`_release_vlan_subif` never freed the sub-iface — leaked
+forever. On srv06's weeks-long uptime this accumulated. Fix:
+try/except around `sniffer.start()` that rolls back both
+`unregister_sniffer` and `_release_vlan_subif` on failure, then
+re-raises.
+
+**N4: dual-sniffer counter increments unsynchronized**
+(`multithreaded_traffic_gen.py:721-757 + counter-lock init at
+~:596`) — When the rescue sniffer starts (VLAN sub-iface case),
+both `AsyncSniffer`s dispatch into the SAME `lfilter` closure
+from separate threads. `seen_total += 1` / `matched += 1` /
+`sig_hits += 1` / `tuple_hits += 1` are non-atomic
+LOAD-ADD-STORE ops — under the GIL two threads still interleave
+between load and store, so `rx_debug` and `[RX-DBG]` log lines
+undercounted. Payload counting via `update_rx` already had its
+own lock so operator-visible `rx_count` was fine; only the
+observability surface lied. Added `_counters_lock` and wrapped
+every increment / snapshot in `with _counters_lock:`. Cost is
+trivial next to the packet-matching work.
+
+**N5: stale-dict writes after unlocked find**
+(`multithreaded_traffic_gen.py:1634-1641` + new
+`StreamTracker.set_stream_field`) — `existing["rx_thread"] = rx_thread`
+happened AFTER the lock was released. If `remove_stream_by_id`
+fired between (e.g. a `max_packets` trip in `_maybe_stop_on_max`),
+the write landed on a dict that was no longer in
+`active_streams`, so downstream stop/join logic reading the
+sniffer thread reference through the tracker got `None`.
+`set_stream_field` does the find + write under one lock and
+returns False when the row is no longer tracked (caller can
+choose to log or skip).
+
+Tests: 22 new (`tests/test_v05397_traffic_gen_concurrency.py`),
+all pass. Regressions on v0.5.392–v0.5.396: intact.
+
+---
+
 ## [0.5.396] - 2026-09-21
 
 ### Fixed — server-side streams endpoints audit (5 items)

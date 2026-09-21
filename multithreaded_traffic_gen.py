@@ -240,6 +240,88 @@ class StreamTracker:
                     return s
         return None
 
+    # v0.5.397 (audit stream-gen N1): atomic check-and-add. Pre-fix,
+    # generate_packets did `existing = find_stream_by_id(...)` then
+    # (with the lock released) `add_stream(...)` — same M2-shape
+    # TOCTOU as launch_single_stream had before v0.5.396. If the
+    # launcher's add_stream landed between the find and the add here,
+    # add_stream's internal dedup would DELETE the launcher's row
+    # (which carried the future, frame_size, etc.) and re-insert this
+    # minimal one — silently dropping the launcher's Future handle so
+    # the downstream Stop button appeared to succeed but the future
+    # never resolved. Holds the lock across the whole check + insert
+    # + set-registration cycle so no other thread can race.
+    #
+    # Returns (stream_row_dict, created_bool). When created_bool is
+    # False, stream_row_dict is the EXISTING row (unmodified — this
+    # is defensive registration, not overwrite). When True, the row
+    # is the just-inserted one.
+    def find_or_add_stream(self, stream):
+        with self.lock:
+            iface = stream.get("interface")
+            sid = stream.get("stream_id")
+            _key = (iface, sid)
+            if _key in self._stream_keys:
+                for s in self.active_streams:
+                    if s.get("interface") == iface and s.get("stream_id") == sid:
+                        return s, False
+                # _stream_keys drift (shouldn't happen but be defensive)
+                self._stream_keys.discard(_key)
+            self._stream_keys.add(_key)
+            _row = {
+                "stream_id": sid,
+                "interface": iface,
+                "stream_name": stream.get("stream_name"),
+                "stop_event": stream.get("stop_event"),
+                "rx_thread": stream.get("rx_thread"),
+                "rx_interface": stream.get("rx_interface"),
+                "flow_tracking_enabled": stream.get(
+                    "flow_tracking_enabled", False),
+                "future": stream.get("future"),
+                "frame_size": stream.get("frame_size", 64),
+                "tx_count": 0,
+                "rx_count": 0,
+                "rx_drained_event": threading.Event(),
+            }
+            self.active_streams.append(_row)
+            return _row, True
+
+    # v0.5.397 (audit stream-gen N5): atomic field setter. Pre-fix,
+    # callers did `row = find_stream_by_id(...)` (lock released), then
+    # `row[key] = value` — if remove_stream_by_id fired between the
+    # find and the write (e.g. a max_packets trip in
+    # _maybe_stop_on_max), the write landed on a dict that was no
+    # longer in active_streams, so downstream code trying to read it
+    # via the tracker got the default (None / missing). Holds the
+    # lock across find + write so the row is guaranteed live when
+    # the field is set. Returns True if the row was found and the
+    # field was written, False if the row is no longer tracked.
+    def set_stream_field(self, interface, stream_id, key, value):
+        with self.lock:
+            for s in self.active_streams:
+                if (s.get("interface") == interface
+                        and s.get("stream_id") == stream_id):
+                    s[key] = value
+                    return True
+        return False
+
+    # v0.5.397 (audit stream-gen N2): atomic rx_debug attachment.
+    # Pre-fix, register_sniffer's `for s in list(tracker.active_streams)`
+    # loop bypassed self.lock entirely and raced with add/remove.
+    # The surrounding `except Exception: pass` swallowed the resulting
+    # RuntimeError silently so /api/streams/<id>/rx_debug sometimes
+    # returned nothing with no log trace. Match by stream_id only (see
+    # v0.5.265 F4 note: TX interface stored in `interface`, not RX
+    # iface, so an (iface, sid) predicate would never match a
+    # flow-tracked stream).
+    def attach_rx_debug(self, stream_id, rx_debug):
+        with self.lock:
+            for s in self.active_streams:
+                if s.get("stream_id") == stream_id:
+                    s["rx_debug"] = rx_debug
+                    return True
+        return False
+
     # v0.5.380 (audit stream-gen T5): signal that RX-sniffer drain
     # + teardown is complete for `stream_id`. Called from the RX
     # sniffer's `stopper()` (which knows rx_interface + stream_id
@@ -576,6 +658,18 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     relaxed_now = False
     auto_relax = bool(sel.pop("_auto_relax", True))
     enforce_inbound_only = bool(sel.pop("_enforce_inbound_only", False))
+    # v0.5.397 (audit stream-gen N4): dual-sniffer counter races.
+    # When the rescue sniffer starts (see below, ~line 972), both
+    # AsyncSniffers dispatch into the SAME lfilter closure from
+    # separate threads. `x += 1` on seen_total / matched / sig_hits /
+    # tuple_hits is a non-atomic LOAD-ADD-STORE — under the GIL two
+    # threads still interleave between load and store, so packets
+    # were undercounted in rx_debug and in the periodic [RX-DBG]
+    # log lines (payload counting via update_rx has its own lock
+    # so the operator-visible rx_count was fine; only the
+    # observability surface lied). This lock serializes the counter
+    # updates; cost is trivial next to the packet-matching work.
+    _counters_lock = threading.Lock()
 
     # ---- helpers ----
     def _sig_present(pkt) -> bool:
@@ -718,42 +812,71 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     # ---- lfilter + callback ----
     def lfilter(pkt):
         nonlocal seen_total, matched, sig_hits, tuple_hits, last_dbg, first_seen_ts, relaxed_now
-        seen_total += 1
-        rx_debug["seen_total"] = seen_total
+        # v0.5.397 (audit stream-gen N4): all counter mutations go
+        # under _counters_lock so the primary + rescue sniffers'
+        # increments don't clobber each other. Reads (used in log
+        # messages below) still race with concurrent writes but
+        # they're single dict-load ops — cheap staleness, no
+        # correctness impact on the returned bool.
+        with _counters_lock:
+            seen_total += 1
+            rx_debug["seen_total"] = seen_total
         if first_seen_ts is None:
             first_seen_ts = time.time()
 
         # 1) signature path first (Scapy TX embeds tag)
         if _sig_present(pkt):
-            sig_hits += 1
-            matched += 1
-            rx_debug["sig_hits"] = sig_hits
-            rx_debug["matched"] = matched
-            if matched <= 5:
-                logging.info(f"[RX-MATCH] signature on {sniff_iface} (seen={seen_total}, sig={sig_hits}, tuple={tuple_hits})")
+            with _counters_lock:
+                sig_hits += 1
+                matched += 1
+                rx_debug["sig_hits"] = sig_hits
+                rx_debug["matched"] = matched
+                _log_now = matched <= 5
+                _snap_matched, _snap_sig, _snap_tuple = matched, sig_hits, tuple_hits
+                _snap_seen = seen_total
+            if _log_now:
+                logging.info(f"[RX-MATCH] signature on {sniff_iface} (seen={_snap_seen}, sig={_snap_sig}, tuple={_snap_tuple})")
             return True
 
         # 2) tuple path
         if _tuple_match(pkt):
-            tuple_hits += 1
-            matched += 1
-            rx_debug["tuple_hits"] = tuple_hits
-            rx_debug["matched"] = matched
-            if matched <= 5:
-                logging.info(f"[RX-MATCH] tuple on {sniff_iface} (seen={seen_total}, sig={sig_hits}, tuple={tuple_hits}, relaxed={relaxed_now})")
+            with _counters_lock:
+                tuple_hits += 1
+                matched += 1
+                rx_debug["tuple_hits"] = tuple_hits
+                rx_debug["matched"] = matched
+                _log_now = matched <= 5
+                _snap_matched, _snap_sig, _snap_tuple = matched, sig_hits, tuple_hits
+                _snap_seen = seen_total
+                _snap_relaxed = relaxed_now
+            if _log_now:
+                logging.info(f"[RX-MATCH] tuple on {sniff_iface} (seen={_snap_seen}, sig={_snap_sig}, tuple={_snap_tuple}, relaxed={_snap_relaxed})")
             return True
 
         # 3) after 2s without matches, relax to any UDP (useful for RoCEv2)
         if auto_relax and not relaxed_now and first_seen_ts and (time.time() - first_seen_ts) >= 2.0 and matched == 0:
-            relaxed_now = True
-            rx_debug["relaxed_now"] = True
-            logging.warning(f"[RX] auto-relax enabled on {sniff_iface}: counting any UDP frames (no signature)")
+            with _counters_lock:
+                # Re-check inside lock — another thread may have won the race
+                if not relaxed_now and matched == 0:
+                    relaxed_now = True
+                    rx_debug["relaxed_now"] = True
+                    _log_relaxed = True
+                else:
+                    _log_relaxed = False
+            if _log_relaxed:
+                logging.warning(f"[RX] auto-relax enabled on {sniff_iface}: counting any UDP frames (no signature)")
 
         # periodic debug
         now = time.time()
-        if seen_total in (1, 100, 1000) or (now - last_dbg) >= 2.0:
-            last_dbg = now
-            logging.info(f"[RX-DBG] {sniff_iface}: seen={seen_total} matched={matched} sig={sig_hits} tuple={tuple_hits} relaxed={relaxed_now}")
+        with _counters_lock:
+            _do_dbg = seen_total in (1, 100, 1000) or (now - last_dbg) >= 2.0
+            if _do_dbg:
+                last_dbg = now
+                _snap_seen, _snap_matched = seen_total, matched
+                _snap_sig, _snap_tuple = sig_hits, tuple_hits
+                _snap_relaxed = relaxed_now
+        if _do_dbg:
+            logging.info(f"[RX-DBG] {sniff_iface}: seen={_snap_seen} matched={_snap_matched} sig={_snap_sig} tuple={_snap_tuple} relaxed={_snap_relaxed}")
         return False
 
     # v0.4.1 per-seq dedup: when both the primary (sub-iface) and
@@ -803,22 +926,32 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
         "rescue_active": False,    # set True when rescue sniffer starts
         "started_at": time.time(),
     }
-    try:
-        # Attach to the tracker entry so the REST handler can find it.
-        # v0.5.265 (audit stream-gen F4): the tracker stores the TX
-        # interface in `interface`, not the RX iface. Pre-fix, the
-        # second predicate `s.get("interface") == rx_interface`
-        # NEVER matched — flow tracking requires
-        # rx_interface != interface — so `rx_debug` was never
-        # attached and the /api/streams/<id>/rx_debug REST handler
-        # always returned nothing. stream_id is unique across all
-        # streams; dropping the interface predicate is safe.
-        for s in list(tracker.active_streams):
-            if s.get("stream_id") == stream_id:
-                s["rx_debug"] = rx_debug
-                break
-    except Exception:
-        pass
+    # Attach to the tracker entry so the REST handler can find it.
+    # v0.5.265 (audit stream-gen F4): the tracker stores the TX
+    # interface in `interface`, not the RX iface. Pre-fix, the
+    # second predicate `s.get("interface") == rx_interface`
+    # NEVER matched — flow tracking requires
+    # rx_interface != interface — so `rx_debug` was never
+    # attached and the /api/streams/<id>/rx_debug REST handler
+    # always returned nothing. stream_id is unique across all
+    # streams; dropping the interface predicate is safe.
+    #
+    # v0.5.397 (audit stream-gen N2): pre-fix, this did
+    # `for s in list(tracker.active_streams)` — snapshotting the
+    # list WITHOUT holding tracker.lock. list() races with add/
+    # remove and can raise `RuntimeError: dictionary changed size
+    # during iteration` (or worse, silently miss the row we just
+    # added). The surrounding `except: pass` swallowed the error
+    # so /api/streams/<id>/rx_debug sometimes returned nothing
+    # with no log trace of the failure. attach_rx_debug does the
+    # search + set under a single lock, and logs a debug line if
+    # the row isn't present (so future audits can spot regressions).
+    if not tracker.attach_rx_debug(stream_id, rx_debug):
+        logging.debug(
+            f"[RX] attach_rx_debug: no tracker row for stream_id="
+            f"{stream_id} on '{rx_interface}' — rx_debug endpoint "
+            f"will return empty for this stream"
+        )
 
     def _extract_seq(pkt) -> int | None:
         try:
@@ -855,6 +988,22 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
         tracker.update_rx(rx_interface, stream_name, stream_id)
 
     # ---- start sniffer ----
+    # v0.5.397 (audit stream-gen N3): wrap primary sniffer start in
+    # a try/except that rolls back register_sniffer + VLAN sub-iface
+    # bump on failure. Pre-fix, register_sniffer added the
+    # (rx_interface, stream_id) key to the tracker's _sniffers set
+    # BEFORE AsyncSniffer.start(), and _ensure_vlan_rx_visible had
+    # already bumped _VLAN_SUBIF_REFS[sub]. If sniffer.start() then
+    # raised (libpcap OOM, iface hiccup, permission denied), the
+    # exception propagated to generate_packets — but the tracker
+    # still thought a sniffer was registered on that key, so every
+    # subsequent register_sniffer for the same stream_id returned
+    # False (permanent "sniffer already running" until server
+    # restart), AND the VLAN sub-iface refcount was retained so
+    # _release_vlan_subif would never reach 0 and the sub-iface
+    # leaked forever on that host. On srv06's weeks-long uptime this
+    # accumulated. Rollback both on any exception, then re-raise so
+    # the caller sees the real failure.
     sniffer = AsyncSniffer(
         iface=sniff_iface,
         prn=on_pkt,
@@ -863,7 +1012,29 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
         lfilter=lfilter,
         promisc=True
     )
-    sniffer.start()
+    try:
+        sniffer.start()
+    except Exception as _start_exc:
+        logging.error(
+            f"[RX] primary sniffer start failed on {sniff_iface} "
+            f"for stream_id={stream_id}: {_start_exc} — rolling "
+            f"back register_sniffer and VLAN sub-iface bump"
+        )
+        try:
+            tracker.unregister_sniffer(rx_interface, stream_id)
+        except Exception as _unreg_exc:
+            logging.warning(
+                f"[RX] rollback unregister_sniffer failed: {_unreg_exc}"
+            )
+        if created_vlan_subif:
+            try:
+                _release_vlan_subif(created_vlan_subif)
+            except Exception as _rel_exc:
+                logging.warning(
+                    f"[RX] rollback _release_vlan_subif "
+                    f"'{created_vlan_subif}' failed: {_rel_exc}"
+                )
+        raise
     logging.info(f"RX sniffer started on {sniff_iface} for stream '{stream_name}' (stream_id={stream_id})")
 
     # v0.4.1 fallback sniffer: when we created a VLAN sub-interface
@@ -1578,19 +1749,27 @@ def generate_packets(stream_data, interface, stop_event):
     # ---- register stream row (before sniffer) ----
     # NOTE: Stream is already registered in stream_tracker by launch_single_stream()
     # This is just to ensure it exists if called directly (defensive programming)
+    #
+    # v0.5.397 (audit stream-gen N1): atomic check-and-add. Pre-fix,
+    # the separate find_stream_by_id + add_stream pair here had the
+    # same M2-shape TOCTOU as launch_single_stream (fixed in v0.5.396):
+    # a launcher's add_stream could land between our check and our
+    # add, add_stream's internal dedup would then DELETE the launcher's
+    # row (with future + frame_size) and re-insert our minimal one,
+    # silently dropping the future so Stop button never resolved.
+    # find_or_add_stream holds the lock across the whole cycle; if
+    # a row exists we get it back UNMODIFIED (defensive registration
+    # doesn't overwrite the launcher's fields).
     rx_thread = None
-    # Only add if not already present (avoid duplicate registration)
-    existing = stream_tracker.find_stream_by_id(interface, stream_id)
-    if not existing:
-        stream_tracker.add_stream({
-            "stream_id": stream_id,
-            "interface": interface,
-            "stream_name": stream_name,
-            "stop_event": stop_event,
-            "rx_thread": rx_thread,
-            "rx_interface": rx_interface,
-            "flow_tracking_enabled": flow_tracking_enabled
-        })
+    _row, _created = stream_tracker.find_or_add_stream({
+        "stream_id": stream_id,
+        "interface": interface,
+        "stream_name": stream_name,
+        "stop_event": stop_event,
+        "rx_thread": rx_thread,
+        "rx_interface": rx_interface,
+        "flow_tracking_enabled": flow_tracking_enabled,
+    })
 
     # ---- RX sniffer (if enabled) ----
     # This is the ONLY place where RX sniffer should be started (with proper selector)
@@ -1630,15 +1809,17 @@ def generate_packets(stream_data, interface, stop_event):
                 selector=rx_selector
             )
             
-            # Update the stream_tracker entry with the rx_thread (for both existing and newly added streams)
+            # Update the stream_tracker entry with the rx_thread.
+            # v0.5.397 (audit stream-gen N5): use set_stream_field so
+            # the find + write happen under a single lock acquisition.
+            # Pre-fix, this wrote to the dict returned by
+            # find_stream_by_id AFTER the lock was released — if
+            # remove_stream_by_id fired between, the write hit an
+            # orphan dict and the sniffer thread reference was lost.
             if rx_thread:
-                if existing:
-                    existing["rx_thread"] = rx_thread
-                else:
-                    # Find the stream we just added and update it
-                    stream_entry = stream_tracker.find_stream_by_id(interface, stream_id)
-                    if stream_entry:
-                        stream_entry["rx_thread"] = rx_thread
+                stream_tracker.set_stream_field(
+                    interface, stream_id, "rx_thread", rx_thread,
+                )
         else:
             logging.warning(f"[RX] RX interface '{rx_interface}' is DOWN, skipping RX sniffer")
 
