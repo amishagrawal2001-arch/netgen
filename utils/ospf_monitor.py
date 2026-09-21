@@ -26,6 +26,22 @@ _LAST_OSPF_STATE_LOGGED: Dict[str, str] = {}
 _LAST_OSPF_STATE_LOGGED_LOCK = threading.Lock()
 
 
+# v0.5.381 (audit monitor U1): purge per-device caches when a
+# device is removed. Same pattern as ARP/BGP/ISIS/DHCP.
+def on_device_deleted(device_id: str) -> None:
+    """Drop per-device caches. Called by remove_device."""
+    try:
+        with _LAST_OSPF_STATE_LOGGED_LOCK:
+            _LAST_OSPF_STATE_LOGGED.pop(device_id, None)
+    except Exception:
+        pass
+    try:
+        with _OSPF_WRITE_LOCKS_META_LOCK:
+            _OSPF_WRITE_LOCKS.pop(device_id, None)
+    except Exception:
+        pass
+
+
 def _ospf_write_lock_for(device_id: str) -> threading.Lock:
     with _OSPF_WRITE_LOCKS_META_LOCK:
         return _OSPF_WRITE_LOCKS[device_id]
@@ -110,6 +126,14 @@ class OSPFStatusMonitor:
         self._startup_window_until = time.monotonic() + 25
 
         while self.is_running and not self.stop_event.is_set():
+            # v0.5.381 (audit monitor-drift U5): capture tick start so
+            # we can subtract elapsed exec time from the sleep,
+            # keeping cycle length close to `check_interval` even
+            # when a pass takes several seconds. Pre-fix the loop
+            # slept `check_interval` AFTER the tick, so a pass that
+            # took 8 s + a 10 s interval = 18 s effective cycle (1.8×
+            # drift) — under load the monitor never catches up.
+            _tick_start = time.monotonic()
             try:
                 # Get OSPF-enabled devices
                 devices = self._get_ospf_devices()
@@ -120,13 +144,24 @@ class OSPFStatusMonitor:
                 else:
                     logger.info("[OSPF MONITOR] No OSPF devices found")
 
-                # Wait for next check interval
-                self.stop_event.wait(self.check_interval)
+                # v0.5.381 (audit monitor U2 + U5): check the wait
+                # return value + break immediately on stop_event.
+                # Pre-fix, this called wait() and discarded the
+                # return — a shutdown signal cost one extra loop
+                # iteration + a full check_interval delay. Also
+                # subtract tick elapsed so slow ticks don't compound.
+                _elapsed = time.monotonic() - _tick_start
+                _remaining = max(0.1, self.check_interval - _elapsed)
+                if self.stop_event.wait(_remaining):
+                    break
 
             except Exception as e:
                 logger.error(f"[OSPF MONITOR] Error in monitoring loop: {e}")
-                self.stop_event.wait(5)  # Wait 5 seconds before retrying
-        
+                # v0.5.381 (audit monitor U2): same wait-break for
+                # the error retry path.
+                if self.stop_event.wait(5):
+                    break
+
         logger.info("[OSPF MONITOR] Monitoring loop ended")
     
     def _get_ospf_devices(self) -> List[Dict[str, Any]]:

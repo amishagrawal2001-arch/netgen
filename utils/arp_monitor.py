@@ -46,6 +46,32 @@ def _arp_write_lock_for(device_id: str) -> threading.Lock:
 _LAST_ARP_STATUS_LOGGED: Dict[str, str] = {}
 _LAST_ARP_STATUS_LOGGED_LOCK = threading.Lock()
 
+
+# v0.5.381 (audit monitor U1): purge per-device caches when a
+# device is removed from the DB. Pre-fix, every monitor kept a
+# `_LAST_*_STATE_LOGGED` dict + a per-device write-lock dict that
+# NEVER pruned entries — even for devices that no longer exist.
+# Over months of add/delete churn these dicts grew unbounded
+# (small per entry, but real). `device_database.remove_device`
+# now calls `on_device_deleted(device_id)` on each monitor's
+# module to drop these entries. Best-effort: exceptions swallowed
+# so a monitor import failure doesn't block the delete path.
+def on_device_deleted(device_id: str) -> None:
+    """Drop per-device caches. Called by remove_device after
+    the DELETE commits."""
+    try:
+        with _LAST_ARP_STATUS_LOGGED_LOCK:
+            _LAST_ARP_STATUS_LOGGED.pop(device_id, None)
+    except Exception:
+        pass
+    # v0.5.262 introduced per-device ARP write locks — sibling
+    # dict is `_ARP_WRITE_LOCKS`. Purge that too.
+    try:
+        with _ARP_WRITE_LOCKS_META_LOCK:
+            _ARP_WRITE_LOCKS.pop(device_id, None)
+    except Exception:
+        pass
+
 def _default_self_url():
     """Default self-loopback URL the monitors call back into.
 
@@ -1312,6 +1338,13 @@ class ARPStatusMonitor:
         self._startup_window_until = time.monotonic() + 25  # tolerate refused for 25s more
 
         while not self.stop_event.is_set():
+            # v0.5.381 (audit monitor U5): capture tick start so we
+            # subtract elapsed exec time from the sleep. Pre-fix,
+            # `wait(check_interval)` slept after the tick regardless
+            # of tick duration, so long passes (100 devices × ping
+            # timeout) compounded and the cycle drifted from 10s to
+            # 25s+. Now: cycle length stays close to check_interval.
+            _tick_start = time.monotonic()
             try:
                 # Get all devices that need ARP monitoring
                 devices = self._get_arp_devices()
@@ -1322,8 +1355,10 @@ class ARPStatusMonitor:
                 else:
                     logger.debug("[ARP MONITOR] No ARP devices found")
 
-                # Wait for next check interval
-                if self.stop_event.wait(self.check_interval):
+                # Wait for next check interval — drift-corrected.
+                _elapsed = time.monotonic() - _tick_start
+                _remaining = max(0.1, self.check_interval - _elapsed)
+                if self.stop_event.wait(_remaining):
                     break
 
             except Exception as e:

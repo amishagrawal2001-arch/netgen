@@ -15639,11 +15639,56 @@ def get_device_arp_status(device_id):
         #
         # Same order for v6, using .ipv6_link_local / .ipv6_global /
         # bgp v6 neighbor.
+        # v0.5.381 (audit peer-fallback U4): prefer healthy peers over
+        # first-in-list. Pre-fix, v0.5.376 F1 walked the neighbors
+        # list and returned the FIRST entry with a valid IP.
+        # Real-world neighbor tables include stale entries (peers
+        # that were configured but never came up, or dropped ages
+        # ago and haven't been evicted). If the first entry was
+        # stale, ARP fell back to pinging an unreachable IP and
+        # painted the pill amber even though a healthy peer was
+        # right below it. Fix: two-pass scan — pass 1 picks the
+        # first peer whose state field says
+        # Established / Full / Up / 2-Way; pass 2 falls back to
+        # first-with-valid-IP so behavior degrades gracefully when
+        # no state fields present.
+        _HEALTHY_STATES = {
+            "established", "full", "up", "2-way", "twoway",
+            "connected", "operational", "reachable",
+        }
+
+        def _peer_is_healthy(peer_dict):
+            """True if any of the peer's state-ish fields indicate
+            an operational neighbor. Case-insensitive."""
+            for _sk in ("state", "bgp_state", "ospf_state",
+                        "isis_state", "peer_state", "session_state",
+                        "adjacency_state"):
+                _sv = peer_dict.get(_sk)
+                if _sv is None:
+                    continue
+                if str(_sv).strip().lower() in _HEALTHY_STATES:
+                    return True
+            return False
+
+        def _peer_ip_for_family(peer_dict, keys, family):
+            for _k in keys:
+                _v = peer_dict.get(_k) or ""
+                if not _v:
+                    continue
+                if family == "ipv6":
+                    if ":" in _v and not str(_v).lower().startswith("fe80"):
+                        return _v
+                else:
+                    if "." in _v and ":" not in _v:
+                        return _v
+            return ""
+
         def _first_peer_ip(field_json_str, keys, family="ipv4"):
-            """Extract the first peer IP from a JSON-serialized
-            neighbors list. field_json_str is the raw string from
-            the DB (ospf_neighbors etc); keys is a tuple of
-            candidate field names to try, in preference order."""
+            """Extract a peer IP from a JSON-serialized neighbors
+            list. Prefers peers whose state field indicates a
+            healthy adjacency (v0.5.381 U4); falls back to
+            first-with-valid-IP for backward-compat with peer
+            structures that lack state fields."""
             if not field_json_str:
                 return ""
             try:
@@ -15652,23 +15697,24 @@ def get_device_arp_status(device_id):
                     else field_json_str
                 if not isinstance(_peers, list):
                     return ""
+                # Pass 1: prefer healthy peers.
                 for _p in _peers:
                     if not isinstance(_p, dict):
                         continue
-                    # v6 branch: only accept a global v6 address,
-                    # not link-local (link-local can't be pinged as
-                    # a gateway target — needs %iface suffix).
-                    if family == "ipv6":
-                        for _k in keys:
-                            _v = _p.get(_k) or ""
-                            if _v and ":" in _v \
-                                    and not _v.lower().startswith("fe80"):
-                                return _v
-                    else:
-                        for _k in keys:
-                            _v = _p.get(_k) or ""
-                            if _v and "." in _v and ":" not in _v:
-                                return _v
+                    if not _peer_is_healthy(_p):
+                        continue
+                    _ip = _peer_ip_for_family(_p, keys, family)
+                    if _ip:
+                        return _ip
+                # Pass 2: fall back to first peer with valid IP,
+                # matching pre-v0.5.381 semantics for peer entries
+                # that don't carry a state field.
+                for _p in _peers:
+                    if not isinstance(_p, dict):
+                        continue
+                    _ip = _peer_ip_for_family(_p, keys, family)
+                    if _ip:
+                        return _ip
             except (json.JSONDecodeError, TypeError, ValueError) as _exc:
                 logging.debug(
                     f"[ARP STATUS] peer-fallback parse for "

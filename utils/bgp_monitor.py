@@ -30,6 +30,22 @@ _LAST_BGP_STATE_LOGGED: Dict[str, str] = {}
 _LAST_BGP_STATE_LOGGED_LOCK = threading.Lock()
 
 
+# v0.5.381 (audit monitor U1): purge per-device caches when a
+# device is removed. Same pattern as ARP/OSPF/ISIS/DHCP.
+def on_device_deleted(device_id: str) -> None:
+    """Drop per-device caches. Called by remove_device."""
+    try:
+        with _LAST_BGP_STATE_LOGGED_LOCK:
+            _LAST_BGP_STATE_LOGGED.pop(device_id, None)
+    except Exception:
+        pass
+    try:
+        with _BGP_WRITE_LOCKS_META_LOCK:
+            _BGP_WRITE_LOCKS.pop(device_id, None)
+    except Exception:
+        pass
+
+
 def _bgp_write_lock_for(device_id: str) -> threading.Lock:
     with _BGP_WRITE_LOCKS_META_LOCK:
         return _BGP_WRITE_LOCKS[device_id]
@@ -114,6 +130,14 @@ class BGPStatusMonitor:
         self._startup_window_until = time.monotonic() + 25
 
         while not self.stop_event.is_set():
+            # v0.5.381 (audit monitor U5): capture tick start so we
+            # subtract elapsed exec time from the sleep. Pre-fix,
+            # `wait(check_interval)` slept `check_interval` after
+            # the tick regardless of how long the tick took, so a
+            # 100-device pass taking 6s + a 10s interval = 16s
+            # effective cycle. Under load the monitor never caught
+            # up. Now: cycle length stays close to check_interval.
+            _tick_start = time.monotonic()
             try:
                 # Get all devices with BGP protocol
                 devices = self._get_bgp_devices()
@@ -124,8 +148,10 @@ class BGPStatusMonitor:
                 else:
                     logger.debug("[BGP MONITOR] No BGP devices found")
 
-                # Wait for next check interval
-                if self.stop_event.wait(self.check_interval):
+                # Wait for next check interval — drift-corrected.
+                _elapsed = time.monotonic() - _tick_start
+                _remaining = max(0.1, self.check_interval - _elapsed)
+                if self.stop_event.wait(_remaining):
                     break
 
             except Exception as e:

@@ -1640,6 +1640,35 @@ class DeviceDatabase:
                     f"{device_id} ({device_name}) - {rows_deleted} row(s) deleted"
                 )
                 conn.close()
+
+                # v0.5.381 (audit monitor U1): purge per-device
+                # caches on the sibling monitors. Each monitor
+                # module exposes `on_device_deleted(device_id)`
+                # which drops the entry from its
+                # `_LAST_*_STATE_LOGGED` and per-device write-lock
+                # dicts. Best-effort: import + call failures are
+                # logged at DEBUG and do NOT roll back the delete
+                # (the DB delete already committed above; monitors
+                # are downstream observers).
+                for _mod_name in (
+                    "utils.arp_monitor",
+                    "utils.bgp_monitor",
+                    "utils.ospf_monitor",
+                    "utils.isis_monitor",
+                    "utils.dhcp_monitor",
+                ):
+                    try:
+                        import importlib
+                        _mod = importlib.import_module(_mod_name)
+                        _hook = getattr(_mod, "on_device_deleted", None)
+                        if callable(_hook):
+                            _hook(device_id)
+                    except Exception as _hook_exc:
+                        logger.debug(
+                            f"[DEVICE DB] Monitor cleanup hook "
+                            f"{_mod_name}.on_device_deleted "
+                            f"skipped for {device_id}: {_hook_exc}"
+                        )
                 return True
                 
             except Exception as e:

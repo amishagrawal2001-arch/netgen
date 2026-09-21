@@ -737,12 +737,23 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     # rescue (base) sniffers see the same packet, we don't want to
     # double-count rx_count. Each Scapy-built packet carries
     # `[<stream_id>#<seq>]` in payload (Raw); we extract the seq and
-    # only increment rx_count once per seq. Set is bounded to ~50k
-    # most-recent seqs to cap memory; on overflow we keep the
-    # newest half (rough LRU; cheap enough for the hot path).
-    _seen_seqs_set = set()
-    _seen_seqs_lock = threading.Lock()
+    # only increment rx_count once per seq.
+    #
+    # v0.5.381 (audit stream-gen U3): O(n)→O(1) eviction. Pre-fix,
+    # the set-only approach evicted by rebuilding a fresh set with
+    # the newer half on every _SEQ_CAP overflow — an O(n/2)
+    # allocation + copy. At 500 kpps and _SEQ_CAP=50k, this fired
+    # every ~50 ms and produced ms-level GIL-holding stalls (visible
+    # as rate wobble on the receiving side). New shape: deque with
+    # `maxlen` for O(1) LRU eviction of the oldest seq, plus a
+    # sidecar set for O(1) membership. When the deque discards
+    # its oldest, we drop the same seq from the set — total O(1)
+    # per packet, no periodic stall.
+    from collections import deque
     _SEQ_CAP = 50_000
+    _seen_seqs_set = set()
+    _seen_seqs_order = deque(maxlen=_SEQ_CAP)
+    _seen_seqs_lock = threading.Lock()
     _seq_re = re.compile(
         rb"\[" + re.escape(stream_id.encode()) + rb"(?:/q\d+)?#(\d+)\]"
     )
@@ -805,14 +816,18 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
             with _seen_seqs_lock:
                 if seq in _seen_seqs_set:
                     return  # already counted from the other sniffer
+                # v0.5.381 (audit stream-gen U3): O(1) LRU eviction.
+                # Deque with maxlen auto-drops the OLDEST seq when
+                # we exceed _SEQ_CAP. We mirror that drop into the
+                # set so membership stays consistent. Both ops are
+                # O(1), no periodic O(n/2) rebuild stall.
+                if len(_seen_seqs_order) == _SEQ_CAP:
+                    _oldest = _seen_seqs_order[0]
+                    # The append below will bump _oldest out; drop
+                    # it from the set now so the set stays in sync.
+                    _seen_seqs_set.discard(_oldest)
+                _seen_seqs_order.append(seq)
                 _seen_seqs_set.add(seq)
-                if len(_seen_seqs_set) > _SEQ_CAP:
-                    # Bounded — drop oldest by clearing half.
-                    # Cheap O(n/2) cost amortised over 25k packets;
-                    # at 500 kpps that's every 50 ms, negligible.
-                    keep = set(list(_seen_seqs_set)[_SEQ_CAP // 2:])
-                    _seen_seqs_set.clear()
-                    _seen_seqs_set.update(keep)
         # Count against the original rx_interface key to keep UI stable
         tracker.update_rx(rx_interface, stream_name, stream_id)
 

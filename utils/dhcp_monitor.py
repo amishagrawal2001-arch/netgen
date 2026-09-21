@@ -49,6 +49,22 @@ def _dhcp_write_lock_for(device_id: str) -> threading.Lock:
         return _DHCP_WRITE_LOCKS[device_id]
 
 
+# v0.5.381 (audit monitor U1): purge the per-device write-lock
+# entry when a device is removed. DHCP monitor doesn't keep a
+# `_LAST_*_STATE_LOGGED` cache (state history writes are gated
+# by `add_state_transition`'s own de-dup), so only the lock dict
+# needs pruning. Same on_device_deleted contract as sibling
+# monitors so `device_database.remove_device` can call the same
+# name uniformly.
+def on_device_deleted(device_id: str) -> None:
+    """Drop per-device caches. Called by remove_device."""
+    try:
+        with _DHCP_WRITE_LOCKS_META_LOCK:
+            _DHCP_WRITE_LOCKS.pop(device_id, None)
+    except Exception:
+        pass
+
+
 # v0.5.219 (audit fix C2): shared argv-parse pgrep helper so the
 # server-mode probe stops false-matching ``dnsmasq ... eth10`` when
 # the interface is ``eth1``. Bug M (v0.5.218) applied this pattern

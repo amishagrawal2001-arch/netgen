@@ -127,13 +127,28 @@ def test_f1_ipv4_and_ipv6_paths_both_fall_back():
 def test_f1_ipv6_fallback_excludes_link_local():
     """v6 fallback must skip fe80:: addresses — those can't be
     pinged as a gateway target without a %iface suffix, and the
-    ARP endpoint's ping doesn't add one."""
+    ARP endpoint's ping doesn't add one.
+
+    v0.5.381 U4 refactored the fe80 check out of `_first_peer_ip`
+    into a sibling `_peer_ip_for_family` helper, so widen the
+    slice to cover both the helper and the caller.
+    """
     src = _read("run_tgen_server.py")
-    _start = src.index("def _first_peer_ip(")
-    body = src[_start:_start + 3000]
+    # Slice from the U4 healthy-states block (introduced in U4,
+    # sits immediately BEFORE _peer_ip_for_family) through the
+    # end of _first_peer_ip. Falls back to the raw def anchor
+    # for older tree versions.
+    try:
+        _start = src.index("_HEALTHY_STATES = {")
+    except ValueError:
+        _start = src.index("def _first_peer_ip(")
+    body = src[_start:_start + 4500]
     assert 'startswith("fe80")' in body
-    # negation of fe80 (rejecting link-local)
-    assert "not _v.lower().startswith" in body
+    # negation of fe80 (rejecting link-local). U4 wrapped the
+    # value in str(...) for defensive typing so accept either
+    # shape.
+    assert "not _v.lower().startswith" in body \
+        or "not str(_v).lower().startswith" in body
 
 
 def test_f1_fallback_logs_info_when_fired():

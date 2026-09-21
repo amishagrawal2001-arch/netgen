@@ -24,6 +24,22 @@ _LAST_ISIS_STATE_LOGGED: Dict[str, str] = {}
 _LAST_ISIS_STATE_LOGGED_LOCK = threading.Lock()
 
 
+# v0.5.381 (audit monitor U1): purge per-device caches when a
+# device is removed. Same pattern as ARP/BGP/OSPF/DHCP.
+def on_device_deleted(device_id: str) -> None:
+    """Drop per-device caches. Called by remove_device."""
+    try:
+        with _LAST_ISIS_STATE_LOGGED_LOCK:
+            _LAST_ISIS_STATE_LOGGED.pop(device_id, None)
+    except Exception:
+        pass
+    try:
+        with _ISIS_WRITE_LOCKS_META_LOCK:
+            _ISIS_WRITE_LOCKS.pop(device_id, None)
+    except Exception:
+        pass
+
+
 def _isis_write_lock_for(device_id: str) -> threading.Lock:
     with _ISIS_WRITE_LOCKS_META_LOCK:
         return _ISIS_WRITE_LOCKS[device_id]
@@ -92,8 +108,13 @@ class ISISMonitor:
     def _monitor_loop(self, interval: int):
         """Main monitoring loop."""
         logger.info("[ISIS MONITOR] Monitoring loop started")
-        
+
         while not self.stop_event.is_set():
+            # v0.5.381 (audit monitor U5): capture tick start so we
+            # subtract elapsed exec time from the sleep — keeps the
+            # cycle close to `interval` even when a pass takes
+            # several seconds. Prevents drift under 100-device load.
+            _tick_start = time.monotonic()
             try:
                 # Get all devices with ISIS configured
                 devices = self.device_db.get_all_devices()
@@ -195,10 +216,18 @@ class ISISMonitor:
                 
             except Exception as e:
                 logger.error(f"[ISIS MONITOR] Error in monitoring loop: {e}")
-            
-            # Wait for next check
-            self.stop_event.wait(interval)
-        
+
+            # v0.5.381 (audit monitor U2 + U5): check the wait
+            # return value + break immediately on stop_event. Pre-
+            # fix, this called wait() and discarded the return — a
+            # shutdown signal cost one extra iteration + a full
+            # interval delay. Also subtract tick elapsed so slow
+            # ticks don't compound.
+            _elapsed = time.monotonic() - _tick_start
+            _remaining = max(0.1, interval - _elapsed)
+            if self.stop_event.wait(_remaining):
+                break
+
         logger.info("[ISIS MONITOR] Monitoring loop stopped")
     
     def _check_device_isis_status(self, device_id: str, device_name: str):

@@ -2,6 +2,70 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.381] - 2026-09-20
+
+### Fixed — Monitor + RX correctness bundle (5 items)
+
+**U1: Monitor per-device state-dict cleanup on device delete**
+(`utils/arp_monitor.py`, `bgp_monitor.py`, `ospf_monitor.py`,
+`isis_monitor.py`, `dhcp_monitor.py`, `device_database.py:1642-1670`)
+— Every monitor kept a `_LAST_*_STATE_LOGGED` dict + a per-device
+write-lock dict that NEVER pruned entries, even for devices no
+longer in the DB. Over months of add/delete churn these dicts
+grew unbounded (small per entry, but real memory leak visible on
+long-running servers). Fix: each monitor exposes an
+`on_device_deleted(device_id)` hook; `remove_device` fans out to
+all five monitors after the DELETE commits. Best-effort — a hook
+import/call failure is logged at DEBUG and does NOT roll back
+the delete.
+
+**U2 + U5: OSPF/ISIS/ARP/BGP monitor loop — wait-break + drift correction**
+(`utils/ospf_monitor.py:105-140`, `isis_monitor.py:96-215`,
+`bgp_monitor.py:105-142`, `arp_monitor.py:1301-1345`) — Two
+long-standing gaps in the monitor loops:
+- OSPF + ISIS were calling `self.stop_event.wait(interval)` and
+  discarding the return, so a shutdown signal cost one extra
+  loop iteration + a full check_interval delay. Now check
+  return + `break`.
+- All four monitors slept `check_interval` AFTER the tick
+  regardless of tick duration. A 100-device pass taking 6-8 s
+  plus a 10 s interval = 16-18 s effective cycle — under load
+  the monitor never caught up. Now: capture `_tick_start =
+  time.monotonic()` at loop top, sleep only
+  `max(0.1, interval - elapsed)` so cycle length stays close to
+  the configured interval.
+
+**U3: RX seq-dedup O(n)→O(1) LRU eviction**
+(`multithreaded_traffic_gen.py:743-761, 802-822`) — Pre-fix,
+the per-stream `_seen_seqs_set` was a plain `set` that on
+overflow rebuilt itself with the newer half — an O(n/2)
+allocation + copy. At 500 kpps and `_SEQ_CAP=50_000` this fired
+every ~50 ms and produced ms-level GIL-holding stalls (visible
+as rate wobble on the receiving side). Fix: pair the set with a
+`collections.deque(maxlen=_SEQ_CAP)` — deque's `maxlen`
+auto-drops the oldest seq in O(1), and we mirror that drop into
+the set so membership stays consistent. Total O(1) per packet,
+no periodic stall.
+
+**U4: ARP peer-fallback picks freshest peer over first-in-list**
+(`run_tgen_server.py:15642-15720`) — v0.5.376 F1's peer-fallback
+walked the neighbors list and returned the FIRST entry with a
+valid IP. Real-world neighbor tables include stale entries
+(peers that never came up, or dropped ages ago). If the first
+entry was stale, ARP fell back to pinging an unreachable IP and
+painted the pill amber even though a healthy peer was right
+below it. Fix: two-pass scan — pass 1 picks the first peer
+whose `state` / `bgp_state` / `ospf_state` / `isis_state` /
+`peer_state` / `session_state` / `adjacency_state` field says
+Established / Full / Up / 2-Way / Connected / Operational /
+Reachable; pass 2 falls back to first-with-valid-IP so behavior
+degrades gracefully for peer structures without state fields.
+
+### Tests
+
+New: `tests/test_v05381_monitor_hygiene.py`. AST + structural +
+regression coverage.
+
 ## [0.5.380] - 2026-09-20
 
 ### Fixed — Traffic-gen + monitor bundle (7 bugs)
