@@ -2,6 +2,90 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.394] - 2026-09-21
+
+### Fixed — RFC 2544 sync HTTP + streams deferred tail (5 items)
+
+**K1: RFC 2544 dialog — 6 sync HTTP calls moved off UI thread**
+(`widgets/rfc2544_dialog.py`) — Pre-fix, every HTTP call from this
+dialog ran SYNCHRONOUSLY on the Qt event thread: Start POST (10 s
+timeout), Stop POST (5 s), 2 s-tick poll GET (5 s), export CSV GET
+(5 s), export HTML GET (5 s), and the cleanup POST from `closeEvent`
+(3 s). Worst case: a Start click against an unreachable server froze
+the whole UI for up to 10 s; the close button visually stuck for 3 s.
+Added `_RfcHttpWorker(QThread)` (module-level) with a single
+`done(int, str, str)` signal — mirrors v0.5.392 H2's shape. Added
+`_keepalive_worker` / `_release_worker` on the dialog so PyQt5 5.15
++ Python 3.14 don't GC workers mid-flight. Five call sites use the
+worker; cleanup-on-close uses `threading.Thread(daemon=True)` to
+decouple from the dying dialog widget's Qt lifecycle. Poll ticks
+that arrive while the previous request is still in flight are
+skipped (log line) rather than stacked — better one missed 2 s
+sample than a queue of workers hammering a wedged server.
+
+**K2: `stop_stream` name-fallback stops the WRONG stream on duplicates**
+(`traffic_client/stream_logic.py:1050-1080` + `:1157-1180`) — Pre-fix,
+both fallback sites used `next((s for s in streams if s.name == name), None)` —
+returning the FIRST match. If two streams on the same port shared a
+name (rare — happens with unsaved copies before their stream_id
+lands), the operator's Stop click silently stopped the wrong stream.
+Fix: collect ALL candidates. If exactly one → use it (same behavior
+as before for the common case). If more than one → log a WARNING,
+push a message into `errors_for_user`, and refuse to guess. Hoisted
+`errors_for_user = []` above the row loop so both branches can push
+to it (removed the second initializer). Parity fix in the "update
+local state" block at `:1157`.
+
+**K3: `_apply_stream_body` row-index fallback misfires under sort/filter**
+(`traffic_client/stream_logic.py:1863-1917`) — Pre-fix, the last-
+resort match at `:1864` did
+`matched_stream = self.streams[port_key][row]`
+where `row` is the ABSOLUTE table row. After a header click
+(`sortItems`) or after `_apply_stream_table_filter`
+(`stream_control.py:355`) narrows the visible rows, that row index
+no longer maps to the same position in the underlying stream list —
+so inline edits silently landed on the WRONG stream. Fix: introspect
+`horizontalHeader().isSortIndicatorShown()` AND scan for any active
+filter widget (`_stream_filter_text` / `stream_search_field` /
+`_stream_table_filter`). If either is on, skip the fallback and log
+a warning telling the operator to save the stream first (which
+populates `stream_id` and unblocks the reliable path). When BOTH
+are off, the row-index fallback stays enabled for the common case
+where the operator hasn't touched sort/filter.
+
+**K4: server_tree D5 restore missing keyboard-focus anchor**
+(`traffic_client/server_section.py:1802-1874`) — Pre-fix, the D5
+selection restore (v0.5.388) called only `setCurrentItem`, no
+`setSelected(True)`, no `scrollToItem`, no `selectionModel().setCurrentIndex(...)`.
+Keyboard users lost the focus rectangle when the tree was cleared —
+arrow-key navigation drifted to the wrong row after every refresh
+even though selection had been "restored". Fix: pair `setCurrentItem`
+with `setSelected(True)` (matches the older `should_preserve` branch),
+call `scrollToItem` to bring the restored row into view, and re-
+anchor the `selectionModel`'s currentIndex with `SelectCurrent | Rows`
+so arrow keys resume from the right spot. `setFocus()` is gated —
+only called if the tree already had focus, so a refresh mid-typing
+doesn't yank focus out of the operator's form.
+
+**K5: `_stop_stream_by_id` paints red even when stop failed**
+(`traffic_client/stream_logic.py:340-406`) — Pre-fix, the code captured
+`ok = resp.ok` but always wrote `s["status"] = "stopped"` and painted
+`update_stream_status(row_idx, "red")` regardless. If the stop POST
+failed (network error, server 5xx), the tx_worker was likely still
+sending frames — but the client lied to the UI saying stopped. On the
+next stats poll, v0.5.393 J2's counter-advance override would flip
+back to green, producing a red→green flicker AND leaving the operator
+unsure whether their stop landed. Fix: only mutate local status +
+paint red when `ok`. On failure, log a WARNING and leave the row's
+status hint alone so the next stats poll resolves it authoritatively.
+Also pass `stream_id=` to `update_stream_status` so v0.5.392 H1's
+row re-resolution kicks in.
+
+Tests: 24 new (`tests/test_v05394_rfc2544_and_streams_tail.py`), all
+pass. Regressions on v0.5.389–v0.5.393: intact.
+
+---
+
 ## [0.5.393] - 2026-09-21
 
 ### Fixed — Stream status shows red while traffic actively flowing (user-reported)

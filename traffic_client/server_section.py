@@ -1802,7 +1802,17 @@ class TrafficGenClientServerSection():
         # v0.5.388 (D5): re-select the previously-selected item if
         # it still exists. Preserves the operator's current
         # selection through routine refreshes.
+        # v0.5.394 (audit K4): pair setCurrentItem with setSelected +
+        # scrollToItem + setFocus, and re-anchor the selectionModel's
+        # currentIndex explicitly. Pre-fix, keyboard users lost the
+        # focus rectangle when the tree was cleared, so arrow-key
+        # navigation drifted to the wrong row after a refresh even
+        # though setCurrentItem had "restored" selection. Also match
+        # the shape of the older should_preserve branch which already
+        # called setSelected(True), so both restoration paths look the
+        # same.
         _restored_sel = False
+        _restored_item = None
         if _sel_key is not None:
             try:
                 _kind, _addr, _iface = _sel_key
@@ -1812,17 +1822,55 @@ class TrafficGenClientServerSection():
                         continue
                     if _kind == "server":
                         self.server_tree.setCurrentItem(_it)
+                        _it.setSelected(True)
+                        _restored_item = _it
                         _restored_sel = True
                     else:
                         for _c in range(_it.childCount()):
                             _ch = _it.child(_c)
                             if _ch is not None and _ch.text(0).strip() == _iface:
                                 self.server_tree.setCurrentItem(_ch)
+                                _ch.setSelected(True)
+                                _restored_item = _ch
                                 _restored_sel = True
                                 break
                     break
             except Exception:
                 _restored_sel = False
+                _restored_item = None
+        # Re-anchor keyboard focus + bring the row into view so arrow
+        # keys resume from the right place. Wrapped so a partially-
+        # torn-down tree during shutdown doesn't crash the refresh.
+        if _restored_item is not None:
+            try:
+                self.server_tree.scrollToItem(_restored_item)
+            except Exception:
+                pass
+            try:
+                from PyQt5.QtCore import QItemSelectionModel
+                _idx = self.server_tree.indexFromItem(_restored_item, 0)
+                if _idx is not None and _idx.isValid():
+                    self.server_tree.selectionModel().setCurrentIndex(
+                        _idx,
+                        QItemSelectionModel.SelectCurrent
+                        | QItemSelectionModel.Rows,
+                    )
+            except Exception:
+                pass
+            try:
+                # Only steal focus if the tree itself was previously
+                # the focus owner — don't yank focus out of a form
+                # the operator is currently typing into.
+                _focus = None
+                try:
+                    from PyQt5.QtWidgets import QApplication
+                    _focus = QApplication.focusWidget()
+                except Exception:
+                    _focus = None
+                if _focus is self.server_tree:
+                    self.server_tree.setFocus()
+            except Exception:
+                pass
 
         # v0.5.388 (D5): auto-select first checked TG ONLY on
         # first population (or when should_preserve is False AND

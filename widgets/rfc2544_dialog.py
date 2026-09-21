@@ -16,8 +16,10 @@ import json
 import logging
 from typing import Optional
 
+import threading
+
 import requests
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QKeySequence
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout, QLabel,
@@ -38,6 +40,47 @@ logger = logging.getLogger(__name__)
 
 # Standard RFC 2544 frame sizes (bytes). Section 9 of the RFC.
 RFC2544_FRAME_SIZES = [64, 128, 256, 512, 1024, 1280, 1518]
+
+
+# v0.5.394 (audit rfc2544 K1): every HTTP call from this dialog used
+# to run SYNCHRONOUSLY on the Qt event thread — Start POST (10 s),
+# Stop POST (5 s), 2 s-tick poll GET (5 s), export CSV GET (5 s),
+# export HTML GET (5 s), and cleanup POST from closeEvent (3 s).
+# Worst case: 10 s freeze on a Start against an unreachable server;
+# the close button visually sticks for up to 3 s. This worker moves
+# the HTTP off the UI thread and hands back the parsed status +
+# error + body via a single done(int, str, str) signal, mirroring
+# the shape of v0.5.392 H2's _InlineUpdateWorker (stream_logic.py).
+class _RfcHttpWorker(QThread):
+    done = pyqtSignal(int, str, str)  # (status_code, err_text, body_text)
+
+    def __init__(self, method: str, url: str,
+                 json_payload=None, timeout: float = 5.0,
+                 parent=None):
+        super().__init__(parent)
+        self._method = method.upper()
+        self._url = url
+        self._json = json_payload
+        self._timeout = timeout
+
+    def run(self):
+        try:
+            if self._method == "GET":
+                r = requests.get(self._url, timeout=self._timeout)
+            else:
+                r = requests.post(
+                    self._url,
+                    json=self._json,
+                    timeout=self._timeout,
+                )
+            body = ""
+            try:
+                body = r.text or ""
+            except Exception:
+                body = ""
+            self.done.emit(int(r.status_code), "", body)
+        except Exception as exc:
+            self.done.emit(0, str(exc), "")
 
 
 class Rfc2544Dialog(QDialog):
@@ -356,12 +399,27 @@ class Rfc2544Dialog(QDialog):
         except Exception:
             pass
         if self.server_url:
+            # v0.5.394 (audit rfc2544 K1): fire-and-forget via a
+            # daemon threading.Thread rather than requests.post on
+            # the UI thread. Two reasons: (a) the sync POST froze
+            # the close animation for up to 3 s against an
+            # unreachable server, and (b) the dialog widget is being
+            # torn down NOW, so a QThread pinned to `self` would
+            # race with widget destruction. threading.Thread with
+            # daemon=True is fully decoupled from Qt lifecycle — it
+            # POSTs, logs, and exits after `self` has already died.
+            _url = f"{self.server_url}/api/rfc2544/stop"
+            def _fire_and_forget_stop():
+                try:
+                    requests.post(_url, timeout=3)
+                except Exception as _exc:
+                    logger.debug(f"[RFC 2544] stop on close failed: {_exc}")
             try:
-                requests.post(
-                    f"{self.server_url}/api/rfc2544/stop", timeout=3,
-                )
+                threading.Thread(
+                    target=_fire_and_forget_stop, daemon=True,
+                ).start()
             except Exception as exc:
-                logger.debug(f"[RFC 2544] stop on close failed: {exc}")
+                logger.debug(f"[RFC 2544] stop on close spawn failed: {exc}")
 
     # v0.5.392 (audit streams H4): parameter persistence via
     # QSettings. Save on Start + close, restore on __init__.
@@ -379,6 +437,29 @@ class Rfc2544Dialog(QDialog):
         "duration_spin": "rfc2544/duration_s",
         "resolution_spin": "rfc2544/resolution_pps",
     }
+
+    # v0.5.394 (audit rfc2544 K1): mirrors v0.5.392 H2's shape from
+    # send_inline_update_to_server (traffic_client/stream_logic.py).
+    # Pins live QThread workers on the dialog instance so PyQt5 5.15
+    # on Python 3.14 doesn't GC one mid-flight (the SIGABRT race).
+    # _release_worker is wired to the worker's finished signal and
+    # drops the pin so the list doesn't grow unboundedly across a
+    # long session of Start / Stop / Export clicks.
+    def _keepalive_worker(self, worker):
+        if not hasattr(self, "_live_workers"):
+            self._live_workers = []
+        self._live_workers.append(worker)
+
+    def _release_worker(self, worker):
+        try:
+            if hasattr(self, "_live_workers"):
+                self._live_workers.remove(worker)
+        except ValueError:
+            pass
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
 
     def _rfc2544_settings(self):
         from PyQt5.QtCore import QSettings
@@ -599,18 +680,49 @@ class Rfc2544Dialog(QDialog):
             "capture_latency": self.latency_checkbox.isChecked(),
         }
         url = f"{self.server_url}/api/rfc2544/start"
+        # v0.5.394 (audit rfc2544 K1): fire the Start POST on a worker
+        # thread. Pre-fix, the sync `requests.post(url, timeout=10)`
+        # froze the whole UI for up to 10 s when the server was
+        # unreachable — cursor pinwheel, buttons dead, no way to
+        # cancel. Now: disable Start optimistically so the operator
+        # can't double-click while we're negotiating, then hand off
+        # to _RfcHttpWorker and handle the result in
+        # _on_start_response.
+        self.start_btn.setEnabled(False)
+        self.status_label.setText("Starting…")
+        self.status_label.setStyleSheet("color: #1d4ed8; font-weight: 600;")
+        _w = _RfcHttpWorker(
+            "POST", url, json_payload=params, timeout=10.0, parent=self,
+        )
+        _w.done.connect(self._on_start_response)
+        _w.finished.connect(lambda w=_w: self._release_worker(w))
+        self._keepalive_worker(_w)
+        _w.start()
+
+    def _on_start_response(self, status_code: int, err: str, body: str):
+        """Runs on the UI thread when the _on_start POST resolves."""
+        if err:
+            QMessageBox.warning(self, "Start failed", err)
+            self.start_btn.setEnabled(True)
+            self.status_label.setText("")
+            return
         try:
-            r = requests.post(url, json=params, timeout=10)
-            data = r.json()
-        except Exception as e:
-            QMessageBox.warning(self, "Start failed", f"{e}")
+            data = json.loads(body) if body else {}
+        except Exception as _exc:
+            QMessageBox.warning(
+                self, "Start failed",
+                f"Malformed server response (HTTP {status_code}): {_exc}",
+            )
+            self.start_btn.setEnabled(True)
+            self.status_label.setText("")
             return
         if not data.get("ok"):
             QMessageBox.warning(self, "Start refused",
                                 data.get("error") or "Unknown error")
+            self.start_btn.setEnabled(True)
+            self.status_label.setText("")
             return
 
-        self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.export_btn.setEnabled(False)
         self.status_label.setText("Test running…")
@@ -628,6 +740,34 @@ class Rfc2544Dialog(QDialog):
         self._poll_progress()
 
     def _poll_progress(self):
+        # v0.5.394 (audit rfc2544 K1): the QTimer tick fires on the
+        # Qt event loop; the previous `requests.get(..., timeout=5)`
+        # here blocked the entire UI for up to 5 s per poll cycle if
+        # the server was slow. Now spawn a worker and let it hand the
+        # response back via _on_poll_response. If the previous worker
+        # from a slow tick is still running, skip this tick — better
+        # to miss one 2 s sample than to stack workers on a wedged
+        # server.
+        if getattr(self, "_poll_in_flight", False):
+            logger.debug(
+                "[RFC 2544] previous poll still in flight; skipping tick"
+            )
+            return
+        self._poll_in_flight = True
+        _w = _RfcHttpWorker(
+            "GET",
+            f"{self.server_url}/api/rfc2544/progress",
+            timeout=5.0,
+            parent=self,
+        )
+        _w.done.connect(self._on_poll_response)
+        _w.finished.connect(lambda w=_w: self._release_worker(w))
+        self._keepalive_worker(_w)
+        _w.start()
+
+    def _on_poll_response(self, status_code: int, err: str, body: str):
+        """Runs on the UI thread when a /api/rfc2544/progress GET resolves."""
+        self._poll_in_flight = False
         # v0.5.373 (audit rfc2544-poll-swallows-exceptions): pre-fix
         # a broad `except Exception: return` silently swallowed every
         # poll failure. If the server crashed mid-test the 2s timer
@@ -639,15 +779,21 @@ class Rfc2544Dialog(QDialog):
         # so the operator knows the poll wedged and can retry.
         if not hasattr(self, "_poll_consecutive_fail"):
             self._poll_consecutive_fail = 0
-        try:
-            r = requests.get(f"{self.server_url}/api/rfc2544/progress", timeout=5)
-            data = r.json()
+        _parse_ok = False
+        data = {}
+        if not err:
+            try:
+                data = json.loads(body) if body else {}
+                _parse_ok = True
+            except Exception as _exc:
+                err = f"malformed body: {_exc}"
+        if _parse_ok:
             self._poll_consecutive_fail = 0
-        except Exception as e:
+        else:
             self._poll_consecutive_fail += 1
             logger.debug(
                 f"[RFC 2544] poll failed "
-                f"({self._poll_consecutive_fail}/5): {e}"
+                f"({self._poll_consecutive_fail}/5): {err}"
             )
             if self._poll_consecutive_fail >= 5:
                 logger.warning(
@@ -794,17 +940,31 @@ class Rfc2544Dialog(QDialog):
         self.stop_btn.setEnabled(False)
         self.status_label.setText("Stopping…")
         self.status_label.setStyleSheet("color: #b91c1c; font-weight: 600;")
-        try:
-            r = requests.post(
-                f"{self.server_url}/api/rfc2544/stop", timeout=5
+        # v0.5.394 (audit rfc2544 K1): the sync POST here (5 s timeout)
+        # froze the UI for up to 5 s if the server was slow. Move to
+        # worker; the reply is only used for a debug log line.
+        _w = _RfcHttpWorker(
+            "POST",
+            f"{self.server_url}/api/rfc2544/stop",
+            timeout=5.0,
+            parent=self,
+        )
+        _w.done.connect(self._on_stop_response)
+        _w.finished.connect(lambda w=_w: self._release_worker(w))
+        self._keepalive_worker(_w)
+        _w.start()
+
+    def _on_stop_response(self, status_code: int, err: str, body: str):
+        """Logs the outcome of an /api/rfc2544/stop POST. Kept minimal:
+        the operator sees real state from the next poll tick, not from
+        this reply. Don't re-enable Stop — if the test is genuinely
+        stuck, restarting the server is the escape hatch."""
+        if err:
+            logger.warning(f"[RFC 2544] stop request failed: {err}")
+        elif status_code < 200 or status_code >= 300:
+            logger.warning(
+                f"[RFC 2544] stop returned {status_code}: {body[:200]}"
             )
-            if not r.ok:
-                logger.warning(f"[RFC 2544] stop returned {r.status_code}: {r.text[:200]}")
-        except Exception as e:
-            logger.warning(f"[RFC 2544] stop request failed: {e}")
-            # Don't re-enable Stop — the user will see status from the
-            # next poll. If the test is genuinely stuck, restarting
-            # the server is the escape hatch.
 
     def _on_export_csv(self):
         # Timestamped default filename — operator hits Save without
@@ -820,11 +980,36 @@ class Rfc2544Dialog(QDialog):
         )
         if not path:
             return
+        # v0.5.394 (audit rfc2544 K1): the sync GET (5 s timeout) froze
+        # the UI between operator clicking Save and the file being
+        # written. Now: spawn worker, capture chosen path in closure,
+        # write file in the response slot.
+        _w = _RfcHttpWorker(
+            "GET",
+            f"{self.server_url}/api/rfc2544/progress",
+            timeout=5.0,
+            parent=self,
+        )
+        _w.done.connect(
+            lambda status, err, body, _p=path:
+            self._on_export_csv_response(status, err, body, _p)
+        )
+        _w.finished.connect(lambda w=_w: self._release_worker(w))
+        self._keepalive_worker(_w)
+        _w.start()
+
+    def _on_export_csv_response(self, status_code: int, err: str,
+                                body: str, path: str):
+        if err:
+            QMessageBox.warning(self, "Export failed", err)
+            return
         try:
-            r = requests.get(f"{self.server_url}/api/rfc2544/progress", timeout=5)
-            data = r.json()
-        except Exception as e:
-            QMessageBox.warning(self, "Export failed", f"{e}")
+            data = json.loads(body) if body else {}
+        except Exception as _exc:
+            QMessageBox.warning(
+                self, "Export failed",
+                f"Malformed server response (HTTP {status_code}): {_exc}",
+            )
             return
         rows = data.get("progress") or []
         try:
@@ -875,11 +1060,37 @@ class Rfc2544Dialog(QDialog):
         )
         if not path:
             return
+        # v0.5.394 (audit rfc2544 K1): same shape as _on_export_csv —
+        # worker fires the GET, response slot builds + writes the HTML.
+        _w = _RfcHttpWorker(
+            "GET",
+            f"{self.server_url}/api/rfc2544/progress",
+            timeout=5.0,
+            parent=self,
+        )
+        _w.done.connect(
+            lambda status, err, body, _p=path:
+            self._on_export_html_response(status, err, body, _p)
+        )
+        _w.finished.connect(lambda w=_w: self._release_worker(w))
+        self._keepalive_worker(_w)
+        _w.start()
+
+    def _on_export_html_response(self, status_code: int, err: str,
+                                 body: str, path: str):
+        if err:
+            QMessageBox.warning(
+                self, "Export failed",
+                f"Could not fetch progress: {err}",
+            )
+            return
         try:
-            r = requests.get(f"{self.server_url}/api/rfc2544/progress", timeout=5)
-            data = r.json()
-        except Exception as e:
-            QMessageBox.warning(self, "Export failed", f"Could not fetch progress: {e}")
+            data = json.loads(body) if body else {}
+        except Exception as _exc:
+            QMessageBox.warning(
+                self, "Export failed",
+                f"Malformed server response (HTTP {status_code}): {_exc}",
+            )
             return
         rows = data.get("progress") or []
         params = self._current_params_for_report()

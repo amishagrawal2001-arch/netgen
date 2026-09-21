@@ -362,18 +362,39 @@ class TrafficGenClientStreamLogic:
         finally:
             in_flight.discard(stream_id)
 
-        # update status in memory
-        port_key = self._find_port_key_for_stream(stream_id)
-        if port_key and port_key in self.streams:
-            for s in self.streams[port_key]:
-                if s.get("stream_id") == stream_id:
-                    s["status"] = "stopped"
-                    break
+        # v0.5.394 (audit streams K5): the pre-fix code always mutated
+        # local status to "stopped" and painted the row red regardless
+        # of whether the server actually confirmed the stop. Same
+        # non-authoritative-signal problem class as the v0.5.393 J1/J2
+        # fixes: if the stop POST failed (network error, server 5xx),
+        # the tx_worker is likely STILL running and the DB still says
+        # Running — but the client is now lying to the UI saying it
+        # stopped. On the next stats poll, J2's counter-advance
+        # override would flip it back to green, causing a red→green
+        # flicker AND leaving the operator confused about whether
+        # their stop request landed. Now: only paint red + mark
+        # stopped when the server confirmed (`ok`). On failure, log
+        # a warning and leave the row's status hint alone — the next
+        # poll cycle will resolve it authoritatively (green if still
+        # running, red if the tx_worker actually died anyway).
+        if ok:
+            port_key = self._find_port_key_for_stream(stream_id)
+            if port_key and port_key in self.streams:
+                for s in self.streams[port_key]:
+                    if s.get("stream_id") == stream_id:
+                        s["status"] = "stopped"
+                        break
 
-        if row_idx is not None:
-            self.update_stream_status(row_idx, "red")
-        self.update_stream_table()
-        logger.info(f"[AUTO-STOP {'OK' if ok else 'WARN'}] stream_id={stream_id} on {server_url}")
+            if row_idx is not None:
+                self.update_stream_status(row_idx, "red", stream_id=stream_id)
+            self.update_stream_table()
+            logger.info(f"[AUTO-STOP OK] stream_id={stream_id} on {server_url}")
+        else:
+            logger.warning(
+                f"[AUTO-STOP WARN] stream_id={stream_id} on {server_url} "
+                f"— stop request did NOT confirm; leaving local status "
+                f"alone. Next stats poll will resolve authoritatively."
+            )
 
     def _schedule_stream_auto_stop(self, server_url, port_label, stream_obj, row_idx):
         """
@@ -1014,6 +1035,11 @@ class TrafficGenClientStreamLogic:
         stop_requests = {}  # server_url -> [{"interface": "...", "stream_id": "..."}]
         selected_triplets = []  # (port, name, row_idx, stream_id)
         rows_being_stopped = []  # row indices to flip to "yellow" pending icon
+        # v0.5.394 (audit streams K2): hoisted above the row loop so the
+        # duplicate-name-refusal branch inside the loop can push its own
+        # message alongside network errors from the send-requests block
+        # below (there was a second `errors_for_user = []` there — merged).
+        errors_for_user = []
 
         for idx in selected:
             row = idx.row()
@@ -1047,14 +1073,35 @@ class TrafficGenClientStreamLogic:
                         matched = s
                         break
             
-            # Fallback: match by name if stream_id not available or not found
+            # Fallback: match by name if stream_id not available or not found.
+            # v0.5.394 (audit streams K2): the old `next(...)` returned the
+            # FIRST match, which silently stopped the wrong stream when two
+            # streams on the same port shared a name (rare — happens with
+            # unsaved copies before their stream_id lands). Refuse to guess:
+            # count matches, use the one when unambiguous, otherwise skip
+            # and surface the ambiguity so the operator can save + retry.
             if not matched:
-                matched = next(
-                    (s for s in self.streams.get(port_key, [])
-                     if s.get("name") == name or s.get("protocol_selection", {}).get("name") == name),
-                    None
-                )
-            
+                _candidates = [
+                    s for s in self.streams.get(port_key, [])
+                    if s.get("name") == name
+                    or s.get("protocol_selection", {}).get("name") == name
+                ]
+                if len(_candidates) == 1:
+                    matched = _candidates[0]
+                elif len(_candidates) > 1:
+                    logger.warning(
+                        f"[STOP] Refusing to stop '{name}' on '{port_key}' — "
+                        f"{len(_candidates)} streams share this name and no "
+                        f"stream_id is available to disambiguate. Save the "
+                        f"streams so each gets a stable stream_id, then retry."
+                    )
+                    errors_for_user.append(
+                        f"'{name}' on {port_key}: "
+                        f"{len(_candidates)} streams share this name; "
+                        f"save first to disambiguate."
+                    )
+                    continue
+
             if not matched:
                 logger.error(f"[STOP] Stream '{name}' (stream_id: {stream_id_from_table}) not found in port '{port_key}'")
                 continue
@@ -1107,7 +1154,9 @@ class TrafficGenClientStreamLogic:
             })
 
         # Send stop requests
-        errors_for_user = []
+        # v0.5.394 (audit streams K2): `errors_for_user` moved to the top
+        # of stop_stream so the duplicate-name refusal branch above can
+        # also push to it. Don't re-initialize here.
         in_flight = self._streams_in_flight()
         for server_url, items in stop_requests.items():
             try:
@@ -1144,12 +1193,26 @@ class TrafficGenClientStreamLogic:
                             updated = True
                             break
 
-                # Fallback to name matching if stream_id didn't match
+                # Fallback to name matching if stream_id didn't match.
+                # v0.5.394 (audit streams K2): parity with the top-of-loop
+                # refusal — don't mutate `status` on a duplicate-name
+                # ambiguity; skip and log. Preserves the invariant that
+                # if we refused to send the stop request above, we also
+                # don't lie about local state.
                 if not updated:
-                    for s in self.streams.get(port_key, []):
-                        if s.get("name") == name or s.get("protocol_selection", {}).get("name") == name:
-                            s["status"] = "stopped"
-                            break
+                    _local_matches = [
+                        s for s in self.streams.get(port_key, [])
+                        if s.get("name") == name
+                        or s.get("protocol_selection", {}).get("name") == name
+                    ]
+                    if len(_local_matches) == 1:
+                        _local_matches[0]["status"] = "stopped"
+                    elif len(_local_matches) > 1:
+                        logger.warning(
+                            f"[STOP] Local state: {len(_local_matches)} "
+                            f"streams share name '{name}' on '{port_key}' — "
+                            f"not touching any status locally."
+                        )
 
         if errors_for_user:
             QMessageBox.warning(
@@ -1818,10 +1881,57 @@ class TrafficGenClientStreamLogic:
                         matched_stream = s
                         break
             
-            # Last resort: use row index (assumes table order matches stream list order)
+            # Last resort: use row index (assumes table order matches stream list order).
+            # v0.5.394 (audit streams K3): the row-index fallback silently
+            # writes to `self.streams[port_key][row]` regardless of what
+            # sort/filter the user has applied. After a header click or
+            # after `_apply_stream_table_filter` (stream_control.py:355)
+            # narrows the visible rows, the absolute table row no longer
+            # maps to the same index in the underlying stream list — so
+            # edits land on the WRONG stream. Gate the fallback on
+            # (a) horizontal-header sort disabled AND
+            # (b) no active filter,
+            # both introspected from the widgets. If either is on, skip
+            # the fallback and log — the user can retype after a save
+            # (which populates stream_id and unblocks the reliable path).
             if not matched_stream and row < len(self.streams[port_key]):
-                matched_stream = self.streams[port_key][row]
-                logger.debug(f"[INLINE EDIT] Using row index fallback to find stream at row {row}")
+                _table_sorted = False
+                try:
+                    _header = self.stream_table.horizontalHeader()
+                    _table_sorted = bool(
+                        _header is not None
+                        and _header.isSortIndicatorShown()
+                        and _header.sortIndicatorSection() >= 0
+                    )
+                except Exception:
+                    _table_sorted = False
+                _filter_active = False
+                for _attr in ("_stream_filter_text",
+                              "stream_search_field",
+                              "_stream_table_filter"):
+                    try:
+                        _v = getattr(self, _attr, None)
+                        if _v is None:
+                            continue
+                        # If it's a QLineEdit-like widget, read .text()
+                        _val = _v.text() if hasattr(_v, "text") else _v
+                        if isinstance(_val, str) and _val.strip():
+                            _filter_active = True
+                            break
+                    except Exception:
+                        continue
+                if _table_sorted or _filter_active:
+                    logger.warning(
+                        f"[INLINE EDIT] Refusing row-index fallback at "
+                        f"row {row} — table is "
+                        f"{'sorted' if _table_sorted else 'filtered'}; "
+                        f"row does not map deterministically to "
+                        f"self.streams[{port_key!r}]. Save the stream "
+                        f"first so it gets a stream_id."
+                    )
+                else:
+                    matched_stream = self.streams[port_key][row]
+                    logger.debug(f"[INLINE EDIT] Using row index fallback to find stream at row {row}")
             
             if matched_stream:
                 ps = matched_stream.setdefault("protocol_selection", {})
