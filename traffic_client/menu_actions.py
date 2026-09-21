@@ -483,6 +483,41 @@ class TrafficGenClientMenuAction():
             QMessageBox.warning(self, "No Selection", "Please select a server to remove.")
             return
 
+        # v0.5.387 (audit devices-tab C4): confirmation prompt.
+        # Pre-fix, remove_selected_server destroyed chassis +
+        # associated stats/streams state on a single click, with
+        # NO confirmation. Also silently no-op'd on port
+        # selections (item.parent() is not None) — the operator
+        # saw the click do nothing and had no feedback. Fix:
+        # collect the top-level selections first, warn if the
+        # selection is only ports (no top-level chassis), and
+        # confirm with a QMessageBox.question listing the
+        # chassis addresses about to be removed.
+        _top_level = [it for it in selected_items if it.parent() is None]
+        if not _top_level:
+            QMessageBox.warning(
+                self, "Select a Server (Not a Port)",
+                "You selected one or more PORTS. To remove a "
+                "chassis, select the top-level TG row (the one "
+                "whose parent is the tree root)."
+            )
+            return
+        _addrs = [it.text(1) for it in _top_level if it.text(1)]
+        _addr_lines = "\n  • ".join(_addrs) if _addrs else "(unnamed)"
+        _confirm = QMessageBox.question(
+            self,
+            "Remove Server(s)?",
+            f"Remove the following server(s) and ALL associated "
+            f"chassis + stream stats + row state?\n\n"
+            f"  • {_addr_lines}\n\n"
+            f"This is not reversible — you'll need to re-add the "
+            f"server from Tools → Add Server.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if _confirm != QMessageBox.Yes:
+            return
+
         for item in selected_items:
             if item.parent() is None:  # Ensure it's a top-level item (server)
                 server_address = item.text(1)  # Server address column

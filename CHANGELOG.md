@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.387] - 2026-09-21
+
+### Fixed — Device tab audit HIGHs + MEDs (5 items)
+
+**C1: `prompt_edit_device` UnboundLocalError silently skipped entire pre-fill**
+(`widgets/devices_tab.py:7945-7970, 8115-8145`) — Pre-fix, the
+DHCP-relay + pool-router pre-fill lines at ~:7954/7964 referenced
+`dhcp_config` — a name NOT bound until line ~8083, where it
+appears as a tuple element from `dialog.get_values()` after the
+modal closes. Python treats it as a function-local, so reading
+it raised `UnboundLocalError` on EVERY Edit of a DHCP-enabled
+device with the relay UI present. The bare `except Exception` at
+~:8065 (WARNING-level) swallowed it silently → the ENTIRE
+BGP/OSPF/ISIS/DHCP pre-fill block skipped → Save wrote empty
+defaults over the operator's real config. Fix: reference
+`existing_dhcp` (the correct binding); promote the swallowing
+handler to ERROR with a full traceback so future pre-fill bugs
+scream instead of whisper.
+
+**C2: `_apply_device_status_row` wrong-row DHCP-lease writes**
+(`widgets/devices_tab.py:3509-3600`) — Pre-fix, the async status
+fetcher emitted `(row, device_data)` and the receiver used the
+cached `row` verbatim. Between worker dispatch and this signal
+firing, an SSE-driven `reload_devices_from_server` could rebuild
+the table — `setText` for status + DHCP-lease IPv4/IPv6/gateway
+then landed on whatever OTHER device now sat at that index.
+Fix: signal now carries `(row_hint, device_id, data)`; receiver
+verifies `row_hint` still holds `device_id`, else scans for the
+correct row, else skips (device removed).
+
+**C3: `prompt_edit_device` modal exec_() invalidates cached row**
+(`widgets/devices_tab.py:7846-8180`) — Pre-fix, `row =
+selected_items[0].row()` was captured BEFORE `dialog.exec_()`;
+`exec_()` spins the event loop, letting SSE reload or the 30s
+status poll rebuild the table. On Accept, the setText loop
+mutated whatever device now sat at the stale index. Fix:
+re-resolve `row` from `_self_id` (device_id, captured at
+:7887) AFTER the modal accepts. If the device is gone, abort
+with a clear message.
+
+**C4: `remove_selected_server` no confirmation prompt**
+(`traffic_client/menu_actions.py:479-505`) — Pre-fix, a single
+click destroyed a chassis + all associated stats/streams state,
+with NO confirmation dialog. Also silently no-op'd on port
+selections (`item.parent() is not None`) — the operator saw
+the click do nothing and had no feedback. Fix: collect top-
+level chassis selections; warn if only ports are selected;
+present a `QMessageBox.question` listing the chassis addresses
+about to be removed with a Yes/No confirm (No default).
+
+**C5: `reload_devices_from_server` ghost devices**
+(`widgets/devices_tab.py:4525-4600`) — Pre-fix, `merged_seen_ids`
+was collected but never used. Server-side deletes (via
+netgen-cli or another client's DELETE) left permanent ghost
+rows in the local cache — SSE `device_removed` triggered a
+reload but reload only ADDED, never subtracted. Fix: after
+merging, drop cached devices whose `device_id` isn't in
+`merged_seen_ids`. Two safety rails: (1) skip pruning entirely
+if `merged_seen_ids` is empty (treat as "servers all offline"
+rather than "nuke everything"); (2) never prune a row with
+`_needs_apply` set (in-flight local edit).
+
+### Tests
+
+New: `tests/test_v05387_devices_tab_bugs.py`. AST + structural +
+regression coverage.
+
 ## [0.5.386] - 2026-09-21
 
 ### Fixed — Backlog sweep: OSPF multi-area, FK integrity, VRF clears, docker reconnect, stats perf (5 items)

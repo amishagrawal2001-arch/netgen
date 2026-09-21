@@ -3507,8 +3507,13 @@ class DevicesTab(QWidget):
             from PyQt5.QtCore import QThread, pyqtSignal
 
             class _DeviceStatusFetchWorker(QThread):
-                # (row, device_data) — emitted per device once fetched.
-                row_data = pyqtSignal(int, dict)
+                # v0.5.387 (audit devices-tab C2): also emit
+                # device_id so the receiver can re-verify the row
+                # index against a table that may have been rebuilt
+                # by an SSE reload between worker dispatch and this
+                # signal firing. Payload: (row_hint, device_id,
+                # device_data).
+                row_data = pyqtSignal(int, str, dict)
 
                 def __init__(self, url, jobs):
                     super().__init__()
@@ -3524,7 +3529,9 @@ class DevicesTab(QWidget):
                                 timeout=3,
                             )
                             if r.status_code == 200:
-                                self.row_data.emit(_row, r.json() or {})
+                                # v0.5.387 (C2): include device_id in
+                                # the signal payload.
+                                self.row_data.emit(_row, str(_dev_id), r.json() or {})
                         except Exception:
                             # Unreachable/slow device — skip; next poll retries.
                             pass
@@ -3543,11 +3550,53 @@ class DevicesTab(QWidget):
         except Exception as e:
             logger.error(f"Error refreshing device table: {e}")
 
-    def _apply_device_status_row(self, row, device_data):
+    def _apply_device_status_row(self, row, device_id, device_data):
         """Main-thread slot: apply status + ARP colors for one device row
         from freshly-fetched DB data. Mirrors the old synchronous loop
-        body of _refresh_device_table_from_database (now async)."""
+        body of _refresh_device_table_from_database (now async).
+
+        v0.5.387 (audit devices-tab C2): re-verify the row index
+        against the current table BEFORE writing. Pre-fix, the
+        `row` was cached at worker-dispatch time; an SSE-driven
+        `reload_devices_from_server` between dispatch and this
+        slot rebuilt the table, and the subsequent `setText`
+        (status + DHCP-lease IPv4/IPv6/gateway at ~:3661-3755)
+        wrote into whatever OTHER device now occupied that
+        index. On lease-heavy servers this manifested as one
+        device's lease appearing in another device's row until
+        the next 30s full poll cleaned up.
+        """
         try:
+            # v0.5.387 (C2): row-index verification. If the row
+            # at the cached `row` doesn't hold the expected
+            # `device_id`, scan the table for the correct row.
+            # If the device is gone (SSE removal), skip silently
+            # — the next poll will handle it.
+            _expected_id = str(device_id or "")
+            if _expected_id:
+                name_item_at_hint = self.devices_table.item(
+                    row, self.COL["Device Name"])
+                from PyQt5.QtCore import Qt
+                _row_id = str(
+                    name_item_at_hint.data(Qt.UserRole)
+                ) if name_item_at_hint else ""
+                if _row_id != _expected_id:
+                    # Table shifted; find the correct row.
+                    _found_row = None
+                    for _r in range(self.devices_table.rowCount()):
+                        _it = self.devices_table.item(_r, self.COL["Device Name"])
+                        if _it is None:
+                            continue
+                        if str(_it.data(Qt.UserRole) or "") == _expected_id:
+                            _found_row = _r
+                            break
+                    if _found_row is None:
+                        logger.debug(
+                            f"[DEVICE POLL] row for device_id={_expected_id!r} "
+                            f"vanished after dispatch; skipping status write"
+                        )
+                        return
+                    row = _found_row
             name_item = self.devices_table.item(row, self.COL["Device Name"])
             device_name = name_item.text() if name_item else f"row{row}"
 
@@ -4473,6 +4522,64 @@ class DevicesTab(QWidget):
                         dev["Interface"] = iface
                         dev.setdefault("Status", dev.get("Status") or "Stopped")
                         bucket.append(dev)
+
+        # v0.5.387 (audit devices-tab C5): prune ghost devices —
+        # locally-cached rows for devices the server no longer
+        # knows about. Pre-fix, `merged_seen_ids` was collected
+        # but never used for pruning. Server-side deletes (via
+        # netgen-cli remove-device, or another operator's DELETE
+        # from another client) left permanent ghost rows in the
+        # local `all_devices` cache; the SSE `device_removed`
+        # event triggered a reload but reload only ADDED — never
+        # subtracted. Only a full app restart cleared them.
+        #
+        # Two safety rails:
+        #   1. Skip pruning if the whole `merged_seen_ids` set
+        #      is empty — treat that as "servers all offline /
+        #      returned nothing" rather than "delete every
+        #      device". Better to keep ghost rows than nuke
+        #      real devices on a network hiccup.
+        #   2. Never prune a device with `_needs_apply` set —
+        #      that's an in-progress local edit that hasn't been
+        #      pushed to the server yet.
+        try:
+            _cache = getattr(self.main_window, "all_devices", None)
+            if isinstance(_cache, list) and merged_seen_ids:
+                _pruned = []
+                _dropped = 0
+                for _dev in _cache:
+                    if not isinstance(_dev, dict):
+                        _pruned.append(_dev)
+                        continue
+                    _did = _dev.get("device_id") or _dev.get("Device ID")
+                    if not _did:
+                        # Rows without a device_id are pre-Apply
+                        # locals; always keep.
+                        _pruned.append(_dev)
+                        continue
+                    if _dev.get("_needs_apply"):
+                        # In-flight edit — keep even if not seen
+                        # on server yet.
+                        _pruned.append(_dev)
+                        continue
+                    if _did in merged_seen_ids:
+                        _pruned.append(_dev)
+                    else:
+                        _dropped += 1
+                        logger.debug(
+                            f"[RELOAD] Pruning ghost device "
+                            f"{_did} (name={_dev.get('Device Name')!r}) "
+                            f"— not in server response"
+                        )
+                if _dropped:
+                    self.main_window.all_devices[:] = _pruned
+                    logger.info(
+                        f"[RELOAD] Pruned {_dropped} ghost device(s) "
+                        f"not present on any server "
+                        f"(v0.5.387 audit devices-tab C5)"
+                    )
+        except Exception as _prune_exc:
+            logger.warning(f"[RELOAD] Ghost prune skipped: {_prune_exc}")
 
         # Refresh table after merge.
         self.update_device_table(self.main_window.all_devices)
@@ -7951,7 +8058,23 @@ class DevicesTab(QWidget):
                     # v0.5.296 (audit relay-ui): preload the relay_return_hop
                     # field from dhcp_config so an Edit dialog shows the
                     # current value instead of blank.
-                    _rrh = dhcp_config.get("relay_return_hop") if isinstance(dhcp_config, dict) else ""
+                    #
+                    # v0.5.387 (audit devices-tab C1): pre-fix, both this
+                    # block and the pool_router block below referenced
+                    # `dhcp_config` — a name that ISN'T BOUND UNTIL line
+                    # ~8083, where it appears as a tuple element from
+                    # `dialog.get_values()` after the modal closes.
+                    # Python treats it as a function-local, so reading
+                    # it here raised `UnboundLocalError` on EVERY Edit
+                    # of a DHCP-enabled device with the relay UI
+                    # present. The bare `except Exception` at line
+                    # ~8065 swallowed the error, so the ENTIRE BGP /
+                    # OSPF / ISIS / DHCP pre-fill block silently
+                    # skipped. Save then wrote empty defaults over the
+                    # operator's real config. The intended source is
+                    # `existing_dhcp` (bound at ~:7882 from the DB
+                    # row), same as every other line in this block.
+                    _rrh = existing_dhcp.get("relay_return_hop") if isinstance(existing_dhcp, dict) else ""
                     if _rrh is not None and hasattr(dialog, "dhcp_relay_return_hop_input"):
                         dialog.dhcp_relay_return_hop_input.setText(str(_rrh))
                     # v0.5.315 (audit dhcp-pool-router-vs-relay-return-hop):
@@ -7961,7 +8084,7 @@ class DevicesTab(QWidget):
                     # field CURRENTLY holds), and re-Save would then clear
                     # dhcp-option=3 to the iface-gateway fallback — clients
                     # would lose their default route on the very next apply.
-                    _pool_router = dhcp_config.get("pool_router") if isinstance(dhcp_config, dict) else ""
+                    _pool_router = existing_dhcp.get("pool_router") if isinstance(existing_dhcp, dict) else ""
                     if _pool_router is not None and hasattr(dialog, "dhcp_pool_router_input"):
                         dialog.dhcp_pool_router_input.setText(str(_pool_router))
 
@@ -8063,11 +8186,56 @@ class DevicesTab(QWidget):
             if hasattr(dialog, "_on_protocol_enabled_changed"):
                 dialog._on_protocol_enabled_changed()
         except Exception as _prefill_exc:
-            logger.warning(f"[EDIT] Protocol pre-fill skipped: {_prefill_exc}")
+            # v0.5.387 (audit devices-tab C1): promote to ERROR + include
+            # traceback so future pre-fill bugs surface loudly. Pre-fix
+            # this line was WARNING, and it silently swallowed the
+            # UnboundLocalError described above for so long that
+            # operators learned to re-enter their config after every
+            # Edit — they didn't realise the pre-fill was skipped.
+            import traceback
+            logger.error(
+                f"[EDIT] Protocol pre-fill skipped due to unexpected "
+                f"error — operator's config may NOT be pre-loaded and "
+                f"Save could overwrite with defaults. Re-check all "
+                f"fields before saving. Error: {_prefill_exc}\n"
+                f"{traceback.format_exc()}"
+            )
 
         if dialog.exec_() != dialog.Accepted:
             return
-        
+
+        # v0.5.387 (audit devices-tab C3): re-resolve `row` after
+        # the modal accepts. Pre-fix, `row` was captured at line
+        # ~7853 BEFORE `dialog.exec_()`. exec_() spins the event
+        # loop; SSE-driven `reload_devices_from_server` or a
+        # 30s device-status poll can rebuild the devices table
+        # during the modal. When the operator clicked Save, the
+        # setText loop below (starting at ~:8433) mutated
+        # whatever OTHER device now sat at the stale `row`
+        # index. Fix: locate the row by `_self_id` (captured at
+        # ~:7887); if the device is gone (deleted while the
+        # dialog was open), abort with a message.
+        from PyQt5.QtCore import Qt as _Qt
+        _resolved_row = None
+        if _self_id:
+            for _r in range(self.devices_table.rowCount()):
+                _it = self.devices_table.item(_r, self.COL["Device Name"])
+                if _it is None:
+                    continue
+                if str(_it.data(_Qt.UserRole) or "") == str(_self_id):
+                    _resolved_row = _r
+                    break
+        if _resolved_row is None:
+            QMessageBox.warning(
+                self, "Device Not Found",
+                f"Device '{device_name}' is no longer in the table "
+                f"(deleted or refreshed away while the dialog was "
+                f"open). Edit not applied — please re-select and try "
+                f"again."
+            )
+            return
+        row = _resolved_row
+
         # Get updated values from dialog.
         # The 5 VXLAN-increment fields (incr_vxlan, vxlan_vni_increment_index,
         # vxlan_local_octet_index, vxlan_remote_octet_index, vxlan_udp_increment_index)
