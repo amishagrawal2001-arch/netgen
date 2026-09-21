@@ -2,6 +2,83 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.399] - 2026-09-21
+
+### Fixed — device_database.py DB layer audit (5 items, parallel to v0.5.398 O1-O5)
+
+Same author / same era as `stream_database.py`, so the same 5-bug
+family shipped here too. Every fix is a direct sibling of an O-item
+from v0.5.398.
+
+**P1: `cleanup_old_data` dead datetime compare (parallel to O1)**
+(`utils/device_database.py:cleanup_old_data`) — Same
+`datetime.now(tz.utc).isoformat()` (ISO 'T'-separator) vs
+SQLite `datetime('now', '-N days')` (space-separator) TEXT-collation
+mismatch as O1. `WHERE timestamp < cutoff` matched ZERO rows for
+BOTH `device_stats` and `device_events` cleanup queries. On srv06
+`device_stats` grew ~1 row/device/poll and `device_events` ~3-5
+rows/device/poll forever — silent. Fix: compute cutoff in Python
+as ISO string. Also switched from unsafe `.format(days)` string
+interpolation to bound `?` parameter.
+
+**P2: `update_device_status` leaves live-state fields + no rowcount check (parallel to O2)**
+(`utils/device_database.py:update_device_status`) — Pre-fix, setting
+`status='Stopped'` only touched `status` + `updated_at`. `bgp_established`,
+`bgp_ipv4_state`, `bgp_ipv6_state`, `ospf_established`, `ospf_state`,
+`isis_running`, `isis_established`, `dhcp_running`, `dhcp_state`,
+`arp_ipv4_resolved`, `arp_ipv6_resolved` remained at their last live
+values. Every UI card and `get_all_devices` consumer then rendered
+a "Stopped" device with BGP Established / OSPF Adjacent / DHCP lease
+active — same "DB lies" class as M3 / O2. No rowcount check either;
+a typo device_id logged success and returned True. Fix: when
+transitioning OUT of `Running`, also clear all live-state fields
+(BGP/OSPF/ISIS/DHCP/ARP); check `cursor.rowcount` and return False
++ warn when zero.
+
+**P3: `add_device`/`update_device` TOCTOU + reincarnation on delete-race (parallel to O3)**
+(`utils/device_database.py:add_device` + `:update_device`) — Both
+methods did SELECT-then-INSERT-or-UPDATE across separate statements
+with no transaction wrapping them. Two known bugs:
+  1. Concurrent `add_device` for the same device_id — both saw
+     empty, both attempted INSERT, second raised `IntegrityError`
+     caught by bare `except`. Now: sqlite3.IntegrityError caught
+     specifically → falls through to update_device (typed as a race
+     rather than a silent False).
+  2. `update_device` running after `remove_device` — pre-check
+     found no row, fell through to `add_device(device_data)` and
+     silently RE-CREATED the just-deleted device. Same
+     reincarnation class as M3 / O4. Fix: `BEGIN IMMEDIATE` in
+     both methods; REMOVED the `not found → add_device` fallback
+     in `update_device` (returns False + warns so the caller can
+     surface stale state to the operator).
+
+**P4: read-side datetime format-compare bugs (parallel to O1 read-side)**
+(`utils/device_database.py:get_device_statistics` +
+`:get_database_info`) — Same format-compare bug as P1 but on the
+READ side. `get_device_statistics` used
+`AND timestamp >= datetime('now', '-N hours')` (ISO 'T' > space,
+so filter was effectively "return everything" — but ORDER BY DESC
++ LIMIT-less made this less visible). `get_database_info`'s
+`recent_events_24h` did the same — the reported count was either
+0 or ALL events, never actually "last 24 h". Read-side manifestation
+of the format mismatch that also masked the growth from P1 for
+weeks. Fix: ISO cutoff computed in Python.
+
+**P5: `get_all_devices` unbounded (parallel to O5)**
+(`utils/device_database.py:get_all_devices`) — Pre-fix, no `LIMIT`.
+Called on every UI poll + devices_tab refresh loop, and each row
+parses SIX JSON fields (`protocols`, `bgp_config`, `ospf_config`,
+`isis_config`, `dhcp_config`, `vxlan_config`). Combined with pre-P1
+broken cleanup and the exploding stream_stats/device_stats tables,
+each poll became O(N * 6-JSON-parse). Fix: default `limit=1000`;
+callers that need everything can pass None.
+
+Tests: 21 new (`tests/test_v05399_device_database.py`), all pass
+including runtime regression tests that exercise the actual bugs
+against a temp SQLite DB. Regressions on v0.5.394–v0.5.398: intact.
+
+---
+
 ## [0.5.398] - 2026-09-21
 
 ### Fixed — stream_database.py DB layer audit (5 items)

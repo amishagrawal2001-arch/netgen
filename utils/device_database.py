@@ -9,7 +9,7 @@ import logging
 import os
 import shutil
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 import ipaddress
@@ -1125,12 +1125,29 @@ class DeviceDatabase:
                 logger.error("[DEVICE DB] Cannot add device without device_id")
                 return False
             
+            # v0.5.399 (audit device-db P3): parallel of
+            # stream_database v0.5.398 O3 — atomic check-and-insert
+            # under BEGIN IMMEDIATE. Pre-fix, the SELECT + INSERT
+            # ran in separate statements with no txn wrapping them;
+            # two concurrent add_device calls for the same device_id
+            # both saw empty, both attempted INSERT, second raised
+            # IntegrityError caught by the bare except at :1214 and
+            # silently returned False. Fast-path check for duplicate
+            # first (short read-only txn), then delegate to
+            # update_device (which holds its OWN write lock).
+            with sqlite3.connect(self.db_path) as _pre_conn:
+                cursor = _pre_conn.execute(
+                    "SELECT device_id FROM devices WHERE device_id = ?",
+                    (device_id,),
+                )
+                _dup = cursor.fetchone() is not None
+            if _dup:
+                logger.warning(f"[DEVICE DB] Device {device_id} already exists, updating instead")
+                return self.update_device(device_id, device_data)
+
             with sqlite3.connect(self.db_path) as conn:
-                # Check if device already exists
-                cursor = conn.execute("SELECT device_id FROM devices WHERE device_id = ?", (device_id,))
-                if cursor.fetchone():
-                    logger.warning(f"[DEVICE DB] Device {device_id} already exists, updating instead")
-                    return self.update_device(device_id, device_data)
+                conn.isolation_level = None
+                conn.execute("BEGIN IMMEDIATE")
                 
                 # Prepare device data
                 dhcp_config_raw = device_data.get("dhcp_config", {})
@@ -1195,22 +1212,44 @@ class DeviceDatabase:
                     'updated_at': datetime.now(timezone.utc).isoformat()
                 }
                 
-                # Insert device
-                columns_sql = ", ".join(device_info.keys())
-                placeholders_sql = ", ".join(["?"] * len(device_info))
-                conn.execute(
-                    f"INSERT INTO devices ({columns_sql}) VALUES ({placeholders_sql})",
-                    tuple(device_info.values()),
-                )
-                
-                conn.commit()
-                logger.info(f"[DEVICE DB] Successfully added device {device_id}")
-                
-                # Log device creation event
-                self.log_device_event(device_id, "created", device_data)
-                
-                return True
-                
+                # Insert device (v0.5.399 P3: inside BEGIN IMMEDIATE
+                # opened above so a concurrent add_device / delete
+                # can't race the check-and-insert).
+                try:
+                    columns_sql = ", ".join(device_info.keys())
+                    placeholders_sql = ", ".join(["?"] * len(device_info))
+                    conn.execute(
+                        f"INSERT INTO devices ({columns_sql}) VALUES ({placeholders_sql})",
+                        tuple(device_info.values()),
+                    )
+                    conn.execute("COMMIT")
+                except sqlite3.IntegrityError as _ie:
+                    # Another concurrent add_device won the race
+                    # between our pre-check and the INSERT — log
+                    # specifically and delegate to update_device.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    logger.warning(
+                        f"[DEVICE DB] Concurrent add_device race for "
+                        f"{device_id} lost — falling through to update: {_ie}"
+                    )
+                    return self.update_device(device_id, device_data)
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+
+            logger.info(f"[DEVICE DB] Successfully added device {device_id}")
+            # Log device creation event (outside the txn — event
+            # logging is best-effort observability, shouldn't take
+            # the write lock while the main tx is open).
+            self.log_device_event(device_id, "created", device_data)
+            return True
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to add device {device_id}: {e}")
             return False
@@ -1226,13 +1265,40 @@ class DeviceDatabase:
         Returns:
             bool: True if successful, False otherwise
         """
+        # v0.5.399 (audit device-db P3): parallel of stream_database
+        # v0.5.398 O3. Two fixes here:
+        # (a) BEGIN IMMEDIATE so the exists-check + UPDATE run under
+        #     a single write lock — no window for a concurrent
+        #     add_device or remove_device to race between them.
+        # (b) REMOVED the "not found → add_device(device_data)"
+        #     reincarnation fallback. Pre-fix, if remove_device
+        #     slipped in between the operator's edit-form click and
+        #     this method's SELECT, the row was gone and the code
+        #     silently RE-CREATED it via add_device — reincarnating
+        #     a device the operator had just deleted (same "DB lies"
+        #     class as v0.5.396 M3 / v0.5.398 O3). Now: log a
+        #     warning and return False so the caller can surface the
+        #     stale state to the operator. Callers who want
+        #     upsert-semantics can call add_device directly (which
+        #     itself delegates back here on dup).
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.isolation_level = None
+                conn.execute("BEGIN IMMEDIATE")
                 # Check if device exists
                 cursor = conn.execute("SELECT device_id FROM devices WHERE device_id = ?", (device_id,))
                 if not cursor.fetchone():
-                    logger.warning(f"[DEVICE DB] Device {device_id} not found for update, creating new")
-                    return self.add_device(device_data)
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    logger.warning(
+                        f"[DEVICE DB] update_device: device {device_id} "
+                        f"not found (likely deleted between edit-form "
+                        f"open and Apply). Refusing to reincarnate; "
+                        f"reload the devices tab to sync UI with DB."
+                    )
+                    return False
                 
                 # Prepare update data
                 update_fields = []
@@ -1372,18 +1438,25 @@ class DeviceDatabase:
                 update_values.append(datetime.now(timezone.utc).isoformat())
                 update_values.append(device_id)
                 
-                # Execute update
+                # Execute update (inside the BEGIN IMMEDIATE opened
+                # above — v0.5.399 P3).
                 query = f"UPDATE devices SET {', '.join(update_fields)} WHERE device_id = ?"
-                conn.execute(query, update_values)
-                conn.commit()
-                
-                logger.info(f"[DEVICE DB] Successfully updated device {device_id}")
-                
-                # Log device update event
-                self.log_device_event(device_id, "updated", device_data)
-                
-                return True
-                
+                try:
+                    conn.execute(query, update_values)
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+
+            logger.info(f"[DEVICE DB] Successfully updated device {device_id}")
+            # Log device update event (outside the txn — see
+            # add_device rationale above).
+            self.log_device_event(device_id, "updated", device_data)
+            return True
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to update device {device_id}: {e}")
             return False
@@ -1432,24 +1505,46 @@ class DeviceDatabase:
             logger.error(f"[DEVICE DB] Failed to get device {device_id}: {e}")
             return None
     
-    def get_all_devices(self, status_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_all_devices(self, status_filter: Optional[str] = None,
+                        limit: int = 1000) -> List[Dict[str, Any]]:
         """
         Get all devices, optionally filtered by status.
-        
+
         Args:
             status_filter: Optional status to filter by
-            
+            limit: v0.5.399 (audit device-db P5, parallel of
+                v0.5.398 O5 on streams). Hard cap on the number of
+                rows returned. Pre-fix this method had no LIMIT and
+                was called by every UI poll + devices_tab refresh
+                loop; because it parses SIX JSON fields per row
+                (protocols, bgp_config, ospf_config, isis_config,
+                dhcp_config, vxlan_config) each poll was O(N * 6-JSON-parse).
+                Combined with pre-P1 broken cleanup the device_stats /
+                device_events tables also grew forever which compounded
+                the load. Default 1000; callers that legitimately need
+                everything (admin exports) can pass None or a bigger
+                value.
+
         Returns:
             List of device dictionaries
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                
+
+                _limit_clause = ""
+                if limit is not None and limit > 0:
+                    _limit_clause = f" LIMIT {int(limit)}"
                 if status_filter:
-                    cursor = conn.execute("SELECT * FROM devices WHERE status = ? ORDER BY created_at DESC", (status_filter,))
+                    cursor = conn.execute(
+                        f"SELECT * FROM devices WHERE status = ? "
+                        f"ORDER BY created_at DESC{_limit_clause}",
+                        (status_filter,),
+                    )
                 else:
-                    cursor = conn.execute("SELECT * FROM devices ORDER BY created_at DESC")
+                    cursor = conn.execute(
+                        f"SELECT * FROM devices ORDER BY created_at DESC{_limit_clause}"
+                    )
                 
                 devices = []
                 for row in cursor.fetchall():
@@ -1685,26 +1780,72 @@ class DeviceDatabase:
     def update_device_status(self, device_id: str, status: str) -> bool:
         """
         Update device status.
-        
+
         Args:
             device_id: Device ID
             status: New status (Running, Stopped, etc.)
-            
+
         Returns:
-            bool: True if successful, False otherwise
+            bool: True if a row was updated, False if the device_id
+            was not found. v0.5.399 (audit device-db P2): pre-fix
+            this returned True unconditionally on commit — a typo
+            device_id logged "Updated device X status to Stopped"
+            and returned True with no way for the caller to know
+            nothing happened.
         """
+        # v0.5.399 (audit device-db P2): when transitioning to a
+        # non-Running status, also CLEAR the live-state fields.
+        # Pre-fix, this UPDATE only touched `status` + `updated_at`,
+        # so setting status='Stopped' left bgp_established=1,
+        # ospf_established=1, isis_established=1, dhcp_running=1,
+        # arp_ipv4_resolved=1 etc. at their last live values. Every
+        # UI card and get_all_devices consumer then rendered a
+        # "Stopped" device with BGP Established / OSPF Adjacent /
+        # DHCP lease active — same "DB lies" class as v0.5.396 M3
+        # and v0.5.398 O2 (stop_stream leaving live rates). Only
+        # clear when moving OUT of Running; the Running→Running
+        # path (e.g. monitor healthchecks) is unchanged.
         try:
+            now = datetime.now(timezone.utc).isoformat()
+            _clear_live = str(status).lower() != "running"
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    UPDATE devices 
-                    SET status = ?, updated_at = ? 
-                    WHERE device_id = ?
-                """, (status, datetime.now(timezone.utc).isoformat(), device_id))
+                if _clear_live:
+                    cursor = conn.execute("""
+                        UPDATE devices SET
+                            status = ?,
+                            updated_at = ?,
+                            bgp_established = 0,
+                            bgp_ipv4_state = NULL,
+                            bgp_ipv6_state = NULL,
+                            ospf_established = 0,
+                            ospf_state = NULL,
+                            isis_running = 0,
+                            isis_established = 0,
+                            dhcp_running = 0,
+                            dhcp_state = NULL,
+                            arp_ipv4_resolved = 0,
+                            arp_ipv6_resolved = 0
+                        WHERE device_id = ?
+                    """, (status, now, device_id))
+                else:
+                    cursor = conn.execute("""
+                        UPDATE devices
+                        SET status = ?, updated_at = ?
+                        WHERE device_id = ?
+                    """, (status, now, device_id))
+                _rc = cursor.rowcount
                 conn.commit()
-                
-                logger.info(f"[DEVICE DB] Updated device {device_id} status to {status}")
+
+                if _rc == 0:
+                    logger.warning(
+                        f"[DEVICE DB] update_device_status: no row "
+                        f"matched device_id={device_id} — "
+                        f"already-deleted or typo id"
+                    )
+                    return False
+                logger.info(f"[DEVICE DB] Updated device {device_id} status to {status} (rowcount={_rc}, cleared_live={_clear_live})")
                 return True
-                
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to update device {device_id} status: {e}")
             return False
@@ -2114,22 +2255,35 @@ class DeviceDatabase:
         Returns:
             List of statistics dictionaries
         """
+        # v0.5.399 (audit device-db P4): read-side manifestation of
+        # the P1 datetime format-compare bug. Pre-fix, `datetime('now',
+        # '-N hours')` yields space-separated cutoff that compares
+        # LESS than any ISO-'T' stored timestamp, so `timestamp >=
+        # cutoff` matched ALL rows regardless of age. Wait — actually
+        # the read-side symptom is different: for the >= direction,
+        # ISO 'T' > space means ALL ISO rows compare >= space cutoff,
+        # so the query looks like it works but the age filter is
+        # ineffective (returns everything, not last N hours). Either
+        # way the filter is broken. Fix: ISO cutoff computed in
+        # Python so both sides use the same format.
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(hours=hours)).isoformat()
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute("""
-                    SELECT * FROM device_stats 
-                    WHERE device_id = ? 
-                    AND timestamp >= datetime('now', '-{} hours')
+                    SELECT * FROM device_stats
+                    WHERE device_id = ?
+                    AND timestamp >= ?
                     ORDER BY timestamp DESC
-                """.format(hours), (device_id,))
-                
+                """, (device_id, cutoff))
+
                 stats = []
                 for row in cursor.fetchall():
                     stats.append(dict(row))
-                
+
                 return stats
-                
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to get statistics for device {device_id}: {e}")
             return []
@@ -2276,12 +2430,18 @@ class DeviceDatabase:
                 cursor = conn.execute("SELECT COUNT(*) as total FROM devices")
                 total_devices = cursor.fetchone()['total']
                 
-                # Get recent events count
+                # Get recent events count.
+                # v0.5.399 (audit device-db P4): sibling of the
+                # cleanup / get_device_statistics format-compare bug.
+                # Pre-fix, this returned 0 or ALL events depending on
+                # the compare direction — never actually "last 24h".
+                _recent_cutoff = (datetime.now(timezone.utc)
+                                  - timedelta(hours=24)).isoformat()
                 cursor = conn.execute("""
-                    SELECT COUNT(*) as count 
-                    FROM device_events 
-                    WHERE timestamp >= datetime('now', '-24 hours')
-                """)
+                    SELECT COUNT(*) as count
+                    FROM device_events
+                    WHERE timestamp >= ?
+                """, (_recent_cutoff,))
                 recent_events = cursor.fetchone()['count']
                 
                 # Get database file size
@@ -2311,27 +2471,44 @@ class DeviceDatabase:
         Returns:
             bool: True if successful, False otherwise
         """
+        # v0.5.399 (audit device-db P1): parallel of stream_database
+        # v0.5.398 O1 — dead cleanup. Rows are inserted via
+        # `datetime.now(timezone.utc).isoformat()` (ISO 'T'-separated,
+        # e.g. "2026-09-21T15:30:00.123+00:00"). Cutoffs used SQLite
+        # `datetime('now', '-N days')` (space-separated,
+        # "2026-09-14 15:30:00"). Under SQLite's default TEXT
+        # collation 'T' (0x54) > space (0x20) at position 10, so
+        # `WHERE timestamp < cutoff` matched ZERO rows for BOTH
+        # queries. `device_stats` grew ~1 row/device/poll forever
+        # and `device_events` ~3-5 rows/device/poll — on srv06's
+        # weeks-long uptime these tables ballooned silently. Fix:
+        # compute cutoff in Python as ISO string so both sides of
+        # the compare use the same format. Also switched from unsafe
+        # `.format(days)` string interpolation to a bound `?` parameter.
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=days)).isoformat()
         try:
             with sqlite3.connect(self.db_path) as conn:
                 # Clean up old statistics
                 cursor = conn.execute("""
-                    DELETE FROM device_stats 
-                    WHERE timestamp < datetime('now', '-{} days')
-                """.format(days))
+                    DELETE FROM device_stats
+                    WHERE timestamp < ?
+                """, (cutoff,))
                 stats_deleted = cursor.rowcount
-                
+
                 # Clean up old events (keep more recent events)
                 cursor = conn.execute("""
-                    DELETE FROM device_events 
-                    WHERE timestamp < datetime('now', '-{} days')
-                """.format(days))
+                    DELETE FROM device_events
+                    WHERE timestamp < ?
+                """, (cutoff,))
                 events_deleted = cursor.rowcount
-                
+
                 conn.commit()
-                
-                logger.info(f"[DEVICE DB] Cleaned up {stats_deleted} old statistics and {events_deleted} old events")
+
+                if stats_deleted or events_deleted:
+                    logger.info(f"[DEVICE DB] Cleaned up {stats_deleted} old statistics and {events_deleted} old events (cutoff={cutoff})")
                 return True
-                
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to cleanup old data: {e}")
             return False
