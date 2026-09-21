@@ -2,6 +2,99 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.377] - 2026-09-20
+
+**Client confirm dialog + server WARN when Applying a device
+with populated IPv4/IPv6 address but empty gateway.** Follows
+v0.5.376 (peer-fallback + DB backfill) — where v0.5.376 heals
+the state, v0.5.377 stops new devices from acquiring the same
+persistence gap silently, and surfaces the gap loudly in server
+logs the first time it happens.
+
+### Investigation of root cause
+
+Traced the client-side path that persisted device1 with
+`ipv4_gateway=''`. All the obvious code paths appear correct:
+
+- `AddDeviceDialog.get_values()` (add_device_dialog.py:1876)
+  correctly reads `self.ipv4_gateway_input.text()` when
+  `ipv4_checkbox` is checked
+- `_snapshot_for_upstream_hint()` (2433) correctly places the
+  value under `"ipv4_gateway"`
+- Client's Apply builder (devices_tab.py:6486, 8098) correctly
+  maps `device_info["IPv4 Gateway"]` → `ipv4_gateway` in the
+  server payload
+- Server's `/api/device/apply` (run_tgen_server.py:4362)
+  correctly reads `data.get("ipv4_gateway", "")`
+- `update_device()` is a partial UPDATE so subsequent
+  `/api/isis/configure`-style calls that pass `{protocols,
+  isis_config, updated_at}` don't wipe the gateway
+
+**Three surviving hypothetical origins** — all silent, none
+observable in the current log stream:
+
+1. Operator unchecks IPv4 checkbox mid-dialog session → widget
+   still shows the gateway text but `get_values()` returns `""`
+2. Add-Device template flow (ISIS-only, DHCPv6-server, etc.)
+   bypasses gateway entry entirely
+3. Edit-Save flow clears the gateway field before Save → row
+   was persisted correctly on Add but overwritten on Edit
+
+### Fixes
+
+- **F2 client (widgets/devices_tab.py)** — Add + Edit paths gain
+  a `QMessageBox.question` gate immediately after
+  `dialog.get_values()`. When the operator is about to
+  Save/Apply a device with populated `ipv4`/`ipv6` address but
+  empty gateway, they must explicitly confirm. Default is No
+  so accidental Enter presses don't proceed silently.
+  Different copy for each path: Add says "The device row will
+  be saved WITHOUT a gateway"; Edit says "Existing gateway
+  values in the DB will be OVERWRITTEN with empty strings"
+  (the Edit-Save path is the more likely origin for
+  formerly-populated devices going empty).
+
+- **F2 server (run_tgen_server.py `/api/device/apply`)** —
+  emits `WARNING [DEVICE APPLY WARN v0.5.377]` when the payload
+  has `ipv4` populated but `ipv4_gateway` empty (or same for
+  v6). Names the payload keys the client DID send so the
+  origin trail is grep-able in server logs. Wrapped in its own
+  try/except so the logging can't abort the apply.
+
+### Tests
+
+`tests/test_v05377_empty_gateway_confirm.py` — 14 tests, all
+pass:
+
+- AST-parse both files
+- Marker present on server + client (2 sites on client — Add + Edit)
+- Server WARN fires on `if ipv4 and not ipv4_gateway:`
+  branch + v6 sibling + names the client keys + wrapped in
+  try/except
+- Client Add path calls `QMessageBox.question` with the empty-
+  gateway guard
+- Both confirm dialogs default to No
+- No branch returns early (no silent proceed)
+- Edit path has its own gate (≥2 v0.5.377 sites in the file)
+- Regression guards: v0.5.376 ARP fallback marker, v0.5.372 C3
+  Delete-Stream confirm pattern
+
+### Verification
+
+- Both files AST-parse
+- 14/14 v0.5.377 tests pass
+- Operator UI verification: adding a new device with populated
+  IPv4 address but empty gateway now triggers the confirm dialog
+
+### After v0.5.377 the persistence gap is closed on three fronts
+
+1. **Runtime (v0.5.376 F1)** — server ARP endpoint falls back
+   to peer-derived gateway when DB is empty
+2. **Persistence (v0.5.376 F3)** — startup migration backfills
+   empty gateways from OSPF/ISIS/BGP neighbor tables
+3. **Prevention (v0.5.377)** — client confirms + server WARN
+   catch new occurrences before they land
+
 ## [0.5.376] - 2026-09-20
 
 **ARP gateway status false-negative for devices with empty

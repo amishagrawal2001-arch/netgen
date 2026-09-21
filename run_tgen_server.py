@@ -4478,6 +4478,42 @@ def apply_device():
         logging.info(f"[DEVICE APPLY] ID={device_id} Name='{device_name}' Interface='{interface}' VLAN={vlan}")
         logging.info(f"[DEVICE APPLY] IPv4={ipv4}/{ipv4_mask} IPv6={ipv6}/{ipv6_mask}")
         logging.info(f"[DEVICE APPLY] Gateways: IPv4={ipv4_gateway} IPv6={ipv6_gateway}")
+
+        # v0.5.377 (audit device-apply-empty-gateway-warn): sibling
+        # of v0.5.376 F1/F3. When the client POSTs an ipv4_address
+        # + empty ipv4_gateway (or same for v6), surface a WARN
+        # naming the payload keys the client did send. Makes the
+        # persistence-gap origin (unchecked ipv4_checkbox, template
+        # bypass, edited-and-cleared field, bulk import) visible in
+        # server logs the FIRST time it happens, not weeks later
+        # when the operator hits amber ⚠. Bounded — one WARN per
+        # apply, not once per protocol config write.
+        try:
+            if ipv4 and not ipv4_gateway:
+                _client_keys = sorted(
+                    _k for _k in (data.keys() if isinstance(data, dict) else [])
+                    if _k in ("ipv4", "ipv4_gateway", "ipv4_mask",
+                              "ipv6", "ipv6_gateway", "ipv6_mask",
+                              "loopback_ipv4", "loopback_ipv6")
+                )
+                logging.warning(
+                    f"[DEVICE APPLY WARN v0.5.377] device={device_name!r} "
+                    f"has ipv4_address={ipv4!r} but empty ipv4_gateway. "
+                    f"ARP status will fall back to peer-derived gateway "
+                    f"(v0.5.376 F1) OR flip amber if no peer resolved. "
+                    f"Client sent keys: {_client_keys}. If the client's "
+                    f"IPv4 checkbox is off but the fields were populated, "
+                    f"widget→payload assembly drops all v4 to empty — "
+                    f"toggle IPv4 on before Apply."
+                )
+            if ipv6 and not ipv6_gateway:
+                logging.warning(
+                    f"[DEVICE APPLY WARN v0.5.377] device={device_name!r} "
+                    f"has ipv6_address={ipv6!r} but empty ipv6_gateway. "
+                    f"Same peer-fallback / amber-pill semantics as v4."
+                )
+        except Exception as _warn_exc:
+            logging.debug(f"[DEVICE APPLY WARN] logging failed: {_warn_exc}")
         logging.info(f"[DEVICE APPLY] Protocols: {protocols}")
         logging.info(f"[DEVICE APPLY] BGP Config: {bgp_config}")
         logging.info(f"[DEVICE APPLY] OSPF Config: {ospf_config}")

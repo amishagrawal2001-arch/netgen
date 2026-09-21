@@ -6834,11 +6834,46 @@ class DevicesTab(QWidget):
 
         (
             device_name, iface_name, mac, ipv4, ipv6, ipv4_mask, ipv6_mask,
-            vlan, mtu, ipv4_gateway, ipv6_gateway, incr_mac, incr_ipv4, incr_ipv6, incr_gateway, incr_vlan, incr_vxlan, incr_count, ospf_config, bgp_config, 
+            vlan, mtu, ipv4_gateway, ipv6_gateway, incr_mac, incr_ipv4, incr_ipv6, incr_gateway, incr_vlan, incr_vxlan, incr_count, ospf_config, bgp_config,
             dhcp_config, ipv4_octet_index, ipv6_hextet_index, mac_byte_index, gateway_octet_index, incr_dhcp_pool, dhcp_pool_octet_index,
             incr_loopback, loopback_ipv4_octet_index, loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config,
             vxlan_vni_increment_index, vxlan_local_octet_index, vxlan_remote_octet_index, vxlan_udp_increment_index
         ) = dialog.get_values()
+
+        # v0.5.377 (audit device-apply-empty-gateway-warn): confirm
+        # when the operator is about to Apply an IPv4/IPv6 address
+        # WITHOUT a gateway. Historic silent failure: unchecked
+        # IPv4-in-dialog + populated IPv4 fields = get_values()
+        # returns empty gateway → server saves empty → ARP monitor
+        # reports amber ⚠ (until v0.5.376 F1 peer-fallback). By
+        # asking here, we make the omission a deliberate operator
+        # choice + link the two failure modes for observability.
+        _gw_warnings = []
+        if ipv4 and not ipv4_gateway:
+            _gw_warnings.append(
+                f"• IPv4 address {ipv4!r} has NO gateway"
+            )
+        if ipv6 and not ipv6_gateway:
+            _gw_warnings.append(
+                f"• IPv6 address {ipv6!r} has NO gateway"
+            )
+        if _gw_warnings:
+            _proceed = QMessageBox.question(
+                self, "Confirm empty gateway",
+                "You're about to Apply a device with:\n\n"
+                + "\n".join(_gw_warnings)
+                + "\n\nProceed anyway?\n\n"
+                "The device row will be saved WITHOUT a gateway.\n"
+                "Its ARP status may show amber ⚠ in the Devices tab\n"
+                "until a routing protocol (BGP/OSPF/ISIS) establishes\n"
+                "a peer (v0.5.376 falls back to that peer's address\n"
+                "as the ARP target).",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if _proceed != QMessageBox.Yes:
+                return
+
         vxlan_config = dialog.get_vxlan_config()
         logger.debug(f"VXLAN config from dialog: {vxlan_config}")
 
@@ -8053,6 +8088,37 @@ class DevicesTab(QWidget):
             vxlan_vni_increment_index, vxlan_local_octet_index,
             vxlan_remote_octet_index, vxlan_udp_increment_index,
         ) = dialog.get_values()
+
+        # v0.5.377 (audit device-apply-empty-gateway-warn): same
+        # confirm gate as the Add-Device path. Edit-Save is the
+        # more likely origin for the persistence gap operator hit
+        # on device1 — an existing device with populated fields
+        # gets Edit-clicked, a checkbox toggle mid-session clears
+        # the gateway silently, and Save persists the emptied row.
+        _gw_warnings = []
+        if ipv4 and not ipv4_gateway:
+            _gw_warnings.append(
+                f"• IPv4 address {ipv4!r} has NO gateway"
+            )
+        if ipv6 and not ipv6_gateway:
+            _gw_warnings.append(
+                f"• IPv6 address {ipv6!r} has NO gateway"
+            )
+        if _gw_warnings:
+            _proceed = QMessageBox.question(
+                self, "Confirm empty gateway on Edit",
+                "You're about to Save this device with:\n\n"
+                + "\n".join(_gw_warnings)
+                + "\n\nProceed anyway?\n\n"
+                "Existing gateway values in the DB will be OVERWRITTEN\n"
+                "with empty strings. ARP status may show amber ⚠ until\n"
+                "v0.5.376's peer-derived fallback kicks in.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if _proceed != QMessageBox.Yes:
+                return
+
         new_vxlan_config = dialog.get_vxlan_config()
 
         ipv4_mask = ipv4_mask or "24"
