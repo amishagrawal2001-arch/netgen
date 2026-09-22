@@ -1621,9 +1621,25 @@ class TrafficGenClientServerSection():
                     interfaces = server["interfaces"]
                     logger.debug(f"[SERVER TREE] Using cached interfaces for {server_address}")
                 else:
-                    # Mark as pending and fetch asynchronously
-                    server["online"] = False
-                    self.update_server_status_icon(server, False)
+                    # v0.5.402 (audit startup S4): don't flip
+                    # `online` to False here. Pre-fix, the tree
+                    # render pessimistically marked every uncached
+                    # server as offline (red dot), then the async
+                    # probe below would flip it back to green when
+                    # it landed 100-2000 ms later. On startup with N
+                    # servers this produced an ugly "everything red
+                    # → everything green" flash + the confusing
+                    # implication that servers were down. Instead:
+                    # trust whatever `server["online"]` already
+                    # holds (usually True from session.json, or the
+                    # last-known state). The probe result will
+                    # correct it if wrong. Icon still gets set below
+                    # via the existing render path.
+                    if "online" not in server:
+                        server["online"] = True
+                    self.update_server_status_icon(
+                        server, bool(server.get("online", True))
+                    )
                     # Schedule the iface fetch on a real worker thread.
                     # Previously this used QTimer.singleShot(50, ...) for
                     # a function named *_async, but QTimer fires on the
@@ -1644,9 +1660,35 @@ class TrafficGenClientServerSection():
                             self._conn_mgr = conn_mgr
 
                         def run(self):
+                            # v0.5.402 (audit startup S1 + S5): use
+                            # quick_get, not the retry-adapter get.
+                            # Pre-fix, conn_mgr.get() went through the
+                            # ConnectionManager's session which mounts
+                            # a Retry(total=3, backoff_factor=1) adapter
+                            # — that means every unreachable server
+                            # burned ~7 s (1s + 2s + 4s exponential
+                            # backoff on top of the 2 s per-attempt
+                            # timeout) in this worker thread, even
+                            # though the timeout kwarg was 2 s. Same
+                            # class of bug the ConnectionManager.
+                            # quick_get docstring explicitly documents
+                            # as "the app-freeze operator reported
+                            # after rebooting a server." Fix: call
+                            # quick_get (or requests.get bypass) so
+                            # this per-server probe finishes in one
+                            # 2 s attempt on an unreachable host. On
+                            # a 4-TG lab where 2 TGs are unreachable
+                            # this cuts startup interface-fetch from
+                            # ~14 s → ~2 s (parallel). S5: also log
+                            # per-server wall time so a future retry-
+                            # adapter regression surfaces in logs.
+                            import time as _time
+                            _t0 = _time.monotonic()
+                            _ok = False
+                            _ifaces = []
                             try:
-                                if self._conn_mgr is not None:
-                                    r = self._conn_mgr.get(
+                                if self._conn_mgr is not None and hasattr(self._conn_mgr, "quick_get"):
+                                    r = self._conn_mgr.quick_get(
                                         f"{self._url}/api/interfaces", timeout=2
                                     )
                                 else:
@@ -1654,16 +1696,22 @@ class TrafficGenClientServerSection():
                                         f"{self._url}/api/interfaces", timeout=2
                                     )
                                 if r.status_code == 200:
-                                    self.done.emit(True, _filter_internal_ifaces(r.json()) or [])
-                                    return
-                                logger.warning(
-                                    f"[SERVER TREE] Server {self._url} returned status code: {r.status_code}"
-                                )
+                                    _ok = True
+                                    _ifaces = _filter_internal_ifaces(r.json()) or []
+                                else:
+                                    logger.warning(
+                                        f"[SERVER TREE] Server {self._url} returned status code: {r.status_code}"
+                                    )
                             except Exception as exc:
                                 logger.debug(
                                     f"[SERVER TREE] Probe failed for {self._url}: {exc}"
                                 )
-                            self.done.emit(False, [])
+                            _dt = _time.monotonic() - _t0
+                            logger.info(
+                                f"[SERVER TREE] Probe {self._url}: "
+                                f"{'ok' if _ok else 'fail'} in {_dt*1000:.0f} ms"
+                            )
+                            self.done.emit(_ok, _ifaces)
 
                     conn_mgr = getattr(self, "connection_manager", None)
                     worker = _FetchIfacesWorker(server_address, conn_mgr)
@@ -2214,9 +2262,19 @@ class TrafficGenClientServerSection():
                 self._conn_mgr = conn_mgr
 
             def run(self):
+                # v0.5.402 (audit startup S2): same fix as S1's
+                # _FetchIfacesWorker — retry-adapter get() burns ~7 s
+                # per unreachable server. Use quick_get so a single
+                # 2 s attempt is the ceiling. This _RetryWorker path
+                # fires on "make servers online" retry too, so the
+                # same 7 s → 2 s speedup applies to that button.
+                import time as _time
+                _t0 = _time.monotonic()
+                _ok = False
+                _ifaces = []
                 try:
-                    if self._conn_mgr is not None:
-                        r = self._conn_mgr.get(
+                    if self._conn_mgr is not None and hasattr(self._conn_mgr, "quick_get"):
+                        r = self._conn_mgr.quick_get(
                             f"{self._url}/api/interfaces", timeout=2
                         )
                     else:
@@ -2224,11 +2282,16 @@ class TrafficGenClientServerSection():
                             f"{self._url}/api/interfaces", timeout=2
                         )
                     if r.status_code == 200:
-                        self.done.emit(True, _filter_internal_ifaces(r.json()) or [])
-                        return
+                        _ok = True
+                        _ifaces = _filter_internal_ifaces(r.json()) or []
                 except Exception as exc:
                     logger.debug(f"Retry probe failed for {self._url}: {exc}")
-                self.done.emit(False, [])
+                _dt = _time.monotonic() - _t0
+                logger.info(
+                    f"[SERVER TREE] Retry-probe {self._url}: "
+                    f"{'ok' if _ok else 'fail'} in {_dt*1000:.0f} ms"
+                )
+                self.done.emit(_ok, _ifaces)
 
         conn_mgr = getattr(self, "connection_manager", None)
         worker = _RetryWorker(server_address, conn_mgr)

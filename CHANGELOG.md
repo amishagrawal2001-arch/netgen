@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.402] - 2026-09-21
+
+### Fixed — client startup slow when servers unreachable (user-reported)
+
+Direct operator report: **"when trying to start client app, it tries
+to connect to existing traffic gen server and does not start
+immediately."** Investigation traced the delay to the tree's per-
+server interface probe on startup.
+
+**S1: `_FetchIfacesWorker` used retry-adapter `get()` → 7 s per unreachable server**
+(`traffic_client/server_section.py:1638-1710`) — Pre-fix, the QThread
+that fetches `/api/interfaces` on tree render called
+`conn_mgr.get(url, timeout=2)`. `conn_mgr.get` routes through the
+shared `requests.Session` in `ConnectionManager`, which mounts an
+`HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1))`. That
+means for every unreachable server, `urllib3` retried 3× with 1 s +
+2 s + 4 s exponential backoff — burning ~7 s per server despite the
+`timeout=2` kwarg. On a 4-TG lab with 2 TGs offline the
+wall-clock-to-first-render was ~14 s (workers run in parallel so it
+doesn't compound linearly, but each still holds its slot for 7 s
+and the tree shows "connecting" the whole time). `ConnectionManager`
+already has a `quick_get()` explicitly designed for this case — its
+docstring documents the same operator complaint after a server
+reboot. Fix: `_FetchIfacesWorker.run()` now calls `quick_get()` when
+available, bypassing the retry adapter. Per-server unreachable
+probe drops from ~7 s to the 2 s ceiling.
+
+**S2: `_RetryWorker` at `:2216` had identical retry-adapter bug**
+(`traffic_client/server_section.py:2216-2247`) — Sibling worker
+fires on the "Make Server Online" retry button. Same 7 s → 2 s
+speedup applies. Same fix — `quick_get()` bypass.
+
+**S3: verified — per-server workers already spawn in true parallel**
+`worker.start()` in the tree render loop is non-blocking (Qt returns
+immediately after posting to the thread pool), so N servers start
+their probes within microseconds of each other. No code change
+needed; documented here so future maintainers don't assume the
+per-server serialization was still a real issue after S1+S2.
+
+**S4: preserve session-cached `online: True` during initial render**
+(`traffic_client/server_section.py:1620-1642`) — Pre-fix, the tree
+render pessimistically marked every uncached server as `online=False`
+(red dot) BEFORE the async probe returned. On startup, the operator
+saw "everything red for 2 s → everything green" flash, plus the
+confusing implication that servers were down. Fix: preserve
+whatever `server["online"]` already holds (usually `True` from
+session.json). Probe corrects it if wrong. Removes the red-flash.
+
+**S5: log per-server probe wall time at INFO**
+(`traffic_client/server_section.py:1638-1710 + :2216-2247`) — Added
+`[SERVER TREE] Probe <url>: ok/fail in NNN ms` INFO log per worker
+completion. Makes any future retry-adapter regression visible in
+the client log without needing to reproduce the freeze.
+
+Tests: 10 new (`tests/test_v05402_startup_speed.py`), all pass.
+Regressions on v0.5.397–v0.5.401: intact.
+
+---
+
 ## [0.5.401] - 2026-09-21
 
 ### Fixed — menu_actions.py + dpdk_menu_actions.py: 5-min freeze, boot-breaker, and 3 more sync HTTP holes
