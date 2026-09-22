@@ -2,6 +2,42 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.411] - 2026-09-21
+
+### Fixed — Start All silently no-ops (v0.5.410 trace)
+
+User reported Start All does nothing after v0.5.410 fixed Stop.
+The v0.5.409 diagnostic caught the smoking gun in the log:
+
+```
+2026-09-21 22:16:49,692 - traffic_client.stream_logic - INFO -
+  Skipped stale/unknown ports (not in current UI):
+  ['TG 0 - Port: ens2f1np1']
+```
+
+The streams (sids 9ff9 and 3ede) were being polled continuously
+against that same port_key, so they were definitely in
+`self.streams`. But start_all_streams' visibility filter compares
+the stream_table's Qt.UserRole sids against self.streams sids —
+if those mismatch for any reason (session-load sid reassignment,
+in-place edit didn't sync the stash, table-rebuild race at click
+time, or displayed_sids is simply empty), `valid_ports` came out
+empty and EVERY port got dropped into `unknown_ports` and
+skipped. Start All silently did nothing.
+
+**BB1: fall back to `self.streams.keys()` when valid_ports empty**
+(`traffic_client/stream_logic.py:1720-1738`) — Previously the
+fallback fired only on exception. Now if `valid_ports` ends up
+empty after the sid-intersection check but `self.streams` is
+non-empty, we log a warning and trust the model: any port in
+`self.streams` is a valid start target. No more silent no-op
+from a bookkeeping mismatch.
+
+Also added `[STATE-START-ALL]` diagnostic log at
+`start_all_streams` entry with local-stream count, table row
+count, and port keys — parity with the `[STATE-STOP]` trace so
+future misfires get traced too.
+
 ## [0.5.410] - 2026-09-21
 
 ### Fixed — Stopped stream flips back to GREEN at 15 s (v0.5.409 trace)

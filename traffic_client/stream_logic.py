@@ -1667,6 +1667,18 @@ class TrafficGenClientStreamLogic:
             revert_delay_ms=900
         ) if hasattr(self, "_begin_button_feedback") else (lambda: None))
 
+        # v0.5.411 (audit stream-diag): trace Start All entry —
+        # what streams exist locally, what the table shows.
+        try:
+            _n_streams_local = sum(len(v) for v in getattr(self, "streams", {}).values())
+            _n_rows_table = self.stream_table.rowCount() if hasattr(self, "stream_table") and self.stream_table else 0
+            logger.info(
+                f"[STATE-START-ALL] ENTER local_streams={_n_streams_local} "
+                f"table_rows={_n_rows_table} "
+                f"ports={list(getattr(self, 'streams', {}).keys())}"
+            )
+        except Exception as _e:
+            logger.info(f"[STATE-START-ALL] ENTER (diag err: {_e})")
         try:
             # --- Sanity ---
             if not getattr(self, "server_interfaces", []):
@@ -1711,6 +1723,27 @@ class TrafficGenClientStreamLogic:
             except Exception as e:
                 # If table not ready, fall back to all keys
                 logger.error(f"[START-ALL] Error reading stream table: {e}, falling back to stream keys")
+                valid_ports = set(self.streams.keys())
+            # v0.5.411 (audit stream-BB1): if valid_ports came
+            # out empty — because displayed_sids was empty (table
+            # rebuild race, no rows at click time, UserRole not
+            # stashed) OR because the sids in self.streams don't
+            # match what's in the table's UserRole (session-load
+            # sid reassignment, in-place edit didn't sync the
+            # stash) — the intersection filter would drop EVERY
+            # port and Start All would silently do nothing. Trust
+            # the model in that case: any port key in self.streams
+            # is a valid start target. The user's v0.5.409 trace
+            # showed exactly this: 'TG 0 - Port: ens2f1np1' was
+            # in self.streams (streams were being polled at that
+            # sid pair) but was logged as "Skipped stale/unknown
+            # ports" because displayed_sids didn't match.
+            if not valid_ports and getattr(self, "streams", None):
+                logger.warning(
+                    "[START-ALL] valid_ports came out empty "
+                    "(displayed_sids/table mismatch); falling back "
+                    "to self.streams keys to avoid silent no-op"
+                )
                 valid_ports = set(self.streams.keys())
 
             server_payload_map = {}  # { server_url: { port_label: [(stream_obj, row_idx), ...] } }
