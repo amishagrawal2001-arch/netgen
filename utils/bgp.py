@@ -10,6 +10,21 @@ from typing import Dict, List, Any, Optional
 BGP_INSTANCES = {}
 BGP_ROUTES = {}  # Store advertised routes per device
 
+# v0.5.403 (audit bgp T4): monotonic route-map name counter to prevent
+# collisions when two advertises land within the same second.
+import itertools as _itertools
+import threading as _threading
+_ROUTE_MAP_COUNTER = _itertools.count(1)
+_ROUTE_MAP_COUNTER_LOCK = _threading.Lock()
+
+
+def _next_route_map_counter() -> int:
+    """Return a globally-monotonic integer for route-map naming.
+    Thread-safe. Wraps around only after 2^63 calls, so effectively
+    infinite for BGP-config workloads."""
+    with _ROUTE_MAP_COUNTER_LOCK:
+        return next(_ROUTE_MAP_COUNTER)
+
 # Import Docker FRR management
 try:
     from .frr_docker import (
@@ -119,17 +134,31 @@ def execute_vtysh_command(device_id, vtysh_commands, timeout=10, device_name=Non
         logging.debug(f"[BGP] Commands: {vtysh_commands}")
         
         result = container.exec_run(["bash", "-c", exec_cmd])
-        
+        output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+
         if result.exit_code != 0:
-            output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
             logging.error(f"[BGP] vtysh command failed in container: {output_str}")
-            
+
             # If bgpd is not running, provide helpful error message
             if "bgpd is not running" in output_str:
                 raise RuntimeError(f"bgpd daemon is not running in container {container_name}. Container may need more time to start.")
             else:
                 raise RuntimeError(f"vtysh command failed: {output_str}")
-        
+
+        # v0.5.403 (audit bgp T2): also check for FRR error markers
+        # in the output even when exit_code == 0. See _exec_vtysh_lines
+        # rationale — vtysh happily exits 0 while FRR rejected an
+        # individual config line with `% Unknown command` / `% Malformed`
+        # / `% Same as remote-as`. Pre-fix, execute_vtysh_command's
+        # callers (advertise_bgp_routes, configure_bgp_for_device)
+        # reported success and the BGP session never came up.
+        if _vtysh_output_has_error(output_str):
+            logging.error(
+                f"[BGP] vtysh exit 0 but output contained FRR error "
+                f"marker in container {container_name}: {output_str[:400]}"
+            )
+            raise RuntimeError(f"vtysh reported error markers: {output_str[:200]}")
+
         return result
         
     except Exception as e:
@@ -464,11 +493,74 @@ def build_bgp_stop_cmd(device_id):
 
 
 def stop_bgp(device_id):
-    if device_id in BGP_INSTANCES:
-        logging.info(f"[BGP] Marking BGP instance {device_id} as inactive (not removing config)")
-        BGP_INSTANCES[device_id]["active"] = False
-    else:
+    """Stop BGP on a device.
+
+    v0.5.403 (audit bgp T3): pre-fix, this function ONLY flipped
+    the `active` bool on the in-memory BGP_INSTANCES entry and
+    returned. NO vtysh call, NO `no router bgp`, NO container
+    action. The client's status showed "BGP stopped" while the
+    FRR peer kept sending KEEPALIVE / UPDATE — the operator
+    saw the peer session stay UP in `show bgp summary` on the
+    other side even after clicking Stop. Same "DB lies about
+    live state" class as v0.5.396 M3 / v0.5.398 O2 / v0.5.399 P2.
+    Fix: issue the real vtysh `no router bgp <asn> [vrf <name>]`
+    into the device's FRR container so the router-mode is torn
+    down. Kept the BGP_INSTANCES bool flip for the legacy non-
+    docker path but it's now paired with the real teardown.
+    """
+    if device_id not in BGP_INSTANCES:
         logging.warning(f"[BGP] No active BGP found for device {device_id}")
+        return
+
+    instance = BGP_INSTANCES[device_id]
+    asn = instance.get("asn", 65000)
+
+    # v0.5.403 T3: real teardown for docker deployment.
+    if DOCKER_FRR_AVAILABLE:
+        try:
+            container, ctx_asn, _neigh, router_clause, err = (
+                _resolve_bgp_context(device_id)
+            )
+        except Exception as _exc:
+            logging.error(f"[BGP] stop_bgp: context lookup failed for {device_id}: {_exc}")
+            container, router_clause, err = None, None, str(_exc)
+        if err or container is None or router_clause is None:
+            # Even if we can't resolve context (VRF gone, container
+            # gone), flip the in-memory bool so subsequent stats
+            # don't lie about it being active. Log the reason so
+            # the operator can see why the real teardown was
+            # skipped.
+            logging.warning(
+                f"[BGP] stop_bgp: could not issue real teardown for "
+                f"{device_id} ({err or 'no container'}). Marking "
+                f"in-memory instance inactive only."
+            )
+            instance["active"] = False
+            return
+        # Router clause is either "router bgp <asn>" or
+        # "router bgp <asn> vrf <name>". The teardown is `no <router_clause>`.
+        _teardown_lines = [
+            "configure terminal",
+            f"no {router_clause}",
+            "end",
+            "write memory",
+        ]
+        ok, out = _exec_vtysh_lines(container, _teardown_lines)
+        if ok:
+            logging.info(f"[BGP] stop_bgp: `no {router_clause}` succeeded for device {device_id}")
+        else:
+            logging.error(
+                f"[BGP] stop_bgp: teardown vtysh returned error for "
+                f"{device_id}: {out[:300]}"
+            )
+        # Regardless of teardown outcome, mark inactive so we don't
+        # keep reporting the peer as up.
+        instance["active"] = False
+        return
+
+    # Legacy non-docker path: no vtysh available, just flip the bool.
+    logging.info(f"[BGP] Marking BGP instance {device_id} as inactive (legacy non-docker path)")
+    instance["active"] = False
 
 
 
@@ -515,19 +607,57 @@ def cleanup_device_routes(device_id):
         except (subprocess.CalledProcessError, RuntimeError) as e:
             logging.warning(f"[BGP] Failed to withdraw route {route} during cleanup: {e}")
     
-    # Clean up route-maps (try to remove common route-map names)
+    # Clean up route-maps for this device.
+    # v0.5.403 (audit bgp T5): pre-fix, the cleanup issued
+    # `no route-map RM_<devid>_*` — vtysh HAS NO GLOB SYNTAX. FRR
+    # rejected the line as `% Unknown command` (silent DEBUG log
+    # only; T2 fix now surfaces this too). Result: EVERY advertise
+    # cycle for this device left a fresh RM_<devid>_<ts>_<ctr>_<uuid>
+    # route-map orphaned in the container's running-config. Over
+    # months of ops on srv06 this leaked hundreds of route-maps
+    # per device. Fix: enumerate route-maps matching the device's
+    # prefix via `show running-config | include ^route-map RM_<devid>_`
+    # and issue an explicit `no route-map <exact_name>` per entry.
+    _rm_prefix = f"RM_{device_id[:8]}_"
     try:
-        # Try to remove route-maps that might have been created for this device
-        route_map_cleanup_cmd = [
+        _list_cmd = [
             "vtysh",
-            "-c", "configure terminal",
-            "-c", f"no route-map RM_{device_id}_*",
-            "-c", "exit"
+            "-c", f"show running-config | include ^route-map {_rm_prefix}",
         ]
-        safe_vtysh_command(route_map_cleanup_cmd)
-        logging.info(f"[BGP] Cleaned up route-maps for device {device_id}")
+        try:
+            _list_result = subprocess.run(
+                _list_cmd, capture_output=True, text=True, timeout=5,
+            )
+            _lines = (_list_result.stdout or "").splitlines()
+        except Exception as _list_exc:
+            logging.debug(
+                f"[BGP] route-map enumerate failed for {device_id}: "
+                f"{_list_exc}"
+            )
+            _lines = []
+        # Parse names from lines like `route-map RM_abcd1234_1698... permit 10`
+        _names = set()
+        for _ln in _lines:
+            _parts = _ln.split()
+            # `route-map <name> permit <seq>`
+            if len(_parts) >= 2 and _parts[0] == "route-map":
+                _cand = _parts[1]
+                if _cand.startswith(_rm_prefix):
+                    _names.add(_cand)
+        if _names:
+            _cleanup_cmd = ["vtysh", "-c", "configure terminal"]
+            for _n in sorted(_names):
+                _cleanup_cmd.extend(["-c", f"no route-map {_n}"])
+            _cleanup_cmd.extend(["-c", "exit"])
+            safe_vtysh_command(_cleanup_cmd)
+            logging.info(
+                f"[BGP] Cleaned up {len(_names)} route-map(s) for "
+                f"device {device_id}: {sorted(_names)}"
+            )
+        else:
+            logging.debug(f"[BGP] No route-maps to clean up for device {device_id}")
     except (subprocess.CalledProcessError, RuntimeError) as e:
-        logging.debug(f"[BGP] No route-maps to clean up for device {device_id}: {e}")
+        logging.debug(f"[BGP] route-map cleanup failed for {device_id}: {e}")
     
     # Remove from tracking
     del BGP_ROUTES[device_id]
@@ -827,30 +957,135 @@ def _resolve_bgp_context(device_id: str):
             return None, asn, neighbor, None, f"FRR container {container_name} not running"
 
         # Build the VRF-aware `router bgp` clause.
+        # v0.5.403 (audit bgp T1): fail-closed on VRF probe. Pre-fix,
+        # if `ip -o link show <vrf>` returned non-zero (or timed out,
+        # or the binary was missing, or the container wasn't ready
+        # yet), the code silently downgraded `router_clause` to the
+        # non-VRF form. All subsequent advertise / withdraw / route-
+        # map attach lines then landed in the DEFAULT VRF — but the
+        # interface with the update-source lives in the per-device
+        # VRF, so the BGP peer stayed in Active/Connect forever with
+        # no error surfaced to the operator. Same "silent wrong
+        # default" class as v0.5.401 R4 (Intel-IOMMU-on-AMD). Fix:
+        # when a VRF name is expected (i.e. device is in a per-
+        # device VRF), require the probe to succeed. Return an error
+        # if it doesn't so the caller can surface it.
         vrf_name = frr_mgr.vrf_name_for_device(device_id)
         router_clause = f"router bgp {asn}"
         if vrf_name:
-            check = subprocess.run(
-                ["ip", "-o", "link", "show", vrf_name],
-                capture_output=True, text=True, timeout=2,
-            )
-            if check.returncode == 0 and (check.stdout or "").strip():
-                router_clause = f"router bgp {asn} vrf {vrf_name}"
+            try:
+                check = subprocess.run(
+                    ["ip", "-o", "link", "show", vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                _probe_ok = check.returncode == 0 and (check.stdout or "").strip()
+            except Exception as _probe_exc:
+                logging.error(
+                    f"[BGP] VRF probe for '{vrf_name}' (device "
+                    f"{device_id}) raised: {_probe_exc}. Refusing "
+                    f"to silently downgrade to non-VRF."
+                )
+                return (
+                    None, asn, neighbor, None,
+                    f"VRF probe raised for '{vrf_name}': {_probe_exc}",
+                )
+            if not _probe_ok:
+                logging.error(
+                    f"[BGP] VRF probe for '{vrf_name}' (device "
+                    f"{device_id}) failed (rc={getattr(check, 'returncode', '?')}). "
+                    f"Refusing to silently downgrade to non-VRF — "
+                    f"peer would stay in Active/Connect forever."
+                )
+                return (
+                    None, asn, neighbor, None,
+                    f"VRF '{vrf_name}' probe failed — device VRF "
+                    f"not visible from host. Ensure the FRR container "
+                    f"is running and the per-device VRF is created.",
+                )
+            router_clause = f"router bgp {asn} vrf {vrf_name}"
         return container, asn, neighbor, router_clause, None
     except Exception as exc:
         return None, None, None, None, f"Context lookup failed: {exc}"
 
 
+# v0.5.403 (audit bgp T2): vtysh error markers. Pre-fix, both this
+# helper and execute_vtysh_command treated `exit_code == 0` as
+# success. Problem: `vtysh` exits 0 even when INDIVIDUAL config
+# lines are rejected with an error marker in the output. FRR's
+# standard rejection prefixes are shown in the constant below;
+# advertise_bgp_routes / withdraw_bgp_routes / configure_bgp_for_device
+# all used to return success when FRR had actually rejected the
+# neighbor / prefix / route-map. Operator saw "BGP configured"
+# and the session never came up. Fix: scan output for any of
+# these prefixes and treat their presence as failure.
+_VTYSH_ERROR_MARKERS = (
+    "% Unknown command",
+    "% Malformed",
+    "% Incomplete command",
+    "% Ambiguous command",
+    "% Same as remote-as",
+    "% Command incomplete",
+    "% BGP is already running",  # not an error per se, but call site cares
+    "% Invalid",
+    "% Cannot",
+    "% Failed",
+    "% Configuration Error",
+)
+
+
+def _vtysh_output_has_error(output: str) -> bool:
+    """Return True if the vtysh output contains any FRR-style
+    error marker (a line beginning with `%` that indicates command
+    rejection). Excludes benign lines like `% Warning: ...` which
+    FRR uses for non-fatal advisories."""
+    if not output:
+        return False
+    for _line in output.splitlines():
+        _stripped = _line.strip()
+        if not _stripped.startswith("%"):
+            continue
+        # Warnings are advisory, not command-rejections.
+        if _stripped.lower().startswith("% warning"):
+            continue
+        for _mark in _VTYSH_ERROR_MARKERS:
+            if _mark.lower() in _stripped.lower():
+                return True
+        # Fallback: any other `%`-prefixed line that isn't a
+        # warning is treated as a rejection. FRR is conservative
+        # about emitting `%` prefixes — legitimate output uses
+        # different formatting.
+        return True
+    return False
+
+
 def _exec_vtysh_lines(container, lines):
     """Run a list of vtysh -c commands inside the device's FRR
-    container. Returns (success, output)."""
+    container. Returns (success, output).
+
+    v0.5.403 (audit bgp T2): exit code alone is insufficient —
+    vtysh exits 0 even on `% Unknown command` / `% Malformed` /
+    `% Same as remote-as` (which FRR emits when the operator's
+    ASN matches the neighbor's, a very common misconfig on lab
+    scale-out topologies). Now: also scan output for FRR error
+    markers. Returns (False, output) if any marker found so the
+    caller can log the rejection instead of blindly reporting
+    success to the client.
+    """
     cmd = ["vtysh"]
     for line in lines:
         cmd.extend(["-c", line])
     try:
         result = container.exec_run(cmd)
         output = result.output.decode("utf-8", errors="ignore") if isinstance(result.output, bytes) else str(result.output or "")
-        return result.exit_code == 0, output
+        if result.exit_code != 0:
+            return False, output
+        if _vtysh_output_has_error(output):
+            logging.warning(
+                f"[BGP] vtysh exit 0 but output contained FRR "
+                f"error marker: {output[:300]}"
+            )
+            return False, output
+        return True, output
     except Exception as exc:
         return False, str(exc)
 
@@ -899,7 +1134,22 @@ def advertise_bgp_routes(device_id: str, route_config: Dict[str, Any]) -> Dict[s
     communities = route_config.get("communities", [])
 
     # 1) Route-map for custom attributes.
-    route_map_name = f"RM_{device_id[:8]}_{int(time.time())}"
+    # v0.5.403 (audit bgp T4): route-map name uniqueness. Pre-fix,
+    # the name was f"RM_{device_id[:8]}_{int(time.time())}" — two
+    # advertise calls within the same second on the same device
+    # produced IDENTICAL names. The second `route-map RM_... permit 10`
+    # entered configure-mode against the existing name and
+    # OVERWROTE its `set as-path/metric/local-preference/community`
+    # attributes. Any routes still attached to that route-map on
+    # the neighbor got the new attributes applied silently. Fix:
+    # append a monotonic counter + a random suffix so back-to-back
+    # advertises always get distinct names.
+    _rm_counter = _next_route_map_counter()
+    import uuid as _uuid
+    route_map_name = (
+        f"RM_{device_id[:8]}_{int(time.time())}"
+        f"_{_rm_counter}_{_uuid.uuid4().hex[:6]}"
+    )
     route_map_lines = ["configure terminal", f"route-map {route_map_name} permit 10"]
     if as_path:
         route_map_lines.append(f" set as-path prepend {' '.join(map(str, as_path))}")

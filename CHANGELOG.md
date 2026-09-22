@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.403] - 2026-09-21
+
+### Fixed — utils/bgp.py protocol config audit (5 items)
+
+**T1: `_resolve_bgp_context` silent VRF fallback → peer stuck Active/Connect**
+(`utils/bgp.py:_resolve_bgp_context`) — Pre-fix, if `ip -o link show
+<vrf>` failed for ANY reason (returncode!=0, timeout, `ip` binary
+missing, container not yet ready, race with startup), the code
+silently downgraded `router_clause` from `router bgp <asn> vrf <name>`
+to `router bgp <asn>`. All subsequent advertise / withdraw /
+route-map attach commands then landed in the DEFAULT VRF — but the
+interface with the update-source lives in the per-device VRF, so
+the BGP peer stayed in Active/Connect forever with no error
+surfaced to the operator. Same "silent wrong default" class as
+v0.5.401 R4 (Intel-IOMMU-on-AMD). Fix: fail closed when a VRF
+name is expected. Wraps the subprocess in try/except and returns
+a specific error string when the probe fails or times out.
+
+**T2: `_exec_vtysh_lines` / `execute_vtysh_command` treat exit 0 as success without parsing `%` markers**
+(`utils/bgp.py:_exec_vtysh_lines` + `:execute_vtysh_command` + new
+`_vtysh_output_has_error`) — `vtysh` exits 0 even when individual
+config lines are rejected with `% Unknown command` / `% Malformed`
+/ `% Incomplete` / `% Same as remote-as` / `% Cannot` / `% Failed`
+/ `% Configuration Error`. `advertise_bgp_routes`,
+`withdraw_bgp_routes`, and `configure_bgp_for_device` all returned
+success when FRR had actually rejected the config — operator saw
+"neighbor configured" and the session never came up. Added a
+`_vtysh_output_has_error` scanner that walks the output for the
+known FRR rejection markers (ignoring benign `% Warning: ...`
+advisories). Both `_exec_vtysh_lines` (returns False now) and
+`execute_vtysh_command` (raises now) fail loudly on match.
+
+**T3: `stop_bgp` didn't actually stop BGP**
+(`utils/bgp.py:stop_bgp`) — Pre-fix, `stop_bgp(device_id)` only
+flipped `BGP_INSTANCES[device_id]["active"] = False`. NO vtysh
+call, NO `no router bgp`, NO container action. The FRR peer kept
+sending KEEPALIVE / UPDATE — the operator saw the peer session
+stay UP in `show bgp summary` on the other side even after
+clicking Stop. Same "DB lies about live state" class as
+v0.5.396 M3 / v0.5.398 O2 / v0.5.399 P2. Fix: in docker
+deployment, resolve context via `_resolve_bgp_context` and issue
+`no router bgp <asn> [vrf <name>]` into the device's FRR
+container. Legacy non-docker path unchanged.
+
+**T4: `advertise_bgp_routes` route-map name collision within 1 s**
+(`utils/bgp.py:advertise_bgp_routes` + new
+`_next_route_map_counter`) — Pre-fix, name was
+`RM_{device_id[:8]}_{int(time.time())}`. Two advertise calls
+within the same second on the same device produced IDENTICAL
+names. The second `route-map RM_... permit 10` entered
+configure-mode against the existing name and OVERWROTE its
+`set as-path/metric/local-preference/community` attributes.
+Routes still attached to the old attach on the neighbor got
+the new attributes applied silently. Added a
+`_next_route_map_counter()` (threading.Lock-protected
+itertools.count) plus a `uuid4().hex[:6]` random suffix so
+back-to-back advertises always get distinct names.
+
+**T5: route-map cleanup used non-existent vtysh glob syntax → route-maps leaked forever**
+(`utils/bgp.py:cleanup_device_routes`) — Pre-fix, cleanup issued
+`no route-map RM_<devid>_*`. vtysh has NO GLOB SYNTAX. FRR
+rejected the line as `% Unknown command` (silent DEBUG log only;
+T2 now surfaces this loudly). Result: EVERY advertise cycle for
+this device left a fresh
+`RM_<devid>_<ts>_<counter>_<uuid>` route-map orphaned in the
+container's running-config. Over months of ops on srv06 this
+leaked hundreds of route-maps per device — bloated
+`show running-config` output and slowed FRR startup. Fix:
+enumerate matching route-maps via
+`show running-config | include ^route-map RM_<devid>_`, parse
+the names, and issue explicit `no route-map <exact_name>` per
+entry inside a single vtysh transaction.
+
+Tests: 12 new (`tests/test_v05403_bgp_audit.py`), all pass.
+Regressions on v0.5.398–v0.5.402: intact.
+
+---
+
 ## [0.5.402] - 2026-09-21
 
 ### Fixed — client startup slow when servers unreachable (user-reported)
