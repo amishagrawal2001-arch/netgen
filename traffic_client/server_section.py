@@ -944,6 +944,23 @@ class TrafficGenClientServerSection():
             row_count = 0
             running_count = 0
 
+            # v0.5.406 (audit stats-Y1): the structural rebuild
+            # below reads stream["status"] directly to pick the
+            # dot color. That bypasses the W1/W4 pin (v0.5.405)
+            # in exactly the case that motivated the pin — user
+            # clicks Stop, server races back with status="running"
+            # for one poll, poll writes stream["status"]="running"
+            # (via _paint_green before we can pin), then any
+            # structural rebuild (add/remove/edit stream, port
+            # selection change, server data refresh, sort) picks
+            # up "running" and paints green. Read the pin dict
+            # once, hoisted out of the port loop; the per-stream
+            # branch below forces red inside the grace window.
+            _pinned_rebuild = getattr(self, "_client_stopped_streams", None) or {}
+            _GRACE_S_REBUILD = 15.0
+            import time as _time_rebuild
+            _now_rebuild = _time_rebuild.monotonic()
+
             # Step 3: Build table from model
             for port, streams in getattr(self, "streams", {}).items():
                 tg_id = port.split(" - ")[0]
@@ -1009,7 +1026,17 @@ class TrafficGenClientServerSection():
                     # carry the status for colourblind users.
                     from utils.qicon_loader import status_dot_icon
                     status = stream.get("status", "stopped")
-                    if status == "running":
+                    # v0.5.406 (audit stats-Y1): honor the client-stop
+                    # pin here — otherwise a rebuild triggered right
+                    # after a Stop click paints green because
+                    # stream["status"] got flipped back to "running"
+                    # by a racing stats poll (server hadn't seen the
+                    # stop yet, _paint_green ran) before we could pin.
+                    _sid_for_pin = stream.get("stream_id")
+                    _pin_ts_r = _pinned_rebuild.get(_sid_for_pin) if _sid_for_pin else None
+                    if _pin_ts_r is not None and (_now_rebuild - _pin_ts_r) < _GRACE_S_REBUILD:
+                        dot_color, status_label = "red", "Stopped"
+                    elif status == "running":
                         running_count += 1
                         dot_color, status_label = "green", "Running"
                     elif status == "rx_tracking":

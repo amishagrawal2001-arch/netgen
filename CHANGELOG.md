@@ -2,6 +2,35 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.406] - 2026-09-21
+
+### Fixed — Stop-click STILL leaves row green (v0.5.405 miss)
+
+User re-reported the v0.5.405 symptom after upgrading. Root cause:
+v0.5.404 U4 was tracked as "completed" but the code change never
+landed — `_do_update_stream_table` (structural table rebuild) still
+paints color straight from `stream.get("status")`, no pin check.
+That branch fires on every add / remove / edit / port-selection
+change / server-data refresh / SSE update. Meanwhile a racing
+stats poll (server still says running for one tick) writes
+`stream["status"] = "running"` via `_paint_green`. Next rebuild
+picks up the mutated status and paints green — the W1 pin might
+be set, but the rebuild never asks it.
+
+**Y1: `_do_update_stream_table` honors the client-stop pin**
+(`traffic_client/server_section.py:947-961, 1028-1041`) — Read
+`_client_stopped_streams` and the current monotonic once, hoisted
+before the outer port loop. In the per-stream color decision,
+force `dot_color = "red"`, `status_label = "Stopped"` when the
+sid is pinned and still inside the 15 s grace window. Placed
+BEFORE the `status == "running"` branch so it wins. `running_count`
+is intentionally not bumped for pinned rows.
+
+Belt-and-suspenders with W1 (`update_per_stream_statistics`) and
+W4 (`_refresh_stream_status_in_place`) which each already gate on
+the same pin, so all three of the stream-color paint paths now
+agree on operator intent.
+
 ## [0.5.405] - 2026-09-21
 
 ### Fixed — Stop click leaves stream row stuck GREEN (user-reported)
