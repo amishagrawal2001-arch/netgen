@@ -1832,8 +1832,29 @@ class TrafficGenClientStreamLogic:
                     except Exception as _e:
                         logger.warning(f"[RATE] Could not normalize rate/duration for '{name}': {_e}")
 
-                    # Row index (if helper exists)
-                    row_idx = self._find_table_row(port_label, name) if hasattr(self, "_find_table_row") else None
+                    # v0.5.413 (audit stream-CC1): `_find_table_row`
+                    # was called but never defined anywhere — the
+                    # hasattr guard silently returned None for every
+                    # stream, so row_by_id stayed empty and the
+                    # success branch's `if r is not None:` gate
+                    # blocked BOTH _clear_client_stop AND the green
+                    # paint. The server would happily start the
+                    # stream, but the row stayed red forever because
+                    # the pin never cleared. Fix: inline the row
+                    # lookup by stream_id (matches Z1 sink's H1
+                    # re-resolve pattern — most reliable key).
+                    row_idx = None
+                    _sid_lookup = s.get("stream_id")
+                    if _sid_lookup and hasattr(self, "stream_table") and self.stream_table:
+                        try:
+                            from PyQt5.QtCore import Qt as _Qt_cc1
+                            for _r_cc1 in range(self.stream_table.rowCount()):
+                                _it_cc1 = self.stream_table.item(_r_cc1, 2)
+                                if _it_cc1 and _it_cc1.data(_Qt_cc1.UserRole) == _sid_lookup:
+                                    row_idx = _r_cc1
+                                    break
+                        except Exception:
+                            row_idx = None
                     stream_by_id[s["stream_id"]] = s
                     if row_idx is not None:
                         row_by_id[s["stream_id"]] = row_idx
@@ -1918,7 +1939,22 @@ class TrafficGenClientStreamLogic:
             for server_url, per_port in server_payload_map.items():
                 try:
                     payload = {"streams": {p: [s for (s, _) in items] for p, items in per_port.items()}}
+                    # v0.5.413 (audit stream-diag): trace the send
+                    # + response boundary so a successful start
+                    # leaves a footprint too — pre-fix, only the
+                    # non-OK branch logged, so a silent OK reply
+                    # with no downstream row-paint was invisible.
+                    logger.info(
+                        f"[STATE-START-ALL] send server={server_url} "
+                        f"payload_ports={list(payload.get('streams', {}).keys())} "
+                        f"payload_streams={sum(len(v) for v in payload.get('streams', {}).values())}"
+                    )
                     resp = self._post_traffic_async(server_url, "start", payload, timeout=10)
+                    logger.info(
+                        f"[STATE-START-ALL] recv server={server_url} "
+                        f"http={getattr(resp, 'status_code', '?')} "
+                        f"ok={getattr(resp, 'ok', '?')}"
+                    )
                     if not resp.ok:
                         # v0.5.408 (audit stream-H5): mirror
                         # start_stream K5 — parse started_streams
@@ -1979,16 +2015,27 @@ class TrafficGenClientStreamLogic:
 
                             r = row_by_id.get(sid)
                             st = stream_by_id.get(sid)
+                            # v0.5.413 (audit stream-CC2): clear the
+                            # client-stop pin UNCONDITIONALLY on
+                            # start success — the pin lives on the
+                            # instance dict, not the row. Pre-fix
+                            # this was gated by `if r is not None`
+                            # (v0.5.407 Z2), so when the row lookup
+                            # failed (v0.5.412 CC1) the pin never
+                            # cleared and the row stayed red forever
+                            # even though the server had started
+                            # the stream successfully.
+                            try:
+                                if hasattr(self, "_clear_client_stop"):
+                                    self._clear_client_stop(sid)
+                            except Exception:
+                                pass
                             if r is not None:
-                                # v0.5.407 (audit stats-Z2): clear
-                                # the client-stop pin + pass sid so
-                                # Z1 sink lets green through.
-                                try:
-                                    if hasattr(self, "_clear_client_stop"):
-                                        self._clear_client_stop(sid)
-                                except Exception:
-                                    pass
                                 self.update_stream_status(r, "green", stream_id=sid)
+                            # If r is None the pin is cleared above,
+                            # so the next stats poll will _paint_green
+                            # naturally (server says running + no
+                            # pin override).
                             if st:
                                 st["status"] = "running"
                                 st["enabled"] = True
@@ -2012,17 +2059,21 @@ class TrafficGenClientStreamLogic:
                         # Assume all we sent are running
                         for port_label, items in per_port.items():
                             for st, r in items:
+                                # v0.5.413 (audit stream-CC2):
+                                # unconditional pin-clear on start
+                                # success. Pin is on the instance
+                                # dict, not the row.
+                                _sid_z2b = st.get("stream_id")
+                                try:
+                                    if _sid_z2b and hasattr(self, "_clear_client_stop"):
+                                        self._clear_client_stop(_sid_z2b)
+                                except Exception:
+                                    pass
                                 if r is not None:
-                                    # v0.5.407 (audit stats-Z2):
-                                    # clear pin + pass sid so Z1
-                                    # sink lets green through.
-                                    _sid_z2b = st.get("stream_id")
-                                    try:
-                                        if _sid_z2b and hasattr(self, "_clear_client_stop"):
-                                            self._clear_client_stop(_sid_z2b)
-                                    except Exception:
-                                        pass
                                     self.update_stream_status(r, "green", stream_id=_sid_z2b)
+                                # If r is None the pin is cleared
+                                # above, so the next poll paints
+                                # green naturally.
                                 st["status"] = "running"
                                 st["enabled"] = True
                                 st.setdefault("protocol_selection", {})["enabled"] = True

@@ -84,15 +84,19 @@ def test_z1_sink_bails_when_stream_id_none():
 
 def test_z2_marker_present():
     src = _read("traffic_client/stream_logic.py")
-    # Four Z2 sites in start-path branches.
-    assert src.count("v0.5.407 (audit stats-Z2)") >= 4
+    # Four Z2 sites in start-path branches originally; v0.5.413
+    # CC2 replaced 2 of them (start_all success + fallback) with
+    # unconditional pin-clears. Remaining 2 are in start_stream.
+    assert src.count("v0.5.407 (audit stats-Z2)") >= 2
 
 
 def test_z2_start_path_all_clear_pin_before_green():
     """Each green paint in start_stream / start_all_streams
     must clear the pin first — otherwise the Z1 sink refuses it."""
     src = _read("traffic_client/stream_logic.py")
-    # 5 total clears: v0.5.405 W3 one + v0.5.407 Z2 four.
+    # v0.5.413 CC2 added 2 more unconditional pin-clears in
+    # start_all_streams' success/fallback branches, so we now
+    # expect ≥5 total: W3 one + Z2 two + CC2 two.
     assert src.count("self._clear_client_stop(") >= 5
 
 

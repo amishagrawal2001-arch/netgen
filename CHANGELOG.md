@@ -2,6 +2,54 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.413] - 2026-09-21
+
+### Fixed — Start All builds payload but pin never clears (v0.5.412 trace)
+
+The v0.5.412 diagnostic caught the actual root cause. From the
+user's trace:
+
+```
+[STATE-START-ALL] stream port=… name='ICMP' … enabled=True status=stopped
+[STATE-START-ALL] stream port=… name='UEC'  … enabled=True status=stopped
+[STATE-START-ALL] payload_built servers=['http://san-hp-srv06:5050']
+                  total_streams=2 disabled=0 unknown_ports=[…]
+[no HTTP response log, no pin-clear, no green paint]
+```
+
+Two streams enabled, payload built for the server. Then nothing.
+
+**Root cause**: `_find_table_row(port_label, name)` is *called* at
+`traffic_client/stream_logic.py:1836` guarded by
+`hasattr(self, "_find_table_row")`, but the method **is never
+defined anywhere in the codebase**. `hasattr` returns False,
+`row_idx = None` for every stream, `row_by_id` stays empty. Then
+in the success branch:
+
+```python
+if r is not None:  # ← always False because row_by_id is empty
+    self._clear_client_stop(sid)  # ← never fires
+    self.update_stream_status(r, "green", stream_id=sid)  # ← never fires
+```
+
+The HTTP call succeeded, the server started the streams, but the
+pin never cleared and the row stayed red forever.
+
+**CC1: replace phantom `_find_table_row` with inline sid lookup**
+(`traffic_client/stream_logic.py:1836-1861`) — Walk the table by
+`Qt.UserRole == stream_id` (same pattern the Z1 sink already uses).
+`row_by_id` now populates correctly.
+
+**CC2: `_clear_client_stop` is unconditional on start success**
+(`traffic_client/stream_logic.py:2001-2074`) — The pin lives on
+the instance dict, not the row. Whether we can paint green (row
+found) or have to defer to the next poll (row not found), the
+pin MUST clear on start success. Belt-and-suspenders on top of
+CC1.
+
+Also added `[STATE-START-ALL] send` and `recv` log lines around
+the HTTP call so a successful start leaves a footprint too.
+
 ## [0.5.412] - 2026-09-21
 
 ### Diagnostic — Start All silent exit (v0.5.411 trace)
