@@ -385,6 +385,14 @@ class TrafficGenClientStreamLogic:
                         s["status"] = "stopped"
                         break
 
+            # v0.5.405 (audit stats-W2): pin the stop so the next
+            # poll's J2 counter-advance override can't flip us back
+            # to green if one final in-flight stats batch arrives.
+            try:
+                if hasattr(self, "_pin_client_stop"):
+                    self._pin_client_stop(stream_id)
+            except Exception:
+                pass
             if row_idx is not None:
                 self.update_stream_status(row_idx, "red", stream_id=stream_id)
             self.update_stream_table()
@@ -860,6 +868,15 @@ class TrafficGenClientStreamLogic:
                                 # v0.5.392 (H1): pass stream_id so
                                 # update_stream_status re-resolves
                                 # the row against the current table.
+                                # v0.5.405 (audit stats-W3): clear
+                                # any prior client-stop pin so this
+                                # restart can paint green without
+                                # waiting for the grace window.
+                                try:
+                                    if hasattr(self, "_clear_client_stop"):
+                                        self._clear_client_stop(sid)
+                                except Exception:
+                                    pass
                                 if r is not None:
                                     self.update_stream_status(r, "green", stream_id=sid)
                                 st["status"] = "running"
@@ -1191,6 +1208,14 @@ class TrafficGenClientStreamLogic:
                         if s.get("stream_id") == stream_id_from_table:
                             s["status"] = "stopped"
                             updated = True
+                            # v0.5.405 (audit stats-W2): pin so
+                            # J2 counter-advance can't flip us
+                            # back to green mid-poll.
+                            try:
+                                if hasattr(self, "_pin_client_stop"):
+                                    self._pin_client_stop(stream_id_from_table)
+                            except Exception:
+                                pass
                             break
 
                 # Fallback to name matching if stream_id didn't match.
@@ -1418,10 +1443,19 @@ class TrafficGenClientStreamLogic:
                                     self.streams[port_lbl][i]["status"] = "stopped"
                                     break
 
+                            # v0.5.405 (audit stats-W2): pin the
+                            # sid so the next poll's J2 override
+                            # can't flip it back to green if a
+                            # final in-flight stats batch arrives.
+                            try:
+                                if hasattr(self, "_pin_client_stop"):
+                                    self._pin_client_stop(sid)
+                            except Exception:
+                                pass
                             row_idx = row_index_map.get(sid)
                             if row_idx is not None:
                                 try:
-                                    self.update_stream_status(row_idx, "red")
+                                    self.update_stream_status(row_idx, "red", stream_id=sid)
                                 except Exception as _e:
                                     logger.warning(f"[STOP-ALL] Row icon update failed: sid={sid} ({port_lbl}, {s_name}): {_e}")
                     else:

@@ -97,8 +97,13 @@ def test_u3_refresh_in_place_gates_on_confirm_count():
     body = src[_idx:_idx + 3500]
     assert '_confirms_ro = getattr(self, "_stopped_confirm_count", None)' in body
     assert "_STOPPED_CONFIRM_THRESHOLD_RO = 3" in body
-    # Gate: refuse to flip green→red unless threshold hit
-    assert 'if color == "red" and pushed.get(sid) in ("green", "blue"):' in body
+    # Gate: refuse to flip green→red unless threshold hit.
+    # v0.5.405 W4 wrapped this condition across multiple lines +
+    # added a pin-window exception, so check for the key parts
+    # instead of the exact one-liner.
+    assert 'color == "red"' in body
+    assert 'pushed.get(sid) in ("green", "blue")' in body
+    assert '_STOPPED_CONFIRM_THRESHOLD_RO' in body
 
 
 # ─── version guard ───

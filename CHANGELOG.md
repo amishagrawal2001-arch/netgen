@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.405] - 2026-09-21
+
+### Fixed — Stop click leaves stream row stuck GREEN (user-reported)
+
+User reported the opposite of the v0.5.404 flicker: after clicking
+Stop, the stream row stayed green while the stream was actually
+stopped. Root cause: J2 counter-advance override (v0.5.393) wins
+over operator intent. Two scenarios:
+  1. Server race: one final in-flight stats batch shows `tx_count`
+     going up (still processing samples from tx_worker before it
+     exits) → J2 keeps green.
+  2. Server briefly reports `status="running"` for one poll after
+     the stop landed (DB write lag between stream_tracker removal
+     and status update).
+
+Fix: client-side stops pin the sid to red for a 15 s grace window,
+overriding J2.
+
+**W1: `_client_stopped_streams` grace-window state + helpers**
+(`traffic_client/statistics_section.py:483-517`) — Added
+`_pin_client_stop(sid)` / `_clear_client_stop(sid)` mixin
+methods. First call to `_pin_client_stop` initializes the dict
+lazily. Grace window = 15 s (long enough to absorb server DB write
+lag + a couple of poll ticks; short enough that the pin doesn't
+outlive the actual stop).
+
+**W2: all client stop paths call `_pin_client_stop`**
+(`traffic_client/stream_logic.py:_stop_stream_by_id` + `stop_stream`
++ `stop_all_streams` inner loop) — Three sites patched.
+`stop_all_streams` also now passes `stream_id=` to
+`update_stream_status` (previously missed by v0.5.392 H1). All
+call `_pin_client_stop(sid)` on successful stop.
+
+**W3: start paths call `_clear_client_stop`**
+(`traffic_client/stream_logic.py:start_stream` inner loop at the
+"green paint after start success" site) — When the operator
+restarts a stream, drop the pin so it can paint green
+immediately without waiting for the 15 s window to expire.
+
+**W4: `_refresh_stream_status_in_place` also honors the pin**
+(`traffic_client/server_section.py:1443-1490`) — Reads
+`_client_stopped_streams` alongside the U3 hysteresis cache. If
+the sid is inside its grace window, force `color = "red"`
+regardless of `stream["status"]`. Also bypasses the U3 gate for
+green→red flips inside the window — that's exactly the flip we
+DO want to happen immediately after operator stop.
+
+**W5: pin dict pruned by existing TTL sweep**
+(`traffic_client/statistics_section.py:_stream_last_seen`
+prune block) — Added `_client_stopped_streams` to the same
+Q5-style prune that already handles `_stream_baselines`,
+`_latched_loss_pct`, `_stream_counter_history`. Long-running
+clients won't leak entries for stopped-then-deleted streams.
+
+Tests: 12 new (`tests/test_v05405_stop_pin.py`), all pass.
+Regressions on v0.5.400–v0.5.404: intact.
+
+---
+
 ## [0.5.404] - 2026-09-21
 
 ### Fixed — stream status still flickering green↔red (user-reported)

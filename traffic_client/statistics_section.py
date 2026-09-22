@@ -480,6 +480,41 @@ class StatisticsFetchWorker(QThread):
 
 
 class TrafficGenClientStatisticsSection():
+    # v0.5.405 (audit stats-W1 + W2): shared helper for client-side
+    # stop paths. Every code path that stops a stream (stop_stream,
+    # stop_all_streams, _stop_stream_by_id — all in stream_logic.py)
+    # calls _pin_client_stop(sid) so update_per_stream_statistics
+    # and _refresh_stream_status_in_place force red for a 15 s
+    # grace window regardless of what the server's stats say. This
+    # is what stops the "clicked Stop, row stays green" symptom
+    # the user reported after v0.5.404.
+    def _pin_client_stop(self, stream_id):
+        """Mark `stream_id` as client-stopped now. For the next
+        ~15 s, all status paints will force red regardless of
+        server-side stats — protects against server race windows
+        (final in-flight batch, tracker drop, DB write lag) from
+        flipping the row back to green."""
+        if not stream_id:
+            return
+        import time as _time_mod
+        _pinned = getattr(self, "_client_stopped_streams", None)
+        if _pinned is None:
+            _pinned = {}
+            self._client_stopped_streams = _pinned
+        _pinned[stream_id] = _time_mod.monotonic()
+
+    def _clear_client_stop(self, stream_id):
+        """v0.5.405 (audit stats-W3): drop the client-stop pin for
+        `stream_id`. Called from start paths so a restarted stream
+        can immediately paint green again without waiting for the
+        grace window to expire."""
+        if not stream_id:
+            return
+        _pinned = getattr(self, "_client_stopped_streams", None)
+        if _pinned is None:
+            return
+        _pinned.pop(stream_id, None)
+
     def setup_traffic_statistics_section(self):
         self.statistics_group = QGroupBox("Traffic Statistics")
         # Pull the QGroupBox's internal padding right in. Default Qt
@@ -1951,6 +1986,55 @@ class TrafficGenClientStatisticsSection():
                 if sid_for_history:
                     prev[sid_for_history] = (_tx_now, _rx_now)
 
+                # v0.5.405 (audit stats-W1): operator-stop pinning.
+                # User reported the OPPOSITE flicker after v0.5.404 —
+                # they clicked Stop, tx_worker really died, but the
+                # row stayed GREEN. Root cause: J2 counter-advance
+                # override wins over operator intent. The server can
+                # race — one final in-flight stats batch shows
+                # tx_count going up (still processing the last
+                # samples from tx_worker before it exits) → J2 →
+                # green. Or server_status briefly reports "running"
+                # for one poll after the stop landed. Either way,
+                # the operator's Stop click is ignored by the paint
+                # pipeline. Fix: when stop_stream / stop_all /
+                # _stop_stream_by_id fire, mark the sid in
+                # _client_stopped_streams with a timestamp. For a
+                # 15 s grace window, force red regardless of what
+                # the poll says. `_pin_client_stop(sid)` is called
+                # from every client-side stop path.
+                import time as _time_mod
+                _pinned = getattr(self, "_client_stopped_streams", None)
+                if _pinned is None:
+                    _pinned = {}
+                    self._client_stopped_streams = _pinned
+                _GRACE_S = 15.0
+                _now_ts = _time_mod.monotonic()
+                _pin_ts = _pinned.get(sid_for_history) if sid_for_history else None
+                _pin_active = (
+                    _pin_ts is not None
+                    and (_now_ts - _pin_ts) < _GRACE_S
+                )
+                if _pin_active:
+                    # Force red inside grace window; ignore server
+                    # state entirely. Log so operators can trace.
+                    logger.debug(
+                        f"[STATUS] sid={sid_for_history} in "
+                        f"client-stop grace window "
+                        f"({_now_ts - _pin_ts:.1f}s / {_GRACE_S}s) — "
+                        f"forcing red regardless of server state"
+                    )
+                    stream["status"] = "stopped"
+                    stream["tx_rate"] = 0.0
+                    stream["rx_rate"] = 0.0
+                    self.update_stream_status(
+                        row, "red", stream_id=sid_for_history
+                    )
+                    new_status = "stopped"
+                    if old_status != new_status:
+                        status_changed = True
+                    break  # done with this stream_id
+
                 # v0.5.404 (audit stats-U1 + U2): hysteresis on
                 # green→red transitions. Pre-fix, ANY single poll
                 # where server_status=="stopped" AND counters
@@ -2492,10 +2576,16 @@ class TrafficGenClientStatisticsSection():
             # stream_ids forever. Fold it in here so it evicts on the
             # same trigger as the other per-sid caches.
             _counter_hist_dict = getattr(self, "_stream_counter_history", None)
+            # v0.5.405 (audit stats-W5): also prune the client-stop
+            # pin dict alongside the other per-sid caches so a
+            # long-running client doesn't leak entries for streams
+            # that were stopped-then-deleted.
+            _pinned_dict = getattr(self, "_client_stopped_streams", None)
             _need_prune = (
                 (isinstance(_baselines_dict, dict) and len(_baselines_dict) > _STREAM_CACHE_SOFT_CAP)
                 or (isinstance(_latched_dict, dict) and len(_latched_dict) > _STREAM_CACHE_SOFT_CAP)
                 or (isinstance(_counter_hist_dict, dict) and len(_counter_hist_dict) > _STREAM_CACHE_SOFT_CAP)
+                or (isinstance(_pinned_dict, dict) and len(_pinned_dict) > _STREAM_CACHE_SOFT_CAP)
             )
             if _need_prune:
                 _evict_before = _now - _STREAM_CACHE_TTL_S
@@ -2508,6 +2598,8 @@ class TrafficGenClientStatisticsSection():
                         _latched_dict.pop(_sid_e, None)
                     if isinstance(_counter_hist_dict, dict):
                         _counter_hist_dict.pop(_sid_e, None)
+                    if isinstance(_pinned_dict, dict):
+                        _pinned_dict.pop(_sid_e, None)
                     _last_seen.pop(_sid_e, None)
                 if _stale:
                     logger.debug(

@@ -1429,21 +1429,18 @@ class TrafficGenClientServerSection():
 
             # v0.5.404 (audit stats-U3): consult the same
             # _stopped_confirm_count hysteresis cache that
-            # update_per_stream_statistics uses. Pre-fix, this
-            # in-place refresh happily painted red the moment
-            # `stream["status"] != "running"` — bypassing the J2
-            # counter-advance override AND the U2 confirm-count
-            # gate. So one "stopped" tick from the poller would
-            # flip red here even if the next tick would restore
-            # green. Same source-of-truth divergence caused the
-            # flicker the user reported after v0.5.393 and
-            # v0.5.400. Now: if we're about to paint RED but the
-            # confirm count hasn't hit the threshold yet, skip
-            # the flip and keep whatever color the row already
-            # had. update_per_stream_statistics owns the confirm
-            # counter; this method just reads it.
+            # update_per_stream_statistics uses.
+            # v0.5.405 (audit stats-W4): also consult the
+            # _client_stopped_streams pin so operator-initiated
+            # stops force red immediately (within grace window),
+            # regardless of what stream["status"] currently says
+            # (which may not have been updated yet by the poll).
             _confirms_ro = getattr(self, "_stopped_confirm_count", None) or {}
             _STOPPED_CONFIRM_THRESHOLD_RO = 3
+            _pinned_ro = getattr(self, "_client_stopped_streams", None) or {}
+            _GRACE_S_RO = 15.0
+            import time as _time_ro
+            _now_ro = _time_ro.monotonic()
             for row in range(table.rowCount()):
                 name_item = table.item(row, 2)
                 if name_item is None:
@@ -1458,9 +1455,22 @@ class TrafficGenClientServerSection():
                     continue
                 status = stream.get("status", "stopped")
                 color = self._STATUS_TO_COLOR.get(status, "red")
+                # v0.5.405 (audit stats-W4): if operator recently
+                # clicked Stop for this sid, force red immediately
+                # regardless of stream["status"]. Overrides both
+                # J2 counter-advance (in the poll path) and the
+                # U3 hysteresis gate (below). Skips the pin AFTER
+                # its grace window expires.
+                _pin_ts = _pinned_ro.get(sid)
+                if _pin_ts is not None and (_now_ro - _pin_ts) < _GRACE_S_RO:
+                    color = "red"
                 # U3 gate: refuse to flip green→red unless the
                 # confirm-count agrees the stream is REALLY stopped.
-                if color == "red" and pushed.get(sid) in ("green", "blue"):
+                # W4 exception: if we're in the client-stop pin
+                # window, we WANT the flip — don't gate it.
+                if (color == "red"
+                        and pushed.get(sid) in ("green", "blue")
+                        and (_pin_ts is None or (_now_ro - _pin_ts) >= _GRACE_S_RO)):
                     if _confirms_ro.get(sid, 0) < _STOPPED_CONFIRM_THRESHOLD_RO:
                         logger.debug(
                             f"[STATUS-IN-PLACE] sid={sid} "
