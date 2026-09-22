@@ -769,6 +769,19 @@ class TrafficGenClientStreamControl:
         on col 2) and use that instead of the stale `row` hint.
         Backwards compat: when `stream_id` is None or the row
         can't be resolved, we fall through to the original `row`.
+
+        v0.5.407 (audit stats-Z1): SINK-level client-stop pin
+        gate. Every color paint on the stream table goes through
+        this method, so enforce the pin here as a last-resort
+        override — no matter which of the six-plus paint call
+        sites tries to write green (or blue) for a sid the
+        operator just clicked Stop on, force red for the 15 s
+        grace window. Start-path clears the pin first (via
+        `_clear_client_stop`) so a legitimate restart still
+        paints green. This is a belt-and-suspenders on top of
+        W1 (poll path), W4 (in-place refresh), and Y1
+        (structural rebuild) — any paint that slipped past
+        those still gets caught here.
         """
         from utils.qicon_loader import status_dot_icon
         _target_row = row
@@ -783,6 +796,17 @@ class TrafficGenClientStreamControl:
                         break
             except Exception:
                 _target_row = row
+        if stream_id is not None and color != "red":
+            try:
+                _pinned = getattr(self, "_client_stopped_streams", None)
+                if _pinned:
+                    _pin_ts = _pinned.get(stream_id)
+                    if _pin_ts is not None:
+                        import time as _t_z1
+                        if (_t_z1.monotonic() - _pin_ts) < 15.0:
+                            color = "red"
+            except Exception:
+                pass
         status_item = QTableWidgetItem()
         status_item.setIcon(status_dot_icon(color, 14))
         status_item.setFlags(Qt.ItemIsEnabled)  # read-only

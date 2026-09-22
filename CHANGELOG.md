@@ -2,6 +2,34 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.407] - 2026-09-21
+
+### Fixed — Stop All still leaves rows green (v0.5.406 miss)
+
+User re-reported: clicked Stop All, traffic actually stopped, but all
+rows showed green. v0.5.406 Y1 fixed the structural-rebuild path, but
+there are STILL other paint sites — direct `update_stream_status` calls
+during status changes, DPDK warning branches, live-refresh timers —
+that write green without any pin check of their own. The pin is the
+right abstraction; the problem is that every caller has to remember
+to consult it. That never scales.
+
+**Z1: sink-level pin gate** (`traffic_client/stream_control.py:750-833`) —
+`update_stream_status` (the single method every color paint funnels
+through) now checks the pin ITSELF. If a `stream_id` is passed and
+the requested color is not "red", but the sid is pinned and inside
+the 15 s grace window, the color is forced to red. No caller can
+bypass this — belt-and-suspenders on top of W1, W4, Y1.
+
+**Z2: `_clear_client_stop` parity across start-path paint sites**
+(`traffic_client/stream_logic.py:910, 945, 1799, 1824`) — v0.5.405
+W3 only cleared the pin on ONE of four start-success branches. The
+other three would paint green after Z1 forced them to red — the
+row would stay red even when the operator legitimately restarted
+the stream. Clear the pin before every green paint in start_stream
+/ start_all_streams. Also pass `stream_id=` where it was missing
+so the Z1 gate can find the pin entry.
+
 ## [0.5.406] - 2026-09-21
 
 ### Fixed — Stop-click STILL leaves row green (v0.5.405 miss)

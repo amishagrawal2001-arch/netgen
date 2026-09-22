@@ -907,6 +907,15 @@ class TrafficGenClientStreamLogic:
                             # v0.5.392 (H1): re-resolve row by
                             # stream_id — the pump above may have
                             # invalidated the cached index.
+                            # v0.5.407 (audit stats-Z2): parity
+                            # with the partial-success branch —
+                            # clear the client-stop pin so the
+                            # Z1 sink gate lets green through.
+                            try:
+                                if hasattr(self, "_clear_client_stop"):
+                                    self._clear_client_stop(sid)
+                            except Exception:
+                                pass
                             self.update_stream_status(r, "green", stream_id=sid)
                         if st:
                             st["status"] = "running"
@@ -933,7 +942,15 @@ class TrafficGenClientStreamLogic:
                     for port_label, items in per_port.items():
                         for st, r in items:
                             # v0.5.392 (H1): re-resolve row by sid.
-                            self.update_stream_status(r, "green", stream_id=st.get("stream_id"))
+                            # v0.5.407 (audit stats-Z2): clear pin
+                            # so the Z1 sink gate lets green through.
+                            _sid_z2 = st.get("stream_id")
+                            try:
+                                if _sid_z2 and hasattr(self, "_clear_client_stop"):
+                                    self._clear_client_stop(_sid_z2)
+                            except Exception:
+                                pass
+                            self.update_stream_status(r, "green", stream_id=_sid_z2)
                             st["status"] = "running"
                             st["enabled"] = True
                             st.setdefault("protocol_selection", {})["enabled"] = True
@@ -1779,7 +1796,15 @@ class TrafficGenClientStreamLogic:
                             r = row_by_id.get(sid)
                             st = stream_by_id.get(sid)
                             if r is not None:
-                                self.update_stream_status(r, "green")
+                                # v0.5.407 (audit stats-Z2): clear
+                                # the client-stop pin + pass sid so
+                                # Z1 sink lets green through.
+                                try:
+                                    if hasattr(self, "_clear_client_stop"):
+                                        self._clear_client_stop(sid)
+                                except Exception:
+                                    pass
+                                self.update_stream_status(r, "green", stream_id=sid)
                             if st:
                                 st["status"] = "running"
                                 st["enabled"] = True
@@ -1804,7 +1829,16 @@ class TrafficGenClientStreamLogic:
                         for port_label, items in per_port.items():
                             for st, r in items:
                                 if r is not None:
-                                    self.update_stream_status(r, "green")
+                                    # v0.5.407 (audit stats-Z2):
+                                    # clear pin + pass sid so Z1
+                                    # sink lets green through.
+                                    _sid_z2b = st.get("stream_id")
+                                    try:
+                                        if _sid_z2b and hasattr(self, "_clear_client_stop"):
+                                            self._clear_client_stop(_sid_z2b)
+                                    except Exception:
+                                        pass
+                                    self.update_stream_status(r, "green", stream_id=_sid_z2b)
                                 st["status"] = "running"
                                 st["enabled"] = True
                                 st.setdefault("protocol_selection", {})["enabled"] = True
