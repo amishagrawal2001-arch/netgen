@@ -728,19 +728,43 @@ class TrafficGenClientStreamControl:
         else:
             new_enabled = bool(value)  # Qt.Checked == 2, Qt.PartiallyChecked == 1, Qt.Unchecked == 0
 
-        for stream in self.streams.get(port, []):
-            if stream.get("name") == stream_name or stream.get("protocol_selection", {}).get("name") == stream_name:
-                stream["enabled"] = new_enabled
-                # Keep protocol_selection.enabled in sync — the server's
-                # /traffic/start reads from there too, and a half-synced
-                # state was the cause of "Apply doesn't pick up the
-                # checkbox change" reports.
-                stream.setdefault("protocol_selection", {})["enabled"] = new_enabled
-                logger.info(f"Stream '{stream_name}' on {port} enabled set to {new_enabled}")
-                self.send_inline_update_to_server(port, stream)
-                if hasattr(self, "mark_stream_dirty"):
-                    self.mark_stream_dirty(stream.get("stream_id"))
-                break
+        # v0.5.408 (audit stream-M8): the K2 fix pattern — match by
+        # stream_id when we have it (unique) and only fall back to
+        # name-match when no sid is available. Two streams on the
+        # same port sharing a name would silently toggle the wrong
+        # one otherwise.
+        _target_stream = None
+        if stream_id:
+            for _s in self.streams.get(port, []):
+                if _s.get("stream_id") == stream_id:
+                    _target_stream = _s
+                    break
+        if _target_stream is None:
+            _candidates = [
+                _s for _s in self.streams.get(port, [])
+                if _s.get("name") == stream_name
+                or _s.get("protocol_selection", {}).get("name") == stream_name
+            ]
+            if len(_candidates) == 1:
+                _target_stream = _candidates[0]
+            elif len(_candidates) > 1:
+                logger.warning(
+                    f"[ENABLED-TOGGLE] Refusing to toggle '{stream_name}' "
+                    f"on '{port}' — {len(_candidates)} streams share this "
+                    f"name and no stream_id in the row to disambiguate."
+                )
+                return
+        if _target_stream is not None:
+            _target_stream["enabled"] = new_enabled
+            # Keep protocol_selection.enabled in sync — the server's
+            # /traffic/start reads from there too, and a half-synced
+            # state was the cause of "Apply doesn't pick up the
+            # checkbox change" reports.
+            _target_stream.setdefault("protocol_selection", {})["enabled"] = new_enabled
+            logger.info(f"Stream '{stream_name}' on {port} enabled set to {new_enabled}")
+            self.send_inline_update_to_server(port, _target_stream)
+            if hasattr(self, "mark_stream_dirty"):
+                self.mark_stream_dirty(_target_stream.get("stream_id"))
 
     def update_rx_port(self, port, stream, new_rx):
         """Update rx_port value for the stream."""
@@ -1666,19 +1690,92 @@ class TrafficGenClientStreamControl:
         if _count == 0:
             QMessageBox.warning(self, "No Selection", "Nothing valid to remove.")
             return
+        # v0.5.408 (audit stream-H4): identify RUNNING streams among
+        # the targets so the confirm text is accurate AND so we send
+        # a real /api/traffic/stop before dropping them from the
+        # local dict. Pre-fix, deleting a running stream orphaned
+        # its tx_worker on the server — the exact class of orphan
+        # the Start-preflight modal is supposed to warn about — and
+        # the confirm dialog LIED ("removes from BOTH desktop AND
+        # server"). Now we actually stop first, then delete.
+        _running_targets = []  # [(sid, name, port_key, iface_text)]
+        for _sid, _sname, _pk, _iface in _targets:
+            if not _pk or not _sid:
+                continue
+            for _s in self.streams.get(_pk, []):
+                if _s.get("stream_id") == _sid and _s.get("status") == "running":
+                    _running_targets.append((_sid, _sname, _pk, _iface))
+                    break
         _preview = "\n".join(f"  - {_t[1]}" for _t in _targets[:8])
         if _count > 8:
             _preview += f"\n  ... and {_count - 8} more"
+        _running_note = ""
+        if _running_targets:
+            _running_note = (
+                f"\n\n{len(_running_targets)} of these stream(s) are "
+                f"currently RUNNING and will be stopped on the server "
+                f"first."
+            )
         if QMessageBox.question(
             self,
             "Remove Stream" if _count == 1 else f"Remove {_count} Streams",
-            f"Delete {_count} stream(s)?\n\n{_preview}\n\n"
-            f"This removes the stream from BOTH the desktop client "
-            f"AND the server. It cannot be undone.",
+            f"Delete {_count} stream(s)?\n\n{_preview}"
+            f"{_running_note}\n\n"
+            f"This removes the stream from the desktop client. "
+            f"It cannot be undone.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         ) != QMessageBox.Yes:
             return
+
+        # v0.5.408 (audit stream-H4): stop any running targets on
+        # the server BEFORE we drop them locally. Group by server so
+        # we send one batched /stop per server (mirrors stop_stream
+        # / stop_all_streams). If the stop fails we surface it and
+        # still proceed with the local delete (the user's intent was
+        # clear); the server may have orphans afterward but at least
+        # they were told.
+        _delete_errors = []
+        if _running_targets:
+            _by_server = {}  # server_url -> [ {interface, stream_id, stream_name} ]
+            for _sid, _sname, _pk, _iface in _running_targets:
+                # Extract TG id + interface from the port_key.
+                try:
+                    _tg_id = _pk.split(" - ")[0].strip().replace("TG ", "")
+                    _wire_iface = _pk.split(" - ")[-1].strip()
+                    if "Port:" in _wire_iface:
+                        _wire_iface = _wire_iface.replace("Port:", "").strip()
+                except Exception:
+                    continue
+                _server = next(
+                    (s for s in getattr(self, "server_interfaces", [])
+                     if str(s.get("tg_id")) == _tg_id),
+                    None,
+                )
+                if not _server or not _server.get("address"):
+                    continue
+                _by_server.setdefault(_server["address"], []).append({
+                    "interface": _wire_iface,
+                    "stream_id": _sid,
+                    "stream_name": _sname,
+                })
+            for _server_url, _items in _by_server.items():
+                try:
+                    _resp = self._post_traffic_async(
+                        _server_url, "stop",
+                        {"streams": _items}, timeout=15,
+                    )
+                    if not _resp.ok:
+                        _delete_errors.append(
+                            f"{_server_url}: HTTP {_resp.status_code}"
+                        )
+                    else:
+                        logger.info(
+                            f"[DELETE] Stopped {len(_items)} running "
+                            f"stream(s) on {_server_url} before delete"
+                        )
+                except Exception as _e:
+                    _delete_errors.append(f"{_server_url}: {_e}")
 
         try:
             for _sid, stream_name, port_key, _iface_text in _targets:
@@ -1721,6 +1818,16 @@ class TrafficGenClientStreamControl:
 
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
             self.update_stream_table()
-            QMessageBox.information(self, "Stream Removed", "Selected streams have been removed.")
+            if _delete_errors:
+                QMessageBox.warning(
+                    self, "Stream Removed (server stop failed)",
+                    "Selected streams removed from the desktop client. "
+                    "The server-side stop request failed for:\n\n"
+                    + "\n".join(f"  • {_e}" for _e in _delete_errors)
+                    + "\n\nAny running tx_workers may now be orphaned. "
+                    "Use the Start-preflight orphan reaper to clean up."
+                )
+            else:
+                QMessageBox.information(self, "Stream Removed", "Selected streams have been removed.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An error occurred while removing the stream: {e}")

@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.408] - 2026-09-21
+
+### Fixed — Stream-button audit (7 HIGH + 3 MEDIUM)
+
+Full audit of every stream button action after the v0.5.404–407
+"basic bugs" the user flagged. Same class of fixes: partial-success
+parsing, pin+`stream_id=` on paints, error dialogs, auto-stop timer
+lifecycle. The audit findings pointed at the same fix pattern
+across five separate buttons, so ship one bundle.
+
+**H1: Stop All silent HTTP failure**
+(`traffic_client/stream_logic.py:1354, 1461-1476, 1519-1527`) —
+Non-OK response and connection exception now go into
+`_stop_all_errors` (mirrors `stop_stream`) and surface as a
+QMessageBox at the end. Pre-fix: click Stop All → server 500 →
+rows stayed green forever with no on-screen signal. Doesn't
+paint red or pin on failure (the request FAILED — lying about
+state would repeat the K5 mistake).
+
+**H2: Apply lies about status then never reconciles**
+(`traffic_client/stream_logic.py:1919-1924, 2233-2261, 2306-2337`) —
+`_apply_stream_body` used to pre-flip `s["status"]` to "stopped"
+/ "running" BEFORE the /stop or /restart POST returned; on
+failure it logged only. Now: if the request fails, we RESTORE
+the correct pre-Apply status (running-stream stop-fail → back
+to "running"; running-stream restart-fail → set to "stopped"
+because tx_worker may have died mid-restart) and collect the
+error for a single dialog at the end. Includes M14 fix for
+the restart-exception branch.
+
+**H3: Apply doesn't cancel/reschedule auto-stop timers on restart**
+(`traffic_client/stream_logic.py:2280-2305`) — When Apply causes
+tx_worker restart, the fresh run starts at t=0 but the old
+QTimer keeps counting toward the ORIGINAL deadline. Fires
+prematurely and kills the just-restarted stream. Now: on
+successful restart, cancel the stale timer and schedule a new
+one bound to the fresh run.
+
+**H4: Delete Stream silently orphans tx_workers AND lies in the confirm**
+(`traffic_client/stream_control.py:1611-1699, 1758-1811`) —
+`remove_selected_stream` only mutated `self.streams` (local
+dict). If any target was RUNNING, its tx_worker became a
+server-side orphan — the exact class the Start-preflight
+orphan-reaper is meant to warn about. Confirm text at
+`stream_control.py:1676` affirmatively claimed "removes from
+BOTH the desktop client AND the server" — false. Fix: identify
+running targets up-front, batch a real `/api/traffic/stop` per
+server BEFORE deleting locally, show the count of "will be
+stopped" streams in the confirm text, and if the server stop
+itself fails, still proceed with the local delete (operator's
+intent was clear) but surface a warning dialog listing the
+failures so they know to reap orphans.
+
+**H5: Start All non-OK paints ALL rows red without partial-success parse**
+(`traffic_client/stream_logic.py:1808-1859`) — `start_stream`
+(K5) parses `started_streams` from the non-OK body and greens
+the sids that actually started; `start_all_streams` didn't.
+Operator saw 5/8 rows as red though 5 were really running,
+re-clicked Start, hit `_streams_in_flight` collisions, flicker.
+Now: mirror the K5 pattern.
+
+**H6: Start All exception no partial parse, no dialog**
+(`traffic_client/stream_logic.py:1975-1988`) — Connection
+exception branch was log-only with red paint but no
+`errors_for_user`. Now collects into `_start_all_errors`
+alongside H5 and surfaces via the M13 dialog.
+
+**H7: Four red-paint sites missing `stream_id=`**
+(`traffic_client/stream_logic.py:826, 977, 1854, 1988`) — Row
+capture happens BEFORE `_post_traffic_async` / `_fetch_orphans`
+pump the event loop; a mid-pump `_do_update_stream_table`
+shifts rows so the captured `r` no longer maps to the same
+stream. v0.5.392 H1 fixed this for green paints but not the
+red ones. Now every red paint passes `stream_id=` so the sink
+re-resolves.
+
+**M8: Enabled checkbox matches by name — last K2 straggler**
+(`traffic_client/stream_control.py:731-762`) — `handle_enabled_
+combo_change` read `stream_id` from the row's UserRole for
+port resolution but then walked `self.streams[port]` by NAME
+to toggle. Two streams sharing a name on one port toggled the
+wrong one. Now: match by stream_id when available; fall back
+to name-match only when unambiguous (mirrors K2 refusal
+pattern).
+
+**M11: Stop paths don't cancel pending auto-stop timers**
+(`traffic_client/stream_logic.py:1244-1253, 1465-1475`) — A
+10s-duration stream stopped manually at t=3s left the QTimer
+alive; it fired at t=10s and spammed a redundant
+`_stop_stream_by_id` the operator couldn't correlate. Now
+`stop_stream`, `stop_all_streams`, and Apply's disable-stop
+branch cancel the timer per sid.
+
+**M13: Start All no `errors_for_user` dialog**
+(`traffic_client/stream_logic.py:1810-1814, 1990-2001`) —
+`start_stream` collects and shows failures; `start_all_streams`
+logged only. Now shows a single "Start All — some servers
+failed" dialog with per-server errors.
+
 ## [0.5.407] - 2026-09-21
 
 ### Fixed — Stop All still leaves rows green (v0.5.406 miss)

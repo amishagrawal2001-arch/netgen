@@ -823,7 +823,11 @@ class TrafficGenClientStreamLogic:
                             in_flight.discard(sid)
                         if r is not None:
                             try:
-                                self.update_stream_status(r, "red")
+                                # v0.5.408 (audit stream-H7):
+                                # pass stream_id= so the H1 row-
+                                # reresolve finds the right row
+                                # after mid-pump table shift.
+                                self.update_stream_status(r, "red", stream_id=sid)
                             except Exception:
                                 pass
 
@@ -971,10 +975,12 @@ class TrafficGenClientStreamLogic:
                 errors_for_user.append(err_msg)
                 for items in per_port.values():
                     for st, r in items:
-                        self.update_stream_status(r, "red")
-                        sid = st.get("stream_id")
-                        if sid:
-                            in_flight.discard(sid)
+                        # v0.5.408 (audit stream-H7): pass
+                        # stream_id= so H1 row-reresolve fires.
+                        _sid_h7 = st.get("stream_id")
+                        self.update_stream_status(r, "red", stream_id=_sid_h7)
+                        if _sid_h7:
+                            in_flight.discard(_sid_h7)
 
         # Surface HTTP / connection errors to the user in a single dialog so
         # they don't have to read logs to find out the start failed.
@@ -1233,6 +1239,16 @@ class TrafficGenClientStreamLogic:
                                     self._pin_client_stop(stream_id_from_table)
                             except Exception:
                                 pass
+                            # v0.5.408 (audit stream-M11): cancel
+                            # the pending auto-stop QTimer so it
+                            # doesn't fire minutes later on this
+                            # sid (now stopped) and spam a redundant
+                            # /stop the operator can't correlate.
+                            try:
+                                if hasattr(self, "_cancel_auto_stop_timer"):
+                                    self._cancel_auto_stop_timer(stream_id_from_table)
+                            except Exception:
+                                pass
                             break
 
                 # Fallback to name matching if stream_id didn't match.
@@ -1368,6 +1384,11 @@ class TrafficGenClientStreamLogic:
 
             stop_requests = {}
             total_running = 0
+            # v0.5.408 (audit stream-H1): mirror stop_stream's
+            # errors_for_user list so non-OK responses + connection
+            # exceptions surface as a QMessageBox at the end
+            # instead of vanishing into the log.
+            _stop_all_errors: list[str] = []
 
             for port_label, stream_list in getattr(self, "streams", {}).items():
                 try:
@@ -1469,6 +1490,15 @@ class TrafficGenClientStreamLogic:
                                     self._pin_client_stop(sid)
                             except Exception:
                                 pass
+                            # v0.5.408 (audit stream-M11): parity
+                            # with stop_stream — cancel the auto-
+                            # stop QTimer if any so it doesn't fire
+                            # a stale /stop later.
+                            try:
+                                if hasattr(self, "_cancel_auto_stop_timer"):
+                                    self._cancel_auto_stop_timer(sid)
+                            except Exception:
+                                pass
                             row_idx = row_index_map.get(sid)
                             if row_idx is not None:
                                 try:
@@ -1476,9 +1506,22 @@ class TrafficGenClientStreamLogic:
                                 except Exception as _e:
                                     logger.warning(f"[STOP-ALL] Row icon update failed: sid={sid} ({port_lbl}, {s_name}): {_e}")
                     else:
-                        logger.error(f"[STOP-ALL] Server {server_url} failed: {resp.status_code} {resp.text[:200]}")
+                        # v0.5.408 (audit stream-H1): surface HTTP
+                        # failure to the operator instead of
+                        # log-only. Do NOT paint red or pin — the
+                        # request FAILED, streams are likely still
+                        # running server-side; lying about that
+                        # would repeat the K5 mistake.
+                        body = (resp.text or "").strip()[:200]
+                        err_msg = f"{server_url}: HTTP {resp.status_code} {body}"
+                        logger.error(f"[STOP-ALL] {err_msg}")
+                        _stop_all_errors.append(err_msg)
                 except Exception as e:
-                    logger.error(f"[STOP-ALL] Could not reach {server_url}: {e}")
+                    # v0.5.408 (audit stream-H1): same as above
+                    # for connection exceptions.
+                    err_msg = f"{server_url}: {e}"
+                    logger.error(f"[STOP-ALL] {err_msg}")
+                    _stop_all_errors.append(err_msg)
 
             # v0.5.168: reap orphans on every server that had any.
             # The confirm dialog upstream gave the operator their
@@ -1513,6 +1556,16 @@ class TrafficGenClientStreamLogic:
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
 
             self.update_stream_table()
+            # v0.5.408 (audit stream-H1): surface any per-server
+            # failures collected above.
+            if _stop_all_errors:
+                QMessageBox.warning(
+                    self,
+                    "Stop All — some servers failed",
+                    "The Stop All request failed on the following "
+                    "server(s). Their streams may still be running:\n\n"
+                    + "\n\n".join(f"  • {_e}" for _e in _stop_all_errors),
+                )
         finally:
             finish()
 
@@ -1770,17 +1823,61 @@ class TrafficGenClientStreamLogic:
                         if r is not None:
                             self.update_stream_status(r, "yellow")
 
+            # v0.5.408 (audit stream-M13): collect per-server
+            # errors so the operator sees a single dialog at the
+            # end instead of log-only failures.
+            _start_all_errors: list[str] = []
             # --- Send to servers & update UI ---
             for server_url, per_port in server_payload_map.items():
                 try:
                     payload = {"streams": {p: [s for (s, _) in items] for p, items in per_port.items()}}
                     resp = self._post_traffic_async(server_url, "start", payload, timeout=10)
                     if not resp.ok:
-                        logger.error(f"[HTTP] Failed to start on {server_url}: {resp.status_code} {resp.text[:200]}")
+                        # v0.5.408 (audit stream-H5): mirror
+                        # start_stream K5 — parse started_streams
+                        # from the non-OK body so we only red-flag
+                        # sids the server did NOT confirm as
+                        # started. A 4xx/5xx that partially
+                        # succeeded shouldn't paint five running
+                        # streams red.
+                        body = (resp.text or "").strip()[:300]
+                        err_msg = f"{server_url}: HTTP {resp.status_code} {body}"
+                        logger.error(f"[HTTP] Failed to start on {err_msg}")
+                        _start_all_errors.append(err_msg)
+                        _started_partial: set = set()
+                        try:
+                            _partial = resp.json() or {}
+                            for _entry in (_partial.get("started_streams") or []):
+                                _psid = _entry.get("stream_id")
+                                if _psid:
+                                    _started_partial.add(_psid)
+                        except Exception:
+                            pass
                         for items in per_port.values():
-                            for _, r in items:
-                                if r is not None:
-                                    self.update_stream_status(r, "red")
+                            for _st_h5, r in items:
+                                _sid_h5 = _st_h5.get("stream_id")
+                                if _sid_h5 in _started_partial:
+                                    # This one DID start — green it.
+                                    try:
+                                        if _sid_h5 and hasattr(self, "_clear_client_stop"):
+                                            self._clear_client_stop(_sid_h5)
+                                    except Exception:
+                                        pass
+                                    if r is not None:
+                                        self.update_stream_status(r, "green", stream_id=_sid_h5)
+                                    _st_h5["status"] = "running"
+                                    _st_h5["enabled"] = True
+                                    _st_h5.setdefault("protocol_selection", {})["enabled"] = True
+                                else:
+                                    # v0.5.408 (audit stream-H7):
+                                    # pass stream_id= so H1 row-
+                                    # reresolve finds the correct
+                                    # row after a mid-pump table
+                                    # shift.
+                                    if r is not None:
+                                        self.update_stream_status(r, "red", stream_id=_sid_h5)
+                                if _sid_h5:
+                                    in_flight.discard(_sid_h5)
                         continue
 
                     data = resp.json()
@@ -1850,16 +1947,36 @@ class TrafficGenClientStreamLogic:
                                 )
 
                 except Exception as e:
-                    logger.error(f"Could not reach {server_url}: {e}")
+                    # v0.5.408 (audit stream-H6 + M13 + H7):
+                    # collect the error for the operator dialog,
+                    # and pass stream_id= on the red paint so
+                    # mid-pump row shifts don't paint the wrong row.
+                    err_msg = f"{server_url}: {e}"
+                    logger.error(f"Could not reach {err_msg}")
+                    _start_all_errors.append(err_msg)
                     for items in per_port.values():
-                        for _, r in items:
+                        for _st_h6, r in items:
+                            _sid_h6 = _st_h6.get("stream_id")
                             if r is not None:
-                                self.update_stream_status(r, "red")
+                                self.update_stream_status(r, "red", stream_id=_sid_h6)
+                            if _sid_h6:
+                                in_flight.discard(_sid_h6)
 
             # Refresh, then sync the single toggle icon (session save removed - only save on explicit user action)
             self.update_stream_table()
             if hasattr(self, "update_all_streams_toggle_ui"):
                 self.update_all_streams_toggle_ui()
+            # v0.5.408 (audit stream-M13): show the operator a
+            # single dialog listing per-server failures — matches
+            # what start_stream already does.
+            if _start_all_errors:
+                QMessageBox.warning(
+                    self,
+                    "Start All — some servers failed",
+                    "Start All could not complete on the following "
+                    "server(s):\n\n"
+                    + "\n\n".join(f"  • {_e}" for _e in _start_all_errors),
+                )
 
         finally:
             # Release the in-flight reservations made above. Done in
@@ -1910,6 +2027,12 @@ class TrafficGenClientStreamLogic:
         """The actual Apply logic — wrapped by apply_stream() so the
         re-entrance guard, busy-cursor + button-disabled feedback can
         share a single try/finally without indenting the whole method."""
+        # v0.5.408 (audit stream-H2 + M14): collect per-server
+        # Apply failures so the operator sees a single QMessageBox
+        # at the end. Pre-fix these were log-only, so an Apply on
+        # 4 running streams that failed silently marked them as
+        # "running" locally while their tx_workers may have died.
+        self._apply_errors: list[str] = []
         row_count = self.stream_table.rowCount()
 
         # 🔄 Sync inline-edited values from the table into self.streams
@@ -2193,10 +2316,39 @@ class TrafficGenClientStreamLogic:
                         # site uses .ok.
                         if resp.ok:
                             logger.info(f"Stopped {len(streams_to_stop)} stream(s) that were disabled on {port_label}")
+                            # v0.5.408 (audit stream-M11): parity
+                            # with stop_stream — cancel any
+                            # pending auto-stop QTimers for the
+                            # streams we just stopped.
+                            for _s_apply in streams_to_stop:
+                                try:
+                                    _sid_apply = _s_apply.get("stream_id")
+                                    if _sid_apply and hasattr(self, "_cancel_auto_stop_timer"):
+                                        self._cancel_auto_stop_timer(_sid_apply)
+                                except Exception:
+                                    pass
                         else:
-                            logger.error(f"Failed to stop disabled streams on {port_label}: {resp.status_code} - {resp.text[:200]}")
+                            # v0.5.408 (audit stream-H2): don't
+                            # keep the pre-flipped "stopped"
+                            # status if the /stop request failed.
+                            # Restore "running" and collect the
+                            # error so the operator sees it.
+                            _err = (
+                                f"{server_addr} ({port_label}): stop failed "
+                                f"HTTP {resp.status_code} {resp.text[:150]}"
+                            )
+                            logger.error(_err)
+                            self._apply_errors.append(_err)
+                            for _s_apply in streams_to_stop:
+                                _s_apply["status"] = "running"
                     except Exception as e:
-                        logger.error(f"Error stopping disabled streams on {port_label} via {server_addr}: {e}")
+                        # v0.5.408 (audit stream-H2): same as above
+                        # for connection exceptions.
+                        _err = f"{server_addr} ({port_label}): stop exception {e}"
+                        logger.error(_err)
+                        self._apply_errors.append(_err)
+                        for _s_apply in streams_to_stop:
+                            _s_apply["status"] = "running"
                     # Remove the temporary flag
                     for s in streams_to_stop:
                         s.pop("_was_running", None)
@@ -2233,10 +2385,66 @@ class TrafficGenClientStreamLogic:
                                 # Ensure interface field is preserved
                                 if not s.get("interface"):
                                     s["interface"] = interface_name
+                                # v0.5.408 (audit stream-H3): the
+                                # server just restarted tx_worker
+                                # fresh (its "duration_seconds"
+                                # countdown reset to 0). Cancel
+                                # any stale auto-stop QTimer and
+                                # schedule a new one so the
+                                # timer's deadline matches the
+                                # actual fresh run — otherwise
+                                # the timer fires early and kills
+                                # the just-restarted stream.
+                                try:
+                                    _sid_r = s.get("stream_id")
+                                    if _sid_r and hasattr(self, "_cancel_auto_stop_timer"):
+                                        self._cancel_auto_stop_timer(_sid_r)
+                                    if hasattr(self, "_schedule_stream_auto_stop"):
+                                        _row_idx = None
+                                        if hasattr(self, "_find_table_row"):
+                                            try:
+                                                _sname = (
+                                                    s.get("name")
+                                                    or s.get("protocol_selection", {}).get("name")
+                                                    or ""
+                                                )
+                                                _row_idx = self._find_table_row(port_label, _sname)
+                                            except Exception:
+                                                _row_idx = None
+                                        self._schedule_stream_auto_stop(
+                                            server_addr,
+                                            port_label=port_label,
+                                            stream_obj=s,
+                                            row_idx=_row_idx,
+                                        )
+                                except Exception as _te:
+                                    logger.debug(
+                                        f"[APPLY-H3] auto-stop reschedule "
+                                        f"skipped for '{s.get('name')}': {_te}"
+                                    )
                         else:
-                            logger.error(f"Failed to apply running streams on {port_label}: {resp.status_code} - {resp.text[:200]}")
+                            # v0.5.408 (audit stream-H2): mark
+                            # locally as stopped (the restart
+                            # attempt failed, the previous
+                            # tx_worker may have died or be in
+                            # limbo) and surface the failure to
+                            # the operator.
+                            _err = (
+                                f"{server_addr} ({port_label}): restart failed "
+                                f"HTTP {resp.status_code} {resp.text[:150]}"
+                            )
+                            logger.error(_err)
+                            self._apply_errors.append(_err)
+                            for s in running_streams:
+                                s["status"] = "stopped"
                     except Exception as e:
-                        logger.error(f"Error applying running streams to {port_label} via {server_addr}: {e}")
+                        # v0.5.408 (audit stream-H2 + M14): same
+                        # as above for connection exceptions.
+                        _err = f"{server_addr} ({port_label}): restart exception {e}"
+                        logger.error(_err)
+                        self._apply_errors.append(_err)
+                        for s in running_streams:
+                            s["status"] = "stopped"
                 
                 # For stopped streams, changes are already applied to self.streams above
                 # They will be used when the stream is started later
@@ -2250,6 +2458,22 @@ class TrafficGenClientStreamLogic:
 
         # 🔁 Refresh GUI - this will show all streams with their updated configurations
         self.update_stream_table()
+
+        # v0.5.408 (audit stream-H2 + M14): surface any per-server
+        # Apply failures collected above. Show ONE dialog listing
+        # everything; the operator can then decide whether to
+        # retry or investigate.
+        _apply_errs = getattr(self, "_apply_errors", None)
+        if _apply_errs:
+            QMessageBox.warning(
+                self,
+                "Apply — some operations failed",
+                "Apply completed with errors. The following server "
+                "operations failed and may leave streams in an "
+                "inconsistent state:\n\n"
+                + "\n\n".join(f"  • {_e}" for _e in _apply_errs),
+            )
+            self._apply_errors = []
 
     def send_inline_update_to_server(self, port, stream):
         """Send updated stream configuration to the corresponding TG server.
