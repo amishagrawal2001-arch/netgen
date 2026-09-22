@@ -848,7 +848,7 @@ class TrafficGenClientStreamControl:
             if len(_stack) >= 2:
                 _frame = _stack[-2]
                 _caller = f"{_frame.name}@{_frame.lineno}"
-            logger.info(
+            logger.debug(
                 f"[STATE-PAINT] sid={stream_id} row_hint={row} "
                 f"row_used={_target_row} color_req={_sink_color_before} "
                 f"color_final={color} pin_hit={_sink_pin_hit} "

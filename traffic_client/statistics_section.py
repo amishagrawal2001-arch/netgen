@@ -495,7 +495,7 @@ class TrafficGenClientStatisticsSection():
         (final in-flight batch, tracker drop, DB write lag) from
         flipping the row back to green."""
         if not stream_id:
-            logger.info(
+            logger.debug(
                 "[STATE-PIN] pin refused — stream_id is falsy"
             )
             return
@@ -516,7 +516,7 @@ class TrafficGenClientStatisticsSection():
                 _caller = f"{_frame.name}@{_frame.lineno}"
         except Exception:
             _caller = "?"
-        logger.info(
+        logger.debug(
             f"[STATE-PIN] SET sid={stream_id} caller={_caller} "
             f"pin_dict_size={len(_pinned)}"
         )
@@ -546,7 +546,7 @@ class TrafficGenClientStatisticsSection():
                     _caller = f"{_frame.name}@{_frame.lineno}"
             except Exception:
                 _caller = "?"
-            logger.info(
+            logger.debug(
                 f"[STATE-PIN] CLEAR sid={stream_id} caller={_caller} "
                 f"pin_dict_size={len(_pinned)}"
             )
@@ -2064,7 +2064,7 @@ class TrafficGenClientStatisticsSection():
                 # a just-stopped row still paints green (mismatched
                 # sid key would make _pin_ts=None here).
                 if sid_for_history:
-                    logger.info(
+                    logger.debug(
                         f"[STATE-POLL] pin_lookup sid={sid_for_history} "
                         f"pin_ts={_pin_ts} pin_active={_pin_active} "
                         f"pin_dict_size={len(_pinned)}"
@@ -2124,7 +2124,7 @@ class TrafficGenClientStatisticsSection():
                     # poll-driven green paint so we can see when a
                     # racing poll flips a just-stopped row back to
                     # running.
-                    logger.info(
+                    logger.debug(
                         f"[STATE-POLL] _paint_green sid={_sid} "
                         f"row={_row} — writing status='running'"
                     )
@@ -2137,7 +2137,7 @@ class TrafficGenClientStatisticsSection():
                     # v0.5.409 (audit stream-diag): trace red paints
                     # from the poll path too — symmetrical to the
                     # green trace above.
-                    logger.info(
+                    logger.debug(
                         f"[STATE-POLL] _paint_red sid={_sid} "
                         f"row={_row} — writing status='stopped'"
                     )

@@ -2,6 +2,24 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.414] - 2026-09-21
+
+### Changed — [STATE-*] diagnostic logs downgraded to DEBUG
+
+The three trace-driven fixes (v0.5.410 AA1, v0.5.411 BB1, v0.5.413
+CC1/CC2) all worked as intended — Start/Stop and Start All/Stop All
+now behave correctly. The `[STATE-*]` INFO logs added in v0.5.409
+and v0.5.412 have served their purpose and would just be noise in
+normal use.
+
+15 sites downgraded from `logger.info(...)` to `logger.debug(...)`:
+- `[STATE-PAINT]` (stream_control.py)
+- `[STATE-STOP]`, `[STATE-START-ALL] ENTER/SKIP/stream/payload_built/send/recv` (stream_logic.py)
+- `[STATE-PIN] SET/CLEAR/refused`, `[STATE-POLL] pin_lookup/_paint_green/_paint_red` (statistics_section.py)
+
+Logic and instrumentation intact — set `LOG_LEVEL=DEBUG` to re-
+enable if a future issue needs the trace back.
+
 ## [0.5.413] - 2026-09-21
 
 ### Fixed — Start All builds payload but pin never clears (v0.5.412 trace)

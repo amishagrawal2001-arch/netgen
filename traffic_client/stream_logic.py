@@ -1081,11 +1081,11 @@ class TrafficGenClientStreamLogic:
                 _sid_d = _n_d.data(Qt.UserRole) if _n_d else None
                 _name_d = _n_d.text().strip() if _n_d else ""
                 _diag_selected.append(f"row={_r_d} name={_name_d!r} sid={_sid_d}")
-            logger.info(
+            logger.debug(
                 f"[STATE-STOP] stop_stream ENTER selected={_diag_selected}"
             )
         except Exception as _e:
-            logger.info(f"[STATE-STOP] stop_stream ENTER (diag err: {_e})")
+            logger.debug(f"[STATE-STOP] stop_stream ENTER (diag err: {_e})")
 
         # Build requests per server
         stop_requests = {}  # server_url -> [{"interface": "...", "stream_id": "..."}]
@@ -1672,13 +1672,13 @@ class TrafficGenClientStreamLogic:
         try:
             _n_streams_local = sum(len(v) for v in getattr(self, "streams", {}).values())
             _n_rows_table = self.stream_table.rowCount() if hasattr(self, "stream_table") and self.stream_table else 0
-            logger.info(
+            logger.debug(
                 f"[STATE-START-ALL] ENTER local_streams={_n_streams_local} "
                 f"table_rows={_n_rows_table} "
                 f"ports={list(getattr(self, 'streams', {}).keys())}"
             )
         except Exception as _e:
-            logger.info(f"[STATE-START-ALL] ENTER (diag err: {_e})")
+            logger.debug(f"[STATE-START-ALL] ENTER (diag err: {_e})")
         try:
             # --- Sanity ---
             if not getattr(self, "server_interfaces", []):
@@ -1787,7 +1787,7 @@ class TrafficGenClientStreamLogic:
                     # v0.5.412 (audit stream-diag): per-stream
                     # enabled decision so we can tell if streams
                     # are silently dropped as disabled.
-                    logger.info(
+                    logger.debug(
                         f"[STATE-START-ALL] stream port={port_label} "
                         f"name={name!r} sid={_sid_diag} "
                         f"enabled_raw={s.get('enabled')} "
@@ -1926,7 +1926,7 @@ class TrafficGenClientStreamLogic:
                     len(items) for per_port in server_payload_map.values()
                     for items in per_port.values()
                 )
-                logger.info(
+                logger.debug(
                     f"[STATE-START-ALL] payload_built "
                     f"servers={list(server_payload_map.keys())} "
                     f"total_streams={_n_payload_streams} "
@@ -1944,13 +1944,13 @@ class TrafficGenClientStreamLogic:
                     # leaves a footprint too — pre-fix, only the
                     # non-OK branch logged, so a silent OK reply
                     # with no downstream row-paint was invisible.
-                    logger.info(
+                    logger.debug(
                         f"[STATE-START-ALL] send server={server_url} "
                         f"payload_ports={list(payload.get('streams', {}).keys())} "
                         f"payload_streams={sum(len(v) for v in payload.get('streams', {}).values())}"
                     )
                     resp = self._post_traffic_async(server_url, "start", payload, timeout=10)
-                    logger.info(
+                    logger.debug(
                         f"[STATE-START-ALL] recv server={server_url} "
                         f"http={getattr(resp, 'status_code', '?')} "
                         f"ok={getattr(resp, 'ok', '?')}"
