@@ -140,9 +140,19 @@ class ThroughputChart(QWidget):
 
     def add_sample(self, iface_to_bps, ts=None):
         """Add a sample point. iface_to_bps is {iface_name: bps_value}.
-        Multiple interfaces can be tracked simultaneously."""
+        Multiple interfaces can be tracked simultaneously.
+
+        v0.5.415 (audit stats-DD3): use monotonic() instead of wall-
+        clock time(). Pre-fix an NTP step-back of N seconds would
+        stamp new samples in the past, leaving `now = _samples[-1][0]`
+        pointing at the future timestamp — the sliding-window filter
+        (`t_min = now - WINDOW_SEC`) then excluded the fresh samples
+        or included stale ones, breaking the chart for
+        WINDOW_SEC + jump seconds. Every other timestamped state in
+        this file (pin dict, backoff, last-seen) already uses
+        monotonic(); this was the one hold-out."""
         if ts is None:
-            ts = _time.time()
+            ts = _time.monotonic()
         self._samples.append((ts, dict(iface_to_bps or {})))
         self.update()  # schedule paint
 
@@ -1858,6 +1868,18 @@ class TrafficGenClientStatisticsSection():
     def update_per_stream_statistics(self, stream_stats):
         # print(f"[DEBUG] update_per_stream_statistics() called with {len(stream_stats)} entries")
 
+        # v0.5.415 (audit stats-DD5): honor the operator's Pause
+        # toggle here too. `update_statistics_table` (:2283) and
+        # `update_stream_statistics_table` (:2578) both early-return
+        # on `_refresh_paused`, but this method didn't — so clicking
+        # Pause froze the two stats tables while the main streams-
+        # config table's Status column kept flipping colors and
+        # firing `update_stream_status()` (because this method's
+        # writes bypass the pause gate). "Only the GUI freezes" was
+        # only ~two-thirds true.
+        if getattr(self, "_refresh_paused", False):
+            return
+
         stat_map = {entry.get("stream_id"): entry for entry in stream_stats if entry.get("stream_id")}
 
         # v0.5.386 (audit stats-B5): pre-compute a stream_id →
@@ -2146,9 +2168,35 @@ class TrafficGenClientStatisticsSection():
                 def _accumulate_stopped_signal(_sid=sid_for_history):
                     """Bump the confirm counter for this sid; return
                     True when we've reached the threshold and it's
-                    safe to actually paint red."""
+                    safe to actually paint red.
+
+                    v0.5.415 (audit stats-DD11): dedupe rapid-fire
+                    bumps from the same logical poll cycle. Pre-fix,
+                    BOTH `_stats_worker` (`_on_stats_fetch_finished`)
+                    AND `_poll_worker` (`_on_poll_finished`) called
+                    `update_per_stream_statistics` every ~2 s, so
+                    the counter tripped in ~4 s (2 events × 2 ticks
+                    each) instead of the intended ~6 s (1 event × 3
+                    ticks). Hysteresis window was 33% shorter than
+                    the U2 docstring promised, re-opening the exact
+                    flicker U2 was written to close. Now: refuse to
+                    bump the same sid twice within `_MIN_BUMP_S`
+                    (1.5 s), so back-to-back accumulator calls from
+                    two workers on the same tick count as one."""
                     if not _sid:
                         return True
+                    _MIN_BUMP_S = 1.5
+                    _bump_ts = getattr(self, "_stopped_bump_ts", None)
+                    if _bump_ts is None:
+                        _bump_ts = {}
+                        self._stopped_bump_ts = _bump_ts
+                    _now_bump = _time_mod.monotonic()
+                    _prev_bump = _bump_ts.get(_sid)
+                    if _prev_bump is not None and (_now_bump - _prev_bump) < _MIN_BUMP_S:
+                        # Same-cycle duplicate — don't double-count,
+                        # but still report the current threshold state.
+                        return _confirms.get(_sid, 0) >= _STOPPED_CONFIRM_THRESHOLD
+                    _bump_ts[_sid] = _now_bump
                     _confirms[_sid] = _confirms.get(_sid, 0) + 1
                     return _confirms[_sid] >= _STOPPED_CONFIRM_THRESHOLD
 
@@ -2606,6 +2654,17 @@ class TrafficGenClientStatisticsSection():
         
         if not stream_stats_list:
             logger.debug(f"[DEBUG STREAM STATS] stream_stats_list is empty")
+            # v0.5.415 (audit stats-DD6): an empty response is
+            # STILL a successful poll — the operator's "is the
+            # pipeline fresh?" signal should tick. Pre-fix, a
+            # server with zero streams left the chip frozen at
+            # the timestamp of the last non-empty poll, making
+            # the operator think polling was wedged 10 minutes
+            # later when it wasn't. Bump the chip before bailing.
+            try:
+                self._update_last_refresh_chip()
+            except Exception:
+                pass
             return
 
         logger.debug(f"[DEBUG STREAM STATS] Updating table with {len(stream_stats_list)} stream(s)")
@@ -3053,27 +3112,44 @@ class TrafficGenClientStatisticsSection():
             # TX Rate — bold + blue to match the Interface Statistics tab's
             # Send Frame Rate row, so the live throughput readout looks the
             # same regardless of which tab the user happens to be on.
+            # v0.5.415 (audit stats-DD2): restore the Q3 (v0.5.400)
+            # None-vs-0.0 distinction. Pre-fix the OR-with-0.0
+            # collapsed "server hasn't reported yet" (None) into the
+            # same "0.00 pps" green-zero as "genuinely idle" (0.0),
+            # defeating exactly the false-positive Q3 was written to
+            # fix. Now: None → "—" (muted grey), 0.0 → "0.00 pps".
             tx_rate = stream.get("tx_rate")
-            if tx_rate is None or tx_rate == 0.0:
+            if tx_rate is None:
+                tx_rate_display = "—"
+            elif tx_rate == 0.0:
                 tx_rate_display = "0.00 pps"
             else:
                 tx_rate_display = format_rate(tx_rate)
             # v0.5.374: numeric-aware; sort by raw pps.
             tx_rate_item = _make_numeric_item(tx_rate_display, tx_rate or 0.0)
             tx_rate_item.setFont(QFont("Monaco, Consolas, monospace", 12, QFont.Bold))
-            tx_rate_item.setForeground(QColor("#1d4ed8"))  # Blue for TX
+            if tx_rate is None:
+                tx_rate_item.setForeground(QColor("#9ca3af"))  # muted grey — unknown
+            else:
+                tx_rate_item.setForeground(QColor("#1d4ed8"))  # Blue for TX
             self.stream_statistics_table.setItem(row, 5, tx_rate_item)
 
             # RX Rate — same monospace as TX but regular weight + darker
             # neutral, matching the Receive Frame Rate row in Interface Stats.
+            # v0.5.415 (audit stats-DD2): same None-vs-0.0 fix as TX.
             rx_rate = stream.get("rx_rate")
-            if rx_rate is None or rx_rate == 0.0:
+            if rx_rate is None:
+                rx_rate_display = "—"
+            elif rx_rate == 0.0:
                 rx_rate_display = "0.00 pps"
             else:
                 rx_rate_display = format_rate(rx_rate)
             # v0.5.374: numeric-aware; sort by raw pps.
             rx_rate_item = _make_numeric_item(rx_rate_display, rx_rate or 0.0)
-            rx_rate_item.setForeground(QColor("#111827"))
+            if rx_rate is None:
+                rx_rate_item.setForeground(QColor("#9ca3af"))  # muted grey — unknown
+            else:
+                rx_rate_item.setForeground(QColor("#111827"))
             self.stream_statistics_table.setItem(row, 6, rx_rate_item)
 
             # TX Bit Rate / RX Bit Rate — derived from the per-second rate
@@ -3216,7 +3292,22 @@ class TrafficGenClientStatisticsSection():
             self.stream_statistics_table.setItem(row, 10, loss_item)
 
             # Status
-            status = stream["status"]
+            # v0.5.415 (audit stats-DD1): consult the client-stop
+            # pin here too, otherwise this table lies about state
+            # for up to the AA1 grace window. Pre-fix, the main
+            # streams-config table (server_section.py) correctly
+            # forced red via W1/W4/Y1/Z1 pin gates, but this table
+            # rendered `stream["status"]` straight from the raw API
+            # payload — the pin only mutates `self.streams[...]`
+            # (the config dict), never the API payload dict. Result:
+            # two tables disagreed for up to 15 s (or indefinitely
+            # after v0.5.410 AA1) after every Stop click.
+            _sid_status = stream.get("stream_id")
+            _pinned_status = getattr(self, "_client_stopped_streams", None) or {}
+            if _sid_status and _sid_status in _pinned_status:
+                status = "stopped"
+            else:
+                status = stream.get("status", "unknown")
             status_item = QTableWidgetItem(status)
             if status.lower() == "running":
                 status_item.setForeground(QColor("#10b981"))  # Green
@@ -3232,8 +3323,25 @@ class TrafficGenClientStatisticsSection():
             flow_tracking_item.setTextAlignment(Qt.AlignCenter)
             self.stream_statistics_table.setItem(row, 12, flow_tracking_item)
 
-        # Resize columns to fit content
-        self.stream_statistics_table.resizeColumnsToContents()
+        # v0.5.415 (audit stats-DD4): resizeColumnsToContents used
+        # to run every 2 s poll — snapping back any manual column
+        # widening the operator did to read long stream names, and
+        # causing visible width jitter as content lengths shifted.
+        # Now: run once on the FIRST populated rebuild (when the
+        # operator hasn't yet had a chance to size a column), then
+        # never again unless the column count itself changes. To
+        # re-size explicitly, right-click the header and pick
+        # "Resize Columns to Contents" (Qt built-in).
+        try:
+            _prev_col_count = getattr(self, "_stream_stats_last_col_count", -1)
+            _now_col_count = self.stream_statistics_table.columnCount()
+            _autosized = getattr(self, "_stream_stats_autosized", False)
+            if not _autosized or _now_col_count != _prev_col_count:
+                self.stream_statistics_table.resizeColumnsToContents()
+                self._stream_stats_autosized = True
+                self._stream_stats_last_col_count = _now_col_count
+        except Exception:
+            pass
 
         # v0.2.99: restore sort indicator + re-apply filter + update
         # the last-refresh chip. The capture happened at the top of
@@ -3307,7 +3415,11 @@ class TrafficGenClientStatisticsSection():
         """Stamp the action-bar chip with the current wall-clock time.
         Called at the end of every successful (non-paused) rebuild of
         the stream table — that's the operator's primary "is this
-        fresh?" signal. Format: ``Updated HH:MM:SS``."""
+        fresh?" signal. Format: ``Updated HH:MM:SS``.
+
+        v0.5.415 (audit stats-DD7): also stamps a monotonic
+        timestamp so the watchdog (`_check_refresh_chip_staleness`)
+        can flip the chip amber when polling wedges."""
         if not hasattr(self, "last_refresh_label") \
                 or self.last_refresh_label is None:
             return
@@ -3315,12 +3427,63 @@ class TrafficGenClientStatisticsSection():
         ts = f"{now.tm_hour:02d}:{now.tm_min:02d}:{now.tm_sec:02d}"
         try:
             self.last_refresh_label.setText(f"Updated {ts}")
-            # Reset to neutral grey (the colour is amber when the chip
-            # has been frozen by the pause toggle for > 5 s; otherwise
-            # plain grey).
+            # Reset to neutral grey — the watchdog below will flip
+            # to amber if no fresh update arrives within
+            # _REFRESH_STALE_S seconds.
             self.last_refresh_label.setStyleSheet(
                 "QLabel { color: #6b7280; font-size: 10px; padding: 0 6px; }"
             )
+            self._last_refresh_monotonic = _time.monotonic()
+        except Exception:
+            pass
+        # Lazily arm the staleness watchdog on first stamp. The
+        # timer fires every 2 s and flips the chip amber when
+        # `now - _last_refresh_monotonic > _REFRESH_STALE_S`.
+        try:
+            if not getattr(self, "_refresh_stale_timer", None):
+                from PyQt5.QtCore import QTimer as _QTimer_dd7
+                self._refresh_stale_timer = _QTimer_dd7(self)
+                self._refresh_stale_timer.setInterval(2000)
+                self._refresh_stale_timer.timeout.connect(
+                    self._check_refresh_chip_staleness
+                )
+                self._refresh_stale_timer.start()
+        except Exception:
+            pass
+
+    def _check_refresh_chip_staleness(self):
+        """v0.5.415 (audit stats-DD7): the watchdog the tooltip
+        promised since forever. Runs every 2 s. If the last
+        successful stats-table rebuild happened more than
+        _REFRESH_STALE_S ago (default 5 s), flip the chip text to
+        amber so the operator sees at a glance that polling has
+        wedged. When Pause is active we skip the check — the chip
+        is intentionally frozen; painting it amber would be
+        misleading."""
+        _REFRESH_STALE_S = 5.0
+        if getattr(self, "_refresh_paused", False):
+            return
+        if not hasattr(self, "last_refresh_label") \
+                or self.last_refresh_label is None:
+            return
+        _last = getattr(self, "_last_refresh_monotonic", None)
+        if _last is None:
+            return
+        try:
+            _age = _time.monotonic() - _last
+            if _age > _REFRESH_STALE_S:
+                self.last_refresh_label.setStyleSheet(
+                    "QLabel { color: #b45309; font-size: 10px; "
+                    "padding: 0 6px; font-weight: 600; }"
+                )
+            else:
+                # Only reset to grey if we're currently amber — no
+                # need to churn the stylesheet on every tick.
+                _ss = self.last_refresh_label.styleSheet() or ""
+                if "#b45309" in _ss:
+                    self.last_refresh_label.setStyleSheet(
+                        "QLabel { color: #6b7280; font-size: 10px; padding: 0 6px; }"
+                    )
         except Exception:
             pass
 

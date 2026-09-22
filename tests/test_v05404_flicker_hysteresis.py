@@ -51,7 +51,9 @@ def test_u1_u2_markers_present():
 def test_u2_hysteresis_state_and_threshold():
     src = _read("traffic_client/statistics_section.py")
     _idx = src.index("v0.5.404 (audit stats-U1 + U2)")
-    body = src[_idx:_idx + 6000]
+    # Window widened for v0.5.415 DD11 which grew
+    # _accumulate_stopped_signal's body.
+    body = src[_idx:_idx + 8000]
     # Per-sid confirm cache
     assert "_stopped_confirm_count" in body
     # Threshold = 3

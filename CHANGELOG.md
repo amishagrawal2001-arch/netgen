@@ -2,6 +2,86 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.415] - 2026-09-21
+
+### Fixed — Stream Statistics panel audit (5 HIGH + 3 MEDIUM)
+
+Post-mortem audit of the Stream Statistics panel after the stream-
+button work in v0.5.402–413 stabilized. Novel findings only —
+anything already carrying a v0.5.400 Q1–Q5 / v0.5.404 U1–U5 /
+v0.5.405–413 tag was skipped.
+
+**DD1: stats-table status column consults client-stop pin**
+(`traffic_client/statistics_section.py:3225-3247`) — Pre-fix the
+Stream Statistics table rendered `stream["status"]` straight from
+the raw API payload. The pin, hysteresis, and counter-advance
+gates all mutate the *config* stream dict (`self.streams[...]`),
+never the payload dict — so this table lied about state for up to
+15 s (or indefinitely after v0.5.410 AA1) after every Stop click.
+Two tables disagreed. Now: sid present in
+`_client_stopped_streams` → force "stopped" here too.
+
+**DD2: restore Q3 None-vs-0.0 distinction**
+(`traffic_client/statistics_section.py:3070-3093`) — Q3 (v0.5.400)
+intended `None` (server hasn't reported) → muted "—" and `0.0`
+(genuinely idle) → "0.00 pps", but the caller's `if tx_rate is
+None or tx_rate == 0.0` short-circuit collapsed both into
+"0.00 pps" and `format_rate()` was never reached with `None`.
+Warmup streams read as false-positive green-zero. Now: None →
+muted grey "—", 0.0 → "0.00 pps", rate → `format_rate()`.
+
+**DD3: ThroughputChart uses monotonic() instead of wall-clock**
+(`traffic_client/statistics_section.py:141-155`) — Every other
+timestamped state in this file (pin dict, backoff, last-seen)
+uses `monotonic()`; the chart's `add_sample` was the one holdout
+still calling `time.time()`. NTP step-back of N seconds stamped
+new samples in the past → `now = _samples[-1][0]` still pointed
+at the future timestamp → sliding-window filter excluded fresh
+samples or included stale ones, breaking the chart for
+`WINDOW_SEC + jump` seconds.
+
+**DD4: `resizeColumnsToContents()` runs once per structural change**
+(`traffic_client/statistics_section.py:3252-3271`) — Pre-fix, this
+fired every 2 s poll, snapping back any manual column widening
+the operator did and causing visible width jitter. Now: track
+`_stream_stats_autosized` + `_stream_stats_last_col_count`; run
+once on first populated rebuild, again if column count changes.
+
+**DD5: `update_per_stream_statistics` honors `_refresh_paused`**
+(`traffic_client/statistics_section.py:1858-1875`) —
+`update_statistics_table` and `update_stream_statistics_table`
+both gate on the Pause toggle; this method didn't, so clicking
+Pause froze two tables while the main streams-config table's
+Status column kept flipping colors. Now gated too.
+
+**DD6: chip ticks even on empty-response polls**
+(`traffic_client/statistics_section.py:2607-2626`) — Empty
+`stream_stats_list` early-returned before
+`_update_last_refresh_chip()`, so a poll against a server running
+zero streams left the chip frozen at the last non-empty
+timestamp. Operator thought polling was wedged. Now: chip is
+bumped before the early return.
+
+**DD7: implement the amber-when-stale watchdog the tooltip promised**
+(`traffic_client/statistics_section.py:3323-3392`) — Chip tooltip
+has always claimed "Stale (>5 s) text turns amber to flag a poll
+wedge" but nothing implemented it. Now `_update_last_refresh_chip`
+stamps a monotonic timestamp and arms a QTimer that fires every
+2 s; `_check_refresh_chip_staleness` flips the label amber when
+`now - _last_refresh_monotonic > 5s`, back to grey on the next
+fresh update. Skipped during Pause (intentional freeze).
+
+**DD11: dedupe `_stopped_confirm_count` across dual-worker paths**
+(`traffic_client/statistics_section.py:2168-2198`) — Both
+`_stats_worker` and `_poll_worker` call
+`update_per_stream_statistics` every ~2 s, so U2's confirm
+counter tripped in ~4 s (2 events × 2 ticks) instead of the
+intended ~6 s (1 event × 3 ticks). Hysteresis was 33% weaker
+than the docstring claimed, potentially re-opening the flicker
+U2 was written to close. Now: refuse to bump the same sid twice
+within 1.5 s — back-to-back accumulator calls from two workers
+on the same tick count as one.
+
 ## [0.5.414] - 2026-09-21
 
 ### Changed — [STATE-*] diagnostic logs downgraded to DEBUG
