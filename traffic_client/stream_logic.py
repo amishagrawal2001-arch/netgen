@@ -1070,6 +1070,22 @@ class TrafficGenClientStreamLogic:
         if not selected:
             QMessageBox.warning(self, "No Selection", "Please select a stream to stop.")
             return
+        # v0.5.409 (audit stream-diag): log entry with the selected
+        # rows + their UserRole sids so we know exactly what the
+        # button was asked to act on.
+        try:
+            _diag_selected = []
+            for _idx_d in selected:
+                _r_d = _idx_d.row()
+                _n_d = self.stream_table.item(_r_d, 2)
+                _sid_d = _n_d.data(Qt.UserRole) if _n_d else None
+                _name_d = _n_d.text().strip() if _n_d else ""
+                _diag_selected.append(f"row={_r_d} name={_name_d!r} sid={_sid_d}")
+            logger.info(
+                f"[STATE-STOP] stop_stream ENTER selected={_diag_selected}"
+            )
+        except Exception as _e:
+            logger.info(f"[STATE-STOP] stop_stream ENTER (diag err: {_e})")
 
         # Build requests per server
         stop_requests = {}  # server_url -> [{"interface": "...", "stream_id": "..."}]

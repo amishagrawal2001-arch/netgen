@@ -495,6 +495,9 @@ class TrafficGenClientStatisticsSection():
         (final in-flight batch, tracker drop, DB write lag) from
         flipping the row back to green."""
         if not stream_id:
+            logger.info(
+                "[STATE-PIN] pin refused — stream_id is falsy"
+            )
             return
         import time as _time_mod
         _pinned = getattr(self, "_client_stopped_streams", None)
@@ -502,6 +505,21 @@ class TrafficGenClientStatisticsSection():
             _pinned = {}
             self._client_stopped_streams = _pinned
         _pinned[stream_id] = _time_mod.monotonic()
+        # v0.5.409 (audit stream-diag): every pin change logged
+        # so [STATE-PIN] traces the client-stop dict lifecycle.
+        try:
+            import traceback as _tb_pin
+            _caller = ""
+            _stack = _tb_pin.extract_stack(limit=3)
+            if len(_stack) >= 2:
+                _frame = _stack[-2]
+                _caller = f"{_frame.name}@{_frame.lineno}"
+        except Exception:
+            _caller = "?"
+        logger.info(
+            f"[STATE-PIN] SET sid={stream_id} caller={_caller} "
+            f"pin_dict_size={len(_pinned)}"
+        )
 
     def _clear_client_stop(self, stream_id):
         """v0.5.405 (audit stats-W3): drop the client-stop pin for
@@ -513,7 +531,25 @@ class TrafficGenClientStatisticsSection():
         _pinned = getattr(self, "_client_stopped_streams", None)
         if _pinned is None:
             return
+        _had = stream_id in _pinned
         _pinned.pop(stream_id, None)
+        # v0.5.409 (audit stream-diag): only log real removals so
+        # spurious clears (start-path called with no prior pin)
+        # don't drown the log.
+        if _had:
+            try:
+                import traceback as _tb_clr
+                _caller = ""
+                _stack = _tb_clr.extract_stack(limit=3)
+                if len(_stack) >= 2:
+                    _frame = _stack[-2]
+                    _caller = f"{_frame.name}@{_frame.lineno}"
+            except Exception:
+                _caller = "?"
+            logger.info(
+                f"[STATE-PIN] CLEAR sid={stream_id} caller={_caller} "
+                f"pin_dict_size={len(_pinned)}"
+            )
 
     def setup_traffic_statistics_section(self):
         self.statistics_group = QGroupBox("Traffic Statistics")
@@ -2015,6 +2051,16 @@ class TrafficGenClientStatisticsSection():
                     _pin_ts is not None
                     and (_now_ts - _pin_ts) < _GRACE_S
                 )
+                # v0.5.409 (audit stream-diag): trace pin lookup
+                # per-stream in the poll path — the #1 suspect if
+                # a just-stopped row still paints green (mismatched
+                # sid key would make _pin_ts=None here).
+                if sid_for_history:
+                    logger.info(
+                        f"[STATE-POLL] pin_lookup sid={sid_for_history} "
+                        f"pin_ts={_pin_ts} pin_active={_pin_active} "
+                        f"pin_dict_size={len(_pinned)}"
+                    )
                 if _pin_active:
                     # Force red inside grace window; ignore server
                     # state entirely. Log so operators can trace.
@@ -2066,12 +2112,27 @@ class TrafficGenClientStatisticsSection():
                     if _sid:
                         _confirms.pop(_sid, None)
                     stream["status"] = "running"
+                    # v0.5.409 (audit stream-diag): trace every
+                    # poll-driven green paint so we can see when a
+                    # racing poll flips a just-stopped row back to
+                    # running.
+                    logger.info(
+                        f"[STATE-POLL] _paint_green sid={_sid} "
+                        f"row={_row} — writing status='running'"
+                    )
                     self.update_stream_status(_row, "green", stream_id=_sid)
 
                 def _paint_red(_sid=sid_for_history, _row=row):
                     stream["status"] = "stopped"
                     stream["tx_rate"] = 0.0
                     stream["rx_rate"] = 0.0
+                    # v0.5.409 (audit stream-diag): trace red paints
+                    # from the poll path too — symmetrical to the
+                    # green trace above.
+                    logger.info(
+                        f"[STATE-POLL] _paint_red sid={_sid} "
+                        f"row={_row} — writing status='stopped'"
+                    )
                     self.update_stream_status(_row, "red", stream_id=_sid)
 
                 def _accumulate_stopped_signal(_sid=sid_for_history):

@@ -2,6 +2,40 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.409] - 2026-09-21
+
+### Diagnostic — instrument stream-status transitions
+
+Bug-report cycle keeps producing "still green after Stop" reports
+that the source-level trace can't reproduce. Instrument every
+color-decision + pin-write + poll-paint site at INFO level so the
+next report ships with an actual runtime trace.
+
+Grep the client log for `[STATE-` to see:
+
+- **`[STATE-PAINT]`** (`traffic_client/stream_control.py:812-830`) —
+  every call to `update_stream_status`: sid, row hint vs row
+  actually written, requested color, final color, whether the Z1
+  sink pin gate fired, calling function name.
+- **`[STATE-PIN] SET`** and **`CLEAR`**
+  (`traffic_client/statistics_section.py:491-547`) — every write
+  to `_client_stopped_streams`, with the caller so we can
+  correlate to which button click set it.
+- **`[STATE-STOP]`** (`traffic_client/stream_logic.py:1076-1091`) —
+  `stop_stream` entry with the full selected-rows snapshot
+  (row/name/sid triples).
+- **`[STATE-POLL] pin_lookup`**
+  (`traffic_client/statistics_section.py:2056-2064`) — per-stream
+  pin lookup inside the 2 s stats poll: sid, pin_ts, grace-window
+  active flag, pin dict size. If a just-stopped stream shows
+  `pin_ts=None`, the sid key mismatched — that's the bug.
+- **`[STATE-POLL] _paint_green` / `_paint_red`**
+  (`traffic_client/statistics_section.py:2075-2098`) — every
+  status write from the poll path with sid + row.
+
+No logic changes. Diagnostic-only ship so the next user report
+can be root-caused from a trace instead of another guess.
+
 ## [0.5.408] - 2026-09-21
 
 ### Fixed — Stream-button audit (7 HIGH + 3 MEDIUM)

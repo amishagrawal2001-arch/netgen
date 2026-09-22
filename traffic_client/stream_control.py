@@ -820,6 +820,13 @@ class TrafficGenClientStreamControl:
                         break
             except Exception:
                 _target_row = row
+        # v0.5.409 (audit stream-diag): log every paint with the
+        # requested color, sid, row, whether we resolved to a
+        # different row, and whether the Z1 pin gate fired. Grep
+        # the log for `[STATE-PAINT]` to trace what turned any
+        # given row green/red/yellow — and when.
+        _sink_color_before = color
+        _sink_pin_hit = False
         if stream_id is not None and color != "red":
             try:
                 _pinned = getattr(self, "_client_stopped_streams", None)
@@ -829,8 +836,24 @@ class TrafficGenClientStreamControl:
                         import time as _t_z1
                         if (_t_z1.monotonic() - _pin_ts) < 15.0:
                             color = "red"
+                            _sink_pin_hit = True
             except Exception:
                 pass
+        try:
+            import traceback as _tb_diag
+            _caller = ""
+            _stack = _tb_diag.extract_stack(limit=3)
+            if len(_stack) >= 2:
+                _frame = _stack[-2]
+                _caller = f"{_frame.name}@{_frame.lineno}"
+            logger.info(
+                f"[STATE-PAINT] sid={stream_id} row_hint={row} "
+                f"row_used={_target_row} color_req={_sink_color_before} "
+                f"color_final={color} pin_hit={_sink_pin_hit} "
+                f"caller={_caller}"
+            )
+        except Exception:
+            pass
         status_item = QTableWidgetItem()
         status_item.setIcon(status_dot_icon(color, 14))
         status_item.setFlags(Qt.ItemIsEnabled)  # read-only
