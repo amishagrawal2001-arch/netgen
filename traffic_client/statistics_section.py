@@ -1321,8 +1321,19 @@ class TrafficGenClientStatisticsSection():
             stream_stats = data.get("streams", [])
             
             logger.debug(f"[DEBUG STREAM STATS] Got {len(stream_stats)} stream(s) from {server_address}")
-            # Update stream objects with latest statistics
-            self.update_per_stream_statistics(stream_stats)
+            # v0.5.404 (audit stats-U1 + U2, follow-up trace):
+            # Q1 in v0.5.400 hoisted the aggregated call OUT of
+            # _on_poll_finished (path B) — but path A (this
+            # _on_stats_fetch_finished loop) STILL called it
+            # per-server, causing the exact multi-TG flicker Q1
+            # was meant to eliminate. Every iteration walked
+            # stream_table, hit the "not in stat_map" branch for
+            # streams belonging to OTHER TGs, and (with pre-U2
+            # code) painted them red until the OTHER TG's
+            # iteration corrected them. Fix: don't call
+            # update_per_stream_statistics here; instead
+            # accumulate into all_stream_stats and call it ONCE
+            # after the loop (below) with the full merged list.
             all_stream_stats.extend(stream_stats)
             
             # Process stream statistics for merged_statistics
@@ -1564,6 +1575,24 @@ class TrafficGenClientStatisticsSection():
             else:
                 self.clear_statistics_table()
         
+        # v0.5.404 (audit stats-U1 + U2, follow-up trace): the Q1
+        # fix in v0.5.400 hoisted the aggregated
+        # update_per_stream_statistics call out of _on_poll_finished
+        # (path B) — but this _on_stats_fetch_finished (path A)
+        # was left unchanged, so path A still called it per-server
+        # inside the loop above. Every iteration painted OTHER TGs'
+        # rows red via the "not in stat_map" branch. Net result: on
+        # multi-TG rigs the flicker persisted despite Q1. Fix: also
+        # aggregate here. Same shape Q1 used — one call with the
+        # full merged list, then update_stream_statistics_table.
+        try:
+            self.update_per_stream_statistics(all_stream_stats)
+        except Exception as _upps_exc:
+            logger.error(
+                f"[STATS] aggregated update_per_stream_statistics "
+                f"(path A) failed: {_upps_exc}"
+            )
+
         # Always update stream statistics table with all collected streams (even if empty, to clear table)
         logger.debug(f"[DEBUG STREAM STATS] Calling update_stream_statistics_table with {len(all_stream_stats)} stream(s)")
         self.update_stream_statistics_table(all_stream_stats)
@@ -1922,14 +1951,61 @@ class TrafficGenClientStatisticsSection():
                 if sid_for_history:
                     prev[sid_for_history] = (_tx_now, _rx_now)
 
+                # v0.5.404 (audit stats-U1 + U2): hysteresis on
+                # green→red transitions. Pre-fix, ANY single poll
+                # where server_status=="stopped" AND counters
+                # didn't advance flipped the row to red — even
+                # though that's a common transient (server tracker
+                # briefly drops during restart, poll batching, DB
+                # write race, etc). Combined with the next poll's
+                # "running" recovery, the operator saw a red↔green
+                # strobe. Fix: track per-sid _stopped_confirm_count.
+                # Only flip to red after N (=3) CONSECUTIVE polls
+                # confirming stopped. Every green paint resets the
+                # counter to 0. Real stops (operator clicks Stop,
+                # tx_worker dies) still turn red within ~6 s (3 ×
+                # 2 s poll interval) — imperceptibly slower than
+                # before but eliminates the visible flicker.
+                #
+                # U1: the "absent from stat_map" else-branch used
+                # to default to red. Now it defaults to "no change"
+                # (keep whatever color the row already has) unless
+                # we've seen enough consecutive absents to confirm
+                # the stream really is gone.
+                _STOPPED_CONFIRM_THRESHOLD = 3
+                _confirms = getattr(self, "_stopped_confirm_count", None)
+                if _confirms is None:
+                    _confirms = {}
+                    self._stopped_confirm_count = _confirms
+
+                def _paint_green(_sid=sid_for_history, _row=row):
+                    if _sid:
+                        _confirms.pop(_sid, None)
+                    stream["status"] = "running"
+                    self.update_stream_status(_row, "green", stream_id=_sid)
+
+                def _paint_red(_sid=sid_for_history, _row=row):
+                    stream["status"] = "stopped"
+                    stream["tx_rate"] = 0.0
+                    stream["rx_rate"] = 0.0
+                    self.update_stream_status(_row, "red", stream_id=_sid)
+
+                def _accumulate_stopped_signal(_sid=sid_for_history):
+                    """Bump the confirm counter for this sid; return
+                    True when we've reached the threshold and it's
+                    safe to actually paint red."""
+                    if not _sid:
+                        return True
+                    _confirms[_sid] = _confirms.get(_sid, 0) + 1
+                    return _confirms[_sid] >= _STOPPED_CONFIRM_THRESHOLD
+
                 if server_status == "running":
                     new_status = "running"
-                    stream["status"] = new_status
-                    self.update_stream_status(row, "green", stream_id=sid_for_history)
+                    _paint_green()
                 elif server_status == "stopped":
                     if _counters_advanced:
-                        # Counter-advance override: packets are flowing
-                        # right now, so the server's "stopped" is stale.
+                        # J2 override intact — counters prove the stream is
+                        # still flowing, ignore the server's stale label.
                         try:
                             logger.warning(
                                 f"[STATUS] Server says stopped but "
@@ -1941,27 +2017,35 @@ class TrafficGenClientStatisticsSection():
                         except Exception:
                             pass
                         new_status = "running"
-                        stream["status"] = new_status
-                        self.update_stream_status(row, "green", stream_id=sid_for_history)
+                        _paint_green()
                     else:
-                        new_status = "stopped"
-                        stream["status"] = new_status
-                        # Zero out rates for stopped streams
-                        stream["tx_rate"] = 0.0
-                        stream["rx_rate"] = 0.0
-                        self.update_stream_status(row, "red", stream_id=sid_for_history)
+                        # U2 hysteresis: server EXPLICITLY said stopped
+                        # and counters didn't advance. Confirm this signal
+                        # but don't flip red until we've seen N in a row.
+                        if _accumulate_stopped_signal():
+                            new_status = "stopped"
+                            _paint_red()
+                        else:
+                            # Suppress the flip for now; keep whatever
+                            # color the row currently has.
+                            new_status = old_status
+                            logger.debug(
+                                f"[STATUS] sid={sid_for_history} server "
+                                f"reported stopped but confirm-count "
+                                f"{_confirms.get(sid_for_history, 0)}/"
+                                f"{_STOPPED_CONFIRM_THRESHOLD} — "
+                                f"suppressing red flip"
+                            )
                 elif (stream_id and stream_id in stat_map) or (stream_id_from_table and stream_id_from_table in stat_map):
                     # Fallback: if status not provided but stream is in stats, assume running
                     new_status = "running"
-                    stream["status"] = new_status
-                    self.update_stream_status(row, "green", stream_id=sid_for_history)
+                    _paint_green()
                 else:
-                    # Stream not in stats at all — but J2 counter-advance
-                    # override applies here too: if the last poll for this
-                    # sid pushed higher counts than the one before, the
-                    # stream WAS running and this absence is a transient
-                    # (server bounce, poll landed between DB writes, etc).
-                    # Don't repaint red on the strength of one absent poll.
+                    # U1: stream absent from stat_map. Common causes:
+                    # (a) server response batch briefly omitted this sid;
+                    # (b) partitioned server; (c) genuinely stopped.
+                    # J2 override still fires when counters advanced.
+                    # Otherwise: hysteresis-gate the red flip.
                     if _counters_advanced:
                         try:
                             logger.warning(
@@ -1974,14 +2058,22 @@ class TrafficGenClientStatisticsSection():
                         except Exception:
                             pass
                         new_status = "running"
-                        stream["status"] = new_status
-                        self.update_stream_status(row, "green", stream_id=sid_for_history)
+                        _paint_green()
                     else:
-                        new_status = "stopped"
-                        stream["status"] = new_status
-                        stream["tx_rate"] = 0.0
-                        stream["rx_rate"] = 0.0
-                        self.update_stream_status(row, "red", stream_id=sid_for_history)
+                        if _accumulate_stopped_signal():
+                            new_status = "stopped"
+                            _paint_red()
+                        else:
+                            new_status = old_status
+                            logger.debug(
+                                f"[STATUS] sid={sid_for_history} absent "
+                                f"from stat_map, counters didn't advance, "
+                                f"confirm-count "
+                                f"{_confirms.get(sid_for_history, 0)}/"
+                                f"{_STOPPED_CONFIRM_THRESHOLD} — "
+                                f"suppressing red flip (keeping "
+                                f"'{old_status}')"
+                            )
                 
                 if old_status != new_status:
                     status_changed = True

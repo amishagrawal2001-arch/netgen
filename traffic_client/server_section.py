@@ -1427,6 +1427,23 @@ class TrafficGenClientServerSection():
         try:
             from utils.qicon_loader import status_dot_icon
 
+            # v0.5.404 (audit stats-U3): consult the same
+            # _stopped_confirm_count hysteresis cache that
+            # update_per_stream_statistics uses. Pre-fix, this
+            # in-place refresh happily painted red the moment
+            # `stream["status"] != "running"` — bypassing the J2
+            # counter-advance override AND the U2 confirm-count
+            # gate. So one "stopped" tick from the poller would
+            # flip red here even if the next tick would restore
+            # green. Same source-of-truth divergence caused the
+            # flicker the user reported after v0.5.393 and
+            # v0.5.400. Now: if we're about to paint RED but the
+            # confirm count hasn't hit the threshold yet, skip
+            # the flip and keep whatever color the row already
+            # had. update_per_stream_statistics owns the confirm
+            # counter; this method just reads it.
+            _confirms_ro = getattr(self, "_stopped_confirm_count", None) or {}
+            _STOPPED_CONFIRM_THRESHOLD_RO = 3
             for row in range(table.rowCount()):
                 name_item = table.item(row, 2)
                 if name_item is None:
@@ -1441,6 +1458,18 @@ class TrafficGenClientServerSection():
                     continue
                 status = stream.get("status", "stopped")
                 color = self._STATUS_TO_COLOR.get(status, "red")
+                # U3 gate: refuse to flip green→red unless the
+                # confirm-count agrees the stream is REALLY stopped.
+                if color == "red" and pushed.get(sid) in ("green", "blue"):
+                    if _confirms_ro.get(sid, 0) < _STOPPED_CONFIRM_THRESHOLD_RO:
+                        logger.debug(
+                            f"[STATUS-IN-PLACE] sid={sid} "
+                            f"status='{status}' would flip red but "
+                            f"confirm-count {_confirms_ro.get(sid, 0)}/"
+                            f"{_STOPPED_CONFIRM_THRESHOLD_RO} — "
+                            f"keeping '{pushed.get(sid)}'"
+                        )
+                        continue
                 if pushed.get(sid) == color:
                     continue   # nothing to do
                 try:

@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.404] - 2026-09-21
+
+### Fixed — stream status still flickering green↔red (user-reported)
+
+Follow-up to v0.5.393 J1/J2/J3 and v0.5.400 Q1. User reported the
+flicker was still visible after those fixes. Traced to two remaining
+gaps in the paint pipeline:
+
+**Root cause 1:** `update_per_stream_statistics` flipped `stream["status"]`
+to `"stopped"` (and painted red) on ANY SINGLE poll where
+`server_status=="stopped"` AND counters didn't advance. But that's
+a common transient — the server's stat_map briefly omits a running
+stream during a restart / DB write race / poll batching, or the
+stream's counters plateau for one tick because the tx_worker sample
+timing != poll timing. Next poll: recovery → green. Result: 2-tick
+red↔green strobe.
+
+**Root cause 2:** `_refresh_stream_status_in_place` (`server_section.py`)
+read `stream["status"]` directly and defaulted to red for anything
+not `"running"`/`"rx_tracking"`. It bypassed the J2 counter-advance
+override entirely. So even if `update_per_stream_statistics` had
+correctly held green, an intermediate write to `stream["status"] =
+"stopped"` from somewhere else would flip red here on the next tick.
+
+**U1: "absent from stat_map" branch defaults to no-change**
+(`traffic_client/statistics_section.py:1926-2033`) — Old default was
+red. New: preserves current status (`old_status`) until the confirm-
+count threshold is reached. If the stream really is gone, we'll get
+3 consecutive absent polls and eventually flip red anyway (~6 s
+after true stop).
+
+**U2: hysteresis via `_stopped_confirm_count` (threshold = 3)**
+(`traffic_client/statistics_section.py:1891-1925 + branches`) —
+Added per-sid counter. Every "stopped" signal (either explicit
+server_status OR absent-from-stat_map with counters-didn't-advance)
+bumps it. Every green paint resets it. Only flip to red after 3
+CONSECUTIVE stopped signals. Real stops still turn red within ~6 s
+(3 × 2 s poll interval) — imperceptibly slower than before but
+eliminates the visible flicker.
+
+**U3: `_refresh_stream_status_in_place` reads the same hysteresis cache**
+(`traffic_client/server_section.py:1443-1481`) — Now consults
+`self._stopped_confirm_count`. When it's about to flip green→red
+(painted-was-green, computed-now-red), it gates on
+`confirm-count >= 3`. Below threshold: keeps the cached green.
+Above threshold: paints red as before. Single source of truth for
+"is this stream really stopped?" shared across both paint paths.
+
+**U4/U5: verified not required.** `_do_update_stream_table` (structural
+rebuild) and the shared-paint-helper refactor turned out not to be
+needed — the flicker was purely a poll-path bug and U1-U3 covers
+the poll path completely. Structural rebuild reads
+`stream["status"]` which is now correctly held green by U1/U2.
+
+Tests: 10 new (`tests/test_v05404_flicker_hysteresis.py`), all
+pass. Regressions on v0.5.399–v0.5.403: intact.
+
+---
+
 ## [0.5.403] - 2026-09-21
 
 ### Fixed — utils/bgp.py protocol config audit (5 items)
