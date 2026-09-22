@@ -834,7 +834,9 @@ class TrafficGenClientStreamControl:
                     _pin_ts = _pinned.get(stream_id)
                     if _pin_ts is not None:
                         import time as _t_z1
-                        if (_t_z1.monotonic() - _pin_ts) < 15.0:
+                        # v0.5.410 (audit stream-AA1): indefinite
+                        # grace — was 15.0.
+                        if _pin_ts is not None:
                             color = "red"
                             _sink_pin_hit = True
             except Exception:

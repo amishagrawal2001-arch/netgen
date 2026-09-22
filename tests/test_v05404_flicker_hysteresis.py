@@ -76,10 +76,11 @@ def test_u1_absent_from_stat_map_no_default_red_flip():
     painted red. New branch only paints red if confirm-count says so."""
     src = _read("traffic_client/statistics_section.py")
     _idx = src.index("v0.5.404 (audit stats-U1 + U2)")
-    body = src[_idx:_idx + 6000]
+    body = src[_idx:_idx + 10000]
     # The gated-flip pattern (accumulate then check)
     assert "new_status = old_status" in body
-    # Debug log documents the suppression
+    # Debug log documents the suppression (moved further down
+    # the function by v0.5.410 AA2's clear-pin insert).
     assert "suppressing red flip" in body
 
 

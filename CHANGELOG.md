@@ -2,6 +2,48 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.410] - 2026-09-21
+
+### Fixed — Stopped stream flips back to GREEN at 15 s (v0.5.409 trace)
+
+The v0.5.409 diagnostic trace nailed the actual bug. The
+15-second pin grace-window was too short: if the server hadn't
+caught up (stale stream_tracker entry, tx_worker exit lag, DB
+write race) within 15 s of the operator's Stop click, the pin
+would expire and the poll's server-trust path flipped the row
+back to green. From the trace:
+
+```
+22:03:29 [STATE-POLL] pin_lookup sid=9ff9…  pin_ts=…9094.9 pin_active=True
+        ← row is red, operator sees the correct state
+22:03:37 [STATE-POLL] pin_lookup sid=9ff9…  pin_ts=…9094.9 pin_active=False
+        ← pin expired at 15 s + monotonic drift
+22:03:37 [STATE-POLL] _paint_green sid=9ff9… — writing status='running'
+        ← server still says running → row flips back to green
+```
+
+**AA1: indefinite pin lifetime** across all three pin gates:
+`update_per_stream_statistics` W1 (`traffic_client/statistics_section.py`),
+`_refresh_stream_status_in_place` W4
+(`traffic_client/server_section.py`), `_do_update_stream_table` Y1
+(`traffic_client/server_section.py`), and `update_stream_status`
+Z1 (`traffic_client/stream_control.py`). Grace constant is now
+`float("inf")` — pin never expires by time.
+
+**AA2: server-confirmed hand-off** — when the poll's
+`server_status == "stopped"` branch reaches its hysteresis
+threshold and is about to paint red, it also calls
+`_clear_client_stop(sid)`. Rationale: the server has finally
+caught up and confirms the stream is stopped, so the client-stop
+pin has done its job and can be dropped. If the server later
+autonomously re-starts the stream (via auto-restart or
+operator-elsewhere), the row will follow the server — which is
+now the correct behavior.
+
+**Result**: once you click Stop, the row stays RED until you
+explicitly click Start or the server confirms stopped. No more
+15-second-later regressions.
+
 ## [0.5.409] - 2026-09-21
 
 ### Diagnostic — instrument stream-status transitions

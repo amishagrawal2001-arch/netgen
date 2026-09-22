@@ -2044,13 +2044,21 @@ class TrafficGenClientStatisticsSection():
                 if _pinned is None:
                     _pinned = {}
                     self._client_stopped_streams = _pinned
-                _GRACE_S = 15.0
+                # v0.5.410 (audit stream-AA1): pin is now
+                # INDEFINITE. Old 15 s grace let the pin expire
+                # even when the server never caught up — the
+                # v0.5.409 trace showed exactly that: user stopped
+                # stream 9ff9, pin expired at t+15s while server
+                # still reported "running", _paint_green fired,
+                # row went back to green. Now: pin persists until
+                # either (a) start_stream / start_all_streams
+                # explicitly clears it, or (b) the poll below sees
+                # server confirm status="stopped" and clears it
+                # (server caught up — safe to hand back).
+                _GRACE_S = float("inf")
                 _now_ts = _time_mod.monotonic()
                 _pin_ts = _pinned.get(sid_for_history) if sid_for_history else None
-                _pin_active = (
-                    _pin_ts is not None
-                    and (_now_ts - _pin_ts) < _GRACE_S
-                )
+                _pin_active = _pin_ts is not None
                 # v0.5.409 (audit stream-diag): trace pin lookup
                 # per-stream in the poll path — the #1 suspect if
                 # a just-stopped row still paints green (mismatched
@@ -2169,6 +2177,20 @@ class TrafficGenClientStatisticsSection():
                         # but don't flip red until we've seen N in a row.
                         if _accumulate_stopped_signal():
                             new_status = "stopped"
+                            # v0.5.410 (audit stream-AA2): server
+                            # has caught up and confirmed the sid
+                            # is stopped. This is the hand-off
+                            # signal — clear the client-stop pin
+                            # so future polls don't need to force
+                            # red. If server later flips back to
+                            # "running" (a real re-start elsewhere,
+                            # e.g. auto-restart) the row will
+                            # follow, which is what we want.
+                            try:
+                                if sid_for_history and hasattr(self, "_clear_client_stop"):
+                                    self._clear_client_stop(sid_for_history)
+                            except Exception:
+                                pass
                             _paint_red()
                         else:
                             # Suppress the flip for now; keep whatever

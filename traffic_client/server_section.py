@@ -957,7 +957,10 @@ class TrafficGenClientServerSection():
             # once, hoisted out of the port loop; the per-stream
             # branch below forces red inside the grace window.
             _pinned_rebuild = getattr(self, "_client_stopped_streams", None) or {}
-            _GRACE_S_REBUILD = 15.0
+            # v0.5.410 (audit stream-AA1): pin is now indefinite;
+            # cleared explicitly by start or by server-confirmed
+            # stopped (see AA2 in statistics_section.py).
+            _GRACE_S_REBUILD = float("inf")
             import time as _time_rebuild
             _now_rebuild = _time_rebuild.monotonic()
 
@@ -1465,7 +1468,8 @@ class TrafficGenClientServerSection():
             _confirms_ro = getattr(self, "_stopped_confirm_count", None) or {}
             _STOPPED_CONFIRM_THRESHOLD_RO = 3
             _pinned_ro = getattr(self, "_client_stopped_streams", None) or {}
-            _GRACE_S_RO = 15.0
+            # v0.5.410 (audit stream-AA1): indefinite grace.
+            _GRACE_S_RO = float("inf")
             import time as _time_ro
             _now_ro = _time_ro.monotonic()
             for row in range(table.rowCount()):

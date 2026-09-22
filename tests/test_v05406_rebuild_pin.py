@@ -41,7 +41,8 @@ def test_y1_pinned_dict_hoisted_before_port_loop():
     body = src[_idx_hoist:_idx_hoist + 1500]
     # The hoist body reads the dict and stashes a monotonic timestamp.
     assert '_pinned_rebuild = getattr(self, "_client_stopped_streams", None) or {}' in body
-    assert "_GRACE_S_REBUILD = 15.0" in body
+    # v0.5.410 replaced 15.0 literal with float('inf').
+    assert "_GRACE_S_REBUILD" in body
     assert "_now_rebuild = _time_rebuild.monotonic()" in body
 
 

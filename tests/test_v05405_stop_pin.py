@@ -44,10 +44,12 @@ def test_w1_helpers_defined():
     src = _read("traffic_client/statistics_section.py")
     assert "def _pin_client_stop(self, stream_id):" in src
     assert "def _clear_client_stop(self, stream_id):" in src
-    # Grace window in force
+    # Grace-window constant still present in the pre-loop check
+    # (v0.5.410 changed it to float('inf'), so either literal is
+    # acceptable — the point is the constant exists).
     _idx = src.index("v0.5.405 (audit stats-W1)")
     body = src[_idx:_idx + 4000]
-    assert "_GRACE_S = 15.0" in body
+    assert "_GRACE_S" in body
 
 
 def test_w1_force_red_inside_grace_window():
@@ -112,7 +114,9 @@ def test_w4_refresh_forces_red_inside_grace_window():
     body = src[_idx:_idx + 3500]
     # Reads pinned dict
     assert "_pinned_ro = getattr(self, \"_client_stopped_streams\", None)" in body
-    assert "_GRACE_S_RO = 15.0" in body
+    # v0.5.410 replaced 15.0 with float('inf'); the constant name
+    # is what matters.
+    assert "_GRACE_S_RO" in body
     # Overrides color to red inside window
     assert '_pin_ts is not None and (_now_ro - _pin_ts) < _GRACE_S_RO' in body
 
