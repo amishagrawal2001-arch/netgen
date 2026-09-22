@@ -2,6 +2,32 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.412] - 2026-09-21
+
+### Diagnostic — Start All silent exit (v0.5.411 trace)
+
+v0.5.411's BB1 fallback didn't fire in the user's scenario —
+their trace shows `valid_ports` was non-empty (only `ens2f1np1`
+was skipped, `ens2f0np0` was valid). But Start All still didn't
+send anything. The per-stream decision loop drops streams for
+4 possible reasons (disabled / no server / PCAP missing / other
+continue) and only 1 of those (disabled) surfaces via a dialog.
+Adding per-stream trace so the next report shows which reason
+fired for which stream.
+
+New `[STATE-START-ALL]` log lines
+(`traffic_client/stream_logic.py:1769-1795, 1827-1846`):
+
+- `SKIP port=… reason='no server found for tg_id=…' known_tgs=[…]`
+  — previously-silent tg_id-mismatch skip
+- `stream port=… name=… sid=… enabled_raw=… protocol_enabled=… is_stream_enabled=… status=…`
+  — per-stream enabled decision so we can see if streams are
+  being dropped as disabled without the dialog showing
+- `payload_built servers=[…] total_streams=N disabled=N unknown_ports=[…]`
+  — summary before the HTTP send loop
+
+No logic changes. Diagnostic-only ship.
+
 ## [0.5.411] - 2026-09-21
 
 ### Fixed — Start All silently no-ops (v0.5.410 trace)

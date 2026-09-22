@@ -1767,7 +1767,14 @@ class TrafficGenClientStreamLogic:
                     tx_tg_id = ""
                 tx_server = next((s for s in self.server_interfaces if str(s.get("tg_id")) == tx_tg_id), None)
                 if not tx_server:
-                    # No reachable server for this port; skip silently
+                    # v0.5.412 (audit stream-diag): trace this
+                    # previously-silent skip — no server found
+                    # for the port's TG id.
+                    logger.warning(
+                        f"[STATE-START-ALL] SKIP port={port_label} "
+                        f"reason='no server found for tg_id={tx_tg_id!r}' "
+                        f"known_tgs={[str(s.get('tg_id')) for s in self.server_interfaces]}"
+                    )
                     continue
 
                 server_url = tx_server["address"]
@@ -1775,7 +1782,20 @@ class TrafficGenClientStreamLogic:
                 for s in list(stream_list):
                     # Name for logs/UI
                     name = s.get("protocol_selection", {}).get("name") or s.get("name", "")
-                    if not self._is_stream_enabled(s):
+                    _sid_diag = s.get("stream_id")
+                    _en_diag = self._is_stream_enabled(s)
+                    # v0.5.412 (audit stream-diag): per-stream
+                    # enabled decision so we can tell if streams
+                    # are silently dropped as disabled.
+                    logger.info(
+                        f"[STATE-START-ALL] stream port={port_label} "
+                        f"name={name!r} sid={_sid_diag} "
+                        f"enabled_raw={s.get('enabled')} "
+                        f"protocol_enabled={s.get('protocol_selection', {}).get('enabled')} "
+                        f"is_stream_enabled={_en_diag} "
+                        f"status={s.get('status')}"
+                    )
+                    if not _en_diag:
                         # Only mark disabled if this is a valid, current port
                         disabled_streams.append((port_label, name))
                         continue
@@ -1876,6 +1896,24 @@ class TrafficGenClientStreamLogic:
             # errors so the operator sees a single dialog at the
             # end instead of log-only failures.
             _start_all_errors: list[str] = []
+            # v0.5.412 (audit stream-diag): summary of what the
+            # payload build produced. If server_payload_map is
+            # empty but streams exist locally, the loop above
+            # dropped everything for reasons we should see.
+            try:
+                _n_payload_streams = sum(
+                    len(items) for per_port in server_payload_map.values()
+                    for items in per_port.values()
+                )
+                logger.info(
+                    f"[STATE-START-ALL] payload_built "
+                    f"servers={list(server_payload_map.keys())} "
+                    f"total_streams={_n_payload_streams} "
+                    f"disabled={len(disabled_streams)} "
+                    f"unknown_ports={sorted(unknown_ports)}"
+                )
+            except Exception:
+                pass
             # --- Send to servers & update UI ---
             for server_url, per_port in server_payload_map.items():
                 try:
