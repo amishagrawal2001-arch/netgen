@@ -2,6 +2,93 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.416] - 2026-09-21
+
+### Fixed — utils/ospf.py audit (8 HIGH + 2 MED)
+
+Post-mortem audit of `utils/ospf.py` in parity with the v0.5.403 BGP
+audit. All BGP T1–T3 patterns had OSPF equivalents, plus OSPF-
+specific bugs (worse than BGP had). All fixes touch
+`utils/ospf.py`.
+
+**EE1: `_ospf_vrf_suffix` fails CLOSED on VRF probe failure**
+(`utils/ospf.py:107-186`) — Pre-fix, a `subprocess.run` hang OR
+non-zero exit code silently dropped the VRF suffix → all
+`router ospf*` blocks landed in the default VRF, ospfd sent
+hellos out the wrong routing table, neighbors stayed Down.
+Now: 5s timeout on the probe; if a VRF name IS registered for
+the device but the probe fails, raise `OspfVrfProbeError` so
+callers abort loudly instead of writing config to the wrong
+routing instance. Same class as v0.5.403 BGP T1.
+
+**EE2: vtysh error-marker scanner across all exec sites**
+(`utils/ospf.py:57-88`) — New `_vtysh_output_has_error()` scans
+for `% Unknown command`, `% Malformed`, `% Configuration
+failed`, etc. Wired into `start_ospf_neighbor` and
+`stop_ospf_neighbor` (and the new `stop_ospf`). Pre-fix every
+call trusted exit-code 0 → silent rejections logged as success.
+Same class as v0.5.403 BGP T2.
+
+**EE3: `stop_ospf` actually stops OSPF**
+(`utils/ospf.py:1782-1848`) — Pre-fix this function just popped
+the OSPF_INSTANCES dict — ospfd kept sending hellos and holding
+adjacencies while the UI reported "stopped" (same K5-class lie
+as v0.5.403 BGP T3 pre-fix). Now issues `no router ospf` +
+`no router ospf6` via vtysh, with EE2 error-marker checking.
+
+**EE4: start/stop neighbor read split area IDs**
+(`utils/ospf.py:840-856, 1017-1032, 895, 1041-1054, 1071, 1099`)
+— `configure_ospf_neighbor` writes `area_id_ipv4` and
+`area_id_ipv6` separately; start/stop only read the generic
+`area_id`. Result: Stop-IPv6 issued `no ipv6 ospf6 area 0.0.0.0`
+even when the real area was 2, vtysh silently no-oped,
+adjacency stayed Full while UI reported stopped. Highest-
+severity OSPF-specific bug the audit found.
+
+**EE5: `stop_ospf_neighbor` no longer sends hardcoded 192.168.0.0/24**
+(`utils/ospf.py:958-996`) — Pre-fix, any DB hiccup fell back to
+this hardcoded network, so `no network 192.168.0.0/24 area N`
+silently no-oped when the real config was `10.0.0.0/8` → DB
+flipped Down while router kept advertising. Now: if the network
+can't be computed, log an error and skip the IPv4 removal
+entirely — don't lie to vtysh.
+
+**EE6: `start_ospf_neighbor` no longer injects hardcoded 192.168.0.0/24**
+(`utils/ospf.py:790-826`) — Same fallback on the start path, but
+worse: it INJECTED a bogus prefix onto a live router. Now:
+compute-fail returns False; caller can retry after correcting
+the DB entry.
+
+**EE7: start/stop persist with `end` + `write memory`**
+(`utils/ospf.py:900-919, 1105-1131`) — Pre-fix
+`start_ospf_neighbor` and `stop_ospf_neighbor` only emitted
+`configure terminal` + the config lines. A container restart
+re-loaded from stale `frr.conf` → OSPF came back up (or stayed
+down) contradicting operator intent.
+
+**EE8: `stop_ospf_neighbor` indentation bug — "stop both" now stops both**
+(`utils/ospf.py:1078-1106`) — Real if-nesting bug in the else
+branch: `if ipv4_enabled` was at 8-space (sibling of the
+outer `else:`), so IPv4 lines emitted at top-level config-
+terminal context; `if ipv6_enabled` was nested inside the ipv4
+block, so a device with `ipv4_enabled=False, ipv6_enabled=True`
+silently skipped the OSPFv3 shutdown entirely.
+
+**EE9: `start_ospf_neighbor` IPv6 path clears `router ospf6 shutdown`**
+(`utils/ospf.py:889-904, 908-918`) — Pre-fix, Start-IPv6 only
+added the interface binding but never cleared `router ospf6
+shutdown` from a prior stop-both. Process stayed shut, no
+adjacency formed, exit 0. Now: enter `router ospf6` and issue
+`no shutdown` before the interface binding — parity with the
+IPv4 path.
+
+**EE11: per-device lock** (`utils/ospf.py:90-119, plus start/
+stop/configure wrappers`) — New `_ospf_device_lock(device_id)`
+context manager serializes configure/start/stop for the same
+device. Pre-fix two rapid Apply clicks landed concurrent
+`configure terminal` sessions on the same container, mangling
+config. Same class as v0.5.383 X1 for BGP.
+
 ## [0.5.415] - 2026-09-21
 
 ### Fixed — Stream Statistics panel audit (5 HIGH + 3 MEDIUM)

@@ -54,6 +54,66 @@ def container_exec_with_timeout(container, cmd, timeout_sec: float = 5.0):
 OSPF_INSTANCES = {}
 
 
+# v0.5.416 (audit stream-EE2): vtysh returns exit-code 0 even when
+# the output contains error markers like `% Unknown command` or
+# `% Configuration failed`. Pre-fix every OSPF vtysh call trusted
+# the exit code alone → silent rejections were logged as success.
+# Same marker set as v0.5.403 T2 (bgp.py).
+_VTYSH_ERROR_MARKERS = (
+    "% Unknown command",
+    "% Malformed",
+    "% Configuration failed",
+    "% Same as remote-as",
+    "% Invalid",
+    "% Ambiguous command",
+    "% Incomplete command",
+    "% Command incomplete",
+    "%% Route-map already exists",  # informational but useful
+)
+
+
+def _vtysh_output_has_error(output: str) -> bool:
+    if not output:
+        return False
+    for _line in output.splitlines():
+        _stripped = _line.strip()
+        if not _stripped.startswith("%"):
+            continue
+        for _marker in _VTYSH_ERROR_MARKERS:
+            if _marker in _stripped:
+                return True
+    return False
+
+
+# v0.5.416 (audit stream-EE11): per-device lock so concurrent
+# Apply/Start/Stop clicks on the same device don't step on each
+# other's `configure terminal` state. Mirrors v0.5.383 X1 for BGP.
+# Keyed by device_id; falsy device_id → dummy no-op lock (nothing
+# to serialize against).
+import threading as _threading_ee11
+
+_OSPF_DEVICE_LOCKS: Dict[str, _threading_ee11.Lock] = {}
+_OSPF_DEVICE_LOCKS_GUARD = _threading_ee11.Lock()
+
+
+class _NullLock:
+    def __enter__(self):
+        return self
+    def __exit__(self, *_):
+        return False
+
+
+def _ospf_device_lock(device_id: Optional[str]):
+    if not device_id:
+        return _NullLock()
+    with _OSPF_DEVICE_LOCKS_GUARD:
+        _lk = _OSPF_DEVICE_LOCKS.get(device_id)
+        if _lk is None:
+            _lk = _threading_ee11.Lock()
+            _OSPF_DEVICE_LOCKS[device_id] = _lk
+    return _lk
+
+
 def _ospf_vrf_suffix(device_id: Optional[str]) -> str:
     """Return ' vrf <name>' if this device has been provisioned with a
     Linux VRF, else ''.
@@ -65,25 +125,65 @@ def _ospf_vrf_suffix(device_id: Optional[str]) -> str:
     the device's interface routes live in the VRF table — neighbors
     never come up.
 
-    Falls back to no-VRF if the kernel device isn't present (legacy
-    deployments before VRF wiring landed).
+    v0.5.416 (audit stream-EE1): fail-CLOSED on probe failure. Pre-
+    fix a `subprocess.run` hang OR a non-zero return code silently
+    dropped the VRF suffix, so all `router ospf`/`router ospf6`
+    blocks landed in the DEFAULT VRF — ospfd sent hellos out the
+    default table, per-VRF interface never saw them, neighbors
+    stayed Down. Same class as v0.5.403 BGP T1.
+
+    New behavior: (a) 5s timeout on the `ip link show` probe;
+    (b) if a VRF name IS registered for this device but the probe
+    fails (timeout, non-zero rc, exception), RAISE
+    `OspfVrfProbeError` so callers fail loudly instead of writing
+    config into the wrong routing instance. (c) if no VRF name is
+    registered at all (legacy single-device deployment), return
+    "" — that's the intended non-VRF path.
     """
     if not device_id:
         return ""
     try:
         from utils.frr_docker import FRRDockerManager
         vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
-        if not vrf_name:
-            return ""
+    except Exception as _exc_reg:
+        # Registry lookup itself failed — legacy pre-VRF layout.
+        logging.debug(f"[OSPF VRF] registry lookup failed for {device_id}: {_exc_reg}")
+        return ""
+    if not vrf_name:
+        return ""
+    try:
         check = subprocess.run(
             ["ip", "-o", "link", "show", vrf_name],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=5,
         )
-        if check.returncode == 0 and (check.stdout or "").strip():
-            return f" vrf {vrf_name}"
-    except Exception as exc:
-        logging.debug(f"[OSPF VRF] suffix lookup failed for {device_id}: {exc}")
-    return ""
+    except subprocess.TimeoutExpired as _te:
+        raise OspfVrfProbeError(
+            f"[OSPF VRF] `ip link show {vrf_name}` timed out for device "
+            f"{device_id} after 5 s — refusing to configure in the wrong "
+            f"routing instance."
+        ) from _te
+    except Exception as _exc:
+        raise OspfVrfProbeError(
+            f"[OSPF VRF] probe for {vrf_name} on device {device_id} "
+            f"raised {type(_exc).__name__}: {_exc} — refusing to fall "
+            f"back to default VRF."
+        ) from _exc
+    if check.returncode != 0 or not (check.stdout or "").strip():
+        raise OspfVrfProbeError(
+            f"[OSPF VRF] VRF {vrf_name!r} was registered for device "
+            f"{device_id} but `ip link show` returned rc={check.returncode}, "
+            f"stdout={(check.stdout or '')!r}, stderr={(check.stderr or '')!r} — "
+            f"refusing to fall back to default VRF."
+        )
+    return f" vrf {vrf_name}"
+
+
+class OspfVrfProbeError(RuntimeError):
+    """Raised by _ospf_vrf_suffix when a VRF name is registered for a
+    device but the kernel probe fails — pre-v0.5.416, the code
+    silently dropped the VRF and wrote to default VRF, causing
+    silent misconfig. Callers should catch and abort the operation
+    with a clear error to the operator."""
 
 
 def _ospf_show_scope(device_id: Optional[str]) -> str:
@@ -186,6 +286,24 @@ def configure_ospf_neighbor(
     ipv6_mask: Optional[str] = None,
 ) -> bool:
     """Configure OSPF for a device in FRR container."""
+    # v0.5.416 (audit stream-EE11): per-device lock parity with
+    # start/stop.
+    with _ospf_device_lock(device_id):
+        return _configure_ospf_neighbor_locked(
+            device_id, ospf_config, device_name,
+            ipv4, ipv6, ipv4_mask, ipv6_mask,
+        )
+
+
+def _configure_ospf_neighbor_locked(
+    device_id: str,
+    ospf_config: Dict[str, Any],
+    device_name: str = None,
+    ipv4: Optional[str] = None,
+    ipv6: Optional[str] = None,
+    ipv4_mask: Optional[str] = None,
+    ipv6_mask: Optional[str] = None,
+) -> bool:
     try:
         from utils.frr_docker import FRRDockerManager
         
@@ -742,21 +860,33 @@ def configure_ospf_neighbor(
 
 def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name: str = None, af: str = None) -> bool:
     """Start OSPF for a device by adding network configuration."""
+    # v0.5.416 (audit stream-EE11): per-device lock.
+    with _ospf_device_lock(device_id):
+        return _start_ospf_neighbor_locked(device_id, ospf_config, device_name, af)
+
+
+def _start_ospf_neighbor_locked(device_id: str, ospf_config: Dict[str, Any], device_name: str = None, af: str = None) -> bool:
     try:
         from utils.frr_docker import FRRDockerManager
-        
+
         logging.info(f"[OSPF START] Starting OSPF for device {device_name} ({device_id}) af={af}")
-        
+
         frr_manager = FRRDockerManager()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
-        
+
         # Get device IP addresses from database to calculate correct network
         from utils.device_database import DeviceDatabase
         device_db = DeviceDatabase()
         device_data = device_db.get_device(device_id)
-        
-        # Calculate IPv4 network from device IP
+
+        # v0.5.416 (audit stream-EE6): NEVER fall back to a
+        # hardcoded IPv4 network. Pre-fix, a DB read hiccup or
+        # empty ipv4_address injected `network 192.168.0.0/24
+        # area N` into a device that actually had 10.20.0.5/24,
+        # leaking a bogus prefix to every neighbor in the area.
+        # Fail explicitly instead — caller can retry after
+        # correcting the DB.
         ipv4_network = None
         if device_data and device_data.get("ipv4_address"):
             try:
@@ -766,14 +896,37 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
                 network = ipaddress.IPv4Network(f"{ipv4_addr}/{ipv4_mask}", strict=False)
                 ipv4_network = str(network)
             except Exception as e:
-                logging.warning(f"[OSPF START] Failed to calculate IPv4 network: {e}")
-                ipv4_network = "192.168.0.0/24"  # Fallback to default
-        else:
-            logging.warning(f"[OSPF START] No device data or IPv4 address found, using fallback network")
-            ipv4_network = "192.168.0.0/24"  # Fallback to default
-        
-        # Extract OSPF configuration
+                logging.error(
+                    f"[OSPF START] Failed to calculate IPv4 network for "
+                    f"{device_id}: {e}. Refusing to inject a guessed "
+                    f"network — fix the device's IPv4 address/mask first."
+                )
+                return False
+        elif device_data is None:
+            logging.error(
+                f"[OSPF START] device_data is None for {device_id} — "
+                f"cannot compute IPv4 network. Aborting."
+            )
+            return False
+        # Else: no ipv4_address on this device → skip the IPv4
+        # network line; IPv6-only start is still valid.
+
+        # v0.5.416 (audit stream-EE4): read the split area IDs
+        # (parity with configure_ospf_neighbor which writes them).
+        # Pre-fix per-AF start used the generic `area_id` even
+        # when `area_id_ipv6` was configured, so the interface
+        # binding landed in the wrong area.
         area_id = ospf_config.get("area_id", "0.0.0.0")
+        area_id_ipv4 = (
+            ospf_config.get("area_id_ipv4")
+            or ospf_config.get("area_id")
+            or "0.0.0.0"
+        )
+        area_id_ipv6 = (
+            ospf_config.get("area_id_ipv6")
+            or ospf_config.get("area_id")
+            or "0.0.0.0"
+        )
         ipv4_enabled = ospf_config.get("ipv4_enabled", True)
         ipv6_enabled = ospf_config.get("ipv6_enabled", False)
         # CRITICAL: Validate interface name - do not fall back to 'eth0'
@@ -790,51 +943,79 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
         # Normalize AF input
         af_norm = (af or "").strip().lower() if isinstance(af, str) else None
         
+        # v0.5.416 (audit stream-EE4): each branch below uses the
+        # AF-specific area_id, so a configure that wrote area 2 to
+        # area_id_ipv6 gets the right area on the binding.
         # IPv4-only start: add network statement, no shutdown
         if af_norm in ("ipv4",):
             vtysh_commands.append(f"router ospf{_ospf_vrf_suffix(device_id)}")
             vtysh_commands.append(" no shutdown")
-        if ipv4_enabled and ipv4_network:
-            vtysh_commands.append(f" network {ipv4_network} area {area_id}")
-            logging.info(f"[OSPF START] (IPv4) Adding network: {ipv4_network} area {area_id}")
+            if ipv4_enabled and ipv4_network:
+                vtysh_commands.append(f" network {ipv4_network} area {area_id_ipv4}")
+                logging.info(f"[OSPF START] (IPv4) Adding network: {ipv4_network} area {area_id_ipv4}")
             vtysh_commands.append("exit")
-        
-        # IPv6-only start: add interface area binding
+
+        # v0.5.416 (audit stream-EE9): IPv6-only start now also
+        # enters `router ospf6` and issues `no shutdown` before
+        # binding the interface. Pre-fix, a prior stop-both left
+        # `router ospf6 shutdown` intact; Start-IPv6 only added
+        # the interface binding, so the process stayed shut and
+        # no adjacency formed (exit 0, code returned True).
         elif af_norm in ("ipv6",):
             vtysh_commands.extend([
+                f"router ospf6{_ospf_vrf_suffix(device_id)}",
+                " no shutdown",
+                "exit",
                 f"interface {interface}",
-                f" ipv6 ospf6 area {area_id}",
+                f" ipv6 ospf6 area {area_id_ipv6}",
                 "exit",
             ])
-            logging.info(f"[OSPF START] (IPv6) Adding interface {interface} area {area_id} binding")
-        
+            logging.info(f"[OSPF START] (IPv6) Adding interface {interface} area {area_id_ipv6} binding")
+
         # Start both (legacy behavior)
         else:
             # IPv4
             vtysh_commands.append(f"router ospf{_ospf_vrf_suffix(device_id)}")
             vtysh_commands.append(" no shutdown")
             if ipv4_enabled and ipv4_network:
-                vtysh_commands.append(f" network {ipv4_network} area {area_id}")
-                logging.info(f"[OSPF START] Adding network: {ipv4_network} area {area_id}")
+                vtysh_commands.append(f" network {ipv4_network} area {area_id_ipv4}")
+                logging.info(f"[OSPF START] Adding network: {ipv4_network} area {area_id_ipv4}")
             vtysh_commands.append("exit")
-            
-            # IPv6
+
+            # IPv6 — mirror the EE9 shutdown-clear pattern.
             if ipv6_enabled:
                 vtysh_commands.extend([
+                    f"router ospf6{_ospf_vrf_suffix(device_id)}",
+                    " no shutdown",
+                    "exit",
                     f"interface {interface}",
-                    f" ipv6 ospf6 area {area_id}",
+                    f" ipv6 ospf6 area {area_id_ipv6}",
                     "exit",
                 ])
         
+        # v0.5.416 (audit stream-EE7): persist so container restart
+        # doesn't lose the change.
+        vtysh_commands.append("end")
+        vtysh_commands.append("write memory")
+
         # Execute commands
         config_commands = "\n".join(vtysh_commands)
         exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
-        
+
         logging.info(f"[OSPF START] Executing commands for {device_name} (af={af}):\n{config_commands}")
         result = container.exec_run(["bash", "-c", exec_cmd])
-        
+
+        _out_start = result.output.decode() if result.output else ""
         if result.exit_code != 0:
-            logging.error(f"[OSPF START] Command failed: {result.output.decode()}")
+            logging.error(f"[OSPF START] Command failed: {_out_start}")
+            return False
+        # v0.5.416 (audit stream-EE2): scan for `%` error markers
+        # on exit-code-0 responses too.
+        if _vtysh_output_has_error(_out_start):
+            logging.error(
+                f"[OSPF START] vtysh returned exit 0 but output "
+                f"contains error marker(s):\n{_out_start}"
+            )
             return False
         
         # Update instance status
@@ -925,21 +1106,39 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
 
 def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) -> bool:
     """Stop OSPF for a device by removing network configuration."""
+    # v0.5.416 (audit stream-EE11): per-device lock — parity with
+    # v0.5.383 X1 for BGP/FRR. Concurrent Apply/Stop clicks on the
+    # same device previously stepped on each other's vtysh
+    # configure-terminal state, mangling config. See also
+    # configure_ospf_neighbor and start_ospf_neighbor which take
+    # the same lock.
+    with _ospf_device_lock(device_id):
+        return _stop_ospf_neighbor_locked(device_id, device_name, af)
+
+
+def _stop_ospf_neighbor_locked(device_id: str, device_name: str = None, af: str = None) -> bool:
     try:
         from utils.frr_docker import FRRDockerManager
-        
+
         logging.info(f"[OSPF STOP] Stopping OSPF for device {device_name} ({device_id}) af={af}")
-        
+
         frr_manager = FRRDockerManager()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
-        
+
         # Get device IP addresses from database to calculate correct network
         from utils.device_database import DeviceDatabase
         device_db = DeviceDatabase()
         device_data = device_db.get_device(device_id)
-        
-        # Calculate IPv4 network from device IP
+
+        # v0.5.416 (audit stream-EE5): NEVER fall back to a
+        # hardcoded network. Pre-fix, if the DB read hiccuped or
+        # the device's ipv4_address was empty, `stop_ospf_neighbor`
+        # sent `no network 192.168.0.0/24 area N` — which vtysh
+        # silently no-ops when the real config was `10.0.0.0/8`,
+        # so the network stayed advertised while the DB flipped
+        # to Down (same class as v0.5.396 M3, DB lies about live
+        # state). Fail fast instead.
         ipv4_network = None
         if device_data and device_data.get("ipv4_address"):
             try:
@@ -949,15 +1148,55 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
                 network = ipaddress.IPv4Network(f"{ipv4_addr}/{ipv4_mask}", strict=False)
                 ipv4_network = str(network)
             except Exception as e:
-                logging.warning(f"[OSPF STOP] Failed to calculate IPv4 network: {e}")
-                ipv4_network = "192.168.0.0/24"  # Fallback to default
-        else:
-            logging.warning(f"[OSPF STOP] No device data or IPv4 address found, using fallback network")
-            ipv4_network = "192.168.0.0/24"  # Fallback to default
-        
-        # Get OSPF configuration to determine area ID and interface
-        ospf_config = device_data.get("ospf_config", {}) if device_data else {}
+                logging.error(
+                    f"[OSPF STOP] Failed to calculate IPv4 network for "
+                    f"{device_id}: {e}. Refusing to send stop with a "
+                    f"guessed network (would silently no-op vtysh)."
+                )
+                # Signal caller: we CANNOT reliably stop the IPv4 side.
+                # Leave ipv4_network=None; the per-AF branches below
+                # skip the IPv4 removal in that case.
+                ipv4_network = None
+        elif device_data is None:
+            logging.error(
+                f"[OSPF STOP] device_data is None for {device_id} — "
+                f"cannot determine network; IPv4 stop will be skipped."
+            )
+        # Else: no ipv4_address configured on this device → nothing
+        # to remove on the IPv4 side. Not an error.
+
+        # v0.5.416 (audit stream-EE14): tolerate ospf_config stored
+        # as JSON string (some legacy rows) — mirror BGP's
+        # _resolve_bgp_context handling.
+        _raw_cfg = device_data.get("ospf_config", {}) if device_data else {}
+        if isinstance(_raw_cfg, str):
+            try:
+                import json as _json_ee14
+                _raw_cfg = _json_ee14.loads(_raw_cfg)
+            except Exception as _je:
+                logging.warning(
+                    f"[OSPF STOP] ospf_config was a str but failed to "
+                    f"parse as JSON for {device_id}: {_je}; treating as empty"
+                )
+                _raw_cfg = {}
+        ospf_config = _raw_cfg if isinstance(_raw_cfg, dict) else {}
+        # v0.5.416 (audit stream-EE4): read the split area IDs so
+        # per-AF stops target the actual configured area. Pre-fix
+        # only `area_id` was read; when configure had written
+        # `area_id_ipv6=2` while `area_id=0` (default), Stop-IPv6
+        # issued `no ipv6 ospf6 area 0.0.0.0` which vtysh silently
+        # no-oped → adjacency stayed Full while UI said stopped.
         area_id = ospf_config.get("area_id", "0.0.0.0")
+        area_id_ipv4 = (
+            ospf_config.get("area_id_ipv4")
+            or ospf_config.get("area_id")
+            or "0.0.0.0"
+        )
+        area_id_ipv6 = (
+            ospf_config.get("area_id_ipv6")
+            or ospf_config.get("area_id")
+            or "0.0.0.0"
+        )
         ipv4_enabled = ospf_config.get("ipv4_enabled", True)
         ipv6_enabled = ospf_config.get("ipv6_enabled", False)
         # CRITICAL: Validate interface name - do not fall back to 'eth0'
@@ -977,55 +1216,91 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
         af_norm = (af or "").strip().lower() if isinstance(af, str) else None
 
         # IPv4-only stop: remove network statements, avoid global shutdown
+        # v0.5.416 (audit stream-EE4): use area_id_ipv4 not the
+        # generic area_id.
         if af_norm in ("ipv4",):
             vtysh_commands.append(f"router ospf{_ospf_vrf_suffix(device_id)}")
             if ipv4_enabled and ipv4_network:
-                vtysh_commands.append(f" no network {ipv4_network} area {area_id}")
-                logging.info(f"[OSPF STOP] (IPv4) Removing network: {ipv4_network} area {area_id}")
+                vtysh_commands.append(f" no network {ipv4_network} area {area_id_ipv4}")
+                logging.info(f"[OSPF STOP] (IPv4) Removing network: {ipv4_network} area {area_id_ipv4}")
             vtysh_commands.append("exit")
 
         # IPv6-only stop: remove interface area binding only
+        # v0.5.416 (audit stream-EE4): use area_id_ipv6 not the
+        # generic area_id — this was the highest-severity OSPF-
+        # specific bug the audit found.
         elif af_norm in ("ipv6",):
-            # Always try to remove IPv6 interface binding if af=ipv6 is specified, 
+            # Always try to remove IPv6 interface binding if af=ipv6 is specified,
             # regardless of ipv6_enabled flag (in case config is out of sync)
             vtysh_commands.extend([
                 f"interface {interface}",
-                f" no ipv6 ospf6 area {area_id}",
+                f" no ipv6 ospf6 area {area_id_ipv6}",
                 "exit",
             ])
-            logging.info(f"[OSPF STOP] (IPv6) Removing interface {interface} area {area_id} binding")
+            logging.info(f"[OSPF STOP] (IPv6) Removing interface {interface} area {area_id_ipv6} binding")
 
         # Stop both (legacy behavior)
+        # v0.5.416 (audit stream-EE8): indentation bug fix. Pre-fix
+        # `if ipv4_enabled` was at the 8-space (sibling of `else:`),
+        # not nested inside it, so the IPv4 block emitted at
+        # top-level configure-terminal context (silently ignored
+        # today, but every one becomes a hard failure once EE2's
+        # error scanner lands). Worse: `if ipv6_enabled` was
+        # nested inside the ipv4 block, so a device with
+        # `ipv4_enabled=False, ipv6_enabled=True` skipped the
+        # ospf6 shutdown entirely — IPv6 OSPF never got stopped.
         else:
             # IPv4
             vtysh_commands.append(f"router ospf{_ospf_vrf_suffix(device_id)}")
-        if ipv4_enabled and ipv4_network:
-            vtysh_commands.append(f" no network {ipv4_network} area {area_id}")
-            logging.info(f"[OSPF STOP] Removing network: {ipv4_network} area {area_id}")
-            # Full shutdown when stopping both
+            if ipv4_enabled and ipv4_network:
+                vtysh_commands.append(f" no network {ipv4_network} area {area_id_ipv4}")
+                logging.info(f"[OSPF STOP] Removing network: {ipv4_network} area {area_id_ipv4}")
+            # Full shutdown when stopping both — apply regardless
+            # of ipv4_enabled so the shutdown lands.
             vtysh_commands.extend([" shutdown", "exit"])
-        
-            # IPv6
+
+            # IPv6 — now at the correct outer indent, so it fires
+            # even when ipv4_enabled is False.
             if ipv6_enabled:
                 vtysh_commands.extend([
                     f"router ospf6{_ospf_vrf_suffix(device_id)}",
                     " shutdown",
                     "exit",
                     f"interface {interface}",
-                    f" no ipv6 ospf6 area {area_id}",
+                    f" no ipv6 ospf6 area {area_id_ipv6}",
                     "exit"
                 ])
         
+        # v0.5.416 (audit stream-EE7): persist the change with
+        # `end` + `write memory` so a container restart doesn't
+        # re-load OSPF from a stale frr.conf. Pre-fix stop_ospf_
+        # neighbor left running-config diverged from startup-
+        # config → restart brought OSPF back up, contradicting
+        # operator intent + UI state.
+        vtysh_commands.append("end")
+        vtysh_commands.append("write memory")
+
         # Execute commands
         config_commands = "\n".join(vtysh_commands)
         exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
-        
+
         logging.info(f"[OSPF STOP] Executing commands for {device_name} (af={af}):\n{config_commands}")
         result = container.exec_run(["bash", "-c", exec_cmd])
-        
+
         output = result.output.decode() if result.output else ""
+        # v0.5.416 (audit stream-EE2): also scan output for vtysh
+        # `%` error markers. Pre-fix `exit_code != 0` was the only
+        # signal; vtysh exits 0 on `% Unknown command` / `%
+        # Malformed` / `% Configuration failed`, so silent
+        # rejections were logged as success.
         if result.exit_code != 0:
             logging.error(f"[OSPF STOP] Command failed with exit code {result.exit_code}: {output}")
+            return False
+        if _vtysh_output_has_error(output):
+            logging.error(
+                f"[OSPF STOP] vtysh returned exit 0 but output "
+                f"contains error marker(s):\n{output}"
+            )
             return False
         else:
             logging.info(f"[OSPF STOP] Commands executed successfully. Output: {output}")
@@ -1690,11 +1965,79 @@ def build_ospf_stop_cmd(device_id, iface):
     return ['vtysh'] + [f'-c "{line}"' for line in cmds]
 
 def stop_ospf(device_id, iface):
-    if device_id in OSPF_INSTANCES:
+    """v0.5.416 (audit stream-EE3): actually issue `no router ospf`
+    + `no router ospf6` via vtysh. Pre-fix this just popped the
+    dict entry — ospfd kept sending hellos and holding
+    adjacencies while the UI reported "stopped" (same K5-class
+    lie as v0.5.403 BGP T3 pre-fix). Mirror BGP's post-T3
+    stop_bgp shape."""
+    with _ospf_device_lock(device_id):
+        _stop_ospf_locked(device_id, iface)
+
+
+def _stop_ospf_locked(device_id, iface):
+    _had_instance = device_id in OSPF_INSTANCES
+    if _had_instance:
         logging.info(f"[OSPF] Stopping OSPF on {iface} for device {device_id}")
         del OSPF_INSTANCES[device_id]
     else:
         logging.warning(f"[OSPF] No active OSPF found for device {device_id}")
+
+    # Fetch device_name (needed to resolve container).
+    _device_name = None
+    try:
+        from utils.device_database import DeviceDatabase
+        _dev = DeviceDatabase().get_device(device_id)
+        if _dev:
+            _device_name = _dev.get("device_name") or _dev.get("name")
+    except Exception as _de:
+        logging.debug(f"[OSPF] device lookup failed for {device_id}: {_de}")
+
+    try:
+        from utils.frr_docker import FRRDockerManager
+        _frr = FRRDockerManager()
+        _container_name = _frr._get_container_name(device_id, _device_name)
+        _container = _frr.client.containers.get(_container_name)
+    except Exception as _ce:
+        logging.warning(
+            f"[OSPF] Could not reach container for {device_id} — "
+            f"instance-dict cleared but no vtysh teardown issued: {_ce}"
+        )
+        return
+
+    try:
+        _vrf = _ospf_vrf_suffix(device_id)
+    except OspfVrfProbeError as _ve:
+        logging.error(
+            f"[OSPF] stop refused: VRF probe failure for {device_id}: {_ve}"
+        )
+        return
+
+    _cmds = [
+        "configure terminal",
+        f"no router ospf{_vrf}",
+        f"no router ospf6{_vrf}",
+        "end",
+        "write memory",
+    ]
+    _script = "\n".join(_cmds)
+    _exec = f"vtysh << 'EOF'\n{_script}\nEOF"
+    try:
+        _result = _container.exec_run(["bash", "-c", _exec])
+        _output = _result.output.decode() if _result.output else ""
+        if _result.exit_code != 0:
+            logging.error(
+                f"[OSPF] `no router ospf*` failed exit={_result.exit_code}: {_output}"
+            )
+            return
+        if _vtysh_output_has_error(_output):
+            logging.error(
+                f"[OSPF] `no router ospf*` exit 0 but error marker in output:\n{_output}"
+            )
+            return
+        logging.info(f"[OSPF] Torn down router ospf/ospf6 for {device_id}")
+    except Exception as _ee:
+        logging.error(f"[OSPF] stop exec failed for {device_id}: {_ee}")
 
 def cleanup_device_routes(device_id):
     """Clean up OSPF routes for a specific device."""
