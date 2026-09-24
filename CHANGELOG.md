@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.417] - 2026-09-22
+
+### Fixed — utils/isis.py audit (9 HIGH)
+
+Post-mortem audit of `utils/isis.py` completing the BGP → OSPF →
+ISIS parity trilogy. All BGP T1–T3 / OSPF EE1–EE3 patterns had ISIS
+equivalents, plus ISIS-specific bugs the OSPF audit did not have
+(operator-picked config fields silently dropped, hardcoded NET
+producing duplicate system-IDs in the same area). All fixes touch
+`utils/isis.py` (with a new import from `utils/isis_net.py`).
+
+**FF1: hello_interval / hello_multiplier / metric wired to vtysh**
+(`utils/isis.py:_isis_interface_timer_lines`) — Pre-fix the three
+UI-collected timer/metric fields were saved to the DB and echoed
+back in the display, but NEVER made it onto the router — a textbook
+silent-misconfig bug (operator changes hello-interval, nothing
+happens on the wire). New `_isis_interface_timer_lines()` helper
+emits `isis hello-interval N` / `isis hello-multiplier N` / `isis
+metric N` on every interface both `configure_isis_neighbor` and
+`start_isis_neighbor` touch. Blank fields are skipped so FRR
+defaults still apply.
+
+**FF2: `_isis_vrf_suffix` fails CLOSED on VRF probe failure**
+(`utils/isis.py:_isis_vrf_suffix`) — Same class as v0.5.403 BGP T1
+and v0.5.416 OSPF EE1. Pre-fix, a subprocess hang or non-zero exit
+code silently dropped the VRF suffix and pushed `router isis CORE`
+into the default routing instance; isisd sent hellos out the wrong
+table, adjacencies stayed Down forever. Now: 5s timeout, and if a
+VRF name IS registered but the probe fails, raise
+`IsisVrfProbeError` so `configure`/`start`/`stop` abort loudly.
+
+**FF3: vtysh error-marker scanner across all exec sites**
+(`utils/isis.py:_vtysh_output_has_error`) — vtysh returns rc=0 even
+when it rejects individual lines with `% Unknown command`, `%
+Malformed`, `% Configuration failed`. New scanner wired into
+`configure`, `start`, and `stop`; a `%` line in the output now
+downgrades the result to failure. Same class as v0.5.403 BGP T2
+and v0.5.416 OSPF EE2.
+
+**FF4: `stop_isis_neighbor` actually stops ISIS**
+(`utils/isis.py:_stop_isis_neighbor_locked`) — Pre-fix, stop only
+stripped the per-interface `ip router isis CORE` lines and
+deliberately preserved the router-level `router isis CORE`,
+`is-type`, and `net` — meaning isisd kept running, kept originating
+LSPs, and any container restart brought ISIS back up on every
+interface that had ever been enabled. Now: issues `no router isis
+CORE{vrf}` and persists with `write memory`, so the instance is
+actually torn down. Same class as v0.5.403 BGP T3 and v0.5.416
+OSPF EE3.
+
+**FF5 + FF9: hardcoded NET `49.0001.0000.0000.0001.00` removed
+from all four sites** (`_configure_isis_neighbor_locked`,
+`_start_isis_neighbor_locked`, `_stop_isis_neighbor_locked`, and
+the start-time `no net …` clean-up) — Pre-fix ANY device whose
+operator hadn't picked a NET got the same shared default →
+two devices in the same lab ended up with duplicate system-IDs in
+the same area, corrupting the LSDB and triggering SPF thrash.
+New `_resolve_isis_net()` helper wires in `utils.isis_net.
+validate_isis_net` and raises `IsisNetError` on empty/malformed
+NET instead of silently falling back. Configure/start refuse to
+proceed without a valid, operator-supplied NET.
+
+**FF6: `start_isis_neighbor` no longer sends hardcoded `no net`
+clean-up line** (`_start_isis_neighbor_locked`) — Pre-fix the start
+builder unconditionally issued `no net 49.0001.0000.0000.0001.00`
+— meaning any device whose operator had explicitly set that NET
+got it stripped every time Start was clicked, and any two devices
+that had ever fallen back to the same hardcoded NET (FF5) landed
+with duplicate system-IDs. Now: NET is set only from the validated
+operator input; no hardcoded default is ever touched.
+
+**FF7: hardcoded `vlan20` interface fallback removed from start
++ stop** (`_start_isis_neighbor_locked`, `_stop_isis_neighbor_locked`)
+— Pre-fix, when a device had no configured interface and no VLAN
+column in the DB, both paths defaulted to `vlan20`. If two devices
+on the same host both hit that fallback, device D's Start could
+enable ISIS on the shared `vlan20` (or device D's Stop could rip it
+off, killing device E's adjacency). Now: Start fails loudly if no
+interface can be resolved; Stop proceeds with router-level teardown
+only.
+
+**FF8: per-device lock across configure/start/stop**
+(`utils/isis.py:_isis_device_lock`) — Concurrent Apply + Start
+clicks on the same device could race the `configure terminal`
+session, producing nested-config errors. New per-device lock keyed
+by `device_id`, matching v0.5.383 X1 (BGP) and v0.5.416 EE11
+(OSPF). Public wrappers (`configure_isis_neighbor`,
+`start_isis_neighbor`, `stop_isis_neighbor`) each acquire the lock
+and dispatch to a `_..._locked` body that carries the vtysh
+session.
+
+### Tests
+
+- `tests/test_v05417_isis_audit.py` — 36 tests: FF1-FF9 markers,
+  helper unit tests (`_resolve_isis_net` accept/reject, timer-line
+  generation, lock reuse-per-device), body scans that confirm the
+  hardcoded NET / vlan20 literals are gone from live code, plus
+  regression guards for v0.5.416 EE1 and v0.5.403 BGP T2.
+
 ## [0.5.416] - 2026-09-21
 
 ### Fixed — utils/ospf.py audit (8 HIGH + 2 MED)

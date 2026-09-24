@@ -12,6 +12,73 @@ import subprocess
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 
+from utils.isis_net import validate_isis_net
+
+
+# v0.5.417 (audit stream-FF3): vtysh returns exit-code 0 even when
+# the output contains error markers like `% Unknown command` or
+# `% Malformed`. Pre-fix every ISIS vtysh call trusted the exit code
+# alone → silent rejections were logged as success. Same marker set
+# as v0.5.403 T2 (bgp.py) and v0.5.416 EE2 (ospf.py).
+_VTYSH_ERROR_MARKERS = (
+    "% Unknown command",
+    "% Malformed",
+    "% Configuration failed",
+    "% Invalid",
+    "% Ambiguous command",
+    "% Incomplete command",
+    "% Command incomplete",
+)
+
+
+def _vtysh_output_has_error(output: str) -> bool:
+    if not output:
+        return False
+    for _line in output.splitlines():
+        _stripped = _line.strip()
+        if not _stripped.startswith("%"):
+            continue
+        for _marker in _VTYSH_ERROR_MARKERS:
+            if _marker in _stripped:
+                return True
+    return False
+
+
+# v0.5.417 (audit stream-FF8): per-device lock so concurrent
+# Apply/Start/Stop clicks on the same device don't step on each
+# other's `configure terminal` state. Mirrors v0.5.383 X1 (BGP) and
+# v0.5.416 EE11 (OSPF).
+_ISIS_DEVICE_LOCKS: Dict[str, threading.Lock] = {}
+_ISIS_DEVICE_LOCKS_GUARD = threading.Lock()
+
+
+class _NullLock:
+    def __enter__(self):
+        return self
+    def __exit__(self, *_):
+        return False
+
+
+def _isis_device_lock(device_id: Optional[str]):
+    if not device_id:
+        return _NullLock()
+    with _ISIS_DEVICE_LOCKS_GUARD:
+        _lk = _ISIS_DEVICE_LOCKS.get(device_id)
+        if _lk is None:
+            _lk = threading.Lock()
+            _ISIS_DEVICE_LOCKS[device_id] = _lk
+    return _lk
+
+
+class IsisVrfProbeError(RuntimeError):
+    """Raised by _isis_vrf_suffix when a VRF name is registered for a
+    device but the kernel probe fails — pre-v0.5.417, the code
+    silently dropped the VRF and wrote to the default routing
+    instance, causing silent misconfig (hellos go out the default
+    table, per-VRF iface never sees them, adjacencies stay Down).
+    Callers should catch and abort the operation with a clear error
+    to the operator."""
+
 
 def _isis_vrf_suffix(device_id: Optional[str]) -> str:
     """Return ' vrf <name>' if this device has been provisioned with a
@@ -22,25 +89,128 @@ def _isis_vrf_suffix(device_id: Optional[str]) -> str:
     The per-interface `ip router isis CORE` references just bind the
     iface to the named instance and don't carry a VRF keyword.
 
-    Falls back to no-VRF for legacy deployments that pre-date VRF
-    wiring (kernel VRF iface not present).
+    v0.5.417 (audit stream-FF2): fail-CLOSED on probe failure. Pre-
+    fix a subprocess hang OR a non-zero return code silently dropped
+    the VRF suffix, so `router isis CORE` landed in the DEFAULT
+    routing instance — isisd sent hellos out the default table,
+    per-VRF interface never saw them, neighbors stayed Down. Same
+    class as v0.5.403 BGP T1 and v0.5.416 OSPF EE1.
+
+    New behavior: (a) 5s timeout on the `ip link show` probe;
+    (b) if a VRF name IS registered for this device but the probe
+    fails (timeout, non-zero rc, exception), RAISE
+    `IsisVrfProbeError` so callers fail loudly instead of writing
+    config into the wrong routing instance. (c) if no VRF name is
+    registered at all (legacy single-device deployment), return
+    "" — that's the intended non-VRF path.
     """
     if not device_id:
         return ""
     try:
         from utils.frr_docker import FRRDockerManager
         vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
-        if not vrf_name:
-            return ""
+    except Exception as _exc_reg:
+        # Registry lookup itself failed — legacy pre-VRF layout.
+        logging.debug(f"[ISIS VRF] registry lookup failed for {device_id}: {_exc_reg}")
+        return ""
+    if not vrf_name:
+        return ""
+    try:
         check = subprocess.run(
             ["ip", "-o", "link", "show", vrf_name],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=5,
         )
-        if check.returncode == 0 and (check.stdout or "").strip():
-            return f" vrf {vrf_name}"
-    except Exception as exc:
-        logging.debug(f"[ISIS VRF] suffix lookup failed for {device_id}: {exc}")
-    return ""
+    except subprocess.TimeoutExpired as _te:
+        raise IsisVrfProbeError(
+            f"[ISIS VRF] `ip link show {vrf_name}` timed out for device "
+            f"{device_id} after 5 s — refusing to configure in the wrong "
+            f"routing instance."
+        ) from _te
+    except Exception as _exc:
+        raise IsisVrfProbeError(
+            f"[ISIS VRF] probe for {vrf_name} on device {device_id} "
+            f"raised {type(_exc).__name__}: {_exc} — refusing to fall "
+            f"back to default VRF."
+        ) from _exc
+    if check.returncode != 0 or not (check.stdout or "").strip():
+        raise IsisVrfProbeError(
+            f"[ISIS VRF] VRF {vrf_name!r} was registered for device "
+            f"{device_id} but `ip link show` returned rc={check.returncode}, "
+            f"stdout={(check.stdout or '')!r}, stderr={(check.stderr or '')!r} — "
+            f"refusing to fall back to default VRF."
+        )
+    return f" vrf {vrf_name}"
+
+
+class IsisNetError(ValueError):
+    """v0.5.417 (audit stream-FF5 + FF9): raised when an operator-
+    supplied NET is missing or invalid. Pre-fix the code silently
+    fell back to the hardcoded 49.0001.0000.0000.0001.00 default in
+    FOUR places → two devices in the same lab ended up with the SAME
+    system-id in the SAME area, corrupting the LSDB. Callers should
+    catch and surface the reason to the operator."""
+
+
+def _resolve_isis_net(area_id: Any, *, device_id: Optional[str] = None) -> str:
+    """v0.5.417 (audit stream-FF5 + FF9): single choke point that
+    validates the operator-supplied NET before we hand it to vtysh.
+
+    - Empty / None NET → `IsisNetError` (no hardcoded fallback).
+    - Malformed NET → `IsisNetError` with the validator's reason.
+    - Valid NET → returned stripped.
+
+    The device_id is included in the exception message for triage.
+    """
+    _raw = "" if area_id is None else str(area_id).strip()
+    if not _raw:
+        raise IsisNetError(
+            f"ISIS NET is empty for device {device_id or '<unknown>'}. "
+            f"v0.5.417 (FF5) no longer falls back to the shared "
+            f"`49.0001.0000.0000.0001.00` default — configure a unique "
+            f"NET per device before starting ISIS."
+        )
+    _reason = validate_isis_net(_raw)
+    if _reason:
+        raise IsisNetError(
+            f"ISIS NET {_raw!r} for device {device_id or '<unknown>'} is "
+            f"invalid: {_reason}."
+        )
+    return _raw
+
+
+def _isis_interface_timer_lines(
+    isis_config: Dict[str, Any],
+    *,
+    circuit_type: Optional[str] = None,
+) -> List[str]:
+    """v0.5.417 (audit stream-FF1): emit the per-interface ISIS timer
+    and metric lines the operator picked in the UI. Pre-fix these
+    fields were saved to the DB and displayed back but NEVER made it
+    onto the router — a textbook silent-misconfig bug.
+
+    - `hello_interval` → `isis hello-interval <N>` (seconds)
+    - `hello_multiplier` → `isis hello-multiplier <N>` (dead = hello × mult)
+    - `metric` → `isis metric <N>` (per-AF cost)
+
+    Values are pulled from `isis_config`; blank/None values are
+    skipped (FRR default remains in effect). The `circuit_type`
+    argument stays optional because FF10 (MED) is out of the HIGH
+    slice — kept as a parameter for the follow-up.
+    """
+    lines: List[str] = []
+    _hi = str(isis_config.get("hello_interval") or "").strip()
+    _hm = str(isis_config.get("hello_multiplier") or "").strip()
+    _mt = str(isis_config.get("metric") or "").strip()
+    if _hi:
+        lines.append(f" isis hello-interval {_hi}")
+    if _hm:
+        lines.append(f" isis hello-multiplier {_hm}")
+    if _mt:
+        lines.append(f" isis metric {_mt}")
+    if circuit_type:
+        lines.append(f" isis circuit-type {circuit_type}")
+    return lines
+
 
 try:
     import docker.errors
@@ -253,11 +423,45 @@ def get_isis_status(device_id: str, device_name: str, container_id: str) -> Dict
         }
 
 def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_name: str = None, ipv4: str = None, ipv6: str = None) -> bool:
-    """Configure ISIS for a device in FRR container."""
+    """Configure ISIS for a device in FRR container.
+
+    v0.5.417 (audit stream-FF8): public wrapper acquires the per-
+    device lock, then dispatches to `_configure_isis_neighbor_locked`.
+    """
+    with _isis_device_lock(device_id):
+        return _configure_isis_neighbor_locked(
+            device_id, isis_config, device_name=device_name, ipv4=ipv4, ipv6=ipv6,
+        )
+
+
+def _configure_isis_neighbor_locked(device_id: str, isis_config: Dict[str, Any], device_name: str = None, ipv4: str = None, ipv6: str = None) -> bool:
+    """Locked body of configure_isis_neighbor. Never call directly —
+    always go through `configure_isis_neighbor` so the per-device
+    lock is held for the duration of the vtysh session."""
     try:
         from utils.frr_docker import FRRDockerManager
-        
+
         logging.info(f"[ISIS CONFIGURE] Configuring ISIS for device {device_name} ({device_id})")
+
+        # v0.5.417 (audit stream-FF5 + FF9): validate NET at the top
+        # so we bail before touching the container if the operator
+        # never configured one (or gave us garbage).
+        try:
+            area_id_validated = _resolve_isis_net(
+                isis_config.get("area_id"), device_id=device_id,
+            )
+        except IsisNetError as _net_exc:
+            logging.error(f"[ISIS CONFIGURE] {_net_exc}")
+            return False
+
+        # v0.5.417 (audit stream-FF2): probe VRF early so a
+        # misconfigured device can't push router-level config into
+        # the default VRF.
+        try:
+            _vrf_suffix = _isis_vrf_suffix(device_id)
+        except IsisVrfProbeError as _vrf_exc:
+            logging.error(f"[ISIS CONFIGURE] {_vrf_exc}")
+            return False
         
         frr_manager = FRRDockerManager()
         container_name = frr_manager._get_container_name(device_id, device_name)
@@ -330,7 +534,11 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
                     logger.warning(f"[ISIS CONFIGURE] ISIS daemon not ready after {max_retries} attempts for {device_name}, proceeding anyway (may fail)")
         
         # Extract ISIS configuration (handle None values - use default if None)
-        area_id = isis_config.get("area_id") or "49.0001.0000.0000.0001.00"
+        # v0.5.417 (audit stream-FF5): NEVER fall back to the shared
+        # hardcoded default `49.0001.0000.0000.0001.00`. The NET has
+        # already been validated at the top of this function and
+        # `area_id_validated` is guaranteed to be a well-formed NET.
+        area_id = area_id_validated
         system_id = isis_config.get("system_id") or "0000.0000.0001"
         level = isis_config.get("level") or "Level-2"
         hello_interval = isis_config.get("hello_interval") or "10"
@@ -454,25 +662,29 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
             # Configure router-level ISIS first. The optional ` vrf <name>`
             # suffix scopes this isisd instance to the device's Linux
             # VRF so multi-device-on-same-NIC deployments don't share
-            # an IS-IS RIB.
-            f"router isis CORE{_isis_vrf_suffix(device_id)}",
+            # an IS-IS RIB. The suffix was probed at the top of this
+            # function via `_vrf_suffix` (FF2 fail-closed).
+            f"router isis CORE{_vrf_suffix}",
             f"is-type {frr_level}",
             f"net {area_id}",
             "exit",
             # Configure interface ISIS
             f"interface {interface}",
         ]
-        
+
         # Add IPv4 or IPv6 ISIS routing based on configured addresses
         if enable_ipv4:
             vtysh_commands.append(f" ip router isis CORE")
         if enable_ipv6:
             vtysh_commands.append(f" ipv6 router isis CORE")
-        
-        vtysh_commands.extend([
-            f"isis network point-to-point",
-            "exit",
-        ])
+
+        vtysh_commands.append(f" isis network point-to-point")
+        # v0.5.417 (audit stream-FF1): emit the per-interface timer
+        # and metric lines the operator picked in the UI. Pre-fix
+        # `hello_interval` / `hello_multiplier` / `metric` were saved
+        # to the DB and shown back in the UI but never touched vtysh.
+        vtysh_commands.extend(_isis_interface_timer_lines(isis_config))
+        vtysh_commands.append("exit")
         
         # Add loopback interface to ISIS if loopback IPs are configured
         loopback_ipv4 = None
@@ -543,8 +755,15 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         if result.exit_code != 0:
             logging.error(f"[ISIS CONFIGURE] Command failed: {result.output.decode()}")
             return False
-        else:
-            logging.info(f"[ISIS CONFIGURE] ✅ ISIS configuration successful")
+        # v0.5.417 (audit stream-FF3): vtysh returns rc=0 even when
+        # commands are rejected — scan output for `%` markers.
+        if _vtysh_output_has_error(_out):
+            logging.error(
+                f"[ISIS CONFIGURE] vtysh output contained error markers "
+                f"despite rc=0; refusing to report success. Output:\n{_out}"
+            )
+            return False
+        logging.info(f"[ISIS CONFIGURE] ✅ ISIS configuration successful")
         
         # Update database with ISIS config and status
         try:
@@ -587,16 +806,27 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
 def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isis_config: Dict[str, Any]) -> bool:
     """
     Start ISIS on a device.
-    
+
+    v0.5.417 (audit stream-FF8): public wrapper acquires the per-
+    device lock, then dispatches to `_start_isis_neighbor_locked`.
+
     Args:
         device_id: Device identifier
         device_name: Device name
         container_id: Docker container ID
         isis_config: ISIS configuration
-        
+
     Returns:
         True if successful, False otherwise
     """
+    with _isis_device_lock(device_id):
+        return _start_isis_neighbor_locked(device_id, device_name, container_id, isis_config)
+
+
+def _start_isis_neighbor_locked(device_id: str, device_name: str, container_id: str, isis_config: Dict[str, Any]) -> bool:
+    """Locked body of start_isis_neighbor. Never call directly — go
+    through `start_isis_neighbor` so the per-device lock is held for
+    the whole vtysh session."""
     try:
         # Normalize isis_config if passed as JSON string
         if isinstance(isis_config, str):
@@ -629,15 +859,43 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
                     interfaces_to_enable.append(vlan_if)
         except Exception:
             pass
+        # v0.5.417 (audit stream-FF7): NEVER fall back to hardcoded
+        # `vlan20`. Pre-fix this was the sole "start something" path
+        # when the device had no configured interface and no VLAN
+        # column, meaning device D's Start could reach across the
+        # host and bring up device E's shared `vlan20`. Fail-loud
+        # instead — the operator must configure an interface.
         if not interfaces_to_enable:
-            interfaces_to_enable.append("vlan20")
+            logger.error(
+                f"[ISIS START] No interface configured for device {device_name} "
+                f"({device_id}) and no VLAN column in the DB. Refusing to fall "
+                f"back to hardcoded `vlan20` (v0.5.417 FF7)."
+            )
+            return False
 
         # Also ensure router-level config is present to match what stop removes
         # Compute router-level parameters
-        area_id = isis_config.get("area_id", "49.0001.0000.0000.0001.00")
+        # v0.5.417 (audit stream-FF5 + FF9): validate the operator-
+        # supplied NET; no hardcoded fallback.
+        try:
+            area_id = _resolve_isis_net(
+                isis_config.get("area_id"), device_id=device_id,
+            )
+        except IsisNetError as _net_exc:
+            logger.error(f"[ISIS START] {_net_exc}")
+            return False
         level = isis_config.get("level", "Level-2")
         level_map = {"Level-1": "level-1-only", "Level-2": "level-2-only", "Level-1-2": "level-1-2"}
         frr_level = level_map.get(level, "level-2-only")
+
+        # v0.5.417 (audit stream-FF2): VRF probe fail-closed so a
+        # missing / mis-registered VRF can't route config into the
+        # default routing instance.
+        try:
+            _vrf_suffix = _isis_vrf_suffix(device_id)
+        except IsisVrfProbeError as _vrf_exc:
+            logger.error(f"[ISIS START] {_vrf_exc}")
+            return False
 
         # Determine address families based on device IP configuration.
         # v0.5.362 (audit isis-db-fallback-double-af, A2): pre-fix, on
@@ -685,28 +943,33 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
         # Note: Global router-id is configured in frr_docker.py when container is created
         # VRF suffix scopes the IS-IS instance to the device's Linux
         # VRF when multi-device-on-same-iface is in use.
+        # v0.5.417 (audit stream-FF6): the pre-fix builder unconditionally
+        # issued `no net 49.0001.0000.0000.0001.00` — meaning any device
+        # whose NET the operator had explicitly set to that value would
+        # get it stripped every Start, and any two devices in the same
+        # lab that ever fell back to that same hardcoded NET landed
+        # with duplicate system-IDs in the same area (LSDB corruption).
+        # The new NET is set unconditionally from the validated operator
+        # input, and no hardcoded default is touched.
         vtysh_commands = [
             "configure terminal",
-            f"router isis CORE{_isis_vrf_suffix(device_id)}",
-            # Best-effort cleanup of common/default NET before setting desired NET
-            "no net 49.0001.0000.0000.0001.00",
+            f"router isis CORE{_vrf_suffix}",
             f"is-type {frr_level}",
             f"net {area_id}",
             "exit",
         ]
         for iface in interfaces_to_enable:
-            vtysh_commands.extend([
-                f"interface {iface}",
-            ])
+            vtysh_commands.append(f"interface {iface}")
             # Add IPv4 or IPv6 based on configured addresses
             if enable_ipv4:
                 vtysh_commands.append(" ip router isis CORE")
             if enable_ipv6:
                 vtysh_commands.append(" ipv6 router isis CORE")
-            vtysh_commands.extend([
-                " isis network point-to-point",
-                "exit",
-            ])
+            vtysh_commands.append(" isis network point-to-point")
+            # v0.5.417 (audit stream-FF1): per-interface timer +
+            # metric lines that used to be silently dropped.
+            vtysh_commands.extend(_isis_interface_timer_lines(isis_config))
+            vtysh_commands.append("exit")
         # Remove None entries from optional lines
         vtysh_commands = [c for c in vtysh_commands if c]
         vtysh_commands.extend(["end", "write"])
@@ -722,9 +985,19 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
         if stdout:
             logger.debug(f"[ISIS START] vtysh output:\n{stdout}")
 
+        # v0.5.417 (audit stream-FF3): vtysh returns rc=0 even when
+        # it rejects individual lines; scan output for `%` markers.
+        if exit_code == 0 and _vtysh_output_has_error(stdout):
+            logger.error(
+                f"[ISIS START] vtysh output for {device_name} contained "
+                f"error markers despite rc=0; refusing to report success. "
+                f"Output:\n{stdout}"
+            )
+            return False
+
         if exit_code == 0:
             logger.info(f"[ISIS START] Successfully started ISIS for {device_name}")
-            
+
             # Update database with ISIS status
             try:
                 from .device_database import DeviceDatabase
@@ -759,16 +1032,27 @@ def stop_isis_neighbor(device_id: str, device_name: str = None, container_id: st
     """
     Stop ISIS on a device by removing ISIS configuration.
     Uses FRRDockerManager for consistency with configure_isis_neighbor.
-    
+
+    v0.5.417 (audit stream-FF8): public wrapper acquires the per-
+    device lock, then dispatches to `_stop_isis_neighbor_locked`.
+
     Args:
         device_id: Device identifier
         device_name: Device name (optional, will be looked up if not provided)
         container_id: Docker container ID (optional, for backward compatibility)
         isis_config: ISIS configuration (optional)
-        
+
     Returns:
         True if successful, False otherwise
     """
+    with _isis_device_lock(device_id):
+        return _stop_isis_neighbor_locked(device_id, device_name, container_id, isis_config)
+
+
+def _stop_isis_neighbor_locked(device_id: str, device_name: str = None, container_id: str = None, isis_config: Dict[str, Any] = None) -> bool:
+    """Locked body of stop_isis_neighbor. Never call directly — go
+    through `stop_isis_neighbor` so the per-device lock is held for
+    the whole vtysh session."""
     try:
         from utils.frr_docker import FRRDockerManager
         from utils.device_database import DeviceDatabase
@@ -840,9 +1124,17 @@ def stop_isis_neighbor(device_id: str, device_name: str = None, container_id: st
         
         # Get interface and net from config if available
         interface = (isis_config or {}).get("interface", None)
-        net = (isis_config or {}).get("area_id", "49.0001.0000.0000.0001.00")
         level = (isis_config or {}).get("level", "Level-2")
-        
+
+        # v0.5.417 (audit stream-FF2): probe VRF fail-closed. Same
+        # rationale as start/configure — writing `no router isis`
+        # into the wrong VRF is worse than a loud failure.
+        try:
+            _vrf_suffix = _isis_vrf_suffix(device_id)
+        except IsisVrfProbeError as _vrf_exc:
+            logger.error(f"[ISIS STOP] {_vrf_exc}")
+            return False
+
         # Build a list of interfaces to clean: configured interface and VLAN from device record
         interfaces_to_clean = []
         try:
@@ -854,11 +1146,21 @@ def stop_isis_neighbor(device_id: str, device_name: str = None, container_id: st
                 vlan_if = f"vlan{device_data.get('vlan')}"
                 if vlan_if not in interfaces_to_clean:
                     interfaces_to_clean.append(vlan_if)
-        except Exception:
-            # Fallback: if nothing resolved, default to vlan20 (legacy)
-            if not interfaces_to_clean:
-                interfaces_to_clean.append("vlan20")
-        
+        except Exception as _iface_exc:
+            logger.warning(f"[ISIS STOP] iface enumeration failed: {_iface_exc}")
+
+        # v0.5.417 (audit stream-FF7): NEVER fall back to hardcoded
+        # `vlan20`. If we have no interfaces to clean but we still
+        # want the router-level teardown (FF4), proceed with the
+        # router-level cleanup alone — that at least stops the
+        # isisd instance so it doesn't keep originating LSPs.
+        if not interfaces_to_clean:
+            logger.warning(
+                f"[ISIS STOP] No interfaces resolved for device "
+                f"{device_name} ({device_id}); router-level teardown "
+                f"only (v0.5.417 FF7 — no hardcoded `vlan20`)."
+            )
+
         # Convert level to FRR format for removal
         level_map = {
             "Level-1": "level-1-only",
@@ -866,7 +1168,7 @@ def stop_isis_neighbor(device_id: str, device_name: str = None, container_id: st
             "Level-1-2": "level-1-2"
         }
         frr_level = level_map.get(level, "level-2-only")
-        
+
         # Build ISIS removal commands - remove from interfaces first, then router
         vtysh_commands = [
             "configure terminal",
@@ -880,24 +1182,46 @@ def stop_isis_neighbor(device_id: str, device_name: str = None, container_id: st
                 "no isis network point-to-point",
                 "exit",
             ])
-        # Do NOT remove router-level configuration (preserve router isis CORE, is-type, and net)
+        # v0.5.417 (audit stream-FF4): actually stop ISIS.
+        # Pre-fix `stop_isis_neighbor` only stripped the per-interface
+        # `ip router isis CORE` lines and DELIBERATELY left `router
+        # isis CORE`, `is-type`, and `net` intact — meaning isisd kept
+        # running with a NET, kept originating LSPs, and any container
+        # restart brought ISIS back up on any interface that had ever
+        # been enabled and never explicitly cleared. Same class as
+        # v0.5.403 BGP T3 and v0.5.416 OSPF EE3. Issue the full
+        # `no router isis CORE` (with VRF suffix) so the instance is
+        # actually torn down.
+        vtysh_commands.append(f"no router isis CORE{_vrf_suffix}")
+        # Persist so container restart doesn't resurrect the config.
         vtysh_commands.extend([
             "end",
-            "write",
+            "write memory",
         ])
-        
+
         # Execute commands using here document
         config_commands = "\n".join(vtysh_commands)
         exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
         logger.info(f"[ISIS STOP] Executing ISIS removal commands on container {container_name}")
         logger.debug(f"[ISIS STOP] Commands: {vtysh_commands}")
-        
+
         result = container.exec_run(["bash", "-c", exec_cmd])
         logger.info(f"[ISIS STOP] Command exit code: {result.exit_code}")
-        logger.info(f"[ISIS STOP] Command output: {result.output.decode()}")
-        
+        _stop_output = result.output.decode() if isinstance(result.output, (bytes, bytearray)) else str(result.output)
+        logger.info(f"[ISIS STOP] Command output: {_stop_output}")
+
         if result.exit_code != 0:
-            logger.error(f"[ISIS STOP] Command failed: {result.output.decode()}")
+            logger.error(f"[ISIS STOP] Command failed: {_stop_output}")
+            return False
+
+        # v0.5.417 (audit stream-FF3): vtysh returns rc=0 even when
+        # it rejects individual lines; scan output for `%` markers.
+        if _vtysh_output_has_error(_stop_output):
+            logger.error(
+                f"[ISIS STOP] vtysh output for {device_name} contained "
+                f"error markers despite rc=0; refusing to report success. "
+                f"Output:\n{_stop_output}"
+            )
             return False
             
         # Update database with ISIS status - clear ISIS config and status
