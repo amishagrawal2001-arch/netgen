@@ -2,6 +2,93 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.420] - 2026-10-02
+
+### Fixed — utils/dhcp.py audit (slice A: 3 HIGH + 4 MED)
+
+Audit of utils/dhcp.py (5953 lines) returned 7 HIGH + 10 MED. This
+release lands the non-v6 subset (3 HIGH + 4 MED). The 4 remaining
+HIGHs are all DHCPv6 server-path bugs that need srv06 end-to-end
+verification first (task #83); they will land as v0.5.421 after
+that verification pass.
+
+**HH1: `_remove_route_and_vrf_copy` skips main-table del on
+VRF-slaved devices.** v0.5.282 made `_add_route_and_vrf_copy` SKIP
+the main-table install whenever `vrf_name` is set, but the
+removal counterpart kept running the main-table del + fallbacks
+unconditionally. All three del shapes failed with "No such
+process" for a route that was never installed there; the final
+failure appended to `failures`, and `stop_dhcp_server` wrote the
+string to `dhcp_last_error`. Every clean stop of a VRF-slaved
+DHCP-server device reported spurious errors in the UI's
+Last-Error. New: gate the main-table removal with
+`if not vrf_name:` to mirror the install guard.
+
+**HH6: dead `pkill -f "dhcp6c.*\\s..."` deleted.** The pattern
+used Python-emitted `\\s` which POSIX ERE does not recognize —
+matched `(^|s)iface(s|$)` literally, almost never fires. The real
+whole-token argv match happens in `_kill_stale_dhcp6c()` right
+after (v0.5.351). Removed the dead call.
+
+**HH7: shell-interpolation hygiene across 5 `/bin/sh -c` sites.**
+Every site that interpolates `{interface}` / `{conffile}` /
+`{pidfile}` / `{dhcp6_conf}` now wraps the field with
+`shlex.quote()`. Low real-world severity (the operator already has
+root on the host, DHCP container is privileged + host-network),
+but defence-in-depth hygiene that closes a general-class gap.
+
+**HH8 (MED): VRF-probe timeout 2s → 5s.** 4 `subprocess.run(["ip",
+"-o", "link", "show", vrf_name], timeout=2)` sites bumped to 5s.
+2s is tight for `ip link show` on srv06 with many interfaces;
+timeout → VRF treated as missing → `_parse_gateway` returns None
+→ `dhcp_lease_gateway` flips to empty in the hot polling path,
+operator sees gateway intermittently disappear.
+
+**HH13 (MED): `_remove_matching_ipv4_anchors` tightened to exact
+`(ip, prefix)` match.** Pre-fix the fallback branch matched
+ip-only across any prefix — so a candidate `(192.168.30.16,
+"28")` derived from a /28 fragment of a /24 pool could match an
+operator-installed `192.168.30.16/24` on the same interface and
+silently delete it on DHCP stop. New: exact-match only; near-miss
+(ip matches, prefix differs) logs at WARN so operator sees the
+skip without losing their address.
+
+**HH15 (MED): `docker.from_env()` now carries `timeout=30`.** 3
+call sites in `_ensure_dhcp_container` / lookup / cleanup bypassed
+docker-py's default-None (wait forever) behaviour. Stuck dockerd
+sockets pinned the Flask worker indefinitely. 30s HTTP timeout
+mirrors the GG6/FF13 parity story for exec_run (which has its own
+threading wrapper).
+
+**HH16 (MED): v6 relay-mode stale-anchor sweep intersects with
+candidate set.** Pre-fix the v0.5.335 relay-mode sweep removed
+ANY non-link-local IPv6 address on the interface that fell inside
+the pool subnet — even operator-installed ones (static test IP,
+dual-role iface, prior non-netgen tooling). New: intersect with
+`_collect_ipv6_anchor_candidates(dhcp_config)` before removing,
+mirroring the v4-side safety that `_remove_matching_ipv4_anchors`
+already provides.
+
+### Tests
+
+- `tests/test_v05420_dhcp_audit.py` — 18 tests covering each
+  marker, body checks for the structural changes (main-table
+  gate, exact-match fallback, candidate intersection), and
+  smoke-level invariants (`timeout=2` fully gone; `shlex.quote`
+  wraps every known-hazardous interpolation; `docker.from_env`
+  never bare). Regression guards for v0.5.418 GG1,
+  v0.5.419 GG4 scanner, and v0.5.417 FF3.
+
+### Deferred to v0.5.421
+
+HH2-HH5 are all DHCPv6 server-path bugs (anchor-fail → dnsmasq
+launch falls through, missing `ipv6_relay_return_hop`, discarded
+`_v6_dad_poll` return, `pool_router` silently falling back to
+server-side gateway). All four are flagged UNVERIFIED on srv06 —
+DHCPv6 server-side end-to-end verification is a long-standing
+pending task. Shipping blind would stack more paper-only fixes
+on an untested path; they will land after that verification.
+
 ## [0.5.419] - 2026-10-02
 
 ### Fixed — utils/frr_docker.py audit (7 HIGH: GG2-GG8)

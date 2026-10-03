@@ -521,7 +521,7 @@ def _parse_gateway(interface: str, container=None, device_id: Optional[str] = No
             if vrf_name:
                 check = subprocess.run(
                     ["ip", "-o", "link", "show", vrf_name],
-                    capture_output=True, text=True, timeout=2,
+                    capture_output=True, text=True, timeout=5,
                 )
                 if check.returncode == 0 and (check.stdout or "").strip():
                     return _scan(["vrf", vrf_name])
@@ -566,7 +566,7 @@ def _parse_gateway6(interface: str, container=None, device_id: Optional[str] = N
             if vrf_name:
                 check = subprocess.run(
                     ["ip", "-o", "link", "show", vrf_name],
-                    capture_output=True, text=True, timeout=2,
+                    capture_output=True, text=True, timeout=5,
                 )
                 if check.returncode == 0 and (check.stdout or "").strip():
                     return _scan(["vrf", vrf_name])
@@ -633,7 +633,7 @@ def _migrate_dhcp_route_to_vrf(
             return False
         check = subprocess.run(
             ["ip", "-o", "link", "show", vrf_name],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True, text=True, timeout=5,
         )
         if check.returncode != 0 or not (check.stdout or "").strip():
             return False  # no VRF on this host
@@ -697,7 +697,7 @@ def _resolve_device_vrf(device_id: str) -> Optional[str]:
             return None
         check = subprocess.run(
             ["ip", "-o", "link", "show", vrf_name],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True, text=True, timeout=5,
         )
         if check.returncode != 0 or not (check.stdout or "").strip():
             return None
@@ -753,9 +753,12 @@ def _add_route_and_vrf_copy(
     _effective_gateway = gateway
     if gateway and interface and family == "ipv4":
         try:
+            # v0.5.420 (audit stream-HH7): shlex.quote the interface
+            # fragment so a DB row with shell metachars (`vlan10; rm
+            # -rf /`) can't inject commands into `/bin/sh -c`.
             _probe = _run_command(
                 ["/bin/sh", "-c",
-                 f"ip -4 -o addr show dev {interface} 2>/dev/null | "
+                 f"ip -4 -o addr show dev {shlex.quote(str(interface))} 2>/dev/null | "
                  f"awk '{{for (i=1;i<=NF;i++) if ($i==\"inet\") "
                  f"print $(i+1)}}'"],
                 container=container, timeout=5,
@@ -888,52 +891,62 @@ def _remove_route_and_vrf_copy(
             # a failure as fatal; the bare form is the safety net.
             raise exc
 
-    # Main table: try `<net> via <gw>` first if we have a gateway,
-    # then fall back to bare `<net>` (mirrors the pre-fix add path
-    # which switched shapes based on whether a gateway was set).
-    if gateway:
+    # Main table — v0.5.420 (audit stream-HH1): mirror the install-
+    # path guard. v0.5.282 made `_add_route_and_vrf_copy` SKIP the
+    # main-table install whenever `vrf_name` is set (VRF-slaved
+    # interfaces don't need a main-table copy). Pre-fix this
+    # function kept doing the main-table del + fallbacks + `dev
+    # iface` form unconditionally — all three fail with "No such
+    # process" for a route that was never installed there, the
+    # final failure appends to `failures`, and `stop_dhcp_server`
+    # writes that string to `dhcp_last_error`. Every clean stop of
+    # a VRF-slaved DHCP-server device reported spurious errors in
+    # the UI's Last-Error column. Only attempt the main-table del
+    # when the install path actually touches the main table.
+    if not vrf_name:
+        if gateway:
+            try:
+                _try_del(["via", gateway])
+                logger.info(
+                    "%s Removed %s %s via %s",
+                    log_prefix, label, str(net), gateway,
+                )
+            except Exception as exc:
+                # Silently fall through — bare form below.
+                logger.debug(
+                    "%s Failed to remove %s %s via %s (falling through): %s",
+                    log_prefix, label, str(net), gateway, exc,
+                )
         try:
-            _try_del(["via", gateway])
+            _try_del([])
             logger.info(
-                "%s Removed %s %s via %s",
-                log_prefix, label, str(net), gateway,
+                "%s Removed %s %s (bare)", log_prefix, label, str(net),
             )
         except Exception as exc:
-            # Silently fall through — bare form below.
-            logger.debug(
-                "%s Failed to remove %s %s via %s (falling through): %s",
-                log_prefix, label, str(net), gateway, exc,
-            )
-    try:
-        _try_del([])
-        logger.info(
-            "%s Removed %s %s (bare)", log_prefix, label, str(net),
-        )
-    except Exception as exc:
-        # Try the `dev <iface>` form as a last resort — mirrors
-        # the pre-fix "alternative route deletion" fallback that
-        # stop_dhcp_server did for routes created with dev
-        # interface.
-        removed_with_dev = False
-        if interface:
-            try:
-                _try_del(["dev", interface])
-                logger.info(
-                    "%s Removed %s %s dev %s",
-                    log_prefix, label, str(net), interface,
+            # Try the `dev <iface>` form as a last resort — mirrors
+            # the pre-fix "alternative route deletion" fallback that
+            # stop_dhcp_server did for routes created with dev
+            # interface.
+            removed_with_dev = False
+            if interface:
+                try:
+                    _try_del(["dev", interface])
+                    logger.info(
+                        "%s Removed %s %s dev %s",
+                        log_prefix, label, str(net), interface,
+                    )
+                    removed_with_dev = True
+                except Exception as dev_exc:
+                    logger.debug(
+                        "%s Also failed with dev %s: %s",
+                        log_prefix, str(net), interface, dev_exc,
+                    )
+            if not removed_with_dev:
+                logger.warning(
+                    "%s Failed to remove %s %s: %s",
+                    log_prefix, label, str(net), exc,
                 )
-                removed_with_dev = True
-            except Exception as dev_exc:
-                logger.debug(
-                    "%s Also failed with dev %s: %s",
-                    log_prefix, str(net), interface, dev_exc,
-                )
-        if not removed_with_dev:
-            logger.warning(
-                "%s Failed to remove %s %s: %s",
-                log_prefix, label, str(net), exc,
-            )
-            failures.append(f"remove {family} {label} {net}: {exc}")
+                failures.append(f"remove {family} {label} {net}: {exc}")
 
     # VRF-scoped mirror (v0.5.219) — only when the device sits in a VRF.
     if not vrf_name:
@@ -1231,9 +1244,12 @@ def _ensure_ipv4_address(
     _existing_mask = ""
     if not ipv4_mask:
         try:
+            # v0.5.420 (audit stream-HH7): shlex.quote the interface
+            # fragment — defence-in-depth hygiene even though
+            # `_normalize_iface_name` strips most hostile input.
             _probe = _run_command(
                 ["/bin/sh", "-c",
-                 f"ip -4 -o addr show dev {interface} 2>/dev/null | "
+                 f"ip -4 -o addr show dev {shlex.quote(str(interface))} 2>/dev/null | "
                  f"awk '{{for (i=1;i<=NF;i++) if ($i==\"inet\") print $(i+1)}}' | "
                  f"head -1"],
                 container=container, timeout=5,
@@ -2282,9 +2298,10 @@ def _iface_ipv4_addresses(interface: str, container=None) -> List[tuple]:
     if not interface:
         return []
     try:
+        # v0.5.420 (audit stream-HH7): shlex.quote the interface.
         _probe = _run_command(
             ["/bin/sh", "-c",
-             f"ip -4 -o addr show dev {interface} 2>/dev/null | "
+             f"ip -4 -o addr show dev {shlex.quote(str(interface))} 2>/dev/null | "
              f"awk '{{for (i=1;i<=NF;i++) if ($i==\"inet\") print $(i+1)}}'"],
             container=container, timeout=5,
         )
@@ -2472,16 +2489,30 @@ def _remove_matching_ipv4_anchors(
         return []
     _removed: List[str] = []
     for anchor_ip, anchor_pfx in list(candidates):
-        # Match either exact-prefix (168.30.1/24 candidate ↔ /24
-        # assignment) or ip-only (in case the assigned mask differs
-        # from what we guessed — e.g., operator picked a /23 pool).
+        # v0.5.420 (audit stream-HH13): tighten the match to EXACT
+        # `(ip, prefix)`. Pre-fix the fallback branch matched ip-only
+        # across any prefix — so a candidate `(192.168.30.16, "28")`
+        # (derived from a /28 fragment of a /24 pool) would match
+        # an operator-installed `192.168.30.16/24` on the same
+        # interface and silently delete it on DHCP server Stop. The
+        # safer story: only touch what we actually added. If the
+        # IP matches but the mask differs, log at WARN so the
+        # operator sees the near-miss and can clean it up by hand
+        # or widen the candidate derivation.
         _match = None
         if (anchor_ip, anchor_pfx) in _current:
             _match = (anchor_ip, anchor_pfx)
         else:
             for _cur_ip, _cur_pfx in _current:
-                if _cur_ip == anchor_ip:
-                    _match = (_cur_ip, _cur_pfx)
+                if _cur_ip == anchor_ip and _cur_pfx != anchor_pfx:
+                    logger.warning(
+                        "[DHCP] v0.5.420 HH13: anchor sweep for %s/%s "
+                        "on %s found %s/%s with a DIFFERENT prefix; "
+                        "NOT removing (pre-fix would have deleted it, "
+                        "but it may be operator-installed and unrelated).",
+                        anchor_ip, anchor_pfx, interface,
+                        _cur_ip, _cur_pfx,
+                    )
                     break
         if not _match:
             continue
@@ -3082,7 +3113,14 @@ def _get_dhcp_container_name(device_id: str, mode: Optional[str] = None) -> str:
 def _get_dhcp_container(device_id: str, mode: Optional[str] = None):
     """Return existing DHCP container if it exists."""
     try:
-        client = docker.from_env()
+        # v0.5.420 (audit stream-HH15): HTTP timeout on the docker
+        # client so a stuck dockerd socket doesn't pin the Flask
+        # worker indefinitely. docker-py's default is None (wait
+        # forever). 30s is generous for `containers.get` + `reload`
+        # which are HTTP GETs; container.start / .run keep their own
+        # longer natural runtime. Same parity concern as FF13/GG6
+        # for exec_run.
+        client = docker.from_env(timeout=30)
         name = _get_dhcp_container_name(device_id, mode=mode)
         container = client.containers.get(name)
         container.reload()
@@ -3098,7 +3136,8 @@ def _get_dhcp_container(device_id: str, mode: Optional[str] = None):
 def _ensure_dhcp_container(device_id: str, mode: Optional[str] = None):
     """Ensure a dedicated DHCP container exists and is running for the device."""
     try:
-        client = docker.from_env()
+        # v0.5.420 (audit stream-HH15): HTTP timeout — see note above.
+        client = docker.from_env(timeout=30)
     except Exception as docker_exc:
         logger.error("[DHCP] Failed to connect to Docker daemon: %s", docker_exc, exc_info=True)
         return None
@@ -3286,7 +3325,8 @@ def reap_orphan_dhcp_containers(device_db) -> Dict:
         return result
 
     try:
-        client = docker.from_env()
+        # v0.5.420 (audit stream-HH15): HTTP timeout on docker client.
+        client = docker.from_env(timeout=30)
     except Exception as exc:
         result["errors"].append(f"docker.from_env failed: {exc}")
         return result
@@ -3613,8 +3653,11 @@ def start_dhcp_client(
                     '};\n'
                 ).format(iface=interface)
                 if container:
+                    # v0.5.420 (audit stream-HH7): shlex.quote the
+                    # heredoc redirect target so a path with shell
+                    # metachars can't inject commands.
                     _run_command(
-                        ["/bin/sh", "-c", f"cat <<'EOF' > {dhcp6_conf}\n{dhcp6_conf_content.strip()}\nEOF"],
+                        ["/bin/sh", "-c", f"cat <<'EOF' > {shlex.quote(str(dhcp6_conf))}\n{dhcp6_conf_content.strip()}\nEOF"],
                         container=container,
                         timeout=5,
                     )
@@ -3855,17 +3898,15 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
     except Exception as exc:
         logger.debug("[DHCP] dhclient -6 release error: %s", exc)
 
-    # v0.5.218: kill any wide-DHCPv6 dhcp6c bound to this
-    # interface. pkill -f pattern is anchored on the interface
-    # name via re.escape (see bug M) — otherwise "eth1" would
-    # match "dhcp6c ... eth10".
-    try:
-        _run_command(
-            ["pkill", "-f", f"dhcp6c.*(^|\\s){re.escape(interface)}(\\s|$)"],
-            timeout=5, container=container,
-        )
-    except Exception as exc:
-        logger.debug("[DHCP] dhcp6c pkill error (safe to ignore): %s", exc)
+    # v0.5.420 (audit stream-HH6): the v0.5.218 pkill above lived
+    # here with pattern `dhcp6c.*(^|\\s){re.escape(interface)}(\\s|$)`.
+    # Python's `\\s` emits `\s` into the regex, but pkill's POSIX
+    # ERE engine does NOT recognize `\s` as whitespace shorthand —
+    # the pattern matched `(^|s)iface(s|$)` literally, which almost
+    # never fires. The real whole-token argv match happens in
+    # `_kill_stale_dhcp6c()` immediately below (v0.5.351); this
+    # dead pkill was pure code smell and misled anyone reading
+    # the stop path. Removed.
 
     # v0.5.351 (audit stop-client-v6-stragglers-sweep): mirror the
     # v0.5.240 v4 straggler sweep for dhcp6c. The single-pkill above
@@ -4439,6 +4480,18 @@ def start_dhcp_server(
             # configuration reaches this branch (we're in relay
             # mode). Non-link-local only; link-locals are kernel-
             # managed.
+            # v0.5.420 (audit stream-HH16): intersect with the
+            # candidate set we WOULD have added, not just "any
+            # non-link-local address inside the pool subnet". Pre-fix
+            # the sweep removed ANY IPv6 address on the interface
+            # that happened to fall inside the pool subnet — even
+            # ones the operator installed by hand (static test IP,
+            # dual-role iface, prior non-netgen tooling). The v4
+            # side already does this safely via
+            # `_remove_matching_ipv4_anchors` (see v0.5.239 + HH13);
+            # the v6 relay-mode sweep was the odd one out.
+            _candidates = _collect_ipv6_anchor_candidates(dhcp_config)
+            _candidate_ips = {_c[0] for _c in _candidates}
             try:
                 for _entry in (_parse_ipv6(interface, container=container) or []):
                     _stale_ip = _entry.get("ip") or ""
@@ -4448,18 +4501,29 @@ def start_dhcp_server(
                     try:
                         if ipaddress.IPv6Address(_stale_ip).is_link_local:
                             continue
-                        if ipaddress.IPv6Address(_stale_ip) in _pool_net:
-                            _remove_ipv6_address(
-                                interface, _stale_ip, str(_stale_pfx),
-                                container=container,
+                        if ipaddress.IPv6Address(_stale_ip) not in _pool_net:
+                            continue
+                        if _stale_ip not in _candidate_ips:
+                            logger.warning(
+                                "[DHCP] v0.5.420 HH16: relay-mode sweep "
+                                "for %s found non-candidate anchor %s/%s "
+                                "in pool subnet; NOT removing (likely "
+                                "operator-installed; pre-fix would have "
+                                "deleted it).",
+                                interface, _stale_ip, _stale_pfx,
                             )
-                            logger.info(
-                                "[DHCP] v0.5.335 device %s: removed "
-                                "stale pool-subnet anchor %s/%s from "
-                                "%s (leftover from pre-v0.5.335 "
-                                "apply).",
-                                device_id, _stale_ip, _stale_pfx, interface,
-                            )
+                            continue
+                        _remove_ipv6_address(
+                            interface, _stale_ip, str(_stale_pfx),
+                            container=container,
+                        )
+                        logger.info(
+                            "[DHCP] v0.5.335 device %s: removed "
+                            "stale pool-subnet anchor %s/%s from "
+                            "%s (leftover from pre-v0.5.335 "
+                            "apply).",
+                            device_id, _stale_ip, _stale_pfx, interface,
+                        )
                     except (ipaddress.AddressValueError, ValueError):
                         continue
             except Exception as _stale_sweep_exc:
@@ -4918,8 +4982,10 @@ def start_dhcp_server(
     try:
         if container:
             config_payload = "\n".join(config_lines) + "\n"
+            # v0.5.420 (audit stream-HH7): shlex.quote the heredoc
+            # redirect target.
             _run_command(
-                ["/bin/sh", "-c", f"cat <<'EOF' > {conffile}\n{config_payload}EOF"],
+                ["/bin/sh", "-c", f"cat <<'EOF' > {shlex.quote(str(conffile))}\n{config_payload}EOF"],
                 container=container,
                 timeout=5,
             )
@@ -4945,7 +5011,7 @@ def start_dhcp_server(
     try:
         if container:
             pid_read = _run_command(
-                ["/bin/sh", "-c", f"if [ -f {pidfile} ]; then cat {pidfile}; fi"],
+                ["/bin/sh", "-c", f"if [ -f {shlex.quote(str(pidfile))} ]; then cat {shlex.quote(str(pidfile))}; fi"],
                 container=container,
                 timeout=5,
             ).stdout.strip()
@@ -5360,7 +5426,7 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
         if container:
             # Try to kill dnsmasq by PID file first
             pid_read = _run_command(
-                ["/bin/sh", "-c", f"if [ -f {pidfile} ]; then cat {pidfile}; fi"],
+                ["/bin/sh", "-c", f"if [ -f {shlex.quote(str(pidfile))} ]; then cat {shlex.quote(str(pidfile))}; fi"],
                 container=container,
                 timeout=5,
             ).stdout.strip()
@@ -5404,7 +5470,7 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
             _run_command(["rm", "-f", conffile], container=container, timeout=5)
             # Also remove from dnsmasq.d directory if it exists there
             _run_command(
-                ["/bin/sh", "-c", f"rm -f /etc/dnsmasq.d/ostg-{interface}.conf || true"],
+                ["/bin/sh", "-c", f"rm -f /etc/dnsmasq.d/ostg-{shlex.quote(str(interface))}.conf || true"],
                 container=container,
                 timeout=5,
             )
