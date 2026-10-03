@@ -2,6 +2,104 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.419] - 2026-10-02
+
+### Fixed — utils/frr_docker.py audit (7 HIGH: GG2-GG8)
+
+Follow-up to v0.5.418's GG1 hot fix. Closes the remaining HIGH
+findings from the frr_docker.py audit: BGP/OSPF/ISIS parity gaps
+on the legacy BGP wrappers at the bottom of frr_docker.py, plus
+file-wide silent-misconfig + hang-forever bugs.
+
+**GG2: `configure_bgp_neighbor` handles both container prefixes.**
+Pre-fix `container_name.replace(f"{frr_manager.container_prefix}-",
+"")` only knew about `ostg-frr-`; DHCP-client containers (prefix
+`dhcp-frr-`) produced polluted device_ids like `dhcp-frr-<uuid>`.
+VRF probe then reported "absent", BGP configured in default VRF —
+exactly the v0.5.385 BGP-A1 trap. Fix: new
+`_strip_container_prefix` helper handles both known prefixes.
+
+**GG3: shell-injection-prone verify/diagnostic block deleted.**
+v0.5.365 S6 hardened the `ip addr add` sites but left 6
+`container.exec_run(["bash","-c", f"grep -q '{loopback_ipv4}/32'
+..."])` sites still f-stringing unvalidated operator-supplied
+loopback IPs into `bash -c` — inside a `privileged=True,
+cap_add=['ALL']` container with host paths bind-mounted rw. The
+block was pure diagnostic logging that nothing downstream parsed,
+so the fix is to delete it (per audit GG17).
+
+**GG4 + GG5: vtysh output scanner across 7 primary exec sites.**
+Pre-fix every `container.exec_run("vtysh …")` in this file
+trusted the exit code alone, but vtysh returns rc=0 even when it
+rejects individual lines with `% Unknown command` / `% Error`.
+GG5 covers 3 critical sites on the bring-up path
+(`_configure_interfaces`, `_configure_global_router_id`, the
+manual frr.conf update + reload); GG4 covers the 4 legacy BGP
+wrappers (`configure_bgp_neighbor`, `get_bgp_status`,
+`get_bgp_status_json`, `get_bgp_neighbors`). New
+`_vtysh_output_has_error()` helper reused across all sites. Same
+class as v0.5.403 BGP T2, v0.5.416 OSPF EE2, v0.5.417 ISIS FF3.
+
+**GG6: shared `_exec_run_with_timeout` wrapper across 10+ sites.**
+Pre-fix 20+ `container.exec_run(...)` sites in this file had no
+timeout — a stuck mgmtd / zebra / bgpd pinned the Flask worker
+until netgen-server itself was restarted. New threading-based
+wrapper mirrors the local `exec_run_with_timeout` the ISIS module
+already uses, now shared module-wide. Wired into: mgmtd pgrep +
+start, loopback `ip addr add/replace`, `cat {config_file}`,
+vtysh config writes, and all 4 BGP wrappers. Also fixes **GG12**
+(MED): the pre-fix call at the loopback-cleanup site passed
+`timeout=10` to `container.exec_run`, a kwarg docker-py silently
+discards (or raises `TypeError` the outer except then swallows).
+
+**GG7: hardcoded `192.168.0.2` / `1.1.1.1` fallbacks removed from
+all 5 sites.** Pre-fix any device without ipv4 / loopback / router
+config fell back to shared literals, producing ARP conflicts, OSPF
+"duplicate router ID" errors, and BGP OPEN "bad BGP identifier"
+when two devices both hit the same fallback. Fix:
+- Interface ipv4 fallback → log + leave empty (operator must
+  supply ipv4_address);
+- Loopback ipv4 fallback → log + leave empty;
+- Router-id fallback (2 sites) → derive a unique per-device
+  router-id via `_derive_router_id_from_device_id`.
+Same class as v0.5.416 EE5/EE6, v0.5.417 FF5/FF6.
+
+**GG8: `_ensure_client` wired into all 4 legacy BGP wrappers.**
+v0.5.386 FRR-B4 added the reconnect-on-dockerd-restart helper but
+called it only inside `start_frr_container` / `stop_frr_container`.
+The 4 legacy BGP wrappers (actively called from `run_tgen_server`)
+bypassed it, so a dockerd restart left them APIError-ing forever
+until netgen-server itself restarted — exactly the scenario B4
+was supposed to close.
+
+### Tests
+
+- `tests/test_v05419_frr_docker_audit.py` — 27 tests, including
+  runtime checks for the timeout wrapper (fast-path and
+  slow-path), the prefix-strip helper, and the vtysh-output
+  scanner. Regression guard for v0.5.418 GG1 (instance attrs
+  still set) and the three sibling scanners
+  (v0.5.403 BGP, v0.5.416 OSPF, v0.5.417 ISIS).
+
+### Breaking: hardcoded-fallback behaviour change
+
+Operators who were accidentally relying on the shared
+`192.168.0.2/24` or `1.1.1.1` loopback fallback for devices
+without ipv4_address / loopback_ipv4 configured will see those
+devices now log a warning and skip the IPv4 anchor. Fix: fill in
+`ipv4_address` / `loopback_ipv4` on the affected devices. The
+log line names each site clearly ("v0.5.419 GG7: ...").
+
+### Known gaps (deferred to v0.5.420+)
+
+GG9 (multi-process VRF-alloc file race), GG10 (orphan cleanup
+leaks table ids), GG11 (`_find_existing_container` exception
+corner), GG13 (3 divergent router-id derivation paths), GG14
+(`_create_vrf` partial-failure rollback), GG15 (`_remove_vrf`
+route-flush), GG16 (image build symlink + TOCTOU), GG17 (verify
+block cleanup — now covered by GG3), GG18 (`_bgp_vtysh_scope`
+`vrf all` fallback). All MEDIUM severity per audit.
+
 ## [0.5.418] - 2026-10-02
 
 ### Fixed — CRITICAL: `FRRDockerManager.__init__` dead-code regression (GG1)

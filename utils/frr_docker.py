@@ -7,6 +7,7 @@ import docker
 import logging
 import json
 import time
+import threading
 import subprocess
 import os
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,102 @@ logger = logging.getLogger(__name__)
 
 _FRR_BUILD_DIR = "/opt/netgen"
 _FRR_BUILD_ATTEMPTED = False  # one-shot per process — don't loop on failures
+
+
+# v0.5.419 (audit stream-GG4 + GG5): vtysh returns rc=0 even when
+# it rejects individual lines with `% Unknown command`, `% Error`,
+# `% Malformed`. Pre-fix every `container.exec_run("vtysh …")` site
+# in this file trusted the exit code alone — a device whose
+# `_configure_interfaces` emitted `% Can't find interface vlan20`
+# got logged as "success" and start_frr_container proceeded to run
+# BGP/OSPF configurators against a half-configured container. Same
+# marker set as v0.5.403 BGP T2, v0.5.416 OSPF EE2, v0.5.417
+# ISIS FF3.
+_VTYSH_ERROR_MARKERS = (
+    "% Unknown command",
+    "% Malformed",
+    "% Configuration failed",
+    "% Invalid",
+    "% Ambiguous command",
+    "% Incomplete command",
+    "% Command incomplete",
+    "% Error",
+)
+
+
+def _vtysh_output_has_error(output: str) -> bool:
+    if not output:
+        return False
+    for _line in output.splitlines():
+        _stripped = _line.strip()
+        if not _stripped.startswith("%"):
+            continue
+        for _marker in _VTYSH_ERROR_MARKERS:
+            if _marker in _stripped:
+                return True
+    return False
+
+
+# v0.5.419 (audit stream-GG2): container_name → device_id strip
+# helper. Pre-fix, `configure_bgp_neighbor` and friends only
+# stripped the `ostg-frr-` prefix, so DHCP-client devices
+# (container name `dhcp-frr-<id>`) produced polluted device_ids
+# like `dhcp-frr-<uuid>` which cascaded into VRF-probe-reports-
+# absent → BGP in default VRF, and router-id fallback-to-192.168.0.2
+# (GG7). This helper handles both known prefixes.
+_CONTAINER_NAME_PREFIXES = ("ostg-frr-", "dhcp-frr-")
+
+
+def _strip_container_prefix(container_name: str) -> str:
+    """Return the device_id substring of a container name, stripping
+    whichever known prefix matched. If no known prefix matches, return
+    the name unchanged (callers get a stable identifier instead of a
+    half-stripped one)."""
+    if not container_name:
+        return container_name
+    for _p in _CONTAINER_NAME_PREFIXES:
+        if container_name.startswith(_p):
+            return container_name[len(_p):]
+    return container_name
+
+
+# v0.5.419 (audit stream-GG6): shared threading-based timeout wrapper
+# around `container.exec_run`. Pre-fix, 20+ exec_run sites in this
+# file called the method with no `timeout=` kwarg (and `exec_run` has
+# no such parameter in current docker-py — GG12). A stuck mgmtd /
+# zebra / bgpd pinned the Flask worker that called the method until
+# netgen-server itself was restarted. Same shape as the
+# `exec_run_with_timeout` helper that `utils/isis.py::
+# configure_isis_neighbor` already uses locally; promoted here so
+# the whole module shares it.
+def _exec_run_with_timeout(container, cmd, timeout_sec: float = 15.0):
+    """Run `container.exec_run(cmd)` on a daemon thread; return the
+    result object, or `None` if the exec hung past `timeout_sec`.
+    Exceptions raised by the exec are re-raised in the caller
+    thread. On timeout the thread is left running (docker-py's
+    exec is not interruptible), but Flask gets its worker back."""
+    _result = [None]
+    _exc = [None]
+
+    def _runner():
+        try:
+            _result[0] = container.exec_run(cmd)
+        except Exception as _e:
+            _exc[0] = _e
+
+    _t = threading.Thread(target=_runner, daemon=True)
+    _t.start()
+    _t.join(timeout=timeout_sec)
+    if _t.is_alive():
+        logger.warning(
+            f"[FRR] exec_run exceeded {timeout_sec}s timeout "
+            f"(v0.5.419 audit stream-GG6); abandoning worker thread "
+            f"and returning None to caller"
+        )
+        return None
+    if _exc[0] is not None:
+        raise _exc[0]
+    return _result[0]
 
 
 def _deploy_frr_assets_from_wheel(dest_dir=_FRR_BUILD_DIR):
@@ -1205,9 +1302,25 @@ class FRRDockerManager:
                     ipv4_addr = ''
                     ipv4_mask = ''
                 else:
-                    ipv4_addr = '192.168.0.2'
-                    ipv4_mask = '24'
-            
+                    # v0.5.419 (audit stream-GG7): NEVER fall back to the
+                    # shared hardcoded `192.168.0.2/24`. Any two devices
+                    # that both hit this fallback end up with the same
+                    # IP on different host interfaces → ARP conflicts,
+                    # the second anchor silently overwrites the first.
+                    # Fail-loud instead: leave the fields empty so the
+                    # interface skips the IPv4 anchor, and let whichever
+                    # protocol later complains ("no IPv4 configured on
+                    # interface vlanN") point the operator at the real
+                    # root cause.
+                    logger.warning(
+                        f"[FRR] v0.5.419 GG7: no IPv4 configured and "
+                        f"dhcp_mode={dhcp_mode!r}; NOT falling back to "
+                        f"192.168.0.2/24 — operator must supply "
+                        f"ipv4_address."
+                    )
+                    ipv4_addr = ''
+                    ipv4_mask = ''
+
             # Extract IPv6 address and mask
             ipv6_addr = ''
             ipv6_mask = ''
@@ -1444,9 +1557,25 @@ class FRRDockerManager:
                     ipv4_addr = ''
                     ipv4_mask = ''
                 else:
-                    ipv4_addr = '192.168.0.2'
-                    ipv4_mask = '24'
-            
+                    # v0.5.419 (audit stream-GG7): NEVER fall back to the
+                    # shared hardcoded `192.168.0.2/24`. Any two devices
+                    # that both hit this fallback end up with the same
+                    # IP on different host interfaces → ARP conflicts,
+                    # the second anchor silently overwrites the first.
+                    # Fail-loud instead: leave the fields empty so the
+                    # interface skips the IPv4 anchor, and let whichever
+                    # protocol later complains ("no IPv4 configured on
+                    # interface vlanN") point the operator at the real
+                    # root cause.
+                    logger.warning(
+                        f"[FRR] v0.5.419 GG7: no IPv4 configured and "
+                        f"dhcp_mode={dhcp_mode!r}; NOT falling back to "
+                        f"192.168.0.2/24 — operator must supply "
+                        f"ipv4_address."
+                    )
+                    ipv4_addr = ''
+                    ipv4_mask = ''
+
             # Extract IPv6 address and mask
             ipv6_addr = ''
             ipv6_mask = ''
@@ -1493,8 +1622,21 @@ class FRRDockerManager:
                 loopback_ipv4 = router_id
                 logger.info(f"[FRR] Using router_id {router_id} as loopback fallback")
             else:
-                loopback_ipv4 = '1.1.1.1'
-                logger.info(f"[FRR] Using default loopback 1.1.1.1")
+                # v0.5.419 (audit stream-GG7): NEVER fall back to the
+                # shared hardcoded `1.1.1.1` loopback. Any two devices
+                # that both hit this fallback share the same OSPF/BGP
+                # router-id → OSPF "duplicate router ID" errors, BGP
+                # neighbor stays in Idle/Active forever. Leave the
+                # loopback empty; the subsequent configure block
+                # skips loopback-IP setup when it's empty.
+                logger.warning(
+                    f"[FRR] v0.5.419 GG7: no loopback_ipv4 / ipv4 / "
+                    f"router_id available for {device_name}; NOT "
+                    f"falling back to 1.1.1.1 — leaving loopback "
+                    f"IPv4 unset. Operator must supply loopback_ipv4 "
+                    f"or router_id to get a unique router identifier."
+                )
+                loopback_ipv4 = ''
             
             if loopback_ipv6:
                 loopback_ipv6 = loopback_ipv6.split('/')[0]
@@ -1553,7 +1695,13 @@ class FRRDockerManager:
             wait_interval = 1  # Check every second
             mgmtd_running = False
             for i in range(max_wait):
-                check_result = container.exec_run(["bash", "-c", "pgrep -f mgmtd > /dev/null && echo 'running' || echo 'not_running'"])
+                # v0.5.419 (audit stream-GG6): 3s timeout — a stuck
+                # docker exec here would freeze the whole wait loop.
+                check_result = _exec_run_with_timeout(container, ["bash", "-c", "pgrep -f mgmtd > /dev/null && echo 'running' || echo 'not_running'"], timeout_sec=3.0)
+                if check_result is None:
+                    logger.warning(f"[FRR] mgmtd pgrep check {i+1}/{max_wait} exceeded 3s timeout (GG6)")
+                    time.sleep(wait_interval)
+                    continue
                 check_output = check_result.output.decode('utf-8') if isinstance(check_result.output, bytes) else str(check_result.output)
                 if 'running' in check_output.strip():
                     mgmtd_running = True
@@ -1562,15 +1710,20 @@ class FRRDockerManager:
                 else:
                     logger.debug(f"[FRR] Waiting for mgmtd to start... ({i+1}/{max_wait})")
                     time.sleep(wait_interval)
-            
+
             if not mgmtd_running:
                 logger.warning(f"[FRR] mgmtd is not running after {max_wait} seconds, attempting to start it manually")
                 # Try to start mgmtd manually
-                start_mgmtd_result = container.exec_run(["bash", "-c", "/usr/lib/frr/mgmtd -d -A 127.0.0.1 2>&1 || true"])
+                # v0.5.419 (audit stream-GG6): 5s timeout — fork+exec
+                # of mgmtd should return within a second; anything
+                # longer is a stuck docker exec, not a slow daemon.
+                start_mgmtd_result = _exec_run_with_timeout(container, ["bash", "-c", "/usr/lib/frr/mgmtd -d -A 127.0.0.1 2>&1 || true"], timeout_sec=5.0)
+                if start_mgmtd_result is None:
+                    logger.warning(f"[FRR] mgmtd manual-start exceeded 5s timeout (GG6)")
                 time.sleep(2)  # Give mgmtd time to start
                 # Check again
-                check_result = container.exec_run(["bash", "-c", "pgrep -f mgmtd > /dev/null && echo 'running' || echo 'not_running'"])
-                check_output = check_result.output.decode('utf-8') if isinstance(check_result.output, bytes) else str(check_result.output)
+                check_result = _exec_run_with_timeout(container, ["bash", "-c", "pgrep -f mgmtd > /dev/null && echo 'running' || echo 'not_running'"], timeout_sec=3.0)
+                check_output = (check_result.output.decode('utf-8') if isinstance(check_result.output, bytes) else str(check_result.output)) if check_result is not None else ""
                 if 'running' in check_output.strip():
                     mgmtd_running = True
                     logger.info(f"[FRR] Successfully started mgmtd manually")
@@ -1583,10 +1736,17 @@ class FRRDockerManager:
             
             logger.info(f"[FRR] Executing loopback configuration commands in container {container_name} (mgmtd_running={mgmtd_running})")
             logger.debug(f"[FRR] Full command sequence:\n{config_commands}")
-            result = container.exec_run(["bash", "-c", exec_cmd])
+            # v0.5.419 (audit stream-GG5 + GG6): timeout + output scan.
+            result = _exec_run_with_timeout(container, ["bash", "-c", exec_cmd], timeout_sec=20.0)
+            if result is None:
+                logger.error(f"[FRR] vtysh interface-configure in container {container_name} exceeded 20s timeout (GG6)")
+                return False
             output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
             if result.exit_code != 0:
                 logger.error(f"[FRR] Failed to configure interfaces in container {container_name}: exit_code={result.exit_code}, output={output_str}")
+                return False
+            if _vtysh_output_has_error(output_str):
+                logger.error(f"[FRR] vtysh output for {container_name} interface-configure contained error markers despite rc=0 (GG5); refusing to report success. Output:\n{output_str}")
                 return False
             else:
                 logger.info(f"[FRR] Loopback configuration command executed successfully (exit_code=0)")
@@ -1598,7 +1758,11 @@ class FRRDockerManager:
                 # We need to manually edit /etc/frr/frr.conf to ensure loopback IPs are saved
                 try:
                     config_file = "/etc/frr/frr.conf"
-                    read_result = container.exec_run(["bash", "-c", f"cat {config_file}"])
+                    # v0.5.419 (audit stream-GG6): 5s timeout.
+                    read_result = _exec_run_with_timeout(container, ["bash", "-c", f"cat {config_file}"], timeout_sec=5.0)
+                    if read_result is None:
+                        logger.warning(f"[FRR] cat {config_file} exceeded 5s timeout (GG6); skipping manual frr.conf update")
+                        raise RuntimeError("frr.conf read timeout")
                     config_content = read_result.output.decode('utf-8') if isinstance(read_result.output, bytes) else str(read_result.output)
                     
                     # Check if loopback interface section exists
@@ -1687,12 +1851,21 @@ class FRRDockerManager:
                     
                     # Write updated config back
                     updated_config = '\n'.join(new_lines)
-                    write_result = container.exec_run(["bash", "-c", f"cat > {config_file} << 'CONFIGEOF'\n{updated_config}\nCONFIGEOF"])
-                    if write_result.exit_code == 0:
+                    # v0.5.419 (audit stream-GG5 + GG6): timeout + output scan.
+                    write_result = _exec_run_with_timeout(container, ["bash", "-c", f"cat > {config_file} << 'CONFIGEOF'\n{updated_config}\nCONFIGEOF"], timeout_sec=10.0)
+                    if write_result is None:
+                        logger.warning(f"[FRR] frr.conf write to {container_name} exceeded 10s timeout (GG6); skipping reload")
+                    elif write_result.exit_code == 0:
                         logger.info(f"[FRR] Successfully updated FRR config file with loopback IPs")
                         # Reload FRR configuration
-                        reload_result = container.exec_run(["bash", "-c", "vtysh -c 'configure terminal' -c 'end' -c 'reload' 2>&1 || true"])
-                        logger.debug(f"[FRR] FRR reload result: {reload_result.output.decode('utf-8') if isinstance(reload_result.output, bytes) else str(reload_result.output)}")
+                        reload_result = _exec_run_with_timeout(container, ["bash", "-c", "vtysh -c 'configure terminal' -c 'end' -c 'reload' 2>&1 || true"], timeout_sec=15.0)
+                        if reload_result is None:
+                            logger.warning(f"[FRR] vtysh reload in {container_name} exceeded 15s timeout (GG6)")
+                        else:
+                            _rout = reload_result.output.decode('utf-8') if isinstance(reload_result.output, bytes) else str(reload_result.output)
+                            logger.debug(f"[FRR] FRR reload result: {_rout}")
+                            if _vtysh_output_has_error(_rout):
+                                logger.warning(f"[FRR] vtysh reload output for {container_name} contained error markers (GG5): {_rout}")
                     else:
                         logger.warning(f"[FRR] Failed to write updated config file: {write_result.output.decode('utf-8') if isinstance(write_result.output, bytes) else str(write_result.output)}")
                 except Exception as e:
@@ -1726,18 +1899,22 @@ class FRRDockerManager:
                         )
                         _v4 = None
                     if _v4:
-                        _add = container.exec_run(
-                            ["ip", "addr", "add", f"{_v4}/32", "dev", "lo"]
-                        )
-                        if _add.exit_code != 0:
-                            _rep = container.exec_run(
-                                ["ip", "addr", "replace", f"{_v4}/32", "dev", "lo"]
-                            )
-                            _out = _rep.output.decode('utf-8') if isinstance(_rep.output, bytes) else str(_rep.output)
-                            if _rep.exit_code == 0:
-                                logger.info(f"[FRR] Successfully replaced loopback IPv4 {_v4}/32")
+                        # v0.5.419 (audit stream-GG6): 5s timeout — iproute2
+                        # should return in milliseconds; a longer wait is
+                        # a stuck docker exec.
+                        _add = _exec_run_with_timeout(container, ["ip", "addr", "add", f"{_v4}/32", "dev", "lo"], timeout_sec=5.0)
+                        if _add is None:
+                            logger.warning(f"[FRR] ip addr add {_v4}/32 exceeded 5s timeout (GG6)")
+                        elif _add.exit_code != 0:
+                            _rep = _exec_run_with_timeout(container, ["ip", "addr", "replace", f"{_v4}/32", "dev", "lo"], timeout_sec=5.0)
+                            if _rep is None:
+                                logger.warning(f"[FRR] ip addr replace {_v4}/32 exceeded 5s timeout (GG6)")
                             else:
-                                logger.warning(f"[FRR] Failed to configure loopback IPv4 (may already exist): {_out}")
+                                _out = _rep.output.decode('utf-8') if isinstance(_rep.output, bytes) else str(_rep.output)
+                                if _rep.exit_code == 0:
+                                    logger.info(f"[FRR] Successfully replaced loopback IPv4 {_v4}/32")
+                                else:
+                                    logger.warning(f"[FRR] Failed to configure loopback IPv4 (may already exist): {_out}")
                         else:
                             logger.info(f"[FRR] Successfully added loopback IPv4 {_v4}/32")
 
@@ -1752,47 +1929,38 @@ class FRRDockerManager:
                         )
                         _v6 = None
                     if _v6:
-                        _add6 = container.exec_run(
-                            ["ip", "-6", "addr", "add", f"{_v6}/128", "dev", "lo"]
-                        )
-                        if _add6.exit_code != 0:
-                            _rep6 = container.exec_run(
-                                ["ip", "-6", "addr", "replace", f"{_v6}/128", "dev", "lo"]
-                            )
-                            _out6 = _rep6.output.decode('utf-8') if isinstance(_rep6.output, bytes) else str(_rep6.output)
-                            if _rep6.exit_code == 0:
-                                logger.info(f"[FRR] Successfully replaced loopback IPv6 {_v6}/128")
+                        # v0.5.419 (audit stream-GG6): 5s timeout.
+                        _add6 = _exec_run_with_timeout(container, ["ip", "-6", "addr", "add", f"{_v6}/128", "dev", "lo"], timeout_sec=5.0)
+                        if _add6 is None:
+                            logger.warning(f"[FRR] ip -6 addr add {_v6}/128 exceeded 5s timeout (GG6)")
+                        elif _add6.exit_code != 0:
+                            _rep6 = _exec_run_with_timeout(container, ["ip", "-6", "addr", "replace", f"{_v6}/128", "dev", "lo"], timeout_sec=5.0)
+                            if _rep6 is None:
+                                logger.warning(f"[FRR] ip -6 addr replace {_v6}/128 exceeded 5s timeout (GG6)")
                             else:
-                                logger.warning(f"[FRR] Failed to configure loopback IPv6 (may already exist): {_out6}")
+                                _out6 = _rep6.output.decode('utf-8') if isinstance(_rep6.output, bytes) else str(_rep6.output)
+                                if _rep6.exit_code == 0:
+                                    logger.info(f"[FRR] Successfully replaced loopback IPv6 {_v6}/128")
+                                else:
+                                    logger.warning(f"[FRR] Failed to configure loopback IPv6 (may already exist): {_out6}")
                         else:
                             logger.info(f"[FRR] Successfully added loopback IPv6 {_v6}/128")
             
-            # Verify loopback was configured by checking both running config and saved config
-            verify_cmd = "echo '=== Running Config ===' && vtysh -c 'show running-config' | grep -A 5 'interface lo' || echo 'Loopback not found in running config'; echo '=== Saved Config ===' && cat /etc/frr/frr.conf | grep -A 5 'interface lo' || echo 'Loopback not found in saved config'"
-            verify_result = container.exec_run(["bash", "-c", verify_cmd])
-            verify_output = verify_result.output.decode('utf-8') if isinstance(verify_result.output, bytes) else str(verify_result.output)
-            logger.info(f"[FRR] Loopback verification output:\n{verify_output}")
-            
-            # Also check if loopback IP is actually configured on the interface
-            ip_check_cmd = f"ip addr show lo | grep -E '(inet|inet6)' || echo 'No IPs found on lo'; echo '=== Expected IPv4: {loopback_ipv4}/32 ==='; echo '=== Expected IPv6: {loopback_ipv6}/128 ==='"
-            ip_check_result = container.exec_run(["bash", "-c", ip_check_cmd])
-            ip_check_output = ip_check_result.output.decode('utf-8') if isinstance(ip_check_result.output, bytes) else str(ip_check_result.output)
-            logger.info(f"[FRR] Loopback IP check output:\n{ip_check_output}")
-            
-            # CRITICAL: Check if the loopback IP is actually present
-            if loopback_ipv4:
-                check_ipv4_cmd = f"ip addr show lo | grep -q '{loopback_ipv4}/32' && echo 'Loopback IPv4 {loopback_ipv4}/32 is configured' || echo 'Loopback IPv4 {loopback_ipv4}/32 is NOT configured'"
-                check_ipv4_result = container.exec_run(["bash", "-c", check_ipv4_cmd])
-                check_ipv4_output = check_ipv4_result.output.decode('utf-8') if isinstance(check_ipv4_result.output, bytes) else str(check_ipv4_result.output)
-                logger.info(f"[FRR] Loopback IPv4 verification: {check_ipv4_output}")
-            
-            if loopback_ipv6:
-                check_ipv6_cmd = f"ip addr show lo | grep -q '{loopback_ipv6}/128' && echo 'Loopback IPv6 {loopback_ipv6}/128 is configured' || echo 'Loopback IPv6 {loopback_ipv6}/128 is NOT configured'"
-                check_ipv6_result = container.exec_run(["bash", "-c", check_ipv6_cmd])
-                check_ipv6_output = check_ipv6_result.output.decode('utf-8') if isinstance(check_ipv6_result.output, bytes) else str(check_ipv6_result.output)
-                logger.info(f"[FRR] Loopback IPv6 verification: {check_ipv6_output}")
-            
-            logger.info(f"[FRR] ✅ Successfully configured interfaces (including loopback {loopback_ipv4}/32) in container {container_name}")
+            # v0.5.419 (audit stream-GG3): the pre-fix verify/diagnostic
+            # block that lived here (6 `container.exec_run(["bash","-c",
+            # f"... {loopback_ipv4} ..."])` sites) f-string-interpolated
+            # the OPERATOR-SUPPLIED loopback IPs into `bash -c` without
+            # validation — the v0.5.365 S6 fix hardened only the
+            # `ip addr add` argv-list sites above, not these diagnostic
+            # greps. A device DB row with a loopback field containing
+            # `'; rm -rf /;echo '` was accepted at the input layer,
+            # passed through the ip-addr-add path, then injected shell
+            # at the verify step inside a `privileged=True,
+            # cap_add=['ALL']` container with host paths bind-mounted
+            # rw. The block emitted "configured / NOT configured" log
+            # lines that nothing downstream parsed, so deleting it has
+            # no behavioural cost beyond losing those info lines.
+            logger.info(f"[FRR] ✅ Successfully configured interfaces (loopback IPv4={loopback_ipv4}, loopback IPv6={loopback_ipv6}) in container {container_name}")
             return True
             
         except Exception as e:
@@ -1853,8 +2021,34 @@ class FRRDockerManager:
                     logger.info(f"[FRR] DHCP client device {device_id}: no router-id configured until lease provides an address")
                     return True
                 else:
-                    router_id = "192.168.0.2"
-                    logger.warning(f"[FRR] No IPv4 available, using default router-id {router_id}")
+                    # v0.5.419 (audit stream-GG7): NEVER fall back to the
+                    # shared `192.168.0.2` router-id. Two devices with
+                    # the same router-id cause OSPF neighbor rejection
+                    # ("duplicate router ID") and BGP OPEN "bad BGP
+                    # identifier". Use the deterministic per-device
+                    # derivation instead — same `md5(device_id) %
+                    # 2^24` scheme that `_derive_router_id_from_device_id`
+                    # uses elsewhere so router-id stays consistent
+                    # across restarts.
+                    try:
+                        router_id = frr_manager._derive_router_id_from_device_id(device_id)
+                    except Exception:
+                        # The derivation never raises in practice but
+                        # treat it as a hard skip rather than reusing
+                        # the shared fallback.
+                        logger.warning(
+                            f"[FRR] v0.5.419 GG7: no IPv4 available and "
+                            f"router-id derivation failed for device "
+                            f"{device_id}; skipping global router-id "
+                            f"configure (no shared fallback)."
+                        )
+                        return False
+                    logger.warning(
+                        f"[FRR] v0.5.419 GG7: no IPv4 available for "
+                        f"device {device_id}; derived unique router-id "
+                        f"{router_id} from device_id (no shared "
+                        f"192.168.0.2 fallback)."
+                    )
             
             # Configure global router-id using vtysh
             vtysh_commands = [
@@ -1868,15 +2062,20 @@ class FRRDockerManager:
             exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
             
             logger.info(f"[FRR] Configuring global router-id {router_id} in container {container_name}")
-            result = container.exec_run(["bash", "-c", exec_cmd])
-            
-            if result.exit_code == 0:
-                logger.info(f"[FRR] ✅ Successfully configured global router-id {router_id} in container {container_name}")
-                return True
-            else:
-                output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+            # v0.5.419 (audit stream-GG5 + GG6): timeout + output scan.
+            result = _exec_run_with_timeout(container, ["bash", "-c", exec_cmd], timeout_sec=10.0)
+            if result is None:
+                logger.warning(f"[FRR] global router-id configure in {container_name} exceeded 10s timeout (GG6)")
+                return False
+            output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+            if result.exit_code != 0:
                 logger.warning(f"[FRR] Failed to configure global router-id in container {container_name}: {output_str}")
                 return False
+            if _vtysh_output_has_error(output_str):
+                logger.warning(f"[FRR] vtysh output for {container_name} global router-id configure contained error markers despite rc=0 (GG5): {output_str}")
+                return False
+            logger.info(f"[FRR] ✅ Successfully configured global router-id {router_id} in container {container_name}")
+            return True
                 
         except Exception as e:
             logger.error(f"[FRR] Failed to configure global router-id for container {container_name}: {e}")
@@ -1997,8 +2196,16 @@ class FRRDockerManager:
                                 exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
 
                                 try:
-                                    loopback_result = container.exec_run(["bash", "-c", exec_cmd], timeout=10)
-                                    if loopback_result.exit_code == 0:
+                                    # v0.5.419 (audit stream-GG6 + GG12): pre-fix
+                                    # passed `timeout=10` to `container.exec_run`
+                                    # which docker-py does not accept — kwarg was
+                                    # silently discarded or raised TypeError
+                                    # swallowed by the outer except. Use the
+                                    # threading wrapper so the timeout is real.
+                                    loopback_result = _exec_run_with_timeout(container, ["bash", "-c", exec_cmd], timeout_sec=10.0)
+                                    if loopback_result is None:
+                                        logger.warning(f"[FRR] loopback-cleanup vtysh in {container_name} exceeded 10s timeout (GG6)")
+                                    elif loopback_result.exit_code == 0:
                                         logger.info(f"[FRR] Successfully removed loopback IPs from container {container_name}")
                                     else:
                                         output_str = loopback_result.output.decode('utf-8') if isinstance(loopback_result.output, bytes) else str(loopback_result.output)
@@ -2241,6 +2448,12 @@ def stop_frr_container(device_id: str, device_name: str = None, remove: bool = F
 def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: str = None) -> bool:
     """Configure BGP neighbor in FRR container."""
     try:
+        # v0.5.419 (audit stream-GG8): reconnect docker client if
+        # dockerd was restarted since our last successful call.
+        # Pre-fix, _ensure_client ran only inside start/stop; the
+        # legacy BGP wrappers would APIError-forever after a daemon
+        # restart until netgen-server itself restarted.
+        frr_manager._ensure_client()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
         
@@ -2262,8 +2475,15 @@ def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: s
         # instance to it. `router bgp <asn> vrf <name>` makes bgpd
         # bind TCP/179 inside the VRF table, so multiple devices on
         # the same host won't collide on the listen socket.
-        # Extract device_id from container_name so we can look up its VRF.
-        device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
+        # v0.5.419 (audit stream-GG2): extract device_id from container
+        # name using the shared helper that handles BOTH `ostg-frr-`
+        # and `dhcp-frr-` prefixes. Pre-fix the strip only handled
+        # `ostg-frr-`, so DHCP-client containers (prefix `dhcp-frr-`)
+        # produced polluted device_ids → vrf_name_for_device returned
+        # a mismatched VRF name → VRF probe reported "absent" → BGP
+        # configured in the default VRF (the exact trap v0.5.385 A1
+        # was supposed to prevent).
+        device_id = _strip_container_prefix(container_name)
         vrf_name = neighbor_config.get('vrf_name') or frr_manager.vrf_name_for_device(device_id)
         # v0.5.385 (audit BGP-A1): VRF probe hardening.
         # Pre-fix, `subprocess.run(["ip","-o","link","show", vrf_name])`
@@ -2355,8 +2575,26 @@ def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: s
                 router_id = update_source.split('/')[0] if '/' in update_source else update_source
                 logger.warning(f"[FRR] Loopback IPv4 not found, using update_source {router_id} as router-id (fallback)")
             else:
-                router_id = "192.168.0.2"
-                logger.warning(f"[FRR] No IPv4 available, using default router-id {router_id}")
+                # v0.5.419 (audit stream-GG7): NEVER fall back to the
+                # shared `192.168.0.2` router-id — same rationale as
+                # the sibling fix in _configure_global_router_id above.
+                # Use the deterministic per-device derivation so each
+                # device still gets a unique, stable router-id.
+                try:
+                    router_id = frr_manager._derive_router_id_from_device_id(device_id)
+                except Exception:
+                    logger.warning(
+                        f"[FRR] v0.5.419 GG7: no IPv4 / update_source "
+                        f"and router-id derivation failed for device "
+                        f"{device_id}; refusing to fall back to the "
+                        f"shared 192.168.0.2."
+                    )
+                    return False
+                logger.warning(
+                    f"[FRR] v0.5.419 GG7: no IPv4 / update_source "
+                    f"available for device {device_id}; derived unique "
+                    f"router-id {router_id} (no shared 192.168.0.2 fallback)."
+                )
         
         # Router-id and global knobs are managed by configure_bgp_for_device.
         # Avoid re-applying them here because FRR treats repeated graceful-restart
@@ -2397,16 +2635,24 @@ def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: s
             vtysh_cmd += f" -c '{cmd}'"
         
         logger.info(f"[FRR] Configuring BGP neighbor in container {container_name}: {vtysh_cmd}")
-        
-        result = container.exec_run(vtysh_cmd)
-        
-        if result.exit_code == 0:
-            logger.info(f"[FRR] Successfully configured BGP neighbor in container {container_name}")
-            return True
-        else:
-            output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+
+        # v0.5.419 (audit stream-GG4 + GG6): timeout + output scan on
+        # the legacy BGP wrapper — this function is still called from
+        # run_tgen_server.py in several places, so T2/EE2/FF3 parity
+        # applies here too.
+        result = _exec_run_with_timeout(container, vtysh_cmd, timeout_sec=15.0)
+        if result is None:
+            logger.error(f"[FRR] BGP neighbor configure in {container_name} exceeded 15s timeout (GG6)")
+            return False
+        output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+        if result.exit_code != 0:
             logger.error(f"[FRR] BGP neighbor configuration failed in container {container_name}: {output_str}")
             return False
+        if _vtysh_output_has_error(output_str):
+            logger.error(f"[FRR] BGP neighbor configure output for {container_name} contained error markers despite rc=0 (GG4): {output_str}")
+            return False
+        logger.info(f"[FRR] Successfully configured BGP neighbor in container {container_name}")
+        return True
         
     except Exception as e:
         logger.error(f"[FRR] Failed to configure BGP neighbor for device {device_id}: {e}")
@@ -2437,15 +2683,22 @@ def get_bgp_status(device_id: str, device_name: str = None) -> Dict:
     (which has no neighbors and is never Established).
     """
     try:
+        # v0.5.419 (audit stream-GG8): reconnect docker client.
+        frr_manager._ensure_client()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
 
         # Get BGP summary, scoped to the device's VRF.
         scope = _bgp_vtysh_scope(device_id)
-        result = container.exec_run(f"vtysh -c 'show bgp {scope} summary'")
-        
+        # v0.5.419 (audit stream-GG4 + GG6): timeout + output scan.
+        result = _exec_run_with_timeout(container, f"vtysh -c 'show bgp {scope} summary'", timeout_sec=10.0)
+        if result is None:
+            return {"status": "error", "error": "vtysh show bgp summary exceeded 10s timeout (v0.5.419 GG6)", "container_name": container_name}
+
         if result.exit_code == 0:
             output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+            if _vtysh_output_has_error(output_str):
+                return {"status": "error", "error": f"vtysh output contained error markers (v0.5.419 GG4): {output_str}", "container_name": container_name}
             return {
                 "status": "success",
                 "output": output_str,
@@ -2509,14 +2762,26 @@ def get_bgp_status_json(device_id: str, device_name: str = None) -> Dict:
     modern deployments a robust primary path.
     """
     try:
+        # v0.5.419 (audit stream-GG8): reconnect docker client.
+        frr_manager._ensure_client()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
         scope = _bgp_vtysh_scope(device_id)
 
         def _run(cmd: str) -> Optional[Dict]:
             """Exec a vtysh command and parse its stdout as JSON.
-            Returns None on non-zero exit or unparseable output."""
-            res = container.exec_run(f"vtysh -c '{cmd}'")
+            Returns None on non-zero exit, timeout, error-marker in
+            output, or unparseable output.
+
+            v0.5.419 (audit stream-GG4 + GG6): timeout + output scan.
+            Pre-fix bare `container.exec_run` with no timeout and no
+            `%` scan — a stuck mgmtd pinned the Flask worker, and a
+            `% Can't find …` on stdout parsed as "no neighbors" when
+            the real answer was "query rejected".
+            """
+            res = _exec_run_with_timeout(container, f"vtysh -c '{cmd}'", timeout_sec=10.0)
+            if res is None:
+                return None
             if res.exit_code != 0:
                 return None
             raw = (
@@ -2524,6 +2789,8 @@ def get_bgp_status_json(device_id: str, device_name: str = None) -> Dict:
                 if isinstance(res.output, bytes) else str(res.output)
             )
             if not raw or not raw.strip():
+                return None
+            if _vtysh_output_has_error(raw):
                 return None
             import json as _json
             try:
@@ -2604,15 +2871,22 @@ def get_bgp_neighbors(device_id: str, device_name: str = None) -> Dict:
     VRF-scoped — see get_bgp_status for the why.
     """
     try:
+        # v0.5.419 (audit stream-GG8): reconnect docker client.
+        frr_manager._ensure_client()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
 
         # Get BGP neighbors, scoped to the device's VRF.
         scope = _bgp_vtysh_scope(device_id)
-        result = container.exec_run(f"vtysh -c 'show bgp {scope} neighbors'")
-        
+        # v0.5.419 (audit stream-GG4 + GG6): timeout + output scan.
+        result = _exec_run_with_timeout(container, f"vtysh -c 'show bgp {scope} neighbors'", timeout_sec=10.0)
+        if result is None:
+            return {"status": "error", "error": "vtysh show bgp neighbors exceeded 10s timeout (v0.5.419 GG6)", "container_name": container_name}
+
         if result.exit_code == 0:
             output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+            if _vtysh_output_has_error(output_str):
+                return {"status": "error", "error": f"vtysh output contained error markers (v0.5.419 GG4): {output_str}", "container_name": container_name}
             return {
                 "status": "success",
                 "output": output_str,
