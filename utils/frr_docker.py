@@ -335,6 +335,54 @@ class FRRDockerManager:
         self.container_prefix = "ostg-frr"
         self.image_name = _resolve_frr_image(self.client)
 
+        # v0.5.418 (audit stream-GG1): the two init blocks below were
+        # orphaned by the v0.5.386 FRR-B4 patch (commit c4ab1488),
+        # which inserted `_ensure_client` BETWEEN the two halves of
+        # `__init__` without re-anchoring the second half. Both
+        # try/except branches of `_ensure_client` return explicitly,
+        # so the lines that followed landed as dead code inside
+        # `_ensure_client`'s scope — `_vrf_alloc_lock`,
+        # `_vrf_allocated`, `_vrf_state_path`, `_start_locks`, and
+        # `_start_locks_meta` were NEVER set on the instance. The
+        # first `start_frr_container` call hit `self._start_lock_for`
+        # which read `self._start_locks_meta` → `AttributeError`
+        # before any Flask response went back. Dark across v0.5.386-
+        # v0.5.417. Fix: move the orphaned blocks back into
+        # `__init__` here, above the `_ensure_client` method def.
+        #
+        # v0.5.373 (audit vrf-table-id-collision): allocation-tracker
+        # for per-device VRF routing-table ids. Pre-fix `_vrf_table`
+        # used `md5(device_id) % 1000` — birthday paradox says ~37
+        # devices produce a 50% collision chance, 100+ devices are
+        # near-certain to collide. Two devices sharing a table id
+        # see each other's routes in the same lookup table → silent
+        # wrong-forwarding.
+        #
+        # Fix: hash-derived initial pick (preserves the id every
+        # single-device install has today) followed by linear-probe
+        # over a range 3x larger (1000..3999) that skips already-
+        # allocated ids. Assignment is persisted to a JSON file so
+        # netgen-server restart doesn't churn ids (kernel VRF state
+        # would mismatch what we compute afresh).
+        import threading as _th
+        self._vrf_alloc_lock = _th.Lock()
+        self._vrf_allocated: Dict[str, int] = {}
+        self._vrf_state_path = self._resolve_vrf_state_path()
+        self._load_vrf_allocations()
+
+        # v0.5.383 (audit FRR-X1): per-device start lock. Pre-fix,
+        # two concurrent apply/start calls for the same device_id
+        # both passed the `containers.get() → NotFound` check at
+        # line ~927 and both raced into `containers.run(name=…)`
+        # at ~1217. The loser hit a 409 Conflict, `except Exception`
+        # swallowed it, and the caller marked the device failed
+        # while the container was actually up. Serialises the
+        # check-then-create window per device_id. Distinct from
+        # `_vrf_alloc_lock` (which only guards the VRF table map).
+        from collections import defaultdict as _dd
+        self._start_locks: Dict[str, _th.Lock] = _dd(_th.Lock)
+        self._start_locks_meta = _th.Lock()
+
     # v0.5.386 (audit FRR-B4): docker client reconnect wrapper.
     # Pre-fix, FRRDockerManager bound `docker.from_env()` once in
     # `__init__` and reused it forever. If dockerd was restarted
@@ -379,39 +427,6 @@ class FRRDockerManager:
             # Never let ensure_client itself crash the caller.
             logger.debug(f"[FRR] _ensure_client best-effort skip: {_outer}")
             return self.client
-
-        # v0.5.373 (audit vrf-table-id-collision): allocation-tracker
-        # for per-device VRF routing-table ids. Pre-fix `_vrf_table`
-        # used `md5(device_id) % 1000` — birthday paradox says ~37
-        # devices produce a 50% collision chance, 100+ devices are
-        # near-certain to collide. Two devices sharing a table id
-        # see each other's routes in the same lookup table → silent
-        # wrong-forwarding.
-        #
-        # Fix: hash-derived initial pick (preserves the id every
-        # single-device install has today) followed by linear-probe
-        # over a range 3x larger (1000..3999) that skips already-
-        # allocated ids. Assignment is persisted to a JSON file so
-        # netgen-server restart doesn't churn ids (kernel VRF state
-        # would mismatch what we compute afresh).
-        import threading as _th
-        self._vrf_alloc_lock = _th.Lock()
-        self._vrf_allocated: Dict[str, int] = {}
-        self._vrf_state_path = self._resolve_vrf_state_path()
-        self._load_vrf_allocations()
-
-        # v0.5.383 (audit FRR-X1): per-device start lock. Pre-fix,
-        # two concurrent apply/start calls for the same device_id
-        # both passed the `containers.get() → NotFound` check at
-        # line ~927 and both raced into `containers.run(name=…)`
-        # at ~1217. The loser hit a 409 Conflict, `except Exception`
-        # swallowed it, and the caller marked the device failed
-        # while the container was actually up. Serialises the
-        # check-then-create window per device_id. Distinct from
-        # `_vrf_alloc_lock` (which only guards the VRF table map).
-        from collections import defaultdict as _dd
-        self._start_locks: Dict[str, _th.Lock] = _dd(_th.Lock)
-        self._start_locks_meta = _th.Lock()
 
     _VRF_TABLE_RANGE_LO = 1000
     _VRF_TABLE_RANGE_HI = 3999  # 3000 slots — 100x headroom over

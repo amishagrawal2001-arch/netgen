@@ -2,6 +2,55 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.418] - 2026-10-02
+
+### Fixed — CRITICAL: `FRRDockerManager.__init__` dead-code regression (GG1)
+
+Hot fix for a shipping-breaker that has been dark across **32
+released versions** (v0.5.386 → v0.5.417). Operators upgrading past
+v0.5.386 and then applying (or re-adding) a device have been one
+`AttributeError` away from "Failed to start FRR container" with no
+device coming up at all.
+
+**GG1: `__init__` body split across inserted `_ensure_client`**
+(`utils/frr_docker.py:318-384`) — The v0.5.386 FRR-B4 patch (commit
+`c4ab1488`) inserted the `_ensure_client` reconnect wrapper BETWEEN
+the two halves of `__init__` but didn't dedent the second half.
+Python parsed the orphaned block as the tail of `_ensure_client`'s
+body — *after* both try/except branches returned explicitly on line
+381 — so it was unreachable dead code. The five instance attrs the
+block was supposed to set (`_vrf_alloc_lock`, `_vrf_allocated`,
+`_vrf_state_path`, `_start_locks`, `_start_locks_meta`) were never
+set on the instance. The first `start_frr_container(...)` call hit
+`self._start_lock_for(device_id)` at line 1003, which reads
+`self._start_locks_meta` → `AttributeError`, before Flask sent any
+response.
+
+Why it stayed dark: the v0.5.373 and v0.5.383 regression tests
+(`tests/test_v05373_deferred_bundle.py`,
+`test_v05383_frr_stats_med.py`) only grep source strings; they
+never instantiate the class. srv06 kept running on its pre-v0.5.386
+wheel across the lifetime of these containers, so the crash only
+fires the next time an operator applies a device (or adds a new
+one) on a server that upgraded past v0.5.386.
+
+Fix: move the orphaned v0.5.373 (VRF-alloc tracker) and v0.5.383
+(per-device start-lock) init blocks back into `__init__`, above the
+`_ensure_client` method definition. No logic change — the exact
+same statements are preserved, just at the right indentation level
+so they are actually executed when `FRRDockerManager()` runs.
+
+### Tests
+
+- `tests/test_v05418_frr_init_attrs.py` — 11 tests, including the
+  one the pre-fix suite was missing: instantiate `FRRDockerManager`
+  (with the `docker` module stubbed) and assert all 5 attrs exist,
+  `_start_lock_for('dev-abc')` returns a Lock, `_vrf_table('…')`
+  returns an int in [1000, 3999]. Plus AST-level assertions that
+  `__init__.end_lineno >= 380` so a future indent regression trips
+  the suite before shipping. Regression guards for v0.5.417 FF2
+  and v0.5.416 EE1.
+
 ## [0.5.417] - 2026-09-22
 
 ### Fixed — utils/isis.py audit (9 HIGH)
