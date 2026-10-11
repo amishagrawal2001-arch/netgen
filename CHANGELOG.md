@@ -2,6 +2,50 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.422] - 2026-10-11
+
+### Fixed — Online/Offline no longer collapses + re-expands the whole TGEN tree (JJ1 + JJ2)
+
+Follow-up to v0.5.421 II1 + II2. The II2 fix (invalidate
+`server["interfaces"]` + rely on the three staggered
+`update_server_tree` calls at 500 ms / 3 s / 8 s to re-fetch and
+render) worked for the chip color but caused the full QTreeWidget to
+clear + rebuild **three times** inside the 8-second window — operator
+reported the entire interface list visibly collapsing and re-expanding
+on every Online/Offline click.
+
+**JJ1: replace cache invalidation with in-place mutation.** The
+HTTP-200 branch of `_set_interface_admin_state` no longer sets
+`_srv["interfaces"] = None`. Instead it finds the matching cached
+iface entry and overwrites its `status` + `operstate` fields in place.
+The cached server dict stays intact; a later full `update_server_tree`
+triggered by any other code path renders the correct state.
+
+**JJ2: single-iface refetch helper replaces the three tree rebuilds.**
+A new closure `_refresh_this_iface_only` GETs `/api/interfaces` with a
+3-second timeout, finds the single iface by name, mutates the cached
+entry in-place, and calls
+`self._update_iface_icon_for_operstate(_srv_addr, _iface, _new_ops)`
+to repaint JUST that iface's chip. The 500 ms / 3 s / 8 s stagger from
+v0.5.43 is preserved (slow Mellanox 100G/200G carrier negotiation can
+need up to several seconds) but each timer now fires the lightweight
+closure instead of a full tree rebuild. No visible collapse/expand.
+
+Edits are confined to
+[traffic_client/server_section.py](traffic_client/server_section.py);
+no server-side change.
+
+### Tests
+
+[tests/test_v05422_server_tree_iface_only_refresh.py](tests/test_v05422_server_tree_iface_only_refresh.py) — 14 tests
+covering: AST parse, JJ1 cache-mutation path replaces invalidation,
+JJ2 closure defined with captured server_addr+iface defaults, closure
+calls `_update_iface_icon_for_operstate` (not `update_server_tree`),
+closure fetches `/api/interfaces` with 3s timeout, 500ms/3s/8s QTimer
+schedule preserved but wired to closure, v0.5.421 II1 col-1 match
+intact, version guard, prior-slice regression guards (HH1 / GG1 /
+FF scanner).
+
 ## [0.5.421] - 2026-10-11
 
 ### Fixed — TGEN iface chip stuck green after Online/Offline (II1 + II2)

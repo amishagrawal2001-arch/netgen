@@ -533,37 +533,75 @@ class TrafficGenClientServerSection():
                     logger.debug(
                         f"[INTERFACE ADMIN] icon update failed: {e}"
                     )
-                # v0.5.421 (audit stream-II2): invalidate the
-                # cached interfaces list for this server BEFORE the
-                # scheduled refreshes fire. update_server_tree only
-                # re-fetches /api/interfaces when `server["interfaces"]`
-                # is None (see server_section.py:1687); otherwise it
-                # re-renders the SAME dict it rendered last time.
-                # Pre-fix the admin command successfully flipped the
-                # kernel state and the staggered refreshes ran — but
-                # they rendered the stale cached iface list and the
-                # chip stayed on the pre-flip color forever (until
-                # whatever external poller eventually invalidated
-                # the cache, which could be minutes). Clear the
-                # cache here so each scheduled refresh actually
-                # hits the server and picks up the new status.
+                # v0.5.422 (audit stream-JJ1 — follow-up to II1 + II2):
+                # keep the cache in sync with the kernel's reported
+                # operstate so a LATER full `update_server_tree`
+                # refresh (triggered by some other code path) renders
+                # the correct state, WITHOUT invalidating the whole
+                # cache and forcing a full tree rebuild (which is
+                # what v0.5.421 II2 did — operator reported the
+                # entire interface list collapsed + re-expanded 3×
+                # over the 8-second staggered window). Mutate just
+                # this iface's entry in-place.
                 try:
                     for _srv in getattr(self, "server_interfaces", []):
-                        if _srv.get("address", "") == server_addr:
-                            _srv["interfaces"] = None
-                            break
-                except Exception as _inv_exc:
+                        if _srv.get("address", "") != server_addr:
+                            continue
+                        _cached = _srv.get("interfaces") or []
+                        for _ent in _cached:
+                            if _ent.get("name") == iface:
+                                _ent["status"] = operstate if operstate in ("up", "down") else _ent.get("status")
+                                _ent["operstate"] = operstate
+                                break
+                        break
+                except Exception as _mut_exc:
                     logger.debug(
-                        f"[INTERFACE ADMIN] cache invalidation failed: {_inv_exc}"
+                        f"[INTERFACE ADMIN] cache mutate failed: {_mut_exc}"
                     )
-                # v0.5.43: ALSO stagger refresh schedule. The 500ms
-                # one-shot misses slow carrier negotiation. Try at
-                # 500ms (catches operstate=up), 3s (catches typical
-                # carrier-up), 8s (catches the slow Mellanox case).
-                if hasattr(self, "update_server_tree"):
-                    QTimer.singleShot(500, self.update_server_tree)
-                    QTimer.singleShot(3000, self.update_server_tree)
-                    QTimer.singleShot(8000, self.update_server_tree)
+                # v0.5.422 (audit stream-JJ2): replace the 3 staggered
+                # `self.update_server_tree` calls (which rebuild the
+                # ENTIRE tree — operator sees a visible collapse/
+                # expand flash each time) with a lightweight single-
+                # iface refetch helper that only re-paints THIS
+                # iface's icon via `_update_iface_icon_for_operstate`.
+                # Still fires at 500ms / 3s / 8s to catch slow
+                # Mellanox 100G/200G carrier negotiation (the reason
+                # v0.5.43 added the retries in the first place).
+                def _refresh_this_iface_only(_srv_addr=server_addr, _iface=iface):
+                    try:
+                        import requests as _r2
+                        _base = _srv_addr.rstrip("/")
+                        if "://" not in _base:
+                            _base = f"http://{_base}"
+                        _rp = _r2.get(f"{_base}/api/interfaces", timeout=3)
+                        if _rp.status_code != 200:
+                            return
+                        _data = _rp.json()
+                        _list = _data if isinstance(_data, list) else _data.get("interfaces", [])
+                        for _ent in _list:
+                            if _ent.get("name") == _iface:
+                                _new_ops = _ent.get("operstate") or _ent.get("status") or ""
+                                # Mutate cached entry in-place.
+                                for _srv in getattr(self, "server_interfaces", []):
+                                    if _srv.get("address", "") != _srv_addr:
+                                        continue
+                                    for _c in (_srv.get("interfaces") or []):
+                                        if _c.get("name") == _iface:
+                                            _c["status"] = _ent.get("status", _c.get("status"))
+                                            _c["operstate"] = _new_ops
+                                            break
+                                    break
+                                self._update_iface_icon_for_operstate(
+                                    _srv_addr, _iface, _new_ops,
+                                )
+                                return
+                    except Exception as _ex:
+                        logger.debug(
+                            f"[INTERFACE ADMIN] JJ2 iface-only refresh failed: {_ex}"
+                        )
+                QTimer.singleShot(500, _refresh_this_iface_only)
+                QTimer.singleShot(3000, _refresh_this_iface_only)
+                QTimer.singleShot(8000, _refresh_this_iface_only)
             elif r.status_code == 404:
                 QMessageBox.warning(
                     self, "Interface admin not supported",
