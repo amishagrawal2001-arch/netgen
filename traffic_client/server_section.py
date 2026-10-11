@@ -445,7 +445,19 @@ class TrafficGenClientServerSection():
         root = self.server_tree.invisibleRootItem()
         for i in range(root.childCount()):
             srv_item = root.child(i)
-            srv_label = (srv_item.text(0) or "").lower()
+            # v0.5.421 (audit stream-II1): match on column 1 (the
+            # Server Address column) not column 0. The TG server
+            # row's col 0 is populated by setItemWidget with a
+            # composite "status LED + TG N" widget, so text(0) is
+            # ALWAYS the empty string that QTreeWidgetItem was
+            # constructed with at line ~1647. Pre-fix this loop
+            # read col 0, found "", `server_addr not in ""` was
+            # True → every server row was skipped → no iface
+            # icon ever got updated via the admin-command fast
+            # path (operator saw chip stuck on last-known
+            # state until the next full /api/interfaces refresh
+            # which v0.5.421 II2 ALSO had to force).
+            srv_label = (srv_item.text(1) or "").lower()
             if server_addr.lower() not in srv_label and \
                     server_addr.split(":")[0].lower() not in srv_label:
                 continue
@@ -520,6 +532,29 @@ class TrafficGenClientServerSection():
                 except Exception as e:
                     logger.debug(
                         f"[INTERFACE ADMIN] icon update failed: {e}"
+                    )
+                # v0.5.421 (audit stream-II2): invalidate the
+                # cached interfaces list for this server BEFORE the
+                # scheduled refreshes fire. update_server_tree only
+                # re-fetches /api/interfaces when `server["interfaces"]`
+                # is None (see server_section.py:1687); otherwise it
+                # re-renders the SAME dict it rendered last time.
+                # Pre-fix the admin command successfully flipped the
+                # kernel state and the staggered refreshes ran — but
+                # they rendered the stale cached iface list and the
+                # chip stayed on the pre-flip color forever (until
+                # whatever external poller eventually invalidated
+                # the cache, which could be minutes). Clear the
+                # cache here so each scheduled refresh actually
+                # hits the server and picks up the new status.
+                try:
+                    for _srv in getattr(self, "server_interfaces", []):
+                        if _srv.get("address", "") == server_addr:
+                            _srv["interfaces"] = None
+                            break
+                except Exception as _inv_exc:
+                    logger.debug(
+                        f"[INTERFACE ADMIN] cache invalidation failed: {_inv_exc}"
                     )
                 # v0.5.43: ALSO stagger refresh schedule. The 500ms
                 # one-shot misses slow carrier negotiation. Try at

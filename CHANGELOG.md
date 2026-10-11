@@ -2,6 +2,60 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.421] - 2026-10-11
+
+### Fixed — TGEN iface chip stuck green after Online/Offline (II1 + II2)
+
+Operator reproduction on srv06 (post-v0.5.420 upgrade):
+right-click an interface → Offline → confirmation Yes → POST reached
+server (HTTP 200), kernel operstate flipped to `down`, `/api/interfaces`
+correctly returned `status=down` — but the client's iface chip STAYED
+GREEN forever. Verified via SSH on srv06 + journalctl + direct curl of
+the API endpoint.
+
+Two stacked client-side bugs, both in
+[traffic_client/server_section.py](traffic_client/server_section.py):
+
+**II1: `_update_iface_icon_for_operstate` matched the wrong column.**
+The server-row lookup read `srv_item.text(0)`, but column 0 is
+populated by `setItemWidget(..., 0, tg_id_widget)` at line ~1640, so
+`text(0)` is ALWAYS the empty string the QTreeWidgetItem was
+constructed with (`QTreeWidgetItem(["", server_address, ""])`). The
+server address lives in column 1. `server_addr not in ""` was True
+→ every server row skipped → iface icon never updated via the admin-
+response fast path. Fix: read `text(1)`.
+
+**II2: scheduled refreshes rendered from stale cache.** `update_server_tree`
+only re-fetches `/api/interfaces` when `server["interfaces"]` is None
+(server_section.py:1686-87). The three scheduled `QTimer.singleShot`
+refreshes at 500ms/3s/8s re-rendered from the SAME cached dict —
+which still carried `status="up"` from before the Offline POST → chip
+stuck forever until an external poller eventually invalidated the
+cache (could take minutes). Fix: clear `server["interfaces"] = None`
+for the matching server in the HTTP-200 branch of
+`_set_interface_admin_state`, before the staggered refreshes fire.
+
+Both edits are client-only — no server upgrade required.
+
+### Tests
+
+- `tests/test_v05421_server_tree_icon.py` — 10 tests: markers,
+  body-structure assertions that the column match is now `text(1)`
+  and the cache invalidation sits BEFORE the three QTimer schedules.
+  Regression guards for v0.5.418/419/420 markers.
+
+### Note on srv06 verification
+
+v0.5.418 (GG1), v0.5.419 (GG2-GG8), v0.5.420 (HH1/HH6/HH7/HH8/HH13/HH15/HH16)
+all verified live on srv06 earlier today after the venv upgrade from
+v0.5.415 → v0.5.420 (FRRDockerManager instantiates cleanly, zero
+AttributeError hits, zero "No such process" route-removal errors,
+`/api/interfaces` returns correct per-iface status). The II1 + II2
+bugs this release fixes are long-standing client-side defects (not
+introduced by any of the recent server-side ship cycles) that only
+surfaced because the operator exercised Online/Offline live on srv06
+for the first time with a modern client.
+
 ## [0.5.420] - 2026-10-02
 
 ### Fixed — utils/dhcp.py audit (slice A: 3 HIGH + 4 MED)
