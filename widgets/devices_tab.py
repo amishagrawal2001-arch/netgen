@@ -4475,6 +4475,18 @@ class DevicesTab(QWidget):
                     self.error = exc
 
         merged_seen_ids = set()
+        # v0.5.424 (audit stream-LL1): track whether ANY server
+        # returned 200 cleanly, separate from `merged_seen_ids`. A
+        # server that returned an empty list (Clear-All just ran, or
+        # the inventory is genuinely empty) is a VALID zero signal
+        # and must trigger the ghost prune; a server that errored
+        # or wasn't reached is NOT a valid zero and must leave the
+        # cache alone. Pre-fix, both paths produced `merged_seen_ids
+        # == set()` and the safety rail at :4566 was identical — so
+        # Clear-All never pruned, every row became a ghost, and
+        # protocol tables (OSPF most visibly) kept their stale
+        # "Up"/green rendering until the next monitor tick.
+        any_server_ok = False
         for srv in servers:
             if not srv.get("online", True):
                 continue
@@ -4493,6 +4505,8 @@ class DevicesTab(QWidget):
             if worker.error is not None:
                 logger.warning(f"[RELOAD] {addr} fetch failed: {worker.error}")
                 continue
+            # Server answered cleanly (even if `worker.devices` is []).
+            any_server_ok = True
 
             for dev in worker.devices:
                 if not isinstance(dev, dict):
@@ -4552,50 +4566,76 @@ class DevicesTab(QWidget):
         # event triggered a reload but reload only ADDED — never
         # subtracted. Only a full app restart cleared them.
         #
+        # v0.5.424 (audit stream-LL1): two live-code bugs:
+        #   (a) `isinstance(_cache, list)` — but `all_devices` is a
+        #       DICT (iface → [devices]) throughout the client (see
+        #       :4525, :4759, update_ospf_table). The isinstance
+        #       check was ALWAYS False → prune never ran.
+        #   (b) The gate `and merged_seen_ids` treated "server
+        #       returned [] cleanly" the same as "server errored" —
+        #       so Clear-All, which produces an empty but valid
+        #       response, could never prune the cache. Protocol
+        #       tables (OSPF/BGP) kept rendering ghost rows with
+        #       pre-clear state.
+        # Both fixed below: walk the dict buckets, drop ghost rows,
+        # drop now-empty iface buckets, and gate on `any_server_ok`
+        # (set when a server responded 200, independent of whether
+        # the response list was empty) instead of on
+        # `merged_seen_ids`.
+        #
         # Two safety rails:
-        #   1. Skip pruning if the whole `merged_seen_ids` set
-        #      is empty — treat that as "servers all offline /
-        #      returned nothing" rather than "delete every
-        #      device". Better to keep ghost rows than nuke
+        #   1. Skip pruning if NO server responded cleanly — treat
+        #      that as "servers all offline" rather than "delete
+        #      every device". Better to keep ghost rows than nuke
         #      real devices on a network hiccup.
         #   2. Never prune a device with `_needs_apply` set —
         #      that's an in-progress local edit that hasn't been
         #      pushed to the server yet.
         try:
             _cache = getattr(self.main_window, "all_devices", None)
-            if isinstance(_cache, list) and merged_seen_ids:
-                _pruned = []
+            if isinstance(_cache, dict) and any_server_ok:
                 _dropped = 0
-                for _dev in _cache:
-                    if not isinstance(_dev, dict):
-                        _pruned.append(_dev)
+                _empty_ifaces = []
+                for _iface, _bucket in list(_cache.items()):
+                    if not isinstance(_bucket, list):
                         continue
-                    _did = _dev.get("device_id") or _dev.get("Device ID")
-                    if not _did:
-                        # Rows without a device_id are pre-Apply
-                        # locals; always keep.
-                        _pruned.append(_dev)
-                        continue
-                    if _dev.get("_needs_apply"):
-                        # In-flight edit — keep even if not seen
-                        # on server yet.
-                        _pruned.append(_dev)
-                        continue
-                    if _did in merged_seen_ids:
-                        _pruned.append(_dev)
+                    _kept = []
+                    for _dev in _bucket:
+                        if not isinstance(_dev, dict):
+                            _kept.append(_dev)
+                            continue
+                        _did = _dev.get("device_id") or _dev.get("Device ID")
+                        if not _did:
+                            # Rows without a device_id are pre-Apply
+                            # locals; always keep.
+                            _kept.append(_dev)
+                            continue
+                        if _dev.get("_needs_apply") or _dev.get("_is_new"):
+                            # In-flight edit — keep even if not seen
+                            # on server yet.
+                            _kept.append(_dev)
+                            continue
+                        if _did in merged_seen_ids:
+                            _kept.append(_dev)
+                        else:
+                            _dropped += 1
+                            logger.debug(
+                                f"[RELOAD] Pruning ghost device "
+                                f"{_did} (name={_dev.get('Device Name')!r}) "
+                                f"from iface {_iface!r} — not in server response"
+                            )
+                    if _kept:
+                        _cache[_iface] = _kept
                     else:
-                        _dropped += 1
-                        logger.debug(
-                            f"[RELOAD] Pruning ghost device "
-                            f"{_did} (name={_dev.get('Device Name')!r}) "
-                            f"— not in server response"
-                        )
-                if _dropped:
-                    self.main_window.all_devices[:] = _pruned
+                        _empty_ifaces.append(_iface)
+                for _ei in _empty_ifaces:
+                    _cache.pop(_ei, None)
+                if _dropped or _empty_ifaces:
                     logger.info(
-                        f"[RELOAD] Pruned {_dropped} ghost device(s) "
-                        f"not present on any server "
-                        f"(v0.5.387 audit devices-tab C5)"
+                        f"[RELOAD] Pruned {_dropped} ghost device(s), "
+                        f"{len(_empty_ifaces)} empty iface bucket(s) "
+                        f"(v0.5.424 audit stream-LL1 — was broken by "
+                        f"dict/list mismatch pre-fix)"
                     )
         except Exception as _prune_exc:
             logger.warning(f"[RELOAD] Ghost prune skipped: {_prune_exc}")

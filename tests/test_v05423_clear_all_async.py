@@ -160,7 +160,9 @@ def test_kk1_on_done_handles_partial_failure():
     failed names and a "… and N more" suffix."""
     src = _read("traffic_client/main.py")
     _idx = src.index("def _on_done(")
-    body = src[_idx:_idx + 3000]
+    # Slot body — allow room for later audit slices to grow it
+    # (v0.5.424 LL2 added OSPF/BGP/ISIS table refreshes).
+    body = src[_idx:_idx + 6000]
     assert "Partial cleanup" in body
     assert "device_name" in body
     assert "device_id" in body

@@ -2,6 +2,54 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.424] - 2026-10-11
+
+### Fixed — OSPF rows stuck green/"Up" after Tools → Clear All Devices (LL1 + LL2)
+
+Operator reproduction (post-v0.5.423 KK1 upgrade): Tools → Clear All
+Devices → typed `CLEAR` → device + BGP chips flip red as expected,
+but OSPF rows stay green/`Up` indefinitely. OSPF was added later in
+the dev timeline than BGP, so the client's OSPF plumbing never got
+the same post-remove refresh wiring.
+
+**LL1: `widgets/devices_tab.py` ghost-prune doubly broken.** The
+v0.5.387 C5 block gated on `isinstance(_cache, list)` — but
+`all_devices` is a DICT (iface → `[devices]`) everywhere else in the
+client (`:4525`, `:4759`, `update_ospf_table`). The isinstance check
+was ALWAYS False → the prune has NEVER run. On top of that, the
+"safety rail" `and merged_seen_ids` treated "server returned `[]`
+cleanly" (what Clear-All produces) the same as "server unreachable"
+— so even if the type check were fixed, Clear-All still wouldn't
+prune. Rewrote the prune to walk `all_devices.items()`, drop ghost
+devices + empty iface buckets, and gate on a new `any_server_ok`
+flag set when a server responds 200 (independent of row count).
+Preserves `_needs_apply` and `_is_new` rows so an in-flight edit
+doesn't get nuked by a reload racing with Save.
+
+**LL2: `traffic_client/main.py` Clear-All success slot refreshed
+only the device table.** `reload_devices_from_server()` only kicks
+`update_device_table`. The OSPF table has its own painter
+(`update_ospf_table`) that iterates `all_devices`. With LL1 fixing
+the cache emptying, LL2 kicks the per-table painters (OSPF, BGP,
+ISIS) from the KK1 async-worker's success slot so all three tables
+clear together instead of waiting for OSPF's 20-second monitor tick.
+Each refresh is guarded by `getattr(..., None) + callable(...)` so a
+client build without one of the methods doesn't crash.
+
+Client-only change — no server upgrade required.
+
+### Tests
+
+[tests/test_v05424_clear_all_protocol_table_sync.py](tests/test_v05424_clear_all_protocol_table_sync.py) — 15 tests
+covering: AST parse of both files, LL1 marker, `any_server_ok`
+tracking, `isinstance(_cache, dict)` not `list`, prune gate on
+`any_server_ok` not `merged_seen_ids`, dict-bucket walk + empty-
+iface drop, `_needs_apply` + `_is_new` preservation, LL2 marker,
+slot refreshes OSPF + BGP + ISIS tables, refresh sits in `_on_done`
+(not the sync pre-worker path), prior-slice regression guards
+(v0.5.423 KK1 async worker, v0.5.422 JJ2 closure, v0.5.421 II1
+col-1 match).
+
 ## [0.5.423] - 2026-10-11
 
 ### Fixed — Tools → Clear All Devices no longer freezes the whole client (KK1)

@@ -2110,9 +2110,33 @@ class TrafficGeneratorClient(
             failed = int(data.get("failed") or 0)
 
             # Refresh the Devices tab so the operator sees the empty state.
+            # v0.5.424 (audit stream-LL2): the pre-fix slot called ONLY
+            # `reload_devices_from_server()`, which only refreshes the
+            # device table. The OSPF table (and BGP, to a lesser extent)
+            # has its own per-table painter that iterates `all_devices`
+            # — and with the LL1 ghost-prune now actually firing on an
+            # empty server response, `all_devices` goes to {} and those
+            # painters need a kick to clear their rows. Pre-LL1 the user
+            # saw OSPF rows stuck "Up"/green indefinitely after Clear
+            # All while BGP + device chips went red; LL1 fixes the cache
+            # emptying and LL2 kicks the painters so all three tables
+            # clear together. Also covers ISIS where present.
             try:
                 if hasattr(self, "devices_tab") and self.devices_tab:
                     self.devices_tab.reload_devices_from_server()
+                    for _meth in (
+                        "update_ospf_table",
+                        "update_bgp_table",
+                        "update_isis_table",
+                    ):
+                        _fn = getattr(self.devices_tab, _meth, None)
+                        if callable(_fn):
+                            try:
+                                _fn()
+                            except Exception as _tbl_exc:
+                                logger.debug(
+                                    f"[CLEAR-ALL] {_meth} refresh raised: {_tbl_exc}"
+                                )
             except Exception:
                 pass
 
