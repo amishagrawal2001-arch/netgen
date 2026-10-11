@@ -2,6 +2,54 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.423] - 2026-10-11
+
+### Fixed — Tools → Clear All Devices no longer freezes the whole client (KK1)
+
+Operator reproduction (post-v0.5.422 upgrade): Tools → Clear All
+Devices → typed `CLEAR` → the entire TGEN client UI froze until the
+server finished looping through every device. Each delete can take
+1–3 seconds server-side (FRR container stop → VXLAN+VRF teardown →
+DHCP cancel → OSPF cleanup → DB purge), so a server with 20 devices
+hung the client for ~60 seconds — no spinner, no cancel, no response
+to tab switches or window drags.
+
+Root cause: `clear_all_devices_on_server` in
+[traffic_client/main.py](traffic_client/main.py) ran
+`requests.post(f"{server_url}/api/devices/clear_all", timeout=120)`
+on the UI thread. Classic sync-HTTP-on-event-loop freeze — same shape
+as the v0.5.401 R-slice menu_actions.py fixes and v0.5.374 E1 (DHCP
+restart async).
+
+**KK1 fix:** wrap the POST in an inline `_ClearAllWorker(QThread)`
+with a `done(ok, status, data, err)` signal; show a marquee
+`QProgressDialog` while the worker runs; deliver the result dialog
+from the slot. Server-side loop is still synchronous and
+uncancellable (no server change needed) but the UI stays responsive
+throughout — operator can switch tabs, press "Hide" on the progress
+dialog, and keep working while the server churns. On completion the
+Devices tab reloads automatically and a success/partial-failure
+dialog surfaces with per-device failure names (up to 10, with
+`… and N more` suffix) as before.
+
+Keepalive registered via `self._keepalive_worker(worker)` so the
+PyQt5 5.15 QThread GC race doesn't SIGABRT the client once the
+thread finishes.
+
+Client-only change — no server upgrade required.
+
+### Tests
+
+[tests/test_v05423_clear_all_async.py](tests/test_v05423_clear_all_async.py) — 13 tests covering:
+AST parse, KK1 marker, `_ClearAllWorker(QThread)` class defined inside
+handler, sync `requests.post` removed from live handler body, worker
+POSTs `/api/devices/clear_all` with 120s timeout preserved,
+`QProgressDialog` marquee shown before `worker.start()`,
+`done.connect` precedes `start`, keepalive registered, success slot
+still refreshes devices tab + renders partial-cleanup dialog, prior-
+slice regression guards (v0.5.422 JJ2 closure + v0.5.421 II1 col-1
+match).
+
 ## [0.5.422] - 2026-10-11
 
 ### Fixed — Online/Offline no longer collapses + re-expands the whole TGEN tree (JJ1 + JJ2)

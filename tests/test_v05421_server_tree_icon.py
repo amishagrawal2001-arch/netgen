@@ -81,48 +81,27 @@ def test_ii1_server_match_reads_column_1():
     )
 
 
-# ─── II2: admin-success invalidates cached interfaces ───
+# ─── II2 was superseded by v0.5.422 JJ1 + JJ2.
+#
+# II2's approach (invalidate `_srv["interfaces"] = None` + rely on the
+# three staggered `update_server_tree` calls to refetch and render)
+# fixed the stuck chip but caused a visible full-tree collapse/expand
+# on every Online/Offline click. v0.5.422 JJ1 replaces the cache
+# invalidation with in-place iface mutation, and JJ2 replaces the
+# three `update_server_tree` timers with a single-iface refetch helper.
+#
+# The up-to-date assertions for the admin-success path live in
+# tests/test_v05422_server_tree_iface_only_refresh.py. We keep a
+# single historical marker here so the slice remains discoverable in
+# the test suite.
 
 
-def test_ii2_marker_present():
-    assert "v0.5.421 (audit stream-II2)" in _read("traffic_client/server_section.py")
-
-
-def test_ii2_admin_success_clears_server_interfaces_cache():
-    """`_set_interface_admin_state`'s HTTP-200 branch must clear
-    `server["interfaces"]` for the matching server BEFORE the three
-    scheduled refreshes fire — otherwise update_server_tree re-renders
-    from the stale cached list and the icon stays on the pre-click
-    color forever."""
+def test_ii2_mentioned_in_jj1_jj2_comments():
+    """Comments inside the v0.5.422 JJ1 + JJ2 blocks still reference
+    II2 so the audit trail from II2 → JJ1 → JJ2 is readable from
+    source alone."""
     src = _read("traffic_client/server_section.py")
-    _idx = src.index("def _set_interface_admin_state")
-    _end = src.index("def _on_server_selection_changed_combined", _idx)
-    body = src[_idx:_end]
-    assert "server_interfaces" in body
-    assert "_srv[\"interfaces\"] = None" in body
-    # The invalidation must sit BEFORE the staggered QTimer schedules,
-    # otherwise the 500ms refresh fires with the stale cache intact.
-    _inv_pos = body.index("_srv[\"interfaces\"] = None")
-    _timer_pos = body.index("QTimer.singleShot(500,")
-    assert _inv_pos < _timer_pos, (
-        "cache invalidation must precede the scheduled refreshes"
-    )
-
-
-# ─── Smoke: the admin-success path still schedules the 3 refreshes ───
-
-
-def test_ii2_three_staggered_refreshes_still_scheduled():
-    """v0.5.43 landed 500ms + 3s + 8s refreshes to catch slow Mellanox
-    carrier negotiation. II2 adds a cache-invalidation step but must
-    not drop the staggered schedule."""
-    src = _read("traffic_client/server_section.py")
-    _idx = src.index("def _set_interface_admin_state")
-    _end = src.index("def _on_server_selection_changed_combined", _idx)
-    body = src[_idx:_end]
-    assert "QTimer.singleShot(500, self.update_server_tree)" in body
-    assert "QTimer.singleShot(3000, self.update_server_tree)" in body
-    assert "QTimer.singleShot(8000, self.update_server_tree)" in body
+    assert "II2" in src
 
 
 # ─── version guard ───
