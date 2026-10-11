@@ -1969,8 +1969,18 @@ class TrafficGeneratorClient(
         through the same removal path used by per-row Delete
         (container stop → VXLAN teardown → DHCP cancel → OSPF
         cleanup → DB purge). Ends with a devices-table refresh.
+
+        v0.5.423 (audit stream-KK1): the POST now runs on a background
+        QThread with a marquee QProgressDialog so the whole app no
+        longer freezes while the server loops through N devices (each
+        delete can take 1–3 seconds — N=20 → 60s UI freeze). Mirror
+        of the v0.5.401 R-slice pattern (menu_actions.py) and v0.5.374
+        E1 (DHCP restart async).
         """
-        from PyQt5.QtWidgets import QMessageBox, QInputDialog
+        from PyQt5.QtWidgets import (
+            QMessageBox, QInputDialog, QProgressDialog,
+        )
+        from PyQt5.QtCore import Qt, QThread, pyqtSignal
         import requests
 
         server_url = None
@@ -2019,64 +2029,115 @@ class TrafficGeneratorClient(
         if not ok or typed.strip() != "CLEAR":
             return
 
-        try:
-            resp = requests.post(
-                f"{server_url}/api/devices/clear_all", timeout=120
-            )
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Clear failed",
-                f"Request to {server_url} failed:\n{e}"
-            )
-            return
+        # v0.5.423 KK1: async worker. The pre-fix shape ran
+        # `requests.post(..., timeout=120)` on the UI thread — operator
+        # reported the entire app hung until the server finished every
+        # device. The endpoint loops synchronously server-side (so we
+        # can't cancel it mid-flight) but the UI can at least stay
+        # responsive while it runs.
+        class _ClearAllWorker(QThread):
+            # (ok, http_status, data_dict_or_text, error_msg)
+            done = pyqtSignal(bool, int, object, str)
 
-        if resp.status_code != 200:
-            body = ""
+            def __init__(self, url, parent=None):
+                super().__init__(parent)
+                self._url = url
+
+            def run(self):
+                try:
+                    resp = requests.post(
+                        f"{self._url}/api/devices/clear_all",
+                        timeout=120,
+                    )
+                except Exception as _ex:
+                    self.done.emit(False, 0, None, str(_ex))
+                    return
+                try:
+                    data = resp.json() or {}
+                except Exception:
+                    data = resp.text[:400] if resp.text else ""
+                self.done.emit(resp.status_code == 200, resp.status_code, data, "")
+
+        # Marquee progress dialog so the operator sees something is
+        # happening. Server-side loop is uncancellable so the Cancel
+        # button only hides the dialog (lets the server finish; the
+        # operator can refresh the devices tab manually afterwards).
+        _n_hint = f" ({count})" if count is not None else ""
+        progress = QProgressDialog(
+            f"Clearing devices on {server_url}{_n_hint}…\n"
+            f"Each device: stop FRR → tear down VXLAN+VRF → DHCP cancel → DB purge.",
+            "Hide",
+            0, 0, self,
+        )
+        progress.setWindowTitle("Clearing devices")
+        progress.setWindowModality(Qt.NonModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+
+        worker = _ClearAllWorker(server_url, self)
+        # Permanent keepalive (dodges the PyQt5 5.15 GC race, see
+        # _keepalive_worker docstring in menu_actions.py).
+        if hasattr(self, "_keepalive_worker"):
+            self._keepalive_worker(worker)
+
+        def _on_done(ok_flag, status_code, data, err_msg, _p=progress, _url=server_url):
             try:
-                body = resp.json().get("error") or resp.text[:400]
+                _p.close()
             except Exception:
-                body = resp.text[:400]
-            QMessageBox.critical(
-                self, "Clear failed",
-                f"Server returned {resp.status_code}:\n{body}"
-            )
-            return
+                pass
+            if err_msg:
+                QMessageBox.critical(
+                    self, "Clear failed",
+                    f"Request to {_url} failed:\n{err_msg}"
+                )
+                return
+            if not ok_flag:
+                body = ""
+                if isinstance(data, dict):
+                    body = data.get("error") or ""
+                elif isinstance(data, str):
+                    body = data
+                QMessageBox.critical(
+                    self, "Clear failed",
+                    f"Server returned {status_code}:\n{body}"
+                )
+                return
+            data = data if isinstance(data, dict) else {}
+            total = int(data.get("total") or 0)
+            removed = int(data.get("removed") or 0)
+            failed = int(data.get("failed") or 0)
 
-        try:
-            data = resp.json() or {}
-        except Exception:
-            data = {}
-        total = int(data.get("total") or 0)
-        removed = int(data.get("removed") or 0)
-        failed = int(data.get("failed") or 0)
+            # Refresh the Devices tab so the operator sees the empty state.
+            try:
+                if hasattr(self, "devices_tab") and self.devices_tab:
+                    self.devices_tab.reload_devices_from_server()
+            except Exception:
+                pass
 
-        # Refresh the Devices tab so the operator sees the empty state.
-        try:
-            if hasattr(self, "devices_tab") and self.devices_tab:
-                self.devices_tab.reload_devices_from_server()
-        except Exception:
-            pass
+            if failed == 0:
+                QMessageBox.information(
+                    self, "Devices cleared",
+                    f"Removed {removed} of {total} device(s) on\n{_url}."
+                )
+            else:
+                bad = [
+                    r.get("device_name") or r.get("device_id")
+                    for r in (data.get("results") or [])
+                    if r.get("status_code") != 200
+                ][:10]
+                more = ""
+                if failed > len(bad):
+                    more = f"\n… and {failed - len(bad)} more"
+                QMessageBox.warning(
+                    self, "Partial cleanup",
+                    f"Removed {removed} of {total} device(s).\n"
+                    f"{failed} failed:\n" + "\n".join(f"  • {b}" for b in bad) + more
+                )
 
-        if failed == 0:
-            QMessageBox.information(
-                self, "Devices cleared",
-                f"Removed {removed} of {total} device(s) on\n{server_url}."
-            )
-        else:
-            # Surface the failed device names so the operator can dig in.
-            bad = [
-                r.get("device_name") or r.get("device_id")
-                for r in (data.get("results") or [])
-                if r.get("status_code") != 200
-            ][:10]
-            more = "" if len(bad) < failed else ""
-            if failed > len(bad):
-                more = f"\n… and {failed - len(bad)} more"
-            QMessageBox.warning(
-                self, "Partial cleanup",
-                f"Removed {removed} of {total} device(s).\n"
-                f"{failed} failed:\n" + "\n".join(f"  • {b}" for b in bad) + more
-            )
+        worker.done.connect(_on_done)
+        worker.start()
 
     def show_rfc2544_dialog(self):
         """Open the RFC 2544 throughput test dialog from Tools menu."""
