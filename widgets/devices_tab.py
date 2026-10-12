@@ -9774,12 +9774,31 @@ class DevicesTab(QWidget):
             _row_id = name_item.data(_Qt.UserRole)
             device_info = None
             if _row_id:
+                # v0.5.425 (audit stream-MM5): walk `all_devices` as
+                # a dict (iface → [devices]). Pre-fix the default was
+                # `[]` and the loop iterated the dict directly — in
+                # Python that yields the KEYS (iface label strings),
+                # so `isinstance(_d, dict)` was always False and the
+                # UserRole fast-path was dead code. The explicit
+                # comment at :9759-9763 says the stash exists so
+                # table rebuilds don't misdirect the delete — but
+                # the stash was never consulted. After any rebuild
+                # (SSE event / 30s status poll) the row-shift could
+                # drop a Remove-Selected on the wrong device via
+                # the name-fallback at the next step. Same ghost-
+                # row-leak flavor as LL1: silent, not a crash.
                 try:
-                    for _d in getattr(self.main_window, "all_devices", []) or []:
-                        if isinstance(_d, dict) and (
-                                _d.get("device_id") == _row_id
-                                or _d.get("Device ID") == _row_id):
-                            device_info = _d
+                    _cache = getattr(self.main_window, "all_devices", {}) or {}
+                    for _bucket in _cache.values():
+                        if not isinstance(_bucket, list):
+                            continue
+                        for _d in _bucket:
+                            if isinstance(_d, dict) and (
+                                    _d.get("device_id") == _row_id
+                                    or _d.get("Device ID") == _row_id):
+                                device_info = _d
+                                break
+                        if device_info is not None:
                             break
                 except Exception:
                     device_info = None

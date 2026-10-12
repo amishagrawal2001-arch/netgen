@@ -2,6 +2,102 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.425] - 2026-10-11
+
+### Fixed — Server-side OSPF teardown is now real; configure path no longer lies on vtysh errors; removed broken host-side legacy helpers (MM1 + MM2 + MM4 + MM5)
+
+Closes the loop on today's "OSPF chip stays green after Clear All" bug.
+v0.5.424 LL1+LL2 fixed the CLIENT-SIDE display; this slice fixes the
+SERVER-SIDE reality — pre-fix, FRR was still running OSPF for devices
+the client thought were deleted.
+
+**MM1 (CRITICAL): `cleanup_device_routes`, `remove_ospf_config`, and
+`cleanup_all_ospf_routes` in [utils/ospf.py](utils/ospf.py) were dead
+stubs** — they only `del OSPF_INSTANCES[device_id]` + `return True`
+with no vtysh teardown. All three callers
+(`device_manager.remove_device_protocols` on the device-remove hot
+path, `/api/ospf/cleanup` with and without `device_id`) assumed FRR
+config was torn down with the device. Pre-fix the container's
+running-config kept `router ospf vrf X`, `router ospf6 vrf X`,
+interface-level `ip ospf area <id>`, graceful-restart, redistribute,
+router-id. On container restart or `device_id` reuse OSPF came back
+up with the stale config; neighbors stayed Full against a device the
+UI thought was gone. New shared `_full_ospf_teardown(device_id)`
+helper delegates to the existing `_stop_ospf_locked` (which runs
+`no router ospf{vrf}` + `no router ospf6{vrf}` + `write memory` via
+`vtysh << EOF` in the FRR container, under the per-device lock),
+then issues a second vtysh pass to drop the interface-level
+`no ip/ipv6 ospf area <id>` bindings `_stop_ospf_locked` doesn't
+touch. `cleanup_all_ospf_routes` now iterates every tracked device
+through the helper BEFORE calling `OSPF_INSTANCES.clear()`.
+
+**MM2 (HIGH): `_configure_ospf_neighbor_locked` silently accepted
+vtysh errors on exit 0.** vtysh exits 0 on `% Unknown command` /
+`% Malformed` / `% Configuration failed` (typoed area_id, never-
+created interface, missing daemon). Pre-fix the success branch
+logged "✅ OSPF configuration successful" and set
+`OSPF_INSTANCES[device_id]["active"] = True` while per-AF commands
+were silently rejected — same K5-class lie as v0.5.403 BGP T2
+pre-fix. Added `_vtysh_output_has_error(output_str)` scan to the
+success branch (parity with the already-landed scanners in
+`_start_ospf_neighbor_locked`, `_stop_ospf_neighbor_locked`, and
+`_stop_ospf_locked`).
+
+**MM4 (HIGH): deleted broken host-side legacy helpers.** `start_ospf`,
+`build_ospf_cmd`, and `build_ospf_stop_cmd` in `utils/ospf.py` had
+three stacked bugs: (a) argv construction `['vtysh'] + [f'-c "{line}"'
+for line in cmds]` baked LITERAL double-quotes into each argv
+element — fed to `subprocess.run(argv, shell=False)` by
+`device_manager._run`, vtysh received `-c "configure terminal"` as
+one argument and misinterpreted it; (b) `build_ospf_cmd` emitted
+`network 0.0.0.0/0 area X` (VRF-wide catch-all that would advertise
+every loopback / VXLAN / VRF tap); (c) `build_ospf_stop_cmd` emitted
+`no router ospf{vrf}` which would nuke the entire OSPF process if
+the argv-quoting bug were fixed. All three helpers deleted. The two
+call sites in `utils/device_manager.py` (`start_device_protocols` +
+`stop_device_protocols` OSPF branches) are now logged no-ops; real
+start/stop flows via `/api/device/ospf/{start,stop}` →
+`ospf.start_ospf_neighbor` / `ospf.stop_ospf_neighbor` inside the
+FRR container with per-device locks (unchanged, already correct).
+
+**MM5 (MED, bundled): `widgets/devices_tab.py:9778`
+`remove_selected_device` UserRole device_id fast-path was dead code.**
+Iterated `getattr(main_window, "all_devices", []) or []` as a list —
+but `all_devices` is a dict (iface → `[devices]`), and iterating a
+dict yields its KEYS (iface label strings), so `isinstance(_d, dict)`
+was always False and the stash was never consulted. The comment at
+:9759-9763 says the stash exists precisely so table rebuilds don't
+misdirect the delete — but after any rebuild (SSE event / 30 s
+status poll) the row-shift could drop a Remove-Selected on the
+wrong device via the name-fallback. Same ghost-row-leak flavor as
+v0.5.424 LL1: silent, not a crash. Walk `.values()` + nested
+buckets.
+
+Deferred to a later slice (not blocking): MM3 (partial-apply AF
+mask leak into IPv6 emit block), MM5-audit (raw `container.exec_run`
+timeout parity with `container_exec_with_timeout`), MM6 (per-AF
+stop missing `shutdown` on `router ospf{vrf}`), `_ospf_vrf_suffix`
+5× repeat per configure.
+
+Server-side change in `utils/ospf.py` + `utils/device_manager.py` —
+server upgrade required to pick up the real teardown; the client-
+side piece (MM5) ships via the git-checkout as usual.
+
+### Tests
+
+[tests/test_v05425_ospf_audit.py](tests/test_v05425_ospf_audit.py) — 23 tests
+covering: AST parse of all three files, MM1 markers + `_full_ospf_
+teardown` defined + delegates to `_stop_ospf_locked` + issues
+interface-level cleanup + `cleanup_device_routes` / `remove_ospf_
+config` / `cleanup_all_ospf_routes` all route through it + iterate
+before clear; MM2 marker + success-branch error-marker scan +
+returns False on match; MM4 marker + legacy helpers gone from live
+code + broken argv pattern gone + device_manager OSPF branches are
+logged no-ops referencing real start/stop paths; MM5 marker +
+UserRole walks dict buckets + pre-fix pattern gone; prior-slice
+regression guards (v0.5.424 LL1, v0.5.423 KK1, v0.5.422 JJ2,
+v0.5.421 II1).
+
 ## [0.5.424] - 2026-10-11
 
 ### Fixed — OSPF rows stuck green/"Up" after Tools → Clear All Devices (LL1 + LL2)

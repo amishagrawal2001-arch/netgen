@@ -220,15 +220,24 @@ class DeviceManager:
                 result.setdefault("vxlan", {})["error"] = str(exc)
 
         # OSPF
+        # v0.5.425 (audit stream-MM4): legacy start path removed.
+        # Pre-fix called ospf.build_ospf_cmd (whose argv construction
+        # was broken by literal double-quotes, see utils/ospf.py MM4
+        # comment) + host-side `vtysh …` via _run — never actually
+        # configured OSPF. Real start happens via /api/device/ospf/
+        # start → ospf.start_ospf_neighbor → _start_ospf_neighbor_
+        # locked inside the FRR container. If a future caller wants
+        # start_device_protocols to drive OSPF, port it to call
+        # ospf.start_ospf_neighbor(device_id, ospf_cfg, device_name,
+        # af=...) with the per-AF variant that configure_ospf_neighbor
+        # exposes.
         if "OSPF" in protocols:
-            ospf_cfg = device_data.get("ospf", {}) or {}
-            try:
-                ospf_cmd = ospf.build_ospf_cmd(device_id, iface, ospf_cfg)
-                logging.info(f"[OSPF] Starting: {ospf_cmd}")
-                _run(ospf_cmd if isinstance(ospf_cmd, list) else ospf_cmd.split())
-                result["protocols_started"].append("OSPF")
-            except Exception as e:
-                logging.error(f"[OSPF ERROR] {e}")
+            logging.info(
+                f"[OSPF] start_device_protocols OSPF start is a legacy no-op "
+                f"— real start lives in /api/device/ospf/start → "
+                f"ospf.start_ospf_neighbor (device {device_id})"
+            )
+            result["protocols_started"].append("OSPF")
 
         # BGP (handled in start_device API endpoint, not here)
         # BGP is started via bgp.start_bgp() in the /api/device/start endpoint
@@ -262,14 +271,21 @@ class DeviceManager:
         }
 
         # OSPF stop
+        # v0.5.425 (audit stream-MM4): legacy stop path removed.
+        # Pre-fix called ospf.build_ospf_stop_cmd (broken argv shape,
+        # also emitted `no router ospf{vrf}` which would have nuked
+        # the entire OSPF process if the argv-quoting bug were fixed)
+        # + host-side vtysh via _run. Real stop lives in
+        # ospf.stop_ospf_neighbor / ospf.stop_ospf. Mirror the start
+        # path's defang (above): log + mark stopped so result shape
+        # is unchanged for any caller inspecting protocols_stopped.
         if "OSPF" in protocols:
-            try:
-                ospf_cmd = ospf.build_ospf_stop_cmd(device_id, iface)
-                logging.info(f"[OSPF] Stopping: {ospf_cmd}")
-                _run(ospf_cmd if isinstance(ospf_cmd, list) else ospf_cmd.split())
-                result["protocols_stopped"].append("OSPF")
-            except Exception as e:
-                logging.error(f"[OSPF ERROR] {e}")
+            logging.info(
+                f"[OSPF] stop_device_protocols OSPF stop is a legacy no-op "
+                f"— real stop lives in /api/device/ospf/stop → "
+                f"ospf.stop_ospf_neighbor (device {device_id})"
+            )
+            result["protocols_stopped"].append("OSPF")
 
         # BGP stop (neighbor shutdown)
         if "BGP" in protocols:

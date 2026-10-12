@@ -834,6 +834,24 @@ def _configure_ospf_neighbor_locked(
             logging.error(f"[OSPF CONFIGURE] Command failed (exit code {result.exit_code}): {output_str}")
             return False
         else:
+            # v0.5.425 (audit stream-MM2): vtysh exit 0 can still
+            # carry `% Unknown command` / `% Malformed` /
+            # `% Configuration failed` on a typoed area_id, a
+            # never-created interface, or a missing daemon. Pre-fix
+            # we logged "✅ OSPF configuration successful" and set
+            # OSPF_INSTANCES[device_id]["active"] = True while the
+            # per-AF commands were silently rejected — same K5-class
+            # lie as the v0.5.403 BGP T2 pre-fix. Scan here mirrors
+            # the already-landed scanners in _start_ospf_neighbor_
+            # locked (:1014), _stop_ospf_neighbor_locked (:1299),
+            # and _stop_ospf_locked (:2033).
+            output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output or "")
+            if _vtysh_output_has_error(output_str):
+                logging.error(
+                    f"[OSPF CONFIGURE] exit 0 but %-marker in vtysh output "
+                    f"— configuration silently rejected:\n{output_str}"
+                )
+                return False
             logging.info(f"[OSPF CONFIGURE] ✅ OSPF configuration successful")
         
         # Store OSPF instance
@@ -1920,49 +1938,37 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
         logging.error(f"[OSPF STATUS] Error getting OSPF status: {e}")
         return None
 
-def start_ospf(device_id, iface, config):
-    """Legacy placeholder for manual triggering — use `build_ospf_cmd()`."""
-    cmd = build_ospf_cmd(device_id, iface, config)
-    logging.info(f"[OSPF] Would run: {cmd}")
-    OSPF_INSTANCES[device_id] = {
-        "iface": iface,
-        "area": config.get("area_id", "0.0.0.0"),
-        "graceful_restart": config.get("graceful_restart", False)
-    }
-
-def build_ospf_cmd(device_id, iface, config):
-    area_id = config.get("area_id", "0.0.0.0")
-    gr = config.get("graceful_restart", False)
-
-    cmds = [
-        "configure terminal",
-        f"interface {iface}",
-        f"  ip ospf area {area_id}",
-        f"exit",
-        f"router ospf{_ospf_vrf_suffix(device_id)}",
-        f"  network 0.0.0.0/0 area {area_id}"
-    ]
-
-    if gr:
-        cmds.append("  graceful-restart")
-
-    cmds.extend(["exit", "write"])
-
-    return ['vtysh'] + [f'-c "{line}"' for line in cmds]
-
-def build_ospf_stop_cmd(device_id, iface):
-    instance = OSPF_INSTANCES.get(device_id)
-    area_id = instance["area"] if instance else "0.0.0.0"
-
-    cmds = [
-        "configure terminal",
-        f"interface {iface}",
-        f"  no ip ospf area {area_id}",
-        "exit",
-        f"no router ospf{_ospf_vrf_suffix(device_id)}",
-        "write"
-    ]
-    return ['vtysh'] + [f'-c "{line}"' for line in cmds]
+# v0.5.425 (audit stream-MM4): legacy host-side vtysh helpers
+# removed. Pre-fix:
+#
+#   def build_ospf_cmd(...):
+#       return ['vtysh'] + [f'-c "{line}"' for line in cmds]
+#
+# Each list element was a single argv like `-c "configure terminal"`
+# with the double-quotes LITERAL. Fed to `subprocess.run(argv,
+# shell=False)` by device_manager._run — vtysh received `-c
+# "configure terminal"` as one argument and either rejected it or
+# interpreted it wrong. The entire legacy start/stop silently
+# misfired on the HOST (not the FRR container), returning success
+# but configuring nothing.
+#
+# On top of that:
+#   build_ospf_cmd emitted `network 0.0.0.0/0 area {area_id}` —
+#     a VRF-wide catch-all that would advertise every loopback /
+#     VXLAN / VRF tap in the VRF if the argv-quoting bug were
+#     fixed.
+#   build_ospf_stop_cmd emitted `no router ospf{vrf}` — nuking
+#     the entire OSPF process including config applied by the
+#     real `configure_ospf_neighbor` path.
+#
+# Real OSPF start/stop/configure live in `configure_ospf_neighbor`
+# (line 279), `start_ospf_neighbor` (line 861), `stop_ospf_neighbor`
+# (line 1107), and `stop_ospf` (below). All use `vtysh << EOF`
+# inside the per-device FRR container with a per-device lock. No
+# external caller references these legacy host-side helpers
+# (verified: `start_device_protocols` / `stop_device_protocols` in
+# utils/device_manager.py are the only callers, and nothing in the
+# codebase calls those two functions in turn — dead paths).
 
 def stop_ospf(device_id, iface):
     """v0.5.416 (audit stream-EE3): actually issue `no router ospf`
@@ -2039,46 +2045,178 @@ def _stop_ospf_locked(device_id, iface):
     except Exception as _ee:
         logging.error(f"[OSPF] stop exec failed for {device_id}: {_ee}")
 
-def cleanup_device_routes(device_id):
-    """Clean up OSPF routes for a specific device."""
+# v0.5.425 (audit stream-MM1): shared teardown that `remove_ospf_
+# config` and `cleanup_device_routes` both delegate to.
+#
+# Pre-fix both functions were stubs: `del OSPF_INSTANCES[device_id]`
+# + `return True`, with no vtysh teardown. Callers
+# (`device_manager.remove_device_protocols`, `/api/ospf/cleanup`,
+# `interface-reset`) assumed FRR config was torn down with the
+# device — it wasn't. After "Remove device" the container's
+# running-config still carried `router ospf vrf X`, `router ospf6
+# vrf X`, `interface <iface>; ip ospf area <id>`, graceful-restart,
+# redistribute, router-id. On a container restart or `device_id`
+# reuse OSPF came back up with the stale config, or neighbors
+# stayed Full against a device the UI thought was gone — the
+# server-side half of yesterday's user-reported "OSPF chip stays
+# green after Clear-All" bug (today's LL1+LL2 was the client half).
+#
+# This helper delegates to `_stop_ospf_locked` (which runs
+# `no router ospf{vrf}` + `no router ospf6{vrf}` + `write memory`
+# via `vtysh << EOF` inside the FRR container, under the per-device
+# lock) plus — when we can resolve the device's interface — a
+# second vtysh pass to drop the interface-level `ip ospf area` /
+# `ipv6 ospf6 area` bindings that `_stop_ospf_locked` doesn't
+# touch.
+def _full_ospf_teardown(device_id):
+    _iface = None
+    _area_v4 = None
+    _area_v6 = None
+    # Prefer cached instance (freshest). Fall back to DB-stored
+    # ospf_config / interface so we can still clean up interface-
+    # level bindings when the server restarted between apply and
+    # remove.
+    _inst = OSPF_INSTANCES.get(device_id) or {}
+    _iface = _inst.get("interface")
+    _area_v4 = _inst.get("area_id") or _inst.get("area_id_ipv4") or _inst.get("area")
+    _area_v6 = _inst.get("area_id_ipv6") or _area_v4
+    _device_name = None
+    if not _iface or not _area_v4:
+        try:
+            from utils.device_database import DeviceDatabase
+            _dev = DeviceDatabase().get_device(device_id)
+            if _dev:
+                _device_name = _dev.get("device_name") or _dev.get("name")
+                _iface = _iface or _dev.get("interface")
+                _cfg = _dev.get("ospf_config") or {}
+                if isinstance(_cfg, str):
+                    try:
+                        import json as _json
+                        _cfg = _json.loads(_cfg) if _cfg else {}
+                    except Exception:
+                        _cfg = {}
+                if isinstance(_cfg, dict):
+                    _area_v4 = _area_v4 or _cfg.get("area_id_ipv4") or _cfg.get("area_id") or "0.0.0.0"
+                    _area_v6 = _area_v6 or _cfg.get("area_id_ipv6") or _area_v4
+                    _iface = _iface or _cfg.get("interface")
+        except Exception as _de:
+            logging.debug(f"[OSPF CLEANUP] device lookup failed for {device_id}: {_de}")
+    _area_v4 = _area_v4 or "0.0.0.0"
+    _area_v6 = _area_v6 or _area_v4
+
+    # Phase 1: router-level teardown. _stop_ospf_locked owns the
+    # per-device lock + `no router ospf{vrf}` + `no router ospf6
+    # {vrf}` + `write memory` + the OSPF_INSTANCES eviction.
     try:
-        logging.info(f"[OSPF CLEANUP] Cleaning up OSPF routes for device {device_id}")
-        
-        # Remove from OSPF instances if exists
-        if device_id in OSPF_INSTANCES:
-            del OSPF_INSTANCES[device_id]
-            logging.info(f"[OSPF CLEANUP] Removed OSPF instance for device {device_id}")
-        
+        with _ospf_device_lock(device_id):
+            _stop_ospf_locked(device_id, _iface)
+    except Exception as _se:
+        logging.warning(
+            f"[OSPF CLEANUP] router-level teardown raised for {device_id}: {_se}"
+        )
+
+    # Phase 2: interface-level teardown. Scoped to the device's
+    # own iface and best-effort — if we can't resolve the iface,
+    # or the container is gone, skip (router-level teardown
+    # already killed the adjacency).
+    if not _iface:
+        logging.info(
+            f"[OSPF CLEANUP] No iface resolved for {device_id}; "
+            f"skipping interface-level cleanup (router-level ran)"
+        )
+        return
+    try:
+        from utils.frr_docker import FRRDockerManager
+        _frr = FRRDockerManager()
+        _cn = _frr._get_container_name(device_id, _device_name)
+        _container = _frr.client.containers.get(_cn)
+        _cmds = [
+            "configure terminal",
+            f"interface {_iface}",
+            f"no ip ospf area {_area_v4}",
+            f"no ipv6 ospf6 area {_area_v6}",
+            "end",
+            "write memory",
+        ]
+        _script = "\n".join(_cmds)
+        _exec = f"vtysh << 'EOF'\n{_script}\nEOF"
+        _r = _container.exec_run(["bash", "-c", _exec])
+        _out = _r.output.decode() if _r.output else ""
+        if _r.exit_code != 0 or _vtysh_output_has_error(_out):
+            # The interface itself may already be gone (device
+            # vlan sub-iface torn down a few steps earlier in the
+            # remove flow). Logged at INFO because router-level
+            # teardown is what actually drops the adjacency.
+            logging.info(
+                f"[OSPF CLEANUP] iface-level cleanup for {device_id} on "
+                f"{_iface} returned exit={_r.exit_code} output={_out!r}; "
+                f"skipping (router-level teardown already ran)"
+            )
+        else:
+            logging.info(
+                f"[OSPF CLEANUP] iface-level cleanup done for {device_id} on {_iface}"
+            )
+    except Exception as _ie:
+        logging.debug(
+            f"[OSPF CLEANUP] iface-level cleanup skipped for {device_id}: {_ie}"
+        )
+
+
+def cleanup_device_routes(device_id):
+    """Tear down OSPF for a specific device. v0.5.425 MM1: now actually
+    issues `no router ospf{vrf}` + `no router ospf6{vrf}` + per-iface
+    `no ip/ipv6 ospf area` via vtysh inside the FRR container. Pre-fix
+    this was a stub that only popped `OSPF_INSTANCES[device_id]` and
+    left FRR running (server-side half of today's OSPF-stays-up bug).
+    """
+    try:
+        logging.info(f"[OSPF CLEANUP] cleanup_device_routes for device {device_id}")
+        _full_ospf_teardown(device_id)
         return True
     except Exception as e:
         logging.error(f"[OSPF CLEANUP] Failed to cleanup routes for device {device_id}: {e}")
         return False
 
+
 def remove_ospf_config(device_id):
-    """Remove OSPF configuration for a specific device."""
+    """Tear down OSPF for a specific device — same real work as
+    `cleanup_device_routes`. Both names remain for the two historical
+    call sites (`device_manager.remove_device_protocols` +
+    `/api/ospf/cleanup`); v0.5.425 MM1 unified them around
+    `_full_ospf_teardown`. Pre-fix stub only popped OSPF_INSTANCES.
+    """
     try:
-        logging.info(f"[OSPF CLEANUP] Removing OSPF configuration for device {device_id}")
-        
-        # This would typically involve removing OSPF configuration from FRR
-        # For now, just clean up the instance
-        if device_id in OSPF_INSTANCES:
-            del OSPF_INSTANCES[device_id]
-            logging.info(f"[OSPF CLEANUP] Removed OSPF configuration for device {device_id}")
-        
+        logging.info(f"[OSPF CLEANUP] remove_ospf_config for device {device_id}")
+        _full_ospf_teardown(device_id)
         return True
     except Exception as e:
         logging.error(f"[OSPF CLEANUP] Failed to remove OSPF config for device {device_id}: {e}")
         return False
 
+
 def cleanup_all_ospf_routes():
-    """Clean up all OSPF routes and configurations."""
+    """Tear down OSPF across every tracked device. v0.5.425 MM1: now
+    iterates `OSPF_INSTANCES` and runs the full per-device teardown
+    for each. Pre-fix this was `OSPF_INSTANCES.clear()` with no
+    vtysh — every FRR container kept running OSPF after the
+    operator hit /api/ospf/cleanup.
+    """
     try:
-        logging.info("[OSPF CLEANUP] Cleaning up all OSPF routes and configurations")
-        
-        # Clear all OSPF instances
+        logging.info("[OSPF CLEANUP] cleanup_all_ospf_routes — iterating OSPF_INSTANCES")
+        _device_ids = list(OSPF_INSTANCES.keys())
+        for _did in _device_ids:
+            try:
+                _full_ospf_teardown(_did)
+            except Exception as _pe:
+                logging.warning(
+                    f"[OSPF CLEANUP] per-device teardown raised for {_did}: {_pe}"
+                )
+        # Final sweep in case any entry escaped the teardown
+        # (e.g. a race wrote a new instance after we snapshotted).
         OSPF_INSTANCES.clear()
-        logging.info("[OSPF CLEANUP] Cleared all OSPF instances")
-        
+        logging.info(
+            f"[OSPF CLEANUP] cleanup_all_ospf_routes done — processed {len(_device_ids)} device(s)"
+        )
         return True
     except Exception as e:
         logging.error(f"[OSPF CLEANUP] Failed to cleanup all OSPF routes: {e}")
