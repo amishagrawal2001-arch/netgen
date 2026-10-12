@@ -2,6 +2,97 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.426] - 2026-10-11
+
+### Fixed — UI no longer freezes when the server is unreachable (NN1 + NN2 + NN3 + NN4 + NN5)
+
+Operator report: *"when app not able to connect server, it hangs/
+freezes intermittently"* — specifically on clicking something in the
+Server tree / Devices tab and on switching between TGs or tabs. The
+audit sweep found 15+ sync-HTTP sites on UI-thread handlers; this
+slice fixes the five most-hot. All follow the KK1 / K1 / L1-L5
+QThread-with-done-signal pattern already established.
+
+**NN1 (CRITICAL): the TG-click freeze itself.** The chain
+`_on_server_selection_changed_combined → update_device_table →
+QTimer.singleShot(0, _initialize_arp_status_from_database)` fired on
+EVERY TG click, and the ARP-init loop called
+`_check_individual_arp_resolution` (sync `requests.get(timeout=(3,
+15))`) once per Running device on the UI thread. On N devices with
+an unreachable server, each click = N × 3s UI freeze. Fix: new
+`_ArpInitWorker(QThread)` runs the per-device probe loop in the
+background and emits per-device `(device_name, resolved,
+status_text, device_status)` results. The slot re-matches rows by
+device_name (defensive against mid-flight table rebuilds). A new
+`_arp_init_worker` field is tracked so rapid TG-clicks cancel any
+in-flight prior worker before spawning the replacement — late
+results from stale workers never paint rows that no longer belong
+to the current TG.
+
+**NN2 (HIGH): BGP/OSPF/IS-IS Start/Stop buttons.** The
+`_toggle_protocol_action` handler ran `requests.post(timeout=10)`
+per device synchronously, so starting/stopping a protocol on N
+devices with an unreachable server froze the client for N × 10s.
+Fix: build the per-device job list on the UI thread, dispatch to
+`_ProtoToggleWorker(QThread)`, deliver `(success_count, total)` to
+a slot that runs the post-loop refresh (deferred table rebuild +
+monitoring start/stop).
+
+**NN3 (HIGH): the three "Refresh" buttons.** `refresh_bgp_status`
+(sync GET `timeout=10` per selected device + fleet-wide POST
+`timeout=15`), `refresh_ospf_status` (POST `timeout=15`), and
+`refresh_isis_status` (POST `timeout=15`) all froze the UI for up
+to 15 s per click when the server was down. Fix: three per-
+protocol workers (`_BgpRefreshWorker`, `_OspfForceCheckWorker`,
+`_IsisForceCheckWorker`). Each worker runs the force-check in the
+background; the table re-renders from CACHED DB state immediately
+so the operator sees SOMETHING even when the server is dead, and
+a second re-render fires when the probe completes.
+
+**NN4 (MED): the Preflight bar.** `PreflightBar.refresh` sync
+`requests.get(timeout=5)` fired from the 60 s QTimer, the manual
+Refresh button, AND every Apply-triggered `kick_refresh()` — each
+one a 5 s UI freeze on an unreachable server. Fix:
+`_PreflightFetchWorker(QThread)` + slot that calls `_apply_summary`
+on the main thread.
+
+**NN5 (MED): right-click interface → Online/Offline.**
+`_set_interface_admin_state` sync `requests.post(timeout=5)` froze
+the UI for 5 s per click. Fix: `_AdminStateWorker(QThread)` + slot
+that preserves the full v0.5.422 JJ1 cache mutation + JJ2 three
+staggered single-iface refetches. The JJ2 inner refetch closure
+also moves to its own nested `_IfaceRefetchWorker` — pre-NN5 the
+500 ms / 3 s / 8 s staggered refetches each ran `requests.get(
+timeout=3)` synchronously on the UI thread via QTimer, so an
+unreachable server stalled the client THREE times per
+Online/Offline click. Now zero stalls.
+
+Deferred to a later slice: BGP route dialog sync HTTP, VXLAN
+apply pre-fetch, DHCP delete/attach/apply, device-state-history
+tab switch, topology config viewer, reset-selected-interface
+(30 s × N — worst single site), the Ctrl+C config viewer, and
+`export_devices_to_file` menu action. All one-shot modals or
+lower-hotness than the five fixed here.
+
+Client-only change — no server upgrade required.
+
+### Tests
+
+[tests/test_v05426_unreachable_server_async.py](tests/test_v05426_unreachable_server_async.py) — 27 tests
+covering: AST parse of all 6 touched files; NN1 marker + worker
+class defined + cancellation of prior worker on rapid clicks; NN2
+marker + worker class + sync `requests.post` gone from UI-thread
+body; NN3 marker in all three protocol files + per-protocol worker
+classes + sync HTTP gone from pre-worker body; NN4 marker + fetch
+worker defined (docstring-stripped scan avoids false-positive on
+the rationale text); NN5 marker + worker class + v0.5.422 JJ1
+mutation + JJ2 closure defined as nested worker + 500ms/3s/8s
+staggered schedule preserved; version guard; prior-slice regression
+guards (v0.5.425 MM1 `_full_ospf_teardown`, v0.5.424 LL1 dict
+isinstance check, v0.5.423 KK1, v0.5.422 JJ2, v0.5.421 II1).
+
+192/192 passed across v0.5.417..v0.5.426 slices.
+
 ## [0.5.425] - 2026-10-11
 
 ### Fixed — Server-side OSPF teardown is now real; configure path no longer lies on vtysh errors; removed broken host-side legacy helpers (MM1 + MM2 + MM4 + MM5)

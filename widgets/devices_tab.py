@@ -9516,7 +9516,21 @@ class DevicesTab(QWidget):
             logger.debug(f"[FILTER] re-apply failed: {_filter_exc}")
 
     def _initialize_arp_status_from_database(self):
-        """Initialize ARP status icons using database values for running devices."""
+        """Initialize ARP status icons using database values for running devices.
+
+        v0.5.426 (audit stream-NN1): the per-device probe loop now runs
+        on a background QThread with signal-delivered per-row results.
+        Pre-fix the loop called `_check_individual_arp_resolution`
+        (sync `requests.get(timeout=(3, 15))` per device) on the UI
+        thread. On every TG click
+        (`_on_server_selection_changed_combined` →
+        `update_device_table` → `QTimer.singleShot(0,
+        _initialize_arp_status_from_database)`) with an unreachable
+        server, the client froze for `N_running_devices × 3 s` because
+        each probe hit the full connect-timeout. Exact match for the
+        operator report "when app not able to connect server, it
+        hangs/freeze intermittently".
+        """
         try:
             running_devices = []
             for devices in getattr(self.main_window, "all_devices", {}).values():
@@ -9529,26 +9543,98 @@ class DevicesTab(QWidget):
             if not running_devices:
                 return
 
+            # Snapshot the (device_name → row) map now; the user may
+            # click another TG while the worker is running, which
+            # rebuilds the table and shifts rows. We won't paint stale
+            # rows after a rebuild — the per-result slot re-matches by
+            # device_name defensively.
+            jobs = []
             for device in running_devices:
                 device_name = device.get("Device Name")
                 if not device_name:
                     continue
+                jobs.append({
+                    "device_name": device_name,
+                    "device_status": device.get("Status", "Running"),
+                    "device": device,
+                })
 
-                arp_results = self._check_individual_arp_resolution(device)
+            if not jobs:
+                return
 
-                target_row = None
-                for row in range(self.devices_table.rowCount()):
-                    name_item = self.devices_table.item(row, self.COL["Device Name"])
-                    if name_item and name_item.text() == device_name:
-                        target_row = row
-                        break
+            from PyQt5.QtCore import QThread, pyqtSignal
 
-                if target_row is None:
-                    continue
+            # One worker per table rebuild. Reuse-pattern: if a prior
+            # worker is still running (user is rapidly clicking TGs),
+            # ask it to stop before spawning a replacement — otherwise
+            # late results from the old worker race the new render.
+            prev = getattr(self, "_arp_init_worker", None)
+            if prev is not None:
+                try:
+                    prev.cancelled = True
+                except Exception:
+                    pass
 
-                overall_resolved = arp_results.get("overall_resolved", False)
-                overall_status = arp_results.get("overall_status", "Unknown")
-                self.set_status_icon(target_row, resolved=overall_resolved, status_text=overall_status, device_status=device.get("Status", "Running"))
+            class _ArpInitWorker(QThread):
+                # (device_name, overall_resolved, overall_status, device_status)
+                result = pyqtSignal(str, bool, str, str)
+
+                def __init__(self, outer, jobs):
+                    super().__init__()
+                    self._outer = outer
+                    self._jobs = jobs
+                    self.cancelled = False
+
+                def run(self):
+                    for _j in self._jobs:
+                        if self.cancelled:
+                            return
+                        try:
+                            _res = self._outer._check_individual_arp_resolution(_j["device"])
+                        except Exception as _ex:
+                            logging.debug(
+                                f"[ARP INIT] probe raised for "
+                                f"{_j['device_name']}: {_ex}"
+                            )
+                            continue
+                        if self.cancelled:
+                            return
+                        self.result.emit(
+                            _j["device_name"],
+                            bool(_res.get("overall_resolved", False)),
+                            str(_res.get("overall_status", "Unknown")),
+                            _j["device_status"],
+                        )
+
+            worker = _ArpInitWorker(self, jobs)
+
+            def _on_result(device_name, resolved, status_text, device_status, _w=worker):
+                if getattr(_w, "cancelled", False):
+                    return
+                try:
+                    for row in range(self.devices_table.rowCount()):
+                        name_item = self.devices_table.item(row, self.COL["Device Name"])
+                        if name_item and name_item.text() == device_name:
+                            self.set_status_icon(
+                                row,
+                                resolved=resolved,
+                                status_text=status_text,
+                                device_status=device_status,
+                            )
+                            break
+                except Exception as _ex:
+                    logging.debug(f"[ARP INIT] paint failed for {device_name}: {_ex}")
+
+            worker.result.connect(_on_result)
+            # Permanent keepalive (dodges the PyQt5 5.15 GC race, see
+            # utils/qthread_keepalive.py).
+            try:
+                from utils.qthread_keepalive import keep
+                keep(worker)
+            except Exception:
+                pass
+            self._arp_init_worker = worker
+            worker.start()
 
         except Exception as exc:
             logging.debug(f"[ARP INIT] Skipped ARP initialization: {exc}")
@@ -11517,79 +11603,141 @@ class DevicesTab(QWidget):
             return
 
         action = "start" if starting else "stop"
-        success_count = 0
-        
+
+        # v0.5.426 (audit stream-NN2): build the per-device POST jobs
+        # list on the UI thread, then fire them from a background
+        # QThread. Pre-fix the loop called `requests.post(timeout=10)`
+        # per device synchronously, so BGP/OSPF/ISIS Start/Stop
+        # against an unreachable server froze the client for
+        # N_devices × 10s. The same pattern as the KK1 Clear-All
+        # worker (traffic_client/main.py).
+        _jobs = []
         for device_info in devices_with_protocol:
             device_name = device_info.get("Device Name", "Unknown")
             device_id = device_info.get("device_id")
-            
-            try:
-                # Prepare payload for protocol start/stop
-                payload = {
-                    "device_id": device_id,
-                    "device_name": device_name,
-                    "interface": self._normalize_iface_label(device_info.get("Interface", "")),
-                    "mac": device_info.get("MAC Address", ""),
-                    "vlan": device_info.get("VLAN", "0"),
-                    "ipv4": device_info.get("IPv4", ""),
-                    "ipv6": device_info.get("IPv6", ""),
-                    "protocols": [protocol],
-                    "ipv4_mask": device_info.get("ipv4_mask", "24"),
-                    "ipv6_mask": device_info.get("ipv6_mask", "64"),
-                }
-
-                # Add protocol-specific configuration
-                if protocol == "BGP" and "protocols" in device_info and "BGP" in device_info["protocols"]:
-                    if isinstance(device_info["protocols"], dict):
-                        payload["bgp"] = device_info["protocols"]["BGP"]
-                    else:
-                        payload["bgp"] = device_info.get("bgp_config", {})
-                    
-                    # Add specific neighbor information if rows were selected
-                    logger.info(f"Checking device_name '{device_name}' against selected_bgp_neighbors keys: {list(selected_bgp_neighbors.keys())}")
-                    if device_name in selected_bgp_neighbors:
-                        payload["selected_neighbors"] = list(selected_bgp_neighbors[device_name])
-                        logger.info(f"Adding selected neighbors for {device_name}: {payload['selected_neighbors']}")
-                    else:
-                        logger.info(f"Device '{device_name}' not found in selected_bgp_neighbors")
-                elif protocol == "OSPF" and "protocols" in device_info and "OSPF" in device_info["protocols"]:
-                    if isinstance(device_info["protocols"], dict):
-                        payload["ospf_config"] = device_info["protocols"]["OSPF"]
-                    else:
-                        payload["ospf_config"] = device_info.get("ospf_config", {})
-                elif protocol == "IS-IS" and "protocols" in device_info and "IS-IS" in device_info["protocols"]:
-                    if isinstance(device_info["protocols"], dict):
-                        payload["isis_config"] = device_info["protocols"]["IS-IS"]
-                    else:
-                        payload["isis_config"] = device_info.get("isis_config", {})
-
-                # Call server API - use protocol-specific endpoints
-                if protocol == "BGP" and action == "stop":
-                    url = f"{server_url}/api/device/bgp/stop"
-                    # Set interim "Stopping" state for selected neighbors
-                    self._set_bgp_interim_stopping_state(device_name, payload.get("selected_neighbors", []))
-                elif protocol == "BGP" and action == "start":
-                    url = f"{server_url}/api/device/bgp/start"
-                elif protocol == "OSPF" and action == "stop":
-                    url = f"{server_url}/api/device/ospf/stop"
-                elif protocol == "OSPF" and action == "start":
-                    url = f"{server_url}/api/device/ospf/start"
-                elif protocol == "IS-IS" and action == "stop":
-                    url = f"{server_url}/api/device/isis/stop"
-                elif protocol == "IS-IS" and action == "start":
-                    url = f"{server_url}/api/device/isis/start"
+            payload = {
+                "device_id": device_id,
+                "device_name": device_name,
+                "interface": self._normalize_iface_label(device_info.get("Interface", "")),
+                "mac": device_info.get("MAC Address", ""),
+                "vlan": device_info.get("VLAN", "0"),
+                "ipv4": device_info.get("IPv4", ""),
+                "ipv6": device_info.get("IPv6", ""),
+                "protocols": [protocol],
+                "ipv4_mask": device_info.get("ipv4_mask", "24"),
+                "ipv6_mask": device_info.get("ipv6_mask", "64"),
+            }
+            if protocol == "BGP" and "protocols" in device_info and "BGP" in device_info["protocols"]:
+                if isinstance(device_info["protocols"], dict):
+                    payload["bgp"] = device_info["protocols"]["BGP"]
                 else:
-                    url = f"{server_url}/api/device/{action}"
-                resp = requests.post(url, json=payload, timeout=10)
-                
-                if resp.status_code == 200:
-                    success_count += 1
-                    logging.info(f"[{protocol} {action.upper()}] Success: {device_name}")
+                    payload["bgp"] = device_info.get("bgp_config", {})
+                if device_name in selected_bgp_neighbors:
+                    payload["selected_neighbors"] = list(selected_bgp_neighbors[device_name])
+            elif protocol == "OSPF" and "protocols" in device_info and "OSPF" in device_info["protocols"]:
+                if isinstance(device_info["protocols"], dict):
+                    payload["ospf_config"] = device_info["protocols"]["OSPF"]
                 else:
-                    logging.error(f"[{protocol} {action.upper()}] Failed: {device_name} - {resp.text}")
-                    
-            except Exception as e:
-                logging.error(f"[{protocol} {action.upper()}] Error: {device_name} - {e}")
+                    payload["ospf_config"] = device_info.get("ospf_config", {})
+            elif protocol == "IS-IS" and "protocols" in device_info and "IS-IS" in device_info["protocols"]:
+                if isinstance(device_info["protocols"], dict):
+                    payload["isis_config"] = device_info["protocols"]["IS-IS"]
+                else:
+                    payload["isis_config"] = device_info.get("isis_config", {})
+
+            if protocol == "BGP" and action == "stop":
+                url = f"{server_url}/api/device/bgp/stop"
+                # Interim "Stopping" paint happens on the UI thread
+                # BEFORE the worker fires so the operator sees
+                # immediate feedback on a slow / unreachable server.
+                self._set_bgp_interim_stopping_state(device_name, payload.get("selected_neighbors", []))
+            elif protocol == "BGP" and action == "start":
+                url = f"{server_url}/api/device/bgp/start"
+            elif protocol == "OSPF" and action == "stop":
+                url = f"{server_url}/api/device/ospf/stop"
+            elif protocol == "OSPF" and action == "start":
+                url = f"{server_url}/api/device/ospf/start"
+            elif protocol == "IS-IS" and action == "stop":
+                url = f"{server_url}/api/device/isis/stop"
+            elif protocol == "IS-IS" and action == "start":
+                url = f"{server_url}/api/device/isis/start"
+            else:
+                url = f"{server_url}/api/device/{action}"
+
+            _jobs.append({"url": url, "payload": payload, "device_name": device_name})
+
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class _ProtoToggleWorker(QThread):
+            # (success_count, total)
+            done = pyqtSignal(int, int)
+
+            def __init__(self, jobs, proto, act):
+                super().__init__()
+                self._jobs = jobs
+                self._proto = proto
+                self._act = act
+
+            def run(self):
+                _ok = 0
+                for _j in self._jobs:
+                    try:
+                        _r = requests.post(_j["url"], json=_j["payload"], timeout=10)
+                        if _r.status_code == 200:
+                            _ok += 1
+                            logging.info(f"[{self._proto} {self._act.upper()}] Success: {_j['device_name']}")
+                        else:
+                            logging.error(f"[{self._proto} {self._act.upper()}] Failed: {_j['device_name']} - {_r.text[:200]}")
+                    except Exception as _e:
+                        logging.error(f"[{self._proto} {self._act.upper()}] Error: {_j['device_name']} - {_e}")
+                self.done.emit(_ok, len(self._jobs))
+
+        _tw = _ProtoToggleWorker(_jobs, protocol, action)
+
+        # Capture state we need in the slot (post-worker refresh +
+        # monitoring start/stop).
+        def _on_toggle_done(success_count, total, _proto=protocol, _act=action, _starting=starting):
+            logger.info(f"{_proto.upper()} {_act.upper()} RESULTS: {success_count}/{total} successful")
+            if success_count > 0:
+                logger.info(f"  ✅ Successfully {_act}ed {_proto} for {success_count} device(s)")
+            if success_count < total:
+                logger.error(f"  ❌ Failed to {_act} {_proto} for {total - success_count} device(s)")
+
+            # Protocol-table refresh + monitoring start/stop (moved
+            # here from the former sync post-loop at :11607+).
+            if _proto == "BGP":
+                from PyQt5.QtCore import QTimer as _QT
+                _QT.singleShot(1000, lambda: (self.update_bgp_table(),
+                                              logger.info(f"Refreshed BGP table after {_act} operation")))
+                if _starting and success_count > 0:
+                    self.start_bgp_monitoring()
+                elif not _starting and success_count > 0:
+                    self.stop_bgp_monitoring()
+            elif _proto == "OSPF":
+                from PyQt5.QtCore import QTimer as _QT
+                _QT.singleShot(1000, lambda: (self.update_ospf_table(),
+                                              logger.info(f"Refreshed OSPF table after {_act} operation")))
+                if _starting and success_count > 0:
+                    self.start_ospf_monitoring()
+                elif not _starting and success_count > 0:
+                    self.stop_ospf_monitoring()
+            elif _proto == "IS-IS":
+                from PyQt5.QtCore import QTimer as _QT
+                _QT.singleShot(1000, lambda: (self.update_isis_table() if hasattr(self, "update_isis_table") else None,
+                                              logger.info(f"Refreshed ISIS table after {_act} operation")))
+
+        _tw.done.connect(_on_toggle_done)
+        try:
+            from utils.qthread_keepalive import keep as _keep
+            _keep(_tw)
+        except Exception:
+            pass
+        _tw.start()
+        # The sync-era post-loop refresh/monitoring block below has
+        # been moved into `_on_toggle_done` above. Early return so
+        # the pre-fix tail (which depended on `success_count`
+        # synchronously) can't double-fire.
+        return
 
         # Print results to console instead of popup
         logger.debug(f"\n{'='*60}")

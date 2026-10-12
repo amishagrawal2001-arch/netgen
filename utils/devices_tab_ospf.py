@@ -229,44 +229,71 @@ class OSPFHandler:
         the cache, so the button rarely seemed to do anything between
         the periodic 30s monitor ticks.
         """
+        # v0.5.426 (audit stream-NN3): server-side force-check moved
+        # to a background QThread. Pre-fix `requests.post(timeout=15)`
+        # ran on the UI thread, so the Refresh OSPF button froze the
+        # client for 15s on an unreachable server. Table repaint
+        # (read-only) still happens immediately so the UI shows cached
+        # state while the probe is in-flight.
         try:
             import requests
+            from PyQt5.QtCore import QThread, pyqtSignal
             logger.info("[OSPF REFRESH] Refreshing OSPF table display from database...")
 
-            # Step 1 — server-side force-check so the DB picks up live
-            # OSPF neighbor state. Non-fatal on failure.
-            try:
-                server_url = self.parent.get_server_url(silent=True)
-                if server_url:
-                    fc = requests.post(f"{server_url}/api/ospf/monitor/force-check", timeout=15)
-                    if fc.status_code == 200:
-                        logger.info("[OSPF REFRESH] force-check OK")
-                    else:
-                        logger.warning(f"[OSPF REFRESH] force-check returned HTTP {fc.status_code}")
-            except Exception as exc:
-                logger.warning(f"[OSPF REFRESH] force-check failed (will show cached state): {exc}")
+            server_url = self.parent.get_server_url(silent=True)
+            if server_url:
+                class _OspfForceCheckWorker(QThread):
+                    finished_probe = pyqtSignal()
 
-            # Temporarily disconnect cellChanged signal to prevent issues during refresh
+                    def __init__(self, url):
+                        super().__init__()
+                        self._url = url
+
+                    def run(self):
+                        try:
+                            fc = requests.post(
+                                f"{self._url}/api/ospf/monitor/force-check", timeout=15
+                            )
+                            if fc.status_code == 200:
+                                logger.info("[OSPF REFRESH] force-check OK")
+                            else:
+                                logger.warning(f"[OSPF REFRESH] force-check returned HTTP {fc.status_code}")
+                        except Exception as exc:
+                            logger.warning(f"[OSPF REFRESH] force-check failed (will show cached state): {exc}")
+                        self.finished_probe.emit()
+
+                _w = _OspfForceCheckWorker(server_url)
+                # When the probe completes, re-render the OSPF table
+                # so the operator sees the live state the force-check
+                # just wrote. Done on the UI thread via the signal.
+                _w.finished_probe.connect(lambda: self.update_ospf_table())
+                try:
+                    from utils.qthread_keepalive import keep as _keep
+                    _keep(_w)
+                except Exception:
+                    pass
+                _w.start()
+
+            # Immediate render from cached DB state (fast; non-
+            # blocking). The async force-check above will schedule a
+            # second render when it completes.
             try:
                 self.parent.ospf_table.cellChanged.disconnect()
             except Exception:
-                pass  # Signal might not be connected
-
-            # Update the OSPF table which fetches status from database
-            # This is READ-ONLY - it only updates the display, does NOT apply to server
+                pass
             self.update_ospf_table()
-            
-            # Force table to repaint/update
             self.parent.ospf_table.viewport().update()
             self.parent.ospf_table.repaint()
-            
-            # Reconnect cellChanged signal
             try:
                 self.parent.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
             except Exception:
-                pass  # Signal might already be connected
-            
-            logger.info(f"[OSPF REFRESH] OSPF table refreshed successfully (no server changes) - {self.parent.ospf_table.rowCount()} rows displayed")
+                pass
+
+            logger.info(
+                f"[OSPF REFRESH] OSPF table refreshed (cached), "
+                f"async force-check scheduled — "
+                f"{self.parent.ospf_table.rowCount()} rows displayed"
+            )
         except Exception as e:
             logger.error(f"[OSPF REFRESH ERROR] Error refreshing OSPF table: {e}")
             import traceback

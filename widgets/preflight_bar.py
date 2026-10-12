@@ -160,29 +160,70 @@ class PreflightBar(QFrame):
     # ─────────────────────────────────────────────── public API
     def refresh(self) -> None:
         """Fetch /api/preflight/check and update the pills + cached
-        findings. Safe to call from any context — never raises."""
+        findings. Safe to call from any context — never raises.
+
+        v0.5.426 (audit stream-NN4): the fetch now runs on a
+        background QThread. Pre-fix `requests.get(timeout=5)` ran on
+        the UI thread from (a) the 60-second QTimer, (b) the manual
+        refresh button, and (c) every `kick_refresh()` call from an
+        Apply path — so a 5-second UI freeze was possible on each of
+        those triggers when the selected server was unreachable.
+        """
         url = self._get_server_url() or ""
         if not url:
             # No server selected yet. Leave the bar in its dash state
             # rather than zeroing the counts (the operator hasn't even
             # had a chance to misconfigure anything).
             return
+
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class _PreflightFetchWorker(QThread):
+            # payload or None
+            got = pyqtSignal(object)
+
+            def __init__(self, u):
+                super().__init__()
+                self._u = u
+
+            def run(self):
+                try:
+                    r = requests.get(
+                        f"{self._u.rstrip('/')}/api/preflight/check",
+                        headers=_auth_headers(), timeout=5,
+                    )
+                except Exception as exc:
+                    logger.debug(f"[PREFLIGHT BAR] fetch failed: {exc}")
+                    self.got.emit(None)
+                    return
+                if r.status_code != 200:
+                    logger.debug(f"[PREFLIGHT BAR] HTTP {r.status_code}")
+                    self.got.emit(None)
+                    return
+                try:
+                    payload = r.json() or {}
+                except Exception:
+                    self.got.emit(None)
+                    return
+                self.got.emit(payload)
+
+        _w = _PreflightFetchWorker(url)
+
+        def _on_got(payload):
+            if payload is None:
+                return
+            try:
+                self._apply_summary(payload)
+            except Exception as _ex:
+                logger.debug(f"[PREFLIGHT BAR] apply failed: {_ex}")
+
+        _w.got.connect(_on_got)
         try:
-            r = requests.get(
-                f"{url.rstrip('/')}/api/preflight/check",
-                headers=_auth_headers(), timeout=5,
-            )
-        except Exception as exc:
-            logger.debug(f"[PREFLIGHT BAR] fetch failed: {exc}")
-            return
-        if r.status_code != 200:
-            logger.debug(f"[PREFLIGHT BAR] HTTP {r.status_code}")
-            return
-        try:
-            payload = r.json() or {}
+            from utils.qthread_keepalive import keep as _keep
+            _keep(_w)
         except Exception:
-            return
-        self._apply_summary(payload)
+            pass
+        _w.start()
 
     def stop(self) -> None:
         """Stop the auto-refresh timer (cleanup on app close)."""

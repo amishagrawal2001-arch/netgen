@@ -495,54 +495,99 @@ class TrafficGenClientServerSection():
             )
             if ret != QMessageBox.Yes:
                 return
+        # v0.5.426 (audit stream-NN5): run the admin POST on a
+        # background QThread. Pre-fix the sync `_requests.post(url,
+        # json=..., timeout=5)` on the UI thread froze the client
+        # for up to 5s on every right-click → Online/Offline against
+        # an unreachable server. Mirror the KK1 shape (traffic_client/
+        # main.py `clear_all_devices_on_server`) — worker emits a
+        # `done(ok, status, body_json_or_None, err_msg)` signal, slot
+        # runs on the main thread and preserves the full post-200
+        # chain (icon paint, v0.5.422 JJ1 cache mutation, JJ2 three
+        # staggered single-iface refetches).
         try:
             import requests as _requests
+            from PyQt5.QtCore import QThread, pyqtSignal
             base = server_addr.rstrip("/")
             if "://" not in base:
                 base = f"http://{base}"
             url = f"{base}/api/interfaces/{iface}/admin"
-            r = _requests.post(url, json={"state": state}, timeout=5)
-            if r.status_code == 200:
-                body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-                operstate = body.get("operstate", "unknown")
+
+            class _AdminStateWorker(QThread):
+                # (ok, status_code, body_dict_or_text, err_msg)
+                done = pyqtSignal(bool, int, object, str)
+
+                def __init__(self, u, st):
+                    super().__init__()
+                    self._u = u
+                    self._st = st
+
+                def run(self):
+                    try:
+                        _r = _requests.post(self._u, json={"state": self._st}, timeout=5)
+                    except Exception as _ex:
+                        self.done.emit(False, 0, None, str(_ex))
+                        return
+                    try:
+                        _body = _r.json() if _r.headers.get("content-type", "").startswith("application/json") else _r.text[:400]
+                    except Exception:
+                        _body = _r.text[:400] if _r.text else ""
+                    self.done.emit(_r.status_code == 200, _r.status_code, _body, "")
+
+            _worker = _AdminStateWorker(url, state)
+
+            def _on_done(ok_flag, status_code, body, err_msg):
+                # `server_addr`, `iface`, `state` are captured from
+                # the enclosing method via closure — no default-arg
+                # rebinding (the slot fires once per worker.done,
+                # which outlives this method only via the keepalive
+                # ref so the closure capture is safe).
+                if err_msg:
+                    QMessageBox.warning(
+                        self, "Interface admin failed",
+                        f"Could not reach {server_addr}: {err_msg}",
+                    )
+                    return
+                if status_code == 404:
+                    QMessageBox.warning(
+                        self, "Interface admin not supported",
+                        f"{server_addr} returned 404. The interface "
+                        f"admin endpoint is new in v0.5.4 — upgrade "
+                        f"the server to use Set Online / Offline.",
+                    )
+                    return
+                if not ok_flag:
+                    _txt = body if isinstance(body, str) else str(body)[:300]
+                    QMessageBox.warning(
+                        self, "Interface admin failed",
+                        f"HTTP {status_code} from {server_addr}:\n\n{_txt}",
+                    )
+                    return
+                body_dict = body if isinstance(body, dict) else {}
+                operstate = body_dict.get("operstate", "unknown")
                 QMessageBox.information(
                     self, "Interface state",
                     f"✓ {iface} on {server_addr}:\n\n"
                     f"  requested: {state}\n"
                     f"  kernel says: {operstate}",
                 )
-                # v0.5.43: apply the operstate from the response
-                # DIRECTLY to the matching port_item's icon. Pre-
-                # fix the client waited for the next
-                # update_server_tree() poll to pick up the new
-                # state via /api/interfaces — but psutil's `isup`
-                # check requires carrier (IFF_RUNNING), which takes
-                # 2-10s on big NICs (Mellanox 100G). So a freshly-
-                # upped link stayed red in the GUI for several
-                # seconds even though admin state was correct.
-                #
-                # The admin endpoint reads /sys/.../operstate
-                # directly — same source we now use in
-                # /api/interfaces post-v0.5.43 — so the icon
-                # update is canonical immediately.
+                # v0.5.43 icon paint + v0.5.422 JJ1 cache mutation +
+                # v0.5.422 JJ2 three staggered single-iface refetches.
+                # All three post-200 side effects now run inside the
+                # slot (v0.5.426 NN5), so an unreachable server can't
+                # freeze the operator for 5s during the POST.
                 try:
                     self._update_iface_icon_for_operstate(
                         server_addr, iface, operstate,
                     )
-                except Exception as e:
-                    logger.debug(
-                        f"[INTERFACE ADMIN] icon update failed: {e}"
-                    )
+                except Exception as _e:
+                    logger.debug(f"[INTERFACE ADMIN] icon update failed: {_e}")
                 # v0.5.422 (audit stream-JJ1 — follow-up to II1 + II2):
-                # keep the cache in sync with the kernel's reported
-                # operstate so a LATER full `update_server_tree`
-                # refresh (triggered by some other code path) renders
-                # the correct state, WITHOUT invalidating the whole
-                # cache and forcing a full tree rebuild (which is
-                # what v0.5.421 II2 did — operator reported the
-                # entire interface list collapsed + re-expanded 3×
-                # over the 8-second staggered window). Mutate just
-                # this iface's entry in-place.
+                # mutate the cached iface entry in-place so a later
+                # full `update_server_tree` renders the correct state
+                # WITHOUT invalidating the whole cache (and the
+                # visible tree collapse/expand the pre-JJ1 shape
+                # caused).
                 try:
                     for _srv in getattr(self, "server_interfaces", []):
                         if _srv.get("address", "") != server_addr:
@@ -555,46 +600,72 @@ class TrafficGenClientServerSection():
                                 break
                         break
                 except Exception as _mut_exc:
-                    logger.debug(
-                        f"[INTERFACE ADMIN] cache mutate failed: {_mut_exc}"
-                    )
-                # v0.5.422 (audit stream-JJ2): replace the 3 staggered
-                # `self.update_server_tree` calls (which rebuild the
-                # ENTIRE tree — operator sees a visible collapse/
-                # expand flash each time) with a lightweight single-
-                # iface refetch helper that only re-paints THIS
-                # iface's icon via `_update_iface_icon_for_operstate`.
-                # Still fires at 500ms / 3s / 8s to catch slow
-                # Mellanox 100G/200G carrier negotiation (the reason
-                # v0.5.43 added the retries in the first place).
+                    logger.debug(f"[INTERFACE ADMIN] cache mutate failed: {_mut_exc}")
+                # v0.5.422 (audit stream-JJ2): three staggered
+                # single-iface refetches (500ms / 3s / 8s) catch
+                # slow Mellanox 100G/200G carrier negotiation
+                # without rebuilding the whole tree. Each refetch
+                # now ALSO uses a QThread (v0.5.426 NN5 — the pre-
+                # NN5 closure ran `requests.get` synchronously on
+                # the UI thread via QTimer.singleShot — on an
+                # unreachable server that was a 3s UI stall three
+                # times per Online/Offline click).
                 def _refresh_this_iface_only(_srv_addr=server_addr, _iface=iface):
                     try:
+                        from PyQt5.QtCore import QThread as _QT, pyqtSignal as _ps
                         import requests as _r2
+
+                        class _IfaceRefetchWorker(_QT):
+                            got = _ps(object)  # json or None
+
+                            def __init__(self, u):
+                                super().__init__()
+                                self._u = u
+
+                            def run(self):
+                                try:
+                                    _rp = _r2.get(self._u, timeout=3)
+                                    if _rp.status_code == 200:
+                                        self.got.emit(_rp.json())
+                                        return
+                                except Exception:
+                                    pass
+                                self.got.emit(None)
+
                         _base = _srv_addr.rstrip("/")
                         if "://" not in _base:
                             _base = f"http://{_base}"
-                        _rp = _r2.get(f"{_base}/api/interfaces", timeout=3)
-                        if _rp.status_code != 200:
-                            return
-                        _data = _rp.json()
-                        _list = _data if isinstance(_data, list) else _data.get("interfaces", [])
-                        for _ent in _list:
-                            if _ent.get("name") == _iface:
-                                _new_ops = _ent.get("operstate") or _ent.get("status") or ""
-                                # Mutate cached entry in-place.
-                                for _srv in getattr(self, "server_interfaces", []):
-                                    if _srv.get("address", "") != _srv_addr:
-                                        continue
-                                    for _c in (_srv.get("interfaces") or []):
-                                        if _c.get("name") == _iface:
-                                            _c["status"] = _ent.get("status", _c.get("status"))
-                                            _c["operstate"] = _new_ops
-                                            break
-                                    break
-                                self._update_iface_icon_for_operstate(
-                                    _srv_addr, _iface, _new_ops,
-                                )
+                        _rw = _IfaceRefetchWorker(f"{_base}/api/interfaces")
+
+                        def _on_got(_data, _sa=_srv_addr, _ii=_iface):
+                            if _data is None:
                                 return
+                            _list = _data if isinstance(_data, list) else _data.get("interfaces", [])
+                            for _ent in _list:
+                                if _ent.get("name") == _ii:
+                                    _new_ops = _ent.get("operstate") or _ent.get("status") or ""
+                                    for _srv in getattr(self, "server_interfaces", []):
+                                        if _srv.get("address", "") != _sa:
+                                            continue
+                                        for _c in (_srv.get("interfaces") or []):
+                                            if _c.get("name") == _ii:
+                                                _c["status"] = _ent.get("status", _c.get("status"))
+                                                _c["operstate"] = _new_ops
+                                                break
+                                        break
+                                    try:
+                                        self._update_iface_icon_for_operstate(_sa, _ii, _new_ops)
+                                    except Exception:
+                                        pass
+                                    return
+
+                        _rw.got.connect(_on_got)
+                        try:
+                            from utils.qthread_keepalive import keep as _keep
+                            _keep(_rw)
+                        except Exception:
+                            pass
+                        _rw.start()
                     except Exception as _ex:
                         logger.debug(
                             f"[INTERFACE ADMIN] JJ2 iface-only refresh failed: {_ex}"
@@ -602,23 +673,18 @@ class TrafficGenClientServerSection():
                 QTimer.singleShot(500, _refresh_this_iface_only)
                 QTimer.singleShot(3000, _refresh_this_iface_only)
                 QTimer.singleShot(8000, _refresh_this_iface_only)
-            elif r.status_code == 404:
-                QMessageBox.warning(
-                    self, "Interface admin not supported",
-                    f"{server_addr} returned 404. The interface "
-                    f"admin endpoint is new in v0.5.4 — upgrade "
-                    f"the server to use Set Online / Offline.",
-                )
-            else:
-                QMessageBox.warning(
-                    self, "Interface admin failed",
-                    f"HTTP {r.status_code} from {server_addr}:\n\n"
-                    f"{r.text[:300]}",
-                )
+
+            _worker.done.connect(_on_done)
+            try:
+                from utils.qthread_keepalive import keep
+                keep(_worker)
+            except Exception:
+                pass
+            _worker.start()
         except Exception as exc:
             QMessageBox.warning(
                 self, "Interface admin failed",
-                f"Could not reach {server_addr}: {exc}",
+                f"Could not set up admin-state worker for {server_addr}: {exc}",
             )
 
     def _on_server_selection_changed_combined(self):

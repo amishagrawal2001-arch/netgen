@@ -1063,26 +1063,52 @@ class ISISHandler:
         force-check the button only re-displayed whatever the periodic
         monitor last wrote — same stale-cache UX bug we fixed for ARP.
         """
+        # v0.5.426 (audit stream-NN3): server-side force-check moved
+        # to a background QThread (parity with BGP/OSPF Refresh
+        # buttons in the same slice). Pre-fix the sync
+        # `requests.post(timeout=15)` froze the UI for 15s per
+        # Refresh ISIS click on an unreachable server.
         try:
             import requests
+            from PyQt5.QtCore import QThread, pyqtSignal
             logger.info("[ISIS REFRESH] Refreshing ISIS status from database...")
 
-            # Step 1 — server-side force-check. Non-fatal on failure;
-            # we still re-render whatever's in the DB.
-            try:
-                server_url = self.parent.get_server_url(silent=True)
-                if server_url:
-                    fc = requests.post(f"{server_url}/api/isis/monitor/force-check", timeout=15)
-                    if fc.status_code == 200:
-                        logger.info("[ISIS REFRESH] force-check OK")
-                    else:
-                        logger.warning(f"[ISIS REFRESH] force-check returned HTTP {fc.status_code}")
-            except Exception as exc:
-                logger.warning(f"[ISIS REFRESH] force-check failed (will show cached state): {exc}")
+            server_url = self.parent.get_server_url(silent=True)
+            if server_url:
+                class _IsisForceCheckWorker(QThread):
+                    finished_probe = pyqtSignal()
 
-            # Update the ISIS table which fetches status from database
+                    def __init__(self, url):
+                        super().__init__()
+                        self._url = url
+
+                    def run(self):
+                        try:
+                            fc = requests.post(
+                                f"{self._url}/api/isis/monitor/force-check", timeout=15
+                            )
+                            if fc.status_code == 200:
+                                logger.info("[ISIS REFRESH] force-check OK")
+                            else:
+                                logger.warning(f"[ISIS REFRESH] force-check returned HTTP {fc.status_code}")
+                        except Exception as exc:
+                            logger.warning(f"[ISIS REFRESH] force-check failed (will show cached state): {exc}")
+                        self.finished_probe.emit()
+
+                _w = _IsisForceCheckWorker(server_url)
+                _w.finished_probe.connect(lambda: self.update_isis_table())
+                try:
+                    from utils.qthread_keepalive import keep as _keep
+                    _keep(_w)
+                except Exception:
+                    pass
+                _w.start()
+
+            # Immediate render from cached DB state so the operator
+            # sees SOMETHING even when the server is dead; the async
+            # force-check above will schedule a second render.
             self.update_isis_table()
-            logger.info("[ISIS REFRESH] ISIS status refreshed successfully")
+            logger.info("[ISIS REFRESH] ISIS cached state rendered, force-check scheduled (async)")
         except Exception as e:
             logger.error(f"[ISIS REFRESH ERROR] Error refreshing ISIS status: {e}")
 

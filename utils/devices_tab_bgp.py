@@ -275,50 +275,69 @@ class BGPHandler:
             except Exception as sel_exc:
                 logger.debug(f"[BGP REFRESH] selection scan failed: {sel_exc}")
 
-            if selected_device_ids:
-                # Selective per-device path — one GET per unique device.
-                for did in selected_device_ids:
-                    try:
-                        r = requests.get(
-                            f"{server_url}/api/bgp/status/{did}", timeout=10
-                        )
-                        if r.status_code == 200:
-                            logger.info(f"[BGP REFRESH] selective probe OK for {did}")
-                        else:
-                            logger.warning(
-                                f"[BGP REFRESH] selective probe HTTP {r.status_code} for {did}"
+            # v0.5.426 (audit stream-NN3): both the selective per-
+            # device GET loop (timeout=10 each) and the fleet-wide
+            # force-check POST (timeout=15) now run on a background
+            # QThread. Pre-fix the Refresh BGP button could freeze
+            # the UI for N × 10s (selective, N selected devices) or
+            # 15s (force-check) on an unreachable server. Table
+            # repaint from cache still schedules at the end so the
+            # UI stays responsive even when the server is dead.
+            from PyQt5.QtCore import QThread, pyqtSignal, QTimer
+
+            class _BgpRefreshWorker(QThread):
+                finished_probe = pyqtSignal()
+
+                def __init__(self, url, sel_ids):
+                    super().__init__()
+                    self._url = url
+                    self._sel = sel_ids
+
+                def run(self):
+                    if self._sel:
+                        for did in self._sel:
+                            try:
+                                r = requests.get(
+                                    f"{self._url}/api/bgp/status/{did}", timeout=10
+                                )
+                                if r.status_code == 200:
+                                    logger.info(f"[BGP REFRESH] selective probe OK for {did}")
+                                else:
+                                    logger.warning(
+                                        f"[BGP REFRESH] selective probe HTTP {r.status_code} for {did}"
+                                    )
+                            except Exception as exc:
+                                logger.warning(
+                                    f"[BGP REFRESH] selective probe failed for {did}: {exc}"
+                                )
+                    else:
+                        try:
+                            fc = requests.post(
+                                f"{self._url}/api/bgp/monitor/force-check", timeout=15
                             )
-                    except Exception as exc:
-                        logger.warning(
-                            f"[BGP REFRESH] selective probe failed for {did}: {exc}"
-                        )
-                from PyQt5.QtCore import QTimer
-                QTimer.singleShot(0, lambda: self.parent.update_bgp_table())
+                            if fc.status_code == 200:
+                                logger.info("[BGP REFRESH] force-check OK")
+                            else:
+                                logger.warning(f"[BGP REFRESH] force-check returned HTTP {fc.status_code}")
+                        except Exception as exc:
+                            logger.warning(f"[BGP REFRESH] force-check failed (will show cached state): {exc}")
+                    self.finished_probe.emit()
+
+            _w = _BgpRefreshWorker(server_url, selected_device_ids)
+            _w.finished_probe.connect(lambda: self.parent.update_bgp_table())
+            try:
+                from utils.qthread_keepalive import keep as _keep
+                _keep(_w)
+            except Exception:
+                pass
+            _w.start()
+            if selected_device_ids:
                 logger.info(
                     f"[BGP REFRESH] BGP status refresh scheduled "
-                    f"(selective, {len(selected_device_ids)} device(s))"
+                    f"(selective, {len(selected_device_ids)} device(s), async)"
                 )
-                return
-
-            # Step 1 — fire the server-side force-check. Synchronous
-            # on the server (probes every BGP device in parallel via
-            # docker exec vtysh), normally returns in <1s. Failures
-            # are non-fatal: we still refresh the table from cache.
-            try:
-                fc = requests.post(f"{server_url}/api/bgp/monitor/force-check", timeout=15)
-                if fc.status_code == 200:
-                    logger.info("[BGP REFRESH] force-check OK")
-                else:
-                    logger.warning(f"[BGP REFRESH] force-check returned HTTP {fc.status_code}")
-            except Exception as exc:
-                logger.warning(f"[BGP REFRESH] force-check failed (will show cached state): {exc}")
-
-            # Step 2 — defer the table update so the UI doesn't block
-            # on click. By the time the QTimer fires the force-check
-            # has already updated the DB.
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(0, lambda: self.parent.update_bgp_table())
-            logger.info("[BGP REFRESH] BGP status refresh scheduled (non-blocking)")
+            else:
+                logger.info("[BGP REFRESH] BGP status refresh scheduled (fleet, async)")
         except Exception as e:
             logger.error(f"Error refreshing BGP status: {e}")
 
